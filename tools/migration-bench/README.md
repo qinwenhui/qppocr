@@ -69,3 +69,21 @@ rustc -O -o mem_rust mem.rs
   峰值读成 `0.0` —— 读得到数但是错的。这个坑在第一版里踩过。
 - 这两个程序**不需要模型、不需要语料**，任何机器上都能跑。
   这是它们能留在这里的原因：**公开仓库里不该有依赖第三方语料的测试**。
+
+
+## 2026-09-23 · qppocr 内核复测（阶段 1c 判据）
+
+qppocr-kernels 的 sgemm AVX2 内核落地后，同一方法（7 轮取最好 × 5 次交错）
+复测。Rust 侧走 `sgemm_serial`（与本目录 bench.cpp 同为单线程内核路径），
+`cargo build --release`（默认无 LTO）。
+
+| shape | C++ best | Rust best | Rust/C++ |
+|---|---|---|---|
+| M=3136 N=64 K=576 | 3.232 ms | 2.821 ms | 0.873x |
+| M=1024 N=256 K=256 | 1.861 ms | 1.503 ms | 0.808x |
+| M=512 N=256 K=576 | 2.094 ms | 1.679 ms | 0.802x |
+| M=64 N=64 K=64 | 0.007 ms | 0.005 ms | ~0.8x |
+
+四个形状校验和逐一相同；判据 ≤1.05x 大幅超额（LLVM 对该内核的寄存器
+分配优于本机 GCC）。Rust 侧入口：
+`cargo run --release -p qppocr-kernels --example bench_gemm`。
