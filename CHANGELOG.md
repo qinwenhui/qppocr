@@ -55,6 +55,17 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- perf(pool): 移植 C++ fork-join 线程池（util.hpp `ThreadPool` Windows
+  路径）替代 rayon——批量唤醒、主线程参与、自旋 join、参与者计数屏障
+  （epoch 推进被 join 门控 ⇒ 栈上 Job 生存期安全）。跨线程并发
+  `fork_join` 用 `fork_mu` 串行化而非 C++ 的挂死语义；drop rayon
+  依赖（kernels 零第三方依赖）。TP_CHUNKS 回归 tuning.hpp 默认 8。
+  端到端交错基准（bench v3）：Σ中位 rust 563.5 vs C++ 572.2 ms
+  （**0.985x，整体反超**；v2 为 1.379x），det 单模型 33.5→26.9 ms
+  （C++ 30.5），K=4 并发 0.959x，内存峰值 123 vs 130 MB。含
+  resize 双线性 AVX2（bilinear_row_vec）与全局 FMA 构建旗标
+  （.cargo/config.toml，对齐 C++ `-mavx2 -mfma`；workspace 级配置
+  不传播给下游依赖者）。
 - 公开 API（阶段 4）：`qppocr` 门面 crate——`Engine::new(tier, dir)`
   三行上手；`EngineBuilder`（tier/preset/config/advanced/threads/
   verify_sha256）；`Config`（Option 字段 = 预设覆盖语义）+ `Preset`

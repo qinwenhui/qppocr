@@ -30,6 +30,7 @@
 /// 每线程任务块数的乘子（= `tuning.hpp` `tp_chunks`，语义随 `crate::pool`
 /// 的移植回归 C++：原子领票的动态负载均衡，不是 rayon 的静态微任务）。
 /// C++ rotated 实测 4/8/16/32 在噪声内，**1 是离群值**（16 线程 -8%）。
+#[cfg(feature = "parallel")]
 const TP_CHUNKS: usize = 8;
 
 /// 并行门槛，照搬 `tuning.hpp`。
