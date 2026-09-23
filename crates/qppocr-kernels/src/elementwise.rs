@@ -17,6 +17,7 @@
 //! 位级说明：每条路径对每个元素恰好按同样顺序结合一次，路径间逐位一致
 //! （C++ 注释原话「bit-identical」的前提）。
 
+use crate::buf::F32Buf;
 use crate::par;
 
 /// 二元算子种类（对应 C++ 的 op 码 0..4）。
@@ -265,7 +266,7 @@ pub fn binary_op(
     b: &[f32],
     b_shape: &[i64],
     op: BinOp,
-) -> (Vec<f32>, Vec<i64>) {
+) -> (F32Buf, Vec<i64>) {
     let ra = a_shape.len();
     let rb = b_shape.len();
     let r = ra.max(rb);
@@ -293,12 +294,13 @@ pub fn binary_op(
         }
     }
     let total: i64 = shape.iter().product();
-    let mut y = vec![0.0f32; total.max(0) as usize];
     let out_shape: Vec<i64> = shape.iter().rev().copied().collect();
     if total <= 0 {
-        return (y, out_shape);
+        return (F32Buf::new(), out_shape);
     }
     let total = total as usize;
+    // SAFETY: 每条路径对每个输出元素恰好写一次（标量/向量/odometer 同）。
+    let mut y = unsafe { F32Buf::with_uninit(total) };
     let yp = par::SyncPtr::new(y.as_mut_ptr());
 
     let nobc = (0..r).all(|i| stra[i] != 0 && strb[i] != 0);

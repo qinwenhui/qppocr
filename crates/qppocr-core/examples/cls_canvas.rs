@@ -38,7 +38,7 @@ fn main() {
                         name: String::new(),
                         shape: vec![1, 3, ch as i64, cw as i64],
                         dtype: DType::F32,
-                        f32: buf,
+                        f32: qppocr_kernels::buf::F32Buf::from_vec(&buf),
                         i64: Vec::new(),
                     },
                 )])

@@ -50,7 +50,7 @@ fn main() {
                 name: "x".into(),
                 shape: dims,
                 dtype: DType::F32,
-                f32: data,
+                f32: qppocr_kernels::buf::F32Buf::from_vec(&data),
                 i64: Vec::new(),
             },
         )])
@@ -68,7 +68,7 @@ fn main() {
         for d in &o.shape {
             f.write_all(&d.to_le_bytes()).unwrap();
         }
-        for v in &o.f32 {
+        for v in o.f32.as_slice() {
             f.write_all(&v.to_le_bytes()).unwrap();
         }
     }

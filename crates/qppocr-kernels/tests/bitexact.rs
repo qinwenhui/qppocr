@@ -7,6 +7,7 @@
 #![allow(clippy::approx_constant, clippy::type_complexity)]
 
 use qppocr_kernels::activation::Activation;
+use qppocr_kernels::buf::F32Buf;
 use qppocr_kernels::gemm::{sgemm, sgemm_serial};
 use qppocr_kernels::{Backend, force_backend};
 
@@ -300,8 +301,8 @@ fn conv_bitexact() {
             dw: 1,
             group: 1,
         };
-        let mut y1 = Vec::new();
-        let mut y2 = Vec::new();
+        let mut y1 = F32Buf::new();
+        let mut y2 = F32Buf::new();
         force_backend(Some(Backend::Scalar));
         conv2d(
             &x,
@@ -347,8 +348,8 @@ fn conv_bitexact() {
             dw: 1,
             group: c,
         };
-        let mut y1 = Vec::new();
-        let mut y2 = Vec::new();
+        let mut y1 = F32Buf::new();
+        let mut y2 = F32Buf::new();
         force_backend(Some(Backend::Scalar));
         conv2d(
             &x,
@@ -382,8 +383,8 @@ fn conv_bitexact() {
         rng.fill(&mut x);
         let mut wt = vec![0f32; c * m * 4];
         rng.fill(&mut wt);
-        let mut y1 = Vec::new();
-        let mut y2 = Vec::new();
+        let mut y1 = F32Buf::new();
+        let mut y2 = F32Buf::new();
         force_backend(Some(Backend::Scalar));
         convtranspose2d(
             &x,
@@ -417,8 +418,8 @@ fn conv_bitexact() {
         let (n, c, h, w) = (1usize, 3, 20, 30);
         let mut x = vec![0f32; n * c * h * w];
         rng.fill(&mut x);
-        let mut y1 = Vec::new();
-        let mut y2 = Vec::new();
+        let mut y1 = F32Buf::new();
+        let mut y2 = F32Buf::new();
         force_backend(Some(Backend::Scalar));
         pool2d(&x, n, c, h, w, 2, 2, 1, 1, 0, 0, 1, 1, true, &mut y1);
         force_backend(Some(Backend::Avx2));

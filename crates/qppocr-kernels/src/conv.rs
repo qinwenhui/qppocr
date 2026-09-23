@@ -15,6 +15,7 @@
 //! ⚠ 当前实现 `resize` 清零——缓冲池（阶段 2/3）落地时换成不清零分配。
 
 use crate::activation::Activation;
+use crate::buf::F32Buf;
 use crate::gemm::{im2col, sgemm, sgemm_serial};
 use crate::par;
 
@@ -57,6 +58,9 @@ pub fn conv2d_out_shape(x_shape: &[i64; 4], w_shape: &[i64; 4], p: &ConvParams) 
 
 /// 2D 卷积。`y` 会被重设为输出形状对应的长度；返回输出形状。
 ///
+/// GEMM 路径的输出**不清零**（`resize_uninit`）：sgemm 每元素都在
+/// 寄存器里算满再 store。只有 depthwise 累加路径需要预清零。
+///
 /// bias 在两条 GEMM 路径的 store 阶段折入；只有 depthwise 没经过 GEMM，
 /// 保留独立的加 bias pass。
 #[allow(clippy::too_many_arguments)]
@@ -68,7 +72,7 @@ pub fn conv2d(
     bias: Option<&[f32]>,
     p: &ConvParams,
     act: &Activation,
-    y: &mut Vec<f32>,
+    y: &mut F32Buf,
 ) -> [i64; 4] {
     let out_shape = conv2d_out_shape(x_shape, w_shape, p);
     let (n, c, h, wdim) = (
@@ -89,11 +93,14 @@ pub fn conv2d(
     let out_elems = n * m * ohw;
 
     let depthwise = group > 1 && cg == 1;
-    // TODO(缓冲池): GEMM 路径每元素都会被写，无需清零；resize 的零填充在
-    // det 的 47 MB 输出上是 ~4 ms/节点的无效功。缓冲池落地后换成不清零分配。
-    y.clear();
-    y.resize(out_elems, 0.0);
-    let yp = par::SyncPtr::new(y.as_mut_ptr());
+    if depthwise {
+        y.resize_zeroed(out_elems); // 唯一需要预清零的路径（tap 上 +=）
+    } else {
+        // SAFETY: GEMM 路径（1x1/分块 im2col）每元素都由 sgemm 的 store
+        // 写满，无任何先读。
+        unsafe { y.resize_uninit(out_elems) };
+    }
+    let yp = par::SyncPtr::new(y.as_mut_slice().as_mut_ptr());
     let wt = w;
 
     let mut bias_in_gemm = true;
@@ -328,7 +335,7 @@ pub fn convtranspose2d(
     sw: usize,
     ph: usize,
     pw: usize,
-    y: &mut Vec<f32>,
+    y: &mut F32Buf,
 ) -> [i64; 4] {
     let (n, c, h, wdim) = (
         x_shape[0] as usize,
@@ -348,9 +355,10 @@ pub fn convtranspose2d(
         "convtranspose: only 2x2 s2 p0 supported"
     );
     let (oh, ow) = (h * 2, wdim * 2);
-    y.clear();
-    y.resize(n * m * oh * ow, 0.0);
-    let yp = par::SyncPtr::new(y.as_mut_ptr());
+    // 每个输出元素恰好被赋值一次，无需清零
+    // SAFETY: 下方循环对 (n, co, oy, ox) 全空间赋值。
+    unsafe { y.resize_uninit(n * m * oh * ow) };
+    let yp = par::SyncPtr::new(y.as_mut_slice().as_mut_ptr());
 
     for bn in 0..n {
         let xn = &x[bn * c * h * wdim..(bn + 1) * c * h * wdim];

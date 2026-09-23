@@ -14,6 +14,7 @@ use super::crop::{batch_ratio, cls_view, crop_pads, crop_text_box, pack_crop};
 use super::geometry::{box_margin_clutter, db_postprocess, merge_same_line, sort_reading_order};
 use super::image::{Image, resize_bilinear_img, rotate_image};
 use super::rec::{add_gap_spaces, column_ink, ctc_decode};
+use qppocr_kernels::buf::F32Buf;
 
 /// 识别结果的一行。
 #[derive(Clone, Debug)]
@@ -442,7 +443,11 @@ impl Engine {
         res.det_input_h = nh;
 
         let t_pre0 = now();
-        let mut in_f32 = vec![0f32; 3 * (nh as usize) * (nw as usize)];
+        // core 是 forbid(unsafe)——det 输入的 uninit 优化下沉不了，
+        // 清零（8.5 MB warm ~0.7 ms）可接受；若 profile 显示它重要，
+        // 把「RGB→归一化 NCHW」整体下沉为 kernels 的安全 API。
+        let mut in_f32 =
+            qppocr_kernels::buf::F32Buf::with_zeroed(3 * (nh as usize) * (nw as usize));
         let (scale, mean, istd) = (1.0f32 / 255.0, 0.5f32, 1.0f32 / 0.5f32);
         for y in 0..nh {
             let r = det_img.row(y);
@@ -576,7 +581,7 @@ impl Engine {
             while beg < crops.len() {
                 let end = (beg + self.cfg.rec_batch).min(crops.len());
                 let bsz = end - beg;
-                let mut batch_f32 = vec![0f32; bsz * 3 * (ch as usize) * (cw as usize)];
+                let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (ch as usize) * (cw as usize));
                 for i in beg..end {
                     let view = if self.cfg.cls_window {
                         cls_view(&crops[i], cw, ch)
@@ -657,7 +662,7 @@ impl Engine {
 
             let t_batch0 = now();
             let bsz = end - beg;
-            let mut batch_f32 = vec![0f32; bsz * 3 * (img_h as usize) * (img_w as usize)];
+            let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (img_h as usize) * (img_w as usize));
             for (k, &i) in order[beg..end].iter().enumerate() {
                 pack_crop(
                     &crops[i],

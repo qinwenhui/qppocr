@@ -16,6 +16,7 @@
 )]
 
 use qppocr_kernels::activation::*;
+use qppocr_kernels::buf::F32Buf;
 use qppocr_kernels::conv::{ConvParams, conv2d, convtranspose2d};
 use qppocr_kernels::elementwise::{BinOp, binary_can_inplace, binary_op, binary_op_inplace};
 use qppocr_kernels::gemm::sgemm;
@@ -542,7 +543,7 @@ fn conv2d_kernel_tests() {
             dw: 1,
             group: c.group,
         };
-        let mut y = Vec::new();
+        let mut y = F32Buf::new();
         let out_shape = conv2d(
             &x,
             &[c.n as i64, c.c as i64, c.h as i64, c.w as i64],
@@ -559,7 +560,7 @@ fn conv2d_kernel_tests() {
             "{}: shape",
             c.name
         );
-        check(c.name, &y, &ref_);
+        check(c.name, &y.to_vec(), &ref_);
     }
 }
 
@@ -628,7 +629,7 @@ fn batchnorm_tests() {
             v
         };
         let (sc, bi, me, va) = (mk(), mk(), mk(), mk());
-        let mut y = Vec::new();
+        let mut y = F32Buf::new();
         batchnorm(
             &x,
             &[n as i64, c as i64, h as i64, w as i64],
@@ -651,7 +652,7 @@ fn batchnorm_tests() {
                 }
             }
         }
-        check(&format!("batchnorm N={n} C={c}"), &y, &ref_);
+        check(&format!("batchnorm N={n} C={c}"), &y.to_vec(), &ref_);
     }
 }
 
@@ -1078,7 +1079,7 @@ fn pool_and_resize_tests() {
     // max pool 2x2 s1 SAME_UPPER（v6 det 的形状）：ph=pw=0, peh=pew=1
     let mut x = vec![0f32; n * c * h * w];
     rng.fill(&mut x);
-    let mut y = Vec::new();
+    let mut y = F32Buf::new();
     let (oh, ow) = pool2d(&x, n, c, h, w, 2, 2, 1, 1, 0, 0, 1, 1, true, &mut y);
     assert_eq!((oh, ow), (h, w));
     for nc in 0..n * c {
@@ -1121,7 +1122,7 @@ fn pool_and_resize_tests() {
     }
 
     // global avg pool（f64 累加）
-    let mut g = Vec::new();
+    let mut g = F32Buf::new();
     global_avg_pool(&x, n, c, &mut g);
     for nc in 0..n * c {
         let s: f64 = x[nc * h * w..(nc + 1) * h * w]
@@ -1261,7 +1262,7 @@ fn shape_op_tests() {
     let mut xb = vec![0f32; 40];
     rng.fill(&mut xa);
     rng.fill(&mut xb);
-    let mut out = Payload::F32(Vec::new());
+    let mut out = Payload::F32(F32Buf::new());
     let payloads = [PayloadRef::F32(&xa), PayloadRef::F32(&xb)];
     let cshape = concat_any(&payloads, &xs_shape, 1, &mut out);
     assert_eq!(cshape, vec![2, 8, 4]);
@@ -1281,7 +1282,7 @@ fn shape_op_tests() {
     }
 
     // reduce_mean keepdims
-    let mut rm = Vec::new();
+    let mut rm = F32Buf::new();
     let rs = reduce_mean(&x, &shape, &[2, 3], true, &mut rm);
     assert_eq!(rs, vec![2, 3, 1, 1]);
     for i0 in 0..2 {
@@ -1309,7 +1310,7 @@ fn shape_op_tests() {
     let mut b = vec![0f32; 80 * 101];
     rng.fill(&mut a);
     rng.fill(&mut b);
-    let mut mm = Vec::new();
+    let mut mm = F32Buf::new();
     let ms = matmul(&a, &a_shape, &b, &b_shape, &mut mm);
     assert_eq!(ms, vec![2, 3, 40, 101]);
     let mut ref_ = vec![0f32; 6 * 40 * 101];
@@ -1359,7 +1360,7 @@ fn convtranspose_tests() {
     // ONNX 布局 [C_in, C_out, 2, 2]
     let mut wt = vec![0f32; c * m * 4];
     rng.fill(&mut wt);
-    let mut y = Vec::new();
+    let mut y = F32Buf::new();
     let ys = convtranspose2d(
         &x,
         &[n as i64, c as i64, h as i64, w as i64],

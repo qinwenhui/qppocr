@@ -1,5 +1,6 @@
 //! Resize：nearest（floor）与 bilinear。
 
+use crate::buf::F32Buf;
 use crate::par;
 
 /// 最近邻缩放。`iy = (int)((float)oy * H / oh)`，钳到 `[0, H-1]`。
@@ -12,11 +13,11 @@ pub fn resize_nearest(
     w: usize,
     oh: usize,
     ow: usize,
-    out: &mut Vec<f32>,
+    out: &mut F32Buf,
 ) {
-    out.clear();
-    out.resize(n * c * oh * ow, 0.0);
-    let op = par::SyncPtr::new(out.as_mut_ptr());
+    // SAFETY: 每输出元素写一次。
+    unsafe { out.resize_uninit(n * c * oh * ow) };
+    let op = par::SyncPtr::new(out.as_mut_slice().as_mut_ptr());
     par::parallel_for_units(n * c, |b, e| {
         for nc in b..e {
             let xnc = &x[nc * h * w..(nc + 1) * h * w];
@@ -48,11 +49,11 @@ pub fn resize_bilinear(
     oh: usize,
     ow: usize,
     align_corners: bool,
-    out: &mut Vec<f32>,
+    out: &mut F32Buf,
 ) {
-    out.clear();
-    out.resize(n * c * oh * ow, 0.0);
-    let op = par::SyncPtr::new(out.as_mut_ptr());
+    // SAFETY: 每输出元素写一次。
+    unsafe { out.resize_uninit(n * c * oh * ow) };
+    let op = par::SyncPtr::new(out.as_mut_slice().as_mut_ptr());
 
     let mut iy0 = vec![0usize; oh];
     let mut iy1 = vec![0usize; oh];

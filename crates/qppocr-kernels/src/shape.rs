@@ -7,6 +7,7 @@
 //! 加法一次比较。最内维 `stride == 1` 时内循环是 memcpy 而不是 inner 次
 //! 标量 load——`Transpose [3,6,8,40,15]` 正是这种。
 
+use crate::buf::F32Buf;
 use crate::gemm::sgemm;
 use crate::par;
 
@@ -114,8 +115,8 @@ fn copy_strided_i64(
 /// 张量的两种有效载荷（kernels 层的最小张量表示；core 的 Tensor 包装它）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
-    /// f32。
-    F32(Vec<f32>),
+    /// f32（池化缓冲）。
+    F32(F32Buf),
     /// i64（含 I32/BOOL，按 ONNX 惯例提升）。
     I64(Vec<i64>),
 }
@@ -133,8 +134,15 @@ impl Payload {
     /// 借用视图。
     pub fn as_ref(&self) -> PayloadRef<'_> {
         match self {
-            Payload::F32(v) => PayloadRef::F32(v),
+            Payload::F32(v) => PayloadRef::F32(v.as_slice()),
             Payload::I64(v) => PayloadRef::I64(v),
+        }
+    }
+    /// f32 载荷的切片（Payload::F32 时）。
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        match self {
+            Payload::F32(v) => Some(v.as_slice()),
+            Payload::I64(_) => None,
         }
     }
 }
@@ -205,7 +213,7 @@ pub fn slice_tensor(
     }
     let y = match x {
         PayloadRef::F32(d) => {
-            let mut out = vec![0f32; count as usize];
+            let mut out = F32Buf::with_zeroed(count as usize);
             if count > 0 {
                 slice_copy(x_shape, &shape, &b, &sp, CopyKind::F32(d, &mut out));
             }
@@ -223,7 +231,7 @@ pub fn slice_tensor(
 }
 
 enum CopyKind<'a> {
-    F32(&'a [f32], &'a mut Vec<f32>),
+    F32(&'a [f32], &'a mut F32Buf),
     I64(&'a [i64], &'a mut Vec<i64>),
 }
 
@@ -249,7 +257,7 @@ fn slice_copy(x_shape: &[i64], out_shape: &[i64], b: &[i64], sp: &[i64], mut kin
     };
     match &mut kind {
         CopyKind::F32(src, out) => {
-            let dstp = par::SyncPtr::new(out.as_mut_ptr());
+            let dstp = par::SyncPtr::new(out.as_mut_slice().as_mut_ptr());
             par::parallel_for_elems(outer as usize, count as usize, |ob, oe| {
                 // SAFETY: [ob, oe) 的外层步与其他块不相交。
                 // SAFETY: [ob, oe) 的外层步与其他并行块不相交。
@@ -299,8 +307,8 @@ pub fn transpose_tensor(x: PayloadRef<'_>, x_shape: &[i64], perm: &[i64]) -> (Pa
     };
     match x {
         PayloadRef::F32(d) => {
-            let mut out = vec![0f32; total as usize];
-            let dstp = par::SyncPtr::new(out.as_mut_ptr());
+            let mut out = F32Buf::with_zeroed(total as usize);
+            let dstp = par::SyncPtr::new(out.as_mut_slice().as_mut_ptr());
             par::parallel_for_elems(outer as usize, total as usize, |b, e| {
                 // SAFETY: [b, e) 的外层步与其他并行块不相交。
                 let dst = unsafe {
@@ -375,9 +383,9 @@ pub fn concat_any(
     let total = outer * concat_dim * inner;
     match out {
         Payload::F32(yd) => {
-            yd.clear();
-            yd.resize(total as usize, 0.0);
-            let dstp = par::SyncPtr::new(yd.as_mut_ptr());
+            // SAFETY: concat 的每个元素都由下方块拷贝写满。
+            unsafe { yd.resize_uninit(total as usize) };
+            let dstp = par::SyncPtr::new(yd.as_mut_slice().as_mut_ptr());
             let body = |ub: usize, ue: usize| {
                 for u in ub..ue {
                     let (o, rem) = (
@@ -497,7 +505,7 @@ pub fn reduce_mean(
     x_shape: &[i64],
     axes: &[i64],
     keepdims: bool,
-    out: &mut Vec<f32>,
+    out: &mut F32Buf,
 ) -> Vec<i64> {
     let r = x_shape.len();
     let mut red = vec![false; r];
@@ -529,9 +537,9 @@ pub fn reduce_mean(
             shape.push(1);
         }
     }
-    out.clear();
-    out.resize((outer * inner) as usize, 0.0);
-    let op = par::SyncPtr::new(out.as_mut_ptr());
+    // SAFETY: 每元素写一次。
+    unsafe { out.resize_uninit((outer * inner) as usize) };
+    let op = par::SyncPtr::new(out.as_mut_slice().as_mut_ptr());
     let numel: i64 = x_shape.iter().product();
     par::parallel_for_elems((outer * inner) as usize, numel as usize, |b, e| {
         for lin in b as i64..e as i64 {
@@ -555,7 +563,7 @@ pub fn matmul(
     a_shape: &[i64],
     b: &[f32],
     b_shape: &[i64],
-    out: &mut Vec<f32>,
+    out: &mut F32Buf,
 ) -> Vec<i64> {
     let ra = a_shape.len();
     let rb = b_shape.len();
@@ -587,8 +595,8 @@ pub fn matmul(
     let mut out_shape = bshape.clone();
     out_shape.push(m);
     out_shape.push(n);
-    out.clear();
-    out.resize((nbatch * m * n) as usize, 0.0);
+    // SAFETY: sgemm 每元素写满。
+    unsafe { out.resize_uninit((nbatch * m * n) as usize) };
     let act = crate::activation::Activation::default();
 
     let amat = (m * k) as usize;
@@ -690,13 +698,13 @@ pub fn batchnorm(
     mean: &[f32],
     var: &[f32],
     eps: f32,
-    out: &mut Vec<f32>,
+    out: &mut F32Buf,
 ) {
     let n = x_shape[0] as usize;
     let c = x_shape[1] as usize;
     let plane = usize::checked_div(x.len(), n * c).unwrap_or(0);
-    out.clear();
-    out.resize(x.len(), 0.0);
+    // SAFETY: 每元素写一次。
+    unsafe { out.resize_uninit(x.len()) };
     let op = par::SyncPtr::new(out.as_mut_ptr());
     // 平面索引是 nc*plane、通道索引是 nc%C——纯 c*plane 只对 N==1 成立。
     // 单元是整通道平面，成本读 N*C*plane 元素。

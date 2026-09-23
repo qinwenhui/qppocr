@@ -42,3 +42,11 @@
   114 行上与 C++（转换版）**113 行逐字符相同**；同时完成 §4.4 的
   上游参数复验。修复区域重试偏移、上游 cls 的 attribute 式 Slice
   （C++ 在此段错误）、cls_view 开窗对上游模型有害三个问题。
+- 性能：池化缓冲（pool.hpp/buf.hpp 移植，阶段 3 遗留的短板）。
+  `F32Buf` 按 2^k 分桶回收块（保守默认 64 MB 上限，§6.3 不照搬 C++
+  的 256 MB）；GEMM/binary/conv 等写满型内核走 `resize_uninit`，
+  权重不再每次 run 克隆（arena 两级查找）。mixed.png 端到端
+  143→107 ms（C++ 80 ms，1.34x；此前 545 ms）。binary_op 曾三趟
+  内存流量（清零分配 + 计算 + from_vec 拷贝）→ 单趟。附带
+  QPPOCR_PROF=1 的 per-op/per-shape profile（对标 C++ LEAN_PROF2）。
+  对拍无回归：逐节点 76/77、文本 113/114 维持。

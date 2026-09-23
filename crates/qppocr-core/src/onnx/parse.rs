@@ -148,6 +148,8 @@ const DT_BOOL: u64 = 9;
 
 fn parse_tensor(r: &mut Reader, force_name: &str) -> Result<Tensor> {
     let mut t = Tensor::default();
+    // 权重装载走临时 Vec（一次性，池锁不划算），收尾拷进 F32Buf
+    let mut f32v: Vec<f32> = Vec::new();
     let mut raw_dtype: u64 = DT_FLOAT;
     while !r.eof() {
         let key = r.varint()?;
@@ -172,13 +174,13 @@ fn parse_tensor(r: &mut Reader, force_name: &str) -> Result<Tensor> {
                 if wire == 2 {
                     let (s, l) = r.bytes()?;
                     let n = l / 4;
-                    t.f32.reserve(n);
+                    f32v.reserve(n);
                     for i in 0..n {
                         let b = r.buf[s + i * 4..s + i * 4 + 4].try_into().unwrap();
-                        t.f32.push(f32::from_le_bytes(b));
+                        f32v.push(f32::from_le_bytes(b));
                     }
                 } else {
-                    t.f32.push(f32::from_bits(r.fixed32()?));
+                    f32v.push(f32::from_bits(r.fixed32()?));
                 }
             }
             5 => {
@@ -222,17 +224,17 @@ fn parse_tensor(r: &mut Reader, force_name: &str) -> Result<Tensor> {
                 match raw_dtype {
                     DT_FLOAT => {
                         let cnt = n / 4;
-                        t.f32.reserve(cnt);
+                        f32v.reserve(cnt);
                         for i in 0..cnt {
                             let b = r.buf[s + i * 4..s + i * 4 + 4].try_into().unwrap();
-                            t.f32.push(f32::from_le_bytes(b));
+                            f32v.push(f32::from_le_bytes(b));
                         }
                     }
                     DT_DOUBLE => {
                         let cnt = n / 8;
                         for i in 0..cnt {
                             let b = r.buf[s + i * 8..s + i * 8 + 8].try_into().unwrap();
-                            t.f32.push(f64::from_le_bytes(b) as f32);
+                            f32v.push(f64::from_le_bytes(b) as f32);
                         }
                     }
                     DT_INT64 => {
@@ -288,10 +290,10 @@ fn parse_tensor(r: &mut Reader, force_name: &str) -> Result<Tensor> {
                     let (s, l) = r.bytes()?;
                     let mut rd = r.sub(s, l);
                     while !rd.eof() {
-                        t.f32.push(f64::from_bits(rd.fixed64()?) as f32);
+                        f32v.push(f64::from_bits(rd.fixed64()?) as f32);
                     }
                 } else {
-                    t.f32.push(f64::from_bits(r.fixed64()?) as f32);
+                    f32v.push(f64::from_bits(r.fixed64()?) as f32);
                 }
                 if raw_dtype == DT_DOUBLE {
                     raw_dtype = DT_FLOAT;
@@ -300,6 +302,7 @@ fn parse_tensor(r: &mut Reader, force_name: &str) -> Result<Tensor> {
             _ => r.skip(wire)?,
         }
     }
+    t.f32 = qppocr_kernels::buf::F32Buf::from_vec(&f32v);
     if !force_name.is_empty() {
         t.name = force_name.to_string();
     }
@@ -573,13 +576,13 @@ pub fn load_onnx_memory(data: &[u8], display_name: &str) -> Result<Graph> {
                         }
                         "value_float" => {
                             t.dtype = DType::F32;
-                            t.f32 = vec![a.f];
+                            t.f32 = qppocr_kernels::buf::F32Buf::from_vec(&[a.f]);
                             ok = true;
                             break;
                         }
                         "value_floats" => {
                             t.dtype = DType::F32;
-                            t.f32 = a.floats.clone();
+                            t.f32 = qppocr_kernels::buf::F32Buf::from_vec(&a.floats);
                             ok = true;
                             break;
                         }
