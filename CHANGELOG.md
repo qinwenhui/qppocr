@@ -50,3 +50,8 @@
   内存流量（清零分配 + 计算 + from_vec 拷贝）→ 单趟。附带
   QPPOCR_PROF=1 的 per-op/per-shape profile（对标 C++ LEAN_PROF2）。
   对拍无回归：逐节点 76/77、文本 113/114 维持。
+- perf(conv): im2col 串行化修复嵌套并行——micro-bench 中 stride-2 的
+  im2col 路径从 1.93x 慢反超到 0.74~0.83x 快。根因：C++ 的 im2col 带
+  serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
+  每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
+  conv_bench / im2col_split 两个分解计时 example。
