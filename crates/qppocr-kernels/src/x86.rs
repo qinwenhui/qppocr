@@ -721,3 +721,136 @@ pub unsafe fn pool2x2_row_vec(
         ox += 1;
     }
 }
+
+// ================================================================ 二元（分配路径）
+
+/// 同形平坦：`y[i] = a[i] op b[i]`（写新缓冲，非 inplace）。op 码同 C++。
+#[target_feature(enable = "avx2")]
+pub unsafe fn binary_flat_vec(
+    pa: *const f32,
+    pb: *const f32,
+    py: *mut f32,
+    b: usize,
+    e: usize,
+    op: u8,
+) {
+    let mut i = b;
+    while i + 8 <= e {
+        let va = _mm256_loadu_ps(pa.add(i));
+        let vb = _mm256_loadu_ps(pb.add(i));
+        let r = match op {
+            0 => _mm256_add_ps(va, vb),
+            1 => _mm256_sub_ps(va, vb),
+            2 => _mm256_mul_ps(va, vb),
+            _ => _mm256_div_ps(va, vb),
+        };
+        _mm256_storeu_ps(py.add(i), r);
+        i += 8;
+    }
+    while i < e {
+        let a = *pa.add(i);
+        let bv = *pb.add(i);
+        *py.add(i) = match op {
+            0 => a + bv,
+            1 => a - bv,
+            2 => a * bv,
+            3 => a / bv,
+            _ => a.powf(bv),
+        };
+        i += 1;
+    }
+}
+
+/// 单元素广播：`y[i] = op(sv, v[i])` 或 `op(v[i], sv)`（a_scalar 决定方向）。
+#[target_feature(enable = "avx2")]
+pub unsafe fn binary_scalar_vec(
+    v: *const f32,
+    sv: f32,
+    a_scalar: bool,
+    py: *mut f32,
+    b: usize,
+    e: usize,
+    op: u8,
+) {
+    let vs = _mm256_set1_ps(sv);
+    let mut i = b;
+    while i + 8 <= e {
+        let vv = _mm256_loadu_ps(v.add(i));
+        let r = match (op, a_scalar) {
+            (0, true) => _mm256_add_ps(vs, vv),
+            (0, false) => _mm256_add_ps(vv, vs),
+            (1, true) => _mm256_sub_ps(vs, vv),
+            (1, false) => _mm256_sub_ps(vv, vs),
+            (2, _) => _mm256_mul_ps(vv, vs),
+            (_, true) => _mm256_div_ps(vs, vv),
+            (_, false) => _mm256_div_ps(vv, vs),
+        };
+        _mm256_storeu_ps(py.add(i), r);
+        i += 8;
+    }
+    while i < e {
+        let x = *v.add(i);
+        let (va, vb) = if a_scalar { (sv, x) } else { (x, sv) };
+        *py.add(i) = match op {
+            0 => va + vb,
+            1 => va - vb,
+            2 => va * vb,
+            3 => va / vb,
+            _ => va.powf(vb),
+        };
+        i += 1;
+    }
+}
+
+/// run 路径：`y[o*runlen + j] = op(a值, b[j] 或 cv)`。b 稠密时 bsrc，否则 cv 广播。
+#[allow(clippy::too_many_arguments)] // 内核入参镜像 C++
+#[target_feature(enable = "avx2")]
+pub unsafe fn binary_run_alloc_vec(
+    py: *mut f32,
+    pa_const: *const f32,
+    bsrc: *const f32,
+    o: usize,
+    runlen: usize,
+    ib: usize,
+    b_dense_run: bool,
+    cv: f32,
+    a_const: bool,
+    op: u8,
+) {
+    let dst = py.add(o * runlen);
+    let vc = _mm256_set1_ps(cv);
+    let dense = bsrc.add(ib);
+    let mut j = 0usize;
+    while j + 8 <= runlen {
+        let bv = if b_dense_run {
+            _mm256_loadu_ps(dense.add(j))
+        } else {
+            vc
+        };
+        let av = if a_const {
+            _mm256_set1_ps(*pa_const)
+        } else {
+            _mm256_loadu_ps(dst.add(j)) // 不该发生（a_const 必 true 才走 run alloc）
+        };
+        let r = match op {
+            0 => _mm256_add_ps(av, bv),
+            1 => _mm256_sub_ps(av, bv),
+            2 => _mm256_mul_ps(av, bv),
+            _ => _mm256_div_ps(av, bv),
+        };
+        _mm256_storeu_ps(dst.add(j), r);
+        j += 8;
+    }
+    while j < runlen {
+        let bv = if b_dense_run { *dense.add(j) } else { cv };
+        let av = if a_const { *pa_const } else { *dst.add(j) };
+        *dst.add(j) = match op {
+            0 => av + bv,
+            1 => av - bv,
+            2 => av * bv,
+            3 => av / bv,
+            _ => av.powf(bv),
+        };
+        j += 1;
+    }
+}
