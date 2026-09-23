@@ -23,12 +23,23 @@ CPP_EXE = r"D:\qinwh\code\myself\ocr-demo\q-lite-ocr-cli.exe"
 TESTDATA = r"D:\qinwh\code\myself\ocr-demo\testdata"
 CASES = json.load(open(f"{TESTDATA}/cases.json", encoding="utf-8"))
 
-RUST_ARGS = ["--tier", "tiny"]  # 上游原件
-CPP_ARGS = [  # 转换版（C++ 跑不了上游：cls 段错误 + 无内嵌字典）
-    "--det", r"D:\qinwh\code\myself\ocr-demo\models\PP-OCRv6_det_tiny.onnx",
-    "--rec", r"D:\qinwh\code\myself\ocr-demo\models\PP-OCRv6_rec_tiny.onnx",
-    "--cls", r"D:\qinwh\code\myself\ocr-demo\models\ppocr_cls.onnx",
-]
+# --tier 映射：Rust 跑上游原件，C++ 跑转换版（C++ 跑不了上游：
+# cls 段错误 + 无内嵌字典）；两套模型语义相同（CROSSCHECK.md §4.4）。
+TIERS = {
+    "tiny": (["--tier", "tiny"],
+             ["PP-OCRv6_det_tiny.onnx", "PP-OCRv6_rec_tiny.onnx"]),
+    "small": (["--tier", "small"],
+              ["PP-OCRv6_det_small.onnx", "PP-OCRv6_rec_small.onnx"]),
+}
+TIER = "tiny"
+
+
+def engine_args():
+    rust_args, (det, rec) = TIERS[TIER]
+    cpp_args = ["--det", rf"D:\qinwh\code\myself\ocr-demo\models\{det}",
+                "--rec", rf"D:\qinwh\code\myself\ocr-demo\models\{rec}",
+                "--cls", r"D:\qinwh\code\myself\ocr-demo\models\ppocr_cls.onnx"]
+    return rust_args, cpp_args
 
 
 def run_json(exe, extra, img, bench=1):
@@ -128,7 +139,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--quick", action="store_true", help="只跑 3 轮 + 跳过并发")
+    ap.add_argument("--tier", choices=list(TIERS), default="tiny")
     args = ap.parse_args()
+    global TIER, RUST_ARGS, CPP_ARGS
+    TIER = args.tier
+    RUST_ARGS, CPP_ARGS = engine_args()
     R = 3 if args.quick else args.rounds
 
     imgs = [f"{TESTDATA}/{c['file'].split('/')[-1]}" for c in CASES]

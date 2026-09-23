@@ -142,8 +142,12 @@ pub struct Session {
 impl Session {
     /// 从内存打开模型。
     pub fn from_memory(data: &[u8], display_name: &str) -> Result<Self> {
-        let graph = crate::onnx::load_onnx_memory(data, display_name)?;
-        let initializers = graph.initializers.clone();
+        let mut graph = crate::onnx::load_onnx_memory(data, display_name)?;
+        // ★ 权重单份持有（take 而非 clone）：clone 让 det+rec+cls 的全部
+        // 权重双份常驻（small 档 ≈33 MB × 2），PeakWS 实测多 ~19 MB。
+        // graph.initializers 留空——运行期读者只有下面的 run（已改读
+        // self.initializers）；optimize 系列都在 load 期、take 之前跑完。
+        let initializers = std::mem::take(&mut graph.initializers);
         Ok(Self {
             graph,
             initializers,
@@ -152,8 +156,8 @@ impl Session {
 
     /// 从文件打开模型。
     pub fn open(path: &std::path::Path) -> Result<Self> {
-        let graph = crate::onnx::load_onnx(path)?;
-        let initializers = graph.initializers.clone();
+        let mut graph = crate::onnx::load_onnx(path)?;
+        let initializers = std::mem::take(&mut graph.initializers);
         Ok(Self {
             graph,
             initializers,
@@ -242,7 +246,7 @@ impl Session {
                         Some(&c) if c == 1 => {}
                         _ => return false,
                     }
-                    if g.initializers.contains_key(nm) {
+                    if self.initializers.contains_key(nm) {
                         return false;
                     }
                     if g.is_graph_output(nm) {

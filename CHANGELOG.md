@@ -55,6 +55,15 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- perf(mem)+bench(small): 权重单份化 + small 档全量对比。
+  `Session::open`/`from_memory` 的 `initializers.clone()` 改 `mem::take`
+  ——权重（small ≈33 MB、tiny ≈7 MB）原本双份常驻。实测 PeakWS：
+  small receipt 213→181 MB（反超 C++ 194 约 7%）、small big 225→191
+  （反超 15%）、tiny receipt/big 各降 8 MB（反超 10~12%）。
+  bench_pipeline.py 参数化 `--tier`；small 档成绩（BENCH.md §4b）：
+  单图中位 0.796x、K=2 **0.858x 反超**（tiny 的 K=2 差距随计算密度
+  增大消失，印证串行段争用定位）、K=4 0.649x、准确率 48.3%/CER
+  39.70% 两边一致。
 - feat(api): `Advanced` 从 10 项补齐到全部 29 项行为参数（tuning.hpp
   对账：C++ `OcrConfig` 30 个行为参数——除 cls_model 走构造参数外
   全量同名同默认值；此前 19 项含 `enhance_contrast`/`upscale`/
