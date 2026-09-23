@@ -375,34 +375,42 @@ impl Engine {
         let t_start = now();
 
         // ---- 预处理：长边帽（ppocr reduce_max_side）----
-        let mut work = img.clone();
+        // ★ 内存：超帽路径直接把 resize 结果当 work，不做「先整图克隆、
+        // 再被替换」的过渡——那是原图之外又一整份的瞬时峰值（3000×2000
+        // 的 big.png 上 18 MB）。未超帽才需要克隆（后面补边/增强要写）。
+        let mut work: Image;
         let (mut ratio_h, mut ratio_w) = (1.0f64, 1.0f64);
         {
             let (h, w) = (img.h, img.w);
             // 只在长边真的超帽时碰像素。无条件对齐 32 的旧做法会悄悄
             // 重采样每一张图——900x520 变 896x512，白白丢细节。
+            let mut resized: Option<Image> = None;
             if h.max(w) > self.cfg.max_side_len {
                 let ratio = self.cfg.max_side_len as f64 / (h.max(w)) as f64;
                 let rh = ((h as f64 * ratio / 32.0).round_ties_even() as i32) * 32;
                 let rw = ((w as f64 * ratio / 32.0).round_ties_even() as i32) * 32;
                 if rh > 0 && rw > 0 && (rh != h || rw != w) {
-                    work = resize_bilinear_img(img, rw, rh);
+                    resized = Some(resize_bilinear_img(img, rw, rh));
                     ratio_h = h as f64 / rh as f64;
                     ratio_w = w as f64 / rw as f64;
                 }
             }
+            work = resized.unwrap_or_else(|| img.clone());
         }
 
         if self.cfg.enhance_contrast {
             super::image::auto_levels(&mut work);
         }
-        // 识别器从原图裁（增强后），不从缩过的 work 裁
-        let crop_src: Image = if self.cfg.enhance_contrast {
-            let mut e = img.clone();
-            super::image::auto_levels(&mut e);
-            e
+        // ★ 识别器从原图裁（增强后），不从缩过的 work 裁。与 C++ 相同用
+        // 借用（C++ 是 `const Image* crop_src = &img`）——默认路径零拷贝，
+        // 只有开增强才物化整图副本。
+        let mut enhanced_full: Image;
+        let crop_src: &Image = if self.cfg.enhance_contrast {
+            enhanced_full = img.clone();
+            super::image::auto_levels(&mut enhanced_full);
+            &enhanced_full
         } else {
-            img.clone()
+            img
         };
 
         // ---- 竖长/极矮图补边（PP-OCR 的 use_vertical_padding）----
@@ -526,6 +534,9 @@ impl Engine {
             self.cfg.use_dilation,
         );
         res.num_boxes = boxes.len();
+        // ★ work（未超帽时是原图的整份克隆）此后不再使用——裁剪从原图
+        // 借用走（crop_src）。在这里释放，裁剪/识别阶段不再背着它。
+        drop(work);
 
         sort_reading_order(&mut boxes);
         res.num_merged = merge_same_line(&mut boxes, self.cfg.merge_line_gap as f32);
@@ -570,7 +581,7 @@ impl Engine {
             // 边距杂波判定：unclip 加的框是背景还是杂波？难图.png 的
             // 分离信号（0.48 vs 语料 0.00-0.06）。命中则同中心同方向收窄。
             if self.cfg.unclip_margin_thresh > 0.0 && b.tight_h > 0.0 && !pred.f32.is_empty() {
-                let margin = box_margin_clutter(b, &pred.f32, nh, nw, &crop_src);
+                let margin = box_margin_clutter(b, &pred.f32, nh, nw, crop_src);
                 if margin > self.cfg.unclip_margin_thresh {
                     let c = [
                         (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) * 0.25,
@@ -597,7 +608,7 @@ impl Engine {
                     }
                 }
             }
-            let crop = crop_text_box(&crop_src, &pts);
+            let crop = crop_text_box(crop_src, &pts);
             wh_ratio.push(batch_ratio(
                 &crop,
                 self.cfg.rec_height,
