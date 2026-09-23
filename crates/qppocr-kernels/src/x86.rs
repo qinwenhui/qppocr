@@ -9,8 +9,9 @@
 //! （`mul_add` 序列、round-ties-even、hsum 结合顺序）写的。对拍测试
 //! `tests/bitexact.rs` 逐算子验证这一点。
 
-#![allow(clippy::missing_safety_doc)]
-// 见模块注释：安全性由分发层契约承担
+#![allow(clippy::missing_safety_doc)] // 见模块注释：安全性由分发层契约承担
+#![allow(clippy::approx_constant)]
+// 系数照抄 C++ 字面值：位级一致的要求
 // 本模块全部是 #[target_feature] unsafe 内核，前置条件由各函数的
 // `# Safety` 段声明、由分发层保证；函数体内不再逐操作包 unsafe。
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -160,7 +161,7 @@ pub unsafe fn sgemm_panel_avx2(
                 _mm256_setzero_ps(),
                 _mm256_setzero_ps(),
             );
-            let a0 = a.add((m0 + 0) * k);
+            let a0 = a.add(m0 * k);
             let a1 = a.add((m0 + 1) * k);
             let a2 = a.add((m0 + 2) * k);
             let a3 = a.add((m0 + 3) * k);
@@ -205,7 +206,7 @@ pub unsafe fn sgemm_panel_avx2(
             }
             // 逐行加 bias、store。非整面板先落 t[32] 再拷 nn 列。
             let rows = [
-                (m0 + 0, [c00, c01, c02, c03]),
+                (m0, [c00, c01, c02, c03]),
                 (m0 + 1, [c10, c11, c12, c13]),
                 (m0 + 2, [c20, c21, c22, c23]),
                 (m0 + 3, [c30, c31, c32, c33]),
@@ -377,5 +378,342 @@ pub unsafe fn sgemm_mrows_avx2(
             }
             cp.add(j).write(sv);
         }
+    }
+}
+
+// ================================================================ 激活（向量）
+
+/// relu：`max(v, 0)`，就地。NaN→0（MAXPS 语义：任一 NaN 返回第二操作数）。
+/// 与标量的 `v > 0 ? v : 0` 一致。
+#[target_feature(enable = "avx2")]
+pub unsafe fn relu_vec(t: *mut f32, b: usize, e: usize) {
+    let z = _mm256_setzero_ps();
+    let mut i = b;
+    while i + 8 <= e {
+        let p = t.add(i);
+        _mm256_storeu_ps(p, _mm256_max_ps(_mm256_loadu_ps(p), z));
+        i += 8;
+    }
+    while i < e {
+        *t.add(i) = if *t.add(i) > 0.0 { *t.add(i) } else { 0.0 };
+        i += 1;
+    }
+}
+
+/// hardsigmoid：`clip(0, 1, fma(x, a, b))`，就地。clamp 顺序与标量一致。
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn hardsigmoid_vec(
+    x: *const f32,
+    y: *mut f32,
+    b: usize,
+    e: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    let va = _mm256_set1_ps(alpha);
+    let vb = _mm256_set1_ps(beta);
+    let vz = _mm256_setzero_ps();
+    let vo = _mm256_set1_ps(1.0);
+    let mut i = b;
+    while i + 8 <= e {
+        let v = _mm256_fmadd_ps(_mm256_loadu_ps(x.add(i)), va, vb);
+        _mm256_storeu_ps(y.add(i), _mm256_max_ps(vz, _mm256_min_ps(vo, v)));
+        i += 8;
+    }
+    while i < e {
+        let v = (*x.add(i)).mul_add(alpha, beta);
+        *y.add(i) = if v < 0.0 {
+            0.0
+        } else if v > 1.0 {
+            1.0
+        } else {
+            v
+        };
+        i += 1;
+    }
+}
+
+/// sigmoid：`1 / (1 + exp256(-x))`。
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn sigmoid_vec(x: *const f32, y: *mut f32, b: usize, e: usize) {
+    let one = _mm256_set1_ps(1.0);
+    let zero = _mm256_setzero_ps();
+    let mut i = b;
+    while i + 8 <= e {
+        let v = _mm256_loadu_ps(x.add(i));
+        let en = exp256_ps(_mm256_sub_ps(zero, v));
+        _mm256_storeu_ps(y.add(i), _mm256_div_ps(one, _mm256_add_ps(one, en)));
+        i += 8;
+    }
+    while i < e {
+        let xv = *x.add(i);
+        *y.add(i) = 1.0f32 / (1.0f32 + crate::activation::exp1(-xv));
+        i += 1;
+    }
+}
+
+/// gelu：`c3·x·(erf256(x·(1/c1)) + c2)`，就地（融合 GELU 与 apply_act 共用）。
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn gelu_vec(t: *mut f32, b: usize, e: usize, c1: f32, c2: f32, c3: f32) {
+    let inv_c1 = 1.0f32 / c1;
+    let vs = _mm256_set1_ps(inv_c1);
+    let vc2 = _mm256_set1_ps(c2);
+    let vc3 = _mm256_set1_ps(c3);
+    let mut i = b;
+    while i + 8 <= e {
+        let p = t.add(i);
+        let x = _mm256_loadu_ps(p);
+        _mm256_storeu_ps(p, gelu256_ps(x, vs, vc2, vc3));
+        i += 8;
+    }
+    while i < e {
+        let v = *t.add(i);
+        *t.add(i) = c3 * v * (crate::activation::erf1(v * inv_c1) + c2);
+        i += 1;
+    }
+}
+
+/// clip：`min(hi, max(lo, v))`，就地。NaN 语义与标量版对齐（穿透）：
+/// MAXPS/MINPS 的 NaN 处理是「返回第二操作数」，这里 lo/hi 在第二位，
+/// NaN 输入返回 lo/hi——与标量的比较链不同，故 NaN 只在输入为 NaN 时
+/// 出现差异；正常数据逐位一致。
+#[target_feature(enable = "avx2")]
+pub unsafe fn clip_vec(t: *mut f32, b: usize, e: usize, lo: f32, hi: f32) {
+    let vlo = _mm256_set1_ps(lo);
+    let vhi = _mm256_set1_ps(hi);
+    let mut i = b;
+    while i + 8 <= e {
+        let p = t.add(i);
+        _mm256_storeu_ps(
+            p,
+            _mm256_min_ps(_mm256_max_ps(_mm256_loadu_ps(p), vlo), vhi),
+        );
+        i += 8;
+    }
+    while i < e {
+        let m = if *t.add(i) < lo { lo } else { *t.add(i) };
+        *t.add(i) = if hi < m { hi } else { m };
+        i += 1;
+    }
+}
+
+// ================================================================ 二元（向量）
+
+/// 同形平坦 pass：`dst[i] op= src[i]`（就地）。op 码：0..3 = + - * /。
+#[target_feature(enable = "avx2")]
+pub unsafe fn binary_flat_inplace_vec(dst: *mut f32, src: *const f32, b: usize, e: usize, op: u8) {
+    let mut i = b;
+    while i + 8 <= e {
+        let d = _mm256_loadu_ps(dst.add(i));
+        let s = _mm256_loadu_ps(src.add(i));
+        let r = match op {
+            0 => _mm256_add_ps(d, s),
+            1 => _mm256_sub_ps(d, s),
+            2 => _mm256_mul_ps(d, s),
+            _ => _mm256_div_ps(d, s),
+        };
+        _mm256_storeu_ps(dst.add(i), r);
+        i += 8;
+    }
+    while i < e {
+        let d = *dst.add(i);
+        let s = *src.add(i);
+        *dst.add(i) = match op {
+            0 => d + s,
+            1 => d - s,
+            2 => d * s,
+            3 => d / s,
+            _ => d.powf(s),
+        };
+        i += 1;
+    }
+}
+
+/// run 路径：`dst[j] op= cv`（b 侧常量广播）或 `dst[j] op= bsrc[j]`
+///（b 侧稠密）。a_const=false 时为就地版（dst 是 a）。
+#[allow(clippy::too_many_arguments)] // 内核入参镜像 C++
+#[target_feature(enable = "avx2")]
+pub unsafe fn binary_run_inplace_vec(
+    dst: *mut f32,
+    bsrc: *const f32,
+    o: usize,
+    runlen: usize,
+    ib: usize,
+    b_dense_run: bool,
+    cv: f32,
+    op: u8,
+) {
+    let vc = _mm256_set1_ps(cv);
+    let mut j = 0usize;
+    while j + 8 <= runlen {
+        let d = _mm256_loadu_ps(dst.add(o * runlen + j));
+        let r = if b_dense_run {
+            let s = _mm256_loadu_ps(bsrc.add(ib + j));
+            match op {
+                0 => _mm256_add_ps(d, s),
+                1 => _mm256_sub_ps(d, s),
+                2 => _mm256_mul_ps(d, s),
+                _ => _mm256_div_ps(d, s),
+            }
+        } else {
+            match op {
+                0 => _mm256_add_ps(d, vc),
+                1 => _mm256_sub_ps(d, vc),
+                2 => _mm256_mul_ps(d, vc),
+                _ => _mm256_div_ps(d, vc),
+            }
+        };
+        _mm256_storeu_ps(dst.add(o * runlen + j), r);
+        j += 8;
+    }
+    while j < runlen {
+        let d = *dst.add(o * runlen + j);
+        let bv = if b_dense_run { *bsrc.add(ib + j) } else { cv };
+        *dst.add(o * runlen + j) = match op {
+            0 => d + bv,
+            1 => d - bv,
+            2 => d * bv,
+            3 => d / bv,
+            _ => d.powf(bv),
+        };
+        j += 1;
+    }
+}
+
+// ================================================================ conv 相关
+
+/// depthwise 的 sw==1 内层：`yd[i] = fma(wv, xd[i], yd[i])`，len 个元素。
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn depthwise_fma_vec(yd: *mut f32, xd: *const f32, len: usize, wv: f32) {
+    let vw = _mm256_set1_ps(wv);
+    let mut i = 0usize;
+    while i + 8 <= len {
+        let p = yd.add(i);
+        _mm256_storeu_ps(
+            p,
+            _mm256_fmadd_ps(vw, _mm256_loadu_ps(xd.add(i)), _mm256_loadu_ps(p)),
+        );
+        i += 8;
+    }
+    while i < len {
+        *yd.add(i) = wv.mul_add(*xd.add(i), *yd.add(i));
+        i += 1;
+    }
+}
+
+/// ConvTranspose 的 8 宽 interleave 内核：j..j+8 个输入产生 16 个连续输出。
+/// `a`/`b` 是两个 kx 奇偶的 c 累加；unpacklo/unpackhi + permute2f128 交错。
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn convt_row_vec(
+    xr: *const f32,
+    ch_plane: usize, // 每通道平面跨度 = h*w
+    w0: *const f32,
+    w1: *const f32,
+    c: usize,
+    j: usize,
+    orow: *mut f32,
+) {
+    let mut a = _mm256_setzero_ps();
+    let mut b = _mm256_setzero_ps();
+    for ch in 0..c {
+        let xv = _mm256_loadu_ps(xr.add(ch * ch_plane + j));
+        a = _mm256_fmadd_ps(xv, _mm256_set1_ps(*w0.add(ch)), a);
+        b = _mm256_fmadd_ps(xv, _mm256_set1_ps(*w1.add(ch)), b);
+    }
+    let lo = _mm256_unpacklo_ps(a, b);
+    let hi = _mm256_unpackhi_ps(a, b);
+    _mm256_storeu_ps(orow.add(j * 2), _mm256_permute2f128_ps::<0x20>(lo, hi));
+    _mm256_storeu_ps(orow.add(j * 2 + 8), _mm256_permute2f128_ps::<0x31>(lo, hi));
+}
+
+/// softmax 行内向量相：max/exp/归一的 8-lane 循环（语义与标量镜像版一致，
+/// 标量版按这里的 lane 结构与 hsum 结合顺序写的）。
+/// 前置条件：`inner >= 8`（不足时由分发层走标量路径）。
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn softmax_row_vec(row: *mut f32, inner: usize) {
+    // max：向量化部分逐 lane，标量尾巴单独并入（max 顺序无关）
+    let mut vmax = _mm256_loadu_ps(row);
+    let mut i = 8usize;
+    while i + 8 <= inner {
+        vmax = _mm256_max_ps(vmax, _mm256_loadu_ps(row.add(i)));
+        i += 8;
+    }
+    let mut m2 = hmax256_ps(vmax);
+    while i < inner {
+        if *row.add(i) > m2 {
+            m2 = *row.add(i);
+        }
+        i += 1;
+    }
+    let vmx = _mm256_set1_ps(m2);
+    let mut vsum = _mm256_setzero_ps();
+    let mut i3 = 0usize;
+    while i3 + 8 <= inner {
+        let ev = exp256_ps(_mm256_sub_ps(_mm256_loadu_ps(row.add(i3)), vmx));
+        _mm256_storeu_ps(row.add(i3), ev);
+        vsum = _mm256_add_ps(vsum, ev);
+        i3 += 8;
+    }
+    let mut sum = hsum256_ps(vsum);
+    while i3 < inner {
+        let ev = crate::activation::exp1(*row.add(i3) - m2);
+        *row.add(i3) = ev;
+        sum += ev;
+        i3 += 1;
+    }
+    let inv = 1.0f32 / sum;
+    let vinv = _mm256_set1_ps(inv);
+    let mut i4 = 0usize;
+    while i4 + 8 <= inner {
+        let p = row.add(i4);
+        _mm256_storeu_ps(p, _mm256_mul_ps(_mm256_loadu_ps(p), vinv));
+        i4 += 8;
+    }
+    while i4 < inner {
+        *row.add(i4) *= inv;
+        i4 += 1;
+    }
+}
+
+/// 池化 2x2 s1 的行内相：垂直 max 落 vm、水平 max 落 out（可分）。
+/// vm 长度 W+1，vm[W] 是 -inf 哨兵。`r1` 为 null 表示最后一行（钳制：
+/// vm 就是 r0 的拷贝——绝不能读 r0+W，那是**下一个通道**的数据）。
+#[target_feature(enable = "avx2")]
+pub unsafe fn pool2x2_row_vec(
+    r0: *const f32,
+    r1: *const f32,
+    vm: *mut f32,
+    out: *mut f32,
+    w: usize,
+) {
+    let neg_inf = -f32::MAX;
+    if r1.is_null() {
+        std::ptr::copy_nonoverlapping(r0, vm, w);
+    } else {
+        let mut j = 0usize;
+        while j + 8 <= w {
+            _mm256_storeu_ps(
+                vm.add(j),
+                _mm256_max_ps(_mm256_loadu_ps(r0.add(j)), _mm256_loadu_ps(r1.add(j))),
+            );
+            j += 8;
+        }
+        while j < w {
+            *vm.add(j) = (*r0.add(j)).max(*r1.add(j));
+            j += 1;
+        }
+    }
+    *vm.add(w) = neg_inf;
+    let mut ox = 0usize;
+    while ox + 8 <= w {
+        _mm256_storeu_ps(
+            out.add(ox),
+            _mm256_max_ps(_mm256_loadu_ps(vm.add(ox)), _mm256_loadu_ps(vm.add(ox + 1))),
+        );
+        ox += 8;
+    }
+    while ox < w {
+        *out.add(ox) = (*vm.add(ox)).max(*vm.add(ox + 1));
+        ox += 1;
     }
 }

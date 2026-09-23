@@ -36,6 +36,17 @@ pub enum BinOp {
 }
 
 impl BinOp {
+    /// C++ 的 op 码（0..4 = + - * / pow）；向量路径用。
+    #[inline]
+    pub fn code(self) -> u8 {
+        match self {
+            BinOp::Add => 0,
+            BinOp::Sub => 1,
+            BinOp::Mul => 2,
+            BinOp::Div => 3,
+            BinOp::Pow => 4,
+        }
+    }
     /// 施加二元运算（测试的朴素参考也用它）。
     #[inline]
     pub fn apply(self, a: f32, b: f32) -> f32 {
@@ -127,7 +138,14 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
     // 6x160x3x80 上 ~0.5 ms vs 这里 ~0.03 ms。
     if a_shape == b_shape {
         let pa = par::SyncPtr::new(a.as_mut_ptr());
+        let opc = op.code();
         par::parallel_for_elems(total, total, |b0, e0| {
+            #[cfg(target_arch = "x86_64")]
+            if crate::use_avx2() && opc <= 3 {
+                // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
+                unsafe { crate::x86::binary_flat_inplace_vec(pa.get(), b.as_ptr(), b0, e0, opc) };
+                return;
+            }
             // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
             let dst = unsafe { pa.offset(b0).slice(e0 - b0) };
             for (d, sb) in dst.iter_mut().zip(&b[b0..e0]) {
@@ -201,11 +219,29 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
         }
         for o in o0..o1 {
             let cv = b[ib as usize];
-            // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交。
-            let dst = unsafe { pa.offset(o * runlen as usize).slice(runlen as usize) };
-            for (j, d) in dst.iter_mut().enumerate() {
-                let bv = if b_dense_run { b[ib as usize + j] } else { cv };
-                *d = op.apply_inplace_rev(*d, bv);
+            #[cfg(target_arch = "x86_64")]
+            if crate::use_avx2() && op.code() <= 3 {
+                // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
+                // b 稠密时 bsrc 从 ib 起有 runlen 个元素（步长 1 的保证）。
+                unsafe {
+                    crate::x86::binary_run_inplace_vec(
+                        pa.get(),
+                        b.as_ptr(),
+                        o,
+                        runlen as usize,
+                        ib as usize,
+                        b_dense_run,
+                        cv,
+                        op.code(),
+                    )
+                };
+            } else {
+                // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交。
+                let dst = unsafe { pa.offset(o * runlen as usize).slice(runlen as usize) };
+                for (j, d) in dst.iter_mut().enumerate() {
+                    let bv = if b_dense_run { b[ib as usize + j] } else { cv };
+                    *d = op.apply_inplace_rev(*d, bv);
+                }
             }
             for i in 0..no {
                 let di = k + i;

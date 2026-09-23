@@ -133,6 +133,12 @@ pub fn relu_inplace(t: &mut [f32]) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
+        if crate::use_avx2() {
+            // SAFETY: 区间 [b, e) 与其他并行块不相交。
+            unsafe { crate::x86::relu_vec(tp.get(), b, e) };
+            return;
+        }
         // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
         let seg = unsafe { tp.offset(b).slice(e - b) };
         for v in seg.iter_mut() {
@@ -148,6 +154,12 @@ pub fn hardsigmoid(x: &[f32], alpha: f32, beta: f32, y: &mut [f32]) {
     let yp = par::SyncPtr::new(y.as_mut_ptr());
     let n = x.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
+        if crate::use_avx2() {
+            // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
+            unsafe { crate::x86::hardsigmoid_vec(x.as_ptr(), yp.get(), b, e, alpha, beta) };
+            return;
+        }
         // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
         let seg = unsafe { yp.offset(b).slice(e - b) };
         for (i, d) in seg.iter_mut().enumerate() {
@@ -173,6 +185,12 @@ pub fn sigmoid_tensor(x: &[f32], y: &mut [f32]) {
     let yp = par::SyncPtr::new(y.as_mut_ptr());
     let n = x.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
+        if crate::use_avx2() {
+            // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
+            unsafe { crate::x86::sigmoid_vec(x.as_ptr(), yp.get(), b, e) };
+            return;
+        }
         // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
         let seg = unsafe { yp.offset(b).slice(e - b) };
         for (i, d) in seg.iter_mut().enumerate() {
@@ -188,6 +206,12 @@ pub fn gelu_inplace(t: &mut [f32], c1: f32, c2: f32, c3: f32) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
+        if crate::use_avx2() {
+            // SAFETY: 区间 [b, e) 与其他并行块不相交。
+            unsafe { crate::x86::gelu_vec(tp.get(), b, e, c1, c2, c3) };
+            return;
+        }
         // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
         let seg = unsafe { tp.offset(b).slice(e - b) };
         for v in seg.iter_mut() {
@@ -214,6 +238,12 @@ pub fn clip_inplace(t: &mut [f32], lo: f32, hi: f32) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
+        if crate::use_avx2() {
+            // SAFETY: 区间 [b, e) 与其他并行块不相交。
+            unsafe { crate::x86::clip_vec(tp.get(), b, e, lo, hi) };
+            return;
+        }
         // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
         let seg = unsafe { tp.offset(b).slice(e - b) };
         for v in seg.iter_mut() {
@@ -249,8 +279,23 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
     assert!(t.len() % inner == 0, "softmax: size not multiple of inner");
     let outer = t.len() / inner;
     let tp = par::SyncPtr::new(t.as_mut_ptr());
+    let use_vec = inner >= 8 && {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::use_avx2()
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
     par::parallel_for_units(outer, |b, e| {
         for o in b..e {
+            if use_vec {
+                // SAFETY: 行 o 与其他并行块不相交。
+                unsafe { crate::x86::softmax_row_vec(tp.get().add(o * inner), inner) };
+                continue;
+            }
             // SAFETY: 行 o 与其他并行块不相交。
             let row = unsafe { tp.offset(o * inner).slice(inner) };
             // 行最大值。max 逐位与顺序无关（NaN 除外，这里不会出现）。

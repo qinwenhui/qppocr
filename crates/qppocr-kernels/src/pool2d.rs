@@ -50,6 +50,64 @@ pub fn pool2d(
     out.resize(n * c * oh * ow, 0.0);
     let op = par::SyncPtr::new(out.as_mut_ptr());
 
+    // 2x2 max pool s1 SAME_UPPER——v6 每一个 MaxPool 的形状（det 的是
+    // 1x16x752x992）。max 可分：先垂直 max 进 scratch 行，再水平 max，
+    // 两半都能向量化。标量版做 4 load、3 compare、4 边界测试/输出元素，
+    // 实测 12.7 ms，约是这张 op 实际搬运量的 9 倍。
+    // ph==pw==0、peh==pew==1：输出行 oy 读输入行 {oy, oy+1}（钳制），
+    // 列同理；scratch 行尾放一个 -inf 哨兵让钳制落进普通 max。
+    let pool2x2_s1 = max_pool
+        && kh == 2
+        && kw == 2
+        && sh == 1
+        && sw == 1
+        && ph == 0
+        && pw == 0
+        && peh == 1
+        && pew == 1
+        && oh == h
+        && ow == w;
+    if pool2x2_s1 {
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = crate::use_avx2();
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx2 = false;
+        par::parallel_for_units(n * c * oh, |b, e| {
+            let mut vm = vec![0f32; w + 1]; // 每块一行，跨本块的行复用
+            for u in b..e {
+                let oy = u % oh;
+                let plane = u / oh;
+                // SAFETY: 输出行 (plane, oy) 与其他并行块不相交；
+                // 读侧 x 平面 (plane, {oy, oy+1}) 界内。
+                unsafe {
+                    let r0 = x.as_ptr().add((plane * h + oy) * w);
+                    let outp = op.get().add((plane * oh + oy) * ow);
+                    // 最后一行没有 r1：传 null（读 r0+W 会跨进下一个通道）
+                    let r1 = if oy + 1 < h {
+                        r0.add(w)
+                    } else {
+                        std::ptr::null()
+                    };
+                    if avx2 {
+                        crate::x86::pool2x2_row_vec(r0, r1, vm.as_mut_ptr(), outp, w);
+                    } else {
+                        for j in 0..w {
+                            vm[j] = match r1 {
+                                p if !p.is_null() => (*r0.add(j)).max(*p.add(j)),
+                                _ => *r0.add(j),
+                            };
+                        }
+                        vm[w] = -f32::MAX;
+                        for oxx in 0..w {
+                            *outp.add(oxx) = vm[oxx].max(vm[oxx + 1]);
+                        }
+                    }
+                }
+            }
+        });
+        return (oh, ow);
+    }
+
     // 无 padding 且 kernel == stride：iy = oy*sh+ky、ix = ox*sw+kx 必然在界内，
     // 每输出元素 6 次边界测试消失。
     let in_range = ph == 0

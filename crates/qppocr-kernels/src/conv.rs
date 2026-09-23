@@ -168,9 +168,23 @@ pub fn conv2d(
                                 }
                                 let yseg = &mut yr[ox0..ox1];
                                 let xseg = &xr[ox0 + kx - p.pw..ox1 + kx - p.pw];
-                                for (d, sv) in yseg.iter_mut().zip(xseg) {
-                                    // y += w * x（fma，与 AVX2 一致）
-                                    *d = wv.mul_add(*sv, *d);
+                                #[cfg(target_arch = "x86_64")]
+                                if crate::use_avx2() {
+                                    // SAFETY: 段 [ox0, ox1) 属于本通道平面，
+                                    // 与其他并行块不相交；xseg 同长。
+                                    unsafe {
+                                        crate::x86::depthwise_fma_vec(
+                                            yseg.as_mut_ptr(),
+                                            xseg.as_ptr(),
+                                            ox1 - ox0,
+                                            wv,
+                                        )
+                                    };
+                                } else {
+                                    for (d, sv) in yseg.iter_mut().zip(xseg) {
+                                        // y += w * x（fma，与 AVX2 一致）
+                                        *d = wv.mul_add(*sv, *d);
+                                    }
                                 }
                             }
                         } else {
@@ -357,7 +371,28 @@ pub fn convtranspose2d(
                     for iy in 0..h {
                         let orow = &mut yo[(iy * 2 + ky) * ow..(iy * 2 + ky + 1) * ow];
                         let rowbase = iy * wdim; // 通道内行起点（xn 是 [c][h][w]）
-                        for (j, o2) in orow.chunks_exact_mut(2).enumerate() {
+                        let mut j = 0usize;
+                        #[cfg(target_arch = "x86_64")]
+                        if crate::use_avx2() {
+                            while j + 8 <= wdim {
+                                // SAFETY: 输出段 [j*2, j*2+16) 属于本输出通道，
+                                // 与其他并行块不相交；x 读 [rowbase+j, +8)。
+                                unsafe {
+                                    crate::x86::convt_row_vec(
+                                        xn.as_ptr().add(rowbase),
+                                        h * wdim,
+                                        w0.as_ptr(),
+                                        w1.as_ptr(),
+                                        c,
+                                        j,
+                                        orow.as_mut_ptr(),
+                                    )
+                                };
+                                j += 8;
+                            }
+                        }
+                        while j < wdim {
+                            let o2 = &mut orow[j * 2..j * 2 + 2];
                             // a -> 偶数输出列，b -> 奇数；c 升序累加（位级与
                             // AVX2 的 interleave 写法一致）
                             let mut a = 0.0f32;
@@ -369,6 +404,7 @@ pub fn convtranspose2d(
                             }
                             o2[0] = a;
                             o2[1] = b;
+                            j += 1;
                         }
                     }
                 }
