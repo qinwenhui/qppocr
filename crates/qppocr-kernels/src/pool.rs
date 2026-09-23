@@ -30,10 +30,27 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
+/// 显式线程数请求（0 = 自动）。进程级全局：池在**首次使用**时按它定容，
+/// 之后 [`request_threads`] 是 no-op——对齐 C++ `ThreadPool::get(n)` 的
+/// 「最早调用者定容」语义（C++ 另有 `reconfigure` 在运行边界重建池；
+/// 这里不做，多引擎多线程数并存本来就不是可表达的配置）。
+static THREADS_REQ: AtomicUsize = AtomicUsize::new(0);
+
+/// 请求池的线程数（含主线程）。`n = 0` 回到自动；必须在第一次并行算子
+/// 之前调用才有效。显式请求**不设 16 上限**（C++ `resolve_threads` 的
+/// 「要 24 的人在做实验，悄悄给他 16 会让测量描述一个没人选过的配置」）。
+pub(crate) fn request_threads(n: usize) {
+    THREADS_REQ.store(n, Ordering::Relaxed);
+}
+
 /// 一次 fork 的协调成本对齐（16 线程实测 ~97us，`tools/fork_bench.cpp`）。
 /// 只是文档性常量；实际门控在 [`crate::par::Thresholds`]。
 #[allow(dead_code)]
 pub(crate) const FORK_US: f64 = 97.0;
+
+/// join 纯自旋的轮数上限，之后退化为让出（见 fork_join 的 join 注释）。
+/// 一次 PAUSE ~1-2ns 级，2048 轮 ≈ 数微秒——覆盖无争用的常规 fork。
+const JOIN_SPIN: u32 = 2048;
 
 /// 把闭包指针的生存期擦成 `'static`（`Job` 存不了借用生存期——它在
 /// `static POOL` 的 `Shared` 里）。胖指针布局不变。
@@ -77,7 +94,10 @@ struct Shared {
 
 pub(crate) struct Pool {
     shared: Mutex<Shared>,
-    /// 唤醒全部等待中的 worker（= `ReleaseSemaphore(N-1)`）。
+    /// 唤醒全部等待中的 worker（= `ReleaseSemaphore(N-1)` 的广播语义）。
+    /// 实测对比过 Windows 信号量的逐计数唤醒（K=2 争用下反而慢 ~7%）：
+    /// condvar 的广播在一次 syscall 里完成，信号量的计数累积在 fork
+    /// 风暴下留下大量陈旧计数，回港后逐个烧掉。
     wake: Condvar,
     /// 串行化跨线程并发的 fork_join 调用方（见模块注释）。
     fork_mu: Mutex<()>,
@@ -118,6 +138,19 @@ pub(crate) fn thread_count() -> usize {
 }
 
 fn resolve_threads() -> usize {
+    // 显式请求优先：API（request_threads）→ 环境变量（= C++ LEAN_THREADS）。
+    // 两者都不设 16 上限——显式数字是用户的选择（对齐 C++ resolve_threads）。
+    let req = THREADS_REQ.load(Ordering::Relaxed);
+    if req > 0 {
+        return req;
+    }
+    if let Ok(v) = std::env::var("QPPOCR_THREADS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
     let n = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(4);
@@ -198,15 +231,26 @@ pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
         g.epoch += 1;
         // Release 语义由锁的 unlock 提供；worker 在锁内读到 epoch 与 job。
     }
-    // 锁外唤醒（对齐 C++：publish → ReleaseSemaphore → 主线程干活）
+    // 锁外唤醒（对齐 C++：publish → ReleaseSemaphore(N-1) → 主线程干活）
     p.wake.notify_all();
     // 主线程参与（C++ run_job）
     // SAFETY: job 在本栈上，刚初始化。
     unsafe { run_chunks(&job) };
     // 自旋 join：等全部参与者（含自己）各 bump 一次 done。
     // Release/Acquire 对保证：所有 worker 的 chunk 写入对返回后的主线程可见。
+    //
+    // 纯自旋（C++ 的做法）在核被占满时（多进程并发）是病态的：迟醒的
+    // worker 已 READY 却等不到核，而自旋的主线程恰好占着一个核不放。
+    // 先自旋一段（无争用时零成本命中），之后每轮让出——SwitchToThread
+    // 把当前核立即交给同核待跑的 straggler。
+    let mut spin = 0u32;
     while job.done.load(Ordering::Acquire) < p.threads {
-        std::hint::spin_loop();
+        spin += 1;
+        if spin < JOIN_SPIN {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
     // 不清 job 指针：下一次发布覆盖。`_fk` 在此释放，放行下一个调用方。
 }

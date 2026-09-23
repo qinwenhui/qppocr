@@ -55,6 +55,16 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- feat(par): 线程数管道接通——`par::set_threads`（池首用时定容，显式
+  请求不设 16 上限，对齐 C++ `resolve_threads`）+ `QPPOCR_THREADS`
+  环境变量（对标 `LEAN_THREADS`）+ `EngineBuilder::threads`/CLI
+  `--threads` 落地（此前为装饰性配置）。join 改自适应（自旋 2048 轮
+  后让出，无争用零成本、核满时不烧核挡 straggler）。新增
+  `tools/sweep_parallel.py` 并行度扫描（BENCH.md §5）：单进程延迟
+  最优 t=14~16（默认不动）；吞吐峰在总线程 ≈1.2~1.5× 逻辑核
+  （rust K=6×t=3 = 25.0 img/s 追平 cpp 峰值）；K=2 差距定位为
+  串行段内存争用底差 8%（t=1 无池仍在）× 池放大，非唤醒机制
+  （信号量版实测更慢，已回退）。
 - perf(pool): 移植 C++ fork-join 线程池（util.hpp `ThreadPool` Windows
   路径）替代 rayon——批量唤醒、主线程参与、自旋 join、参与者计数屏障
   （epoch 推进被 join 门控 ⇒ 栈上 Job 生存期安全）。跨线程并发

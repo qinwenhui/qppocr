@@ -1,2 +1,6 @@
-[build]
+# 对齐 C++ build.sh 的 `-mavx2 -mfma`（全局 FMA 收缩语义一致的前提之一）。
+# 只作用于 x86_64 目标——aarch64/wasm 交叉编译不受影响。
+# workspace 级配置不传播给下游依赖者（只影响本仓库的 CLI/example 构建）。
+
+[target.'cfg(target_arch = "x86_64")']
 rustflags = ["-C", "target-feature=+avx2,+fma"]
