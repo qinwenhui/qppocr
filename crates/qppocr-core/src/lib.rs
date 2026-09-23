@@ -17,4 +17,5 @@ pub mod error;
 pub mod executor;
 pub mod graph;
 pub mod onnx;
+pub mod pipeline;
 pub mod tensor;
