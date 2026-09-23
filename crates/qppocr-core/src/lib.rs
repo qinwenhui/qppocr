@@ -15,6 +15,20 @@
 
 pub mod error;
 pub use error::Error;
+
+/// 引擎线程池的总线程数（含主线程）。批量多进程部署按它折算每进程
+/// 线程数（`thread_count / 进程数`）。
+pub fn thread_count() -> usize {
+    #[cfg(feature = "parallel")]
+    {
+        qppocr_kernels::par::pool_thread_count()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        qppocr_kernels::par::threads()
+    }
+}
+
 pub mod executor;
 pub mod graph;
 pub mod onnx;
