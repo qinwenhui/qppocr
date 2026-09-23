@@ -1,3 +1,4 @@
+//! GEMM 性能对拍入口（tools/migration-bench 的 Rust 侧孪生）。
 // GEMM A/B — Rust 侧（qppocr-kernels 的 sgemm）。
 // 与 bench.cpp 同形状、同数据、同「7 轮取最好」口径；交错运行对比。
 // 构建：rustc -O -C target-feature=+avx2,+fma -o bench_rust bench_rs_qppocr.rs
@@ -8,7 +9,7 @@ use std::time::Instant;
 
 use qppocr_kernels::activation::Activation;
 use qppocr_kernels::gemm::sgemm_serial;
-use qppocr_kernels::{force_backend, Backend};
+use qppocr_kernels::{Backend, force_backend};
 
 fn main() {
     force_backend(Some(Backend::Avx2));

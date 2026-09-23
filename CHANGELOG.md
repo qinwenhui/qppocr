@@ -23,3 +23,6 @@
   逐位对拍测试：9 组形状 × bias/serial 组合，AVX2 与标量输出逐位相同。
 - GEMM 性能对拍（交错 5 轮取最好）：Rust/C++ = 0.80~0.87x，判据
   ≤1.05x 大幅超额（tools/migration-bench/README.md）。
+- 其余算子的 AVX2 向量路径与逐位对拍：激活五件套、二元平坦/run、
+  depthwise 内层、convT interleave、softmax 向量相、pool 2x2 可分
+  快路径（含钳制行哨兵修复）。5 组 bitexact 测试全绿。
