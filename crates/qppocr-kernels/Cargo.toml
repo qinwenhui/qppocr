@@ -9,5 +9,13 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+default = ["parallel"]
+# 关掉 = 单线程（WASM/嵌入式用）；阈值门控自动退化为串行
+parallel = ["dep:rayon"]
+
+[dependencies]
+rayon = { version = "1.10", optional = true }
+
 [lints]
 workspace = true
