@@ -89,6 +89,7 @@ pub fn pool2d(
                     } else {
                         std::ptr::null()
                     };
+                    #[cfg(target_arch = "x86_64")]
                     if avx2 {
                         crate::x86::pool2x2_row_vec(r0, r1, vm.as_mut_ptr(), outp, w);
                     } else {

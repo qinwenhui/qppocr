@@ -142,6 +142,7 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
         let opc = op.code();
         par::parallel_for_elems(total, total, |b0, e0| {
             #[cfg(target_arch = "x86_64")]
+            #[cfg(target_arch = "x86_64")]
             if crate::use_avx2() && opc <= 3 {
                 // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
                 unsafe { crate::x86::binary_flat_inplace_vec(pa.get(), b.as_ptr(), b0, e0, opc) };
@@ -220,6 +221,7 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
         }
         for o in o0..o1 {
             let cv = b[ib as usize];
+            #[cfg(target_arch = "x86_64")]
             #[cfg(target_arch = "x86_64")]
             if crate::use_avx2() && op.code() <= 3 {
                 // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；

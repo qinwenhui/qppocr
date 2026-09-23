@@ -138,6 +138,7 @@ pub fn relu_inplace(t: &mut [f32]) {
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
         #[cfg(target_arch = "x86_64")]
+        #[cfg(target_arch = "x86_64")]
         if crate::use_avx2() {
             // SAFETY: 区间 [b, e) 与其他并行块不相交。
             unsafe { crate::x86::relu_vec(tp.get(), b, e) };
@@ -158,6 +159,7 @@ pub fn hardsigmoid(x: &[f32], alpha: f32, beta: f32, y: &mut [f32]) {
     let yp = par::SyncPtr::new(y.as_mut_ptr());
     let n = x.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
         #[cfg(target_arch = "x86_64")]
         if crate::use_avx2() {
             // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
@@ -190,6 +192,7 @@ pub fn sigmoid_tensor(x: &[f32], y: &mut [f32]) {
     let n = x.len();
     par::parallel_for_elems(n, n, |b, e| {
         #[cfg(target_arch = "x86_64")]
+        #[cfg(target_arch = "x86_64")]
         if crate::use_avx2() {
             // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
             unsafe { crate::x86::sigmoid_vec(x.as_ptr(), yp.get(), b, e) };
@@ -210,6 +213,7 @@ pub fn gelu_inplace(t: &mut [f32], c1: f32, c2: f32, c3: f32) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
         #[cfg(target_arch = "x86_64")]
         if crate::use_avx2() {
             // SAFETY: 区间 [b, e) 与其他并行块不相交。
@@ -242,6 +246,7 @@ pub fn clip_inplace(t: &mut [f32], lo: f32, hi: f32) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
+        #[cfg(target_arch = "x86_64")]
         #[cfg(target_arch = "x86_64")]
         if crate::use_avx2() {
             // SAFETY: 区间 [b, e) 与其他并行块不相交。
@@ -295,6 +300,7 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
     };
     par::parallel_for_units(outer, |b, e| {
         for o in b..e {
+            #[cfg(target_arch = "x86_64")]
             if use_vec {
                 // SAFETY: 行 o 与其他并行块不相交。
                 unsafe { crate::x86::softmax_row_vec(tp.get().add(o * inner), inner) };

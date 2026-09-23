@@ -109,6 +109,7 @@ fn sgemm_impl(
     if serial || flops < par::thresholds().gemm_par_min || par::threads() == 1 {
         // SAFETY: 串行调用，无并发访问；形状已在上面的 assert 校验。
         unsafe {
+            #[cfg(target_arch = "x86_64")]
             if avx2 {
                 crate::x86::sgemm_panel_avx2(
                     a.as_ptr(),
@@ -139,6 +140,7 @@ fn sgemm_impl(
         par::parallel_for(np, 1, |pb, pe| {
             // SAFETY: 各面板写不相交的列区间 [p*32, p*32+nn)，元素两两不重叠。
             unsafe {
+                #[cfg(target_arch = "x86_64")]
                 if avx2 {
                     let bp = bptr(bias);
                     crate::x86::sgemm_panel_avx2(
@@ -164,6 +166,7 @@ fn sgemm_impl(
         par::parallel_for(m, 1, |mb, me| {
             // SAFETY: 各块写不相交的行区间 [mb, me)。
             unsafe {
+                #[cfg(target_arch = "x86_64")]
                 if avx2 {
                     let bp = bptr(bias);
                     crate::x86::sgemm_mrows_avx2(

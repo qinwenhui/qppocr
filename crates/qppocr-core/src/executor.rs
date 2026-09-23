@@ -696,9 +696,12 @@ impl Session {
                             && !n.inputs[1].is_empty()
                             && !n.inputs[2].is_empty()
                         {
+                            // starts/ends/axes 通常是折叠进 initializers 的
+                            // 常量（「权重零克隆」后不进 arena，查两级）
                             let grab = |nm: &str| -> Result<Vec<i64>> {
                                 let t = arena
                                     .get(nm)
+                                    .or_else(|| self.initializers.get(nm))
                                     .ok_or_else(|| Error::Graph(format!("Slice: missing {nm}")))?;
                                 Ok(as_i64(t))
                             };
@@ -725,6 +728,7 @@ impl Session {
                         let steps = if n.inputs.len() > 4 && !n.inputs[4].is_empty() {
                             let t = arena
                                 .get(&n.inputs[4])
+                                .or_else(|| self.initializers.get(&n.inputs[4]))
                                 .ok_or_else(|| Error::Graph("Slice: missing steps".into()))?;
                             as_i64(t)
                         } else {
