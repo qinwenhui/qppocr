@@ -53,7 +53,7 @@ impl PoolInner {
             Mutex::new(PoolInner {
                 free: (0..=MAX_CLASS).map(|_| Vec::new()).collect(),
                 held_bytes: 0,
-                cap_bytes: 64 << 20, // 64 MB 保守默认
+                cap_bytes: 256 << 20, // 对齐 C++ 的 256 MB：det 的 concat/中间张量 95 MB 级，64 MB 上限会把最大块全部挤出池（实测端到端慢 1.4x 的主因之一）
                 per_class_cap: [16, 8, 8],
             })
         })

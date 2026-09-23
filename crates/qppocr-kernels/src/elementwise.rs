@@ -306,13 +306,33 @@ pub fn binary_op(
     let yp = par::SyncPtr::new(y.as_mut_ptr());
 
     let nobc = (0..r).all(|i| stra[i] != 0 && strb[i] != 0);
+    // b 沿最内维（反转序 dim0）稠密 = 步长 1——run 向量化可用 load
+    #[allow(clippy::needless_range_loop)]
+    let b_dense_inner = r > 0 && strb[0] == 1;
 
     // 快路径 1：一侧是单元素
     if a.len() == 1 || b.len() == 1 {
         let a_is_scalar = a.len() == 1;
         let sv = if a_is_scalar { a[0] } else { b[0] };
         let v = if a_is_scalar { b } else { a };
+        let opc = op.code();
         par::parallel_for_elems(total, total, |b0, e0| {
+            #[cfg(target_arch = "x86_64")]
+            if crate::use_avx2() && opc <= 3 {
+                // SAFETY: 区间 [b0, e0) 与其他并行块不相交；v 同长。
+                unsafe {
+                    crate::x86::binary_scalar_vec(
+                        v.as_ptr(),
+                        sv,
+                        a_is_scalar,
+                        yp.get(),
+                        b0,
+                        e0,
+                        opc,
+                    )
+                };
+                return;
+            }
             // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
             let seg = unsafe { yp.offset(b0).slice(e0 - b0) };
             for (i, d) in seg.iter_mut().enumerate() {
@@ -372,6 +392,8 @@ pub fn binary_op(
                         ib -= strb[di] * shape[di];
                     }
                 }
+                let opc = op.code();
+                let b_dense_run = b_dense_inner;
                 for o in o0..o1 {
                     let cv = if a_const {
                         a[ia as usize]
@@ -383,7 +405,46 @@ pub fn binary_op(
                     } else {
                         &a[ia as usize..]
                     };
-                    // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交。
+                    // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
+                    // b 稠密时 dense 从 ib 起有 runlen 个元素（步长 1）。
+                    #[cfg(target_arch = "x86_64")]
+                    if crate::use_avx2() && opc <= 3 && a_const {
+                        // dense 切片头 = b.as_ptr()+ib，而内核内部还会 add(ib)——
+                        // 传全量头 b.as_ptr()，偏移只在内核里做一次
+                        let b_head = if a_const { b.as_ptr() } else { a.as_ptr() };
+                        let _ = dense;
+                        // SAFETY: 输出 run [o*runlen,(o+1)*runlen) 不相交；
+                        // b 稠密时 b_head+ib 起有 runlen 个元素（步长 1）。
+                        unsafe {
+                            crate::x86::binary_run_alloc_vec(
+                                yp.get(),
+                                &cv,
+                                b_head,
+                                o,
+                                runlen as usize,
+                                ib as usize,
+                                b_dense_run,
+                                cv,
+                                true,
+                                opc,
+                            )
+                        };
+                        // 尾部推进
+                        for i in 0..no {
+                            let di = k + i;
+                            idx[i] += 1;
+                            ia += stra[di];
+                            ib += strb[di];
+                            if idx[i] < shape[di] {
+                                break;
+                            }
+                            idx[i] = 0;
+                            ia -= stra[di] * shape[di];
+                            ib -= strb[di] * shape[di];
+                        }
+                        continue;
+                    }
+                    // SAFETY: 输出 run [o*runlen,(o+1)*runlen) 不相交。
                     let dst = unsafe { yp.offset(o * runlen as usize).slice(runlen as usize) };
                     for (j, d) in dst.iter_mut().enumerate() {
                         let (va, vb) = if a_const {
@@ -447,7 +508,21 @@ pub fn binary_op(
         }
     };
     if nobc {
+        // SyncPtr 是 *mut 语义；这里指向只读数据，cast 后包装（不可变访问）。
+        let (pa_src, pb_src) = (
+            par::SyncPtr::new(a.as_ptr() as *mut f32),
+            par::SyncPtr::new(b.as_ptr() as *mut f32),
+        );
+        let opc = op.code();
         par::parallel_for_elems(total, total, |b0, e0| {
+            #[cfg(target_arch = "x86_64")]
+            if crate::use_avx2() && opc <= 3 {
+                // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
+                unsafe {
+                    crate::x86::binary_flat_vec(pa_src.get(), pb_src.get(), yp.get(), b0, e0, opc)
+                };
+                return;
+            }
             // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
             let seg = unsafe { yp.offset(b0).slice(e0 - b0) };
             for (i, d) in seg.iter_mut().enumerate() {

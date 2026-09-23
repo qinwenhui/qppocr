@@ -192,6 +192,11 @@ impl Session {
         let prof = std::env::var("QPPOCR_PROF").is_ok();
         let mut prof_acc: std::collections::HashMap<String, (f64, u32)> =
             std::collections::HashMap::new();
+        let prof_t0 = if prof {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         // 消费者引用计数
         let mut refs: HashMap<&str, i64> = HashMap::new();
@@ -967,6 +972,10 @@ impl Session {
                     e.0 += t0.elapsed().as_secs_f64() * 1000.0;
                     e.1 += 1;
                 }
+                #[allow(unused_assignments)]
+                {
+                    let _ = &op_t0;
+                }
                 // 对拍落盘（C++ LEAN_DUMP_DIR 同格式：%06d.f32 + manifest.tsv）
                 if let Some(dir) = &dump_dir {
                     if let Some(t) = arena.get(&n.outputs[0]) {
@@ -1034,9 +1043,18 @@ impl Session {
         }
 
         if prof {
+            let wall = prof_t0
+                .map(|t| t.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            let kernel: f64 = prof_acc.values().map(|(ms, _)| *ms).sum();
             let mut v: Vec<_> = prof_acc.into_iter().collect();
             v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
-            eprintln!("--- per-op profile [{}] ---", g.model_path);
+            eprintln!(
+                "--- per-op profile [{}] (kernel {kernel:.1} ms, wall {wall:.1} ms, executor {:.1} ms = {:.1}%) ---",
+                g.model_path,
+                wall - kernel,
+                100.0 * (wall - kernel) / wall.max(0.001)
+            );
             for (op, (ms, cnt)) in v {
                 eprintln!("  {op:<16} {ms:8.1} ms  x{cnt}");
             }
