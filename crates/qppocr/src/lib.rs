@@ -162,6 +162,46 @@ pub struct Advanced {
     pub rec_space_gap: f64,
     /// 方向分类翻转阈值。
     pub cls_thresh: f32,
+
+    // ---- 以下与 `PipelineConfig` 同名同义（tuning.hpp 基准值）----
+    /// 检测输入长边上限。⚠ 双向帽：低于工作图长边会把检测输入**缩小**。
+    pub det_max_side: i32,
+    /// 检测输入像素上限（原图的倍数，只在补边时生效）。
+    pub det_pixel_budget: f64,
+    /// 检测短边目标（"min" limit type）。
+    pub det_limit_side_len: i32,
+    /// 原图预缩上限。
+    pub max_side_len: i32,
+    /// 连通域上限。
+    pub max_candidates: usize,
+    /// 连通域前是否膨胀 DB 掩码。
+    pub use_dilation: bool,
+    /// 极端宽高比时上下补黑边。
+    pub vertical_padding: bool,
+    /// 补边判定的宽高比阈值。
+    pub width_height_ratio: f64,
+    /// 补边判定的最小高度。
+    pub min_height: i32,
+    /// 识别画布高度（32 的倍数；换值即换 rec 输入分布）。
+    pub rec_height: i32,
+    /// 批宽下限（px @ rec_height）。
+    pub rec_min_width: i32,
+    /// 批宽对齐粒度，0 = 精确宽。
+    pub rec_width_grain: i32,
+    /// 补白代替放大的高度比例下限，0 = 总是放大。
+    pub rec_pad_min_h: f64,
+    /// 每批行数。
+    pub rec_batch: usize,
+    /// 分类器画布高。
+    pub cls_height: i32,
+    /// 分类器画布宽。
+    pub cls_width: i32,
+    /// 超宽行取居中窗口分类。⚠ 对上游 PP-LCNet 有害（默认关）。
+    pub cls_window: bool,
+    /// 自动色阶预处理。⚠ 改变检测器所见（默认关）。
+    pub enhance_contrast: bool,
+    /// 检测放大倍数（成本 ~N²；裁剪仍取原图，默认 1）。
+    pub upscale: i32,
 }
 
 impl Default for Advanced {
@@ -178,6 +218,25 @@ impl Default for Advanced {
             rec_batch_ratio: 1.1,
             rec_space_gap: 0.3,
             cls_thresh: 0.9,
+            det_max_side: 960,
+            det_pixel_budget: 6.0,
+            det_limit_side_len: 736,
+            max_side_len: 960,
+            max_candidates: 1000,
+            use_dilation: true,
+            vertical_padding: true,
+            width_height_ratio: 8.0,
+            min_height: 30,
+            rec_height: 48,
+            rec_min_width: 16,
+            rec_width_grain: 0,
+            rec_pad_min_h: 0.0,
+            rec_batch: 6,
+            cls_height: 48,
+            cls_width: 192,
+            cls_window: false,
+            enhance_contrast: false,
+            upscale: 1,
         }
     }
 }
@@ -374,6 +433,25 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
         rec_batch_ratio: pc.rec_batch_ratio,
         rec_space_gap: pc.rec_space_gap,
         cls_thresh: pc.cls_thresh,
+        det_max_side: pc.det_max_side,
+        det_pixel_budget: pc.det_pixel_budget,
+        det_limit_side_len: pc.det_limit_side_len,
+        max_side_len: pc.max_side_len,
+        max_candidates: pc.max_candidates,
+        use_dilation: pc.use_dilation,
+        vertical_padding: pc.vertical_padding,
+        width_height_ratio: pc.width_height_ratio,
+        min_height: pc.min_height,
+        rec_height: pc.rec_height,
+        rec_min_width: pc.rec_min_width,
+        rec_width_grain: pc.rec_width_grain,
+        rec_pad_min_h: pc.rec_pad_min_h,
+        rec_batch: pc.rec_batch,
+        cls_height: pc.cls_height,
+        cls_width: pc.cls_width,
+        cls_window: pc.cls_window,
+        enhance_contrast: pc.enhance_contrast,
+        upscale: pc.upscale,
     };
     if let Some(f) = advanced_fn {
         f(&mut adv);
@@ -388,5 +466,24 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
     pc.rec_batch_ratio = adv.rec_batch_ratio;
     pc.rec_space_gap = adv.rec_space_gap;
     pc.cls_thresh = adv.cls_thresh;
+    pc.det_max_side = adv.det_max_side;
+    pc.det_pixel_budget = adv.det_pixel_budget;
+    pc.det_limit_side_len = adv.det_limit_side_len;
+    pc.max_side_len = adv.max_side_len;
+    pc.max_candidates = adv.max_candidates;
+    pc.use_dilation = adv.use_dilation;
+    pc.vertical_padding = adv.vertical_padding;
+    pc.width_height_ratio = adv.width_height_ratio;
+    pc.min_height = adv.min_height;
+    pc.rec_height = adv.rec_height;
+    pc.rec_min_width = adv.rec_min_width;
+    pc.rec_width_grain = adv.rec_width_grain;
+    pc.rec_pad_min_h = adv.rec_pad_min_h;
+    pc.rec_batch = adv.rec_batch;
+    pc.cls_height = adv.cls_height;
+    pc.cls_width = adv.cls_width;
+    pc.cls_window = adv.cls_window;
+    pc.enhance_contrast = adv.enhance_contrast;
+    pc.upscale = adv.upscale;
     pc
 }
