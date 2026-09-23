@@ -1,0 +1,16 @@
+[package]
+name = "qppocr"
+description = "纯 Rust、手写内核的 PP-OCRv6 推理引擎（面向上游官方 ONNX 原件）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+
+[dependencies]
+qppocr-core = { path = "../qppocr-core" }
+
+[lints]
+workspace = true
