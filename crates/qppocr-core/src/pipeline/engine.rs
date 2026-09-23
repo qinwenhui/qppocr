@@ -141,7 +141,37 @@ impl Engine {
             Some(p) => Some(Session::open(p)?),
             None => None,
         };
+        Self::from_sessions(det, rec, cls, dict, cfg)
+    }
 
+    /// 从内存字节构造（WASM / 移动端；display_name 只用于报告）。
+    pub fn open_bytes(
+        det: &[u8],
+        rec: &[u8],
+        cls: Option<&[u8]>,
+        display_name: &str,
+        dict: Dictionary,
+        cfg: PipelineConfig,
+    ) -> Result<Self> {
+        let det = Session::from_memory(det, &format!("{display_name}.det.onnx"))?;
+        let rec = Session::from_memory(rec, &format!("{display_name}.rec.onnx"))?;
+        let cls = match cls {
+            Some(b) => Some(Session::from_memory(
+                b,
+                &format!("{display_name}.cls.onnx"),
+            )?),
+            None => None,
+        };
+        Self::from_sessions(det, rec, cls, dict, cfg)
+    }
+
+    fn from_sessions(
+        det: Session,
+        rec: Session,
+        cls: Option<Session>,
+        dict: Dictionary,
+        cfg: PipelineConfig,
+    ) -> Result<Self> {
         // 字典：blank 在 0、字典项、空格在末尾（ppocr 的约定）
         let raw: String = match dict {
             Dictionary::Embedded => {

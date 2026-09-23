@@ -9,8 +9,20 @@ repository.workspace = true
 authors.workspace = true
 readme = "../../README.md"
 
+[features]
+default = ["std", "parallel", "image-decode"]
+std = []
+# 关掉 = 单线程（WASM/嵌入式用）
+parallel = ["qppocr-core/parallel"]
+# 图像解码（JPEG/PNG）。关掉 = 只吃已解码像素
+image-decode = ["dep:image"]
+# 结果的 serde 序列化
+serde = ["dep:serde"]
+
 [dependencies]
 qppocr-core = { path = "../qppocr-core" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+serde = { version = "1", default-features = false, optional = true, features = ["derive"] }
 
 [lints]
 workspace = true
