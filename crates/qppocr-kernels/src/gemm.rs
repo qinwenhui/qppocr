@@ -392,7 +392,9 @@ pub fn im2col(
             }
         }
     };
-    // min_grain=1：单元是输出行，一个 tiled conv 可能只有几行。默认 256 行
-    // 的门槛会让 3x3 conv 的 200 MB im2col 搬运单核跑完。
-    par::parallel_for(rows, 1, body);
+    // ★ 串行执行，调用方负责并行。C++ 的 im2col 带 serial 参数，conv 的
+    // tile_body 总是传 true——因为 tile 本身已在 parallel_for 里，嵌套
+    // fork 是死锁（C++ 池）或微任务调度开销（rayon，实测 160 个 2 行的
+    // 微任务吃掉 1.2 ms）。这里直接执行与 C++ 的实际行为一致。
+    body(0, rows);
 }
