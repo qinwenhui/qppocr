@@ -19,3 +19,7 @@
 - 内核测试：test_ops.cpp 用例集移植 + 补充覆盖（softmax/pool/resize/
   transpose/slice/concat/matmul/reduce_mean/convtranspose），自包含、
   无需模型与语料；并行与单线程两种配置都过。
+- sgemm 的 AVX2+FMA 微内核（4×4 分块、尾部面板按 nn 门控加载）与
+  逐位对拍测试：9 组形状 × bias/serial 组合，AVX2 与标量输出逐位相同。
+- GEMM 性能对拍（交错 5 轮取最好）：Rust/C++ = 0.80~0.87x，判据
+  ≤1.05x 大幅超额（tools/migration-bench/README.md）。
