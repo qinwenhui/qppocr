@@ -110,3 +110,23 @@ C++ 内核的向量循环覆盖 8 的倍数；余数尾巴走**标量 libm**（`
 receipt.png：Rust 439ms vs C++ 81ms。已知主因：executor 每次 run 克隆
 initializers（权重）、conv2d 输出的 `resize` 清零（TODO 标记的 memset，
 det 的 47 MB 输出 ~4 ms/节点）。缓冲池是下一阶段的事。
+
+
+## 阶段 5 补充：small 档全语料（2026-09-23）
+
+**上游 small 原件（Rust）vs 转换版 small（C++）：104/104 逐字符一致（100%）。**
+
+这是 §11-2 功课的一半（small 完成；medium 体积大、无内嵌字典，
+文本对拍待做——上游 cls 段错误使 C++ 侧只能对比转换版）。
+
+### 过程中解决的两个真问题
+
+1. **Slice 常量查找遗漏（4 处）**：「权重零克隆」改造后 initializers
+   不再进 arena，Slice 的 starts/ends/axes/steps（通常是折叠常量）
+   查不到。grab 补两级查找（arena → initializers）。
+2. **sdcb small/medium 字典丢了前导空行项**：sdcb 提取版首行空、
+   缺 `!`/`"`——不是官方字典的真实布局。实测上游 small rec 全部
+   字符偏移 +1（`Email`→`Fnbjm`）；补一个前导空行后 104/104 一致。
+   这同时解释了当初归一化后 SHA 不匹配的悬案（内容差一项）。
+   ⚠ `models/dict_small_medium.txt` 已带修正的前导空行；上游官方
+   字典的 SHA（附录 D `118d0f07…`）待 fetch 落地时重新核对。
