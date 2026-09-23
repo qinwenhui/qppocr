@@ -30,6 +30,18 @@ pub fn decode_file(path: impl AsRef<std::path::Path>) -> Result<Image, crate::Er
     decode_bytes(&std::fs::read(path)?)
 }
 
+/// 只读图片头部取尺寸（不解码像素；feature `image-decode`）。
+///
+/// 批量调度估算一张图要多「重」时用（对应 C++ `auto_workers` 的
+/// `image_dimensions` 头部探测）——解码本身保持全分辨率。
+#[cfg(feature = "image-decode")]
+pub fn probe_dimensions(path: impl AsRef<std::path::Path>) -> Result<(u32, u32), crate::Error> {
+    image::ImageReader::open(path)
+        .map_err(|e| crate::Error::Image(format!("打开失败: {e}")))?
+        .into_dimensions()
+        .map_err(|e| crate::Error::Image(format!("读头部失败: {e}")))
+}
+
 /// 解码图像字节（PNG/JPEG；feature `image-decode`）。
 #[cfg(feature = "image-decode")]
 pub fn decode_bytes(bytes: &[u8]) -> Result<Image, crate::Error> {

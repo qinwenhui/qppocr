@@ -83,6 +83,13 @@ pub fn threads() -> usize {
     }
 }
 
+/// 池的总线程数（含主线程）。CLI 的批量 `--workers` 按它折算每进程
+/// 线程数（`pool / worker 数`），对齐 C++ `threads_each`。
+#[cfg(feature = "parallel")]
+pub fn pool_thread_count() -> usize {
+    crate::pool::thread_count()
+}
+
 /// 请求池的线程数（含主线程，0 = 自动）。必须在**第一次并行算子**之前
 /// 调用——池在首用时定容，之后请求不再生效（C++ `ThreadPool::get` 的
 /// 「最早调用者定容」语义）。显式数字不设 16 上限。

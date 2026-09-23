@@ -55,7 +55,14 @@ mod sha256;
 pub use qppocr_core::Error as CoreError;
 pub use qppocr_core::pipeline::{Dictionary, OcrResult, TextLine, Timings};
 
-pub use image::{Image, decode_bytes, decode_file, rgb_from_bytes};
+pub use image::{Image, decode_bytes, decode_file, probe_dimensions, rgb_from_bytes};
+
+/// 引擎线程池的总线程数（含主线程；`parallel` feature 关闭时为 1）。
+/// 多进程批量部署按它折算每进程线程数（`thread_count / 进程数`）。
+pub fn thread_count() -> usize {
+    qppocr_core::thread_count()
+}
+
 pub use models::{ModelSource, Tier};
 
 use qppocr_core::pipeline::{Engine as CoreEngine, PipelineConfig};

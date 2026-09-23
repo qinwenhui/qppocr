@@ -55,6 +55,14 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- feat(cli): 批量 `--workers`（进程扇出，C++ `auto_workers`/`proc_pool`
+  的移植）——100 图 14.0→5.9 s（C++ 5.7 s，平手）。worker 数自动
+  （头部探测平均 MP：大图 cap 2 / 小图 cap 8 / 核数减半）或显式；
+  连续切块按序拼接保持输入序与 JSON 合并零解析；扇出 vs 顺序同线程数
+  0/100 差异。途中实测并否决了进程内「fork 宽度收窄」方案：fork_mu
+  串行化下收窄反而降并行度，且 gemm 分轴随线程数变会破坏位级一致。
+  同步新增 `qppocr::thread_count()`（池大小查询）与
+  `qppocr::probe_dimensions()`（头部探测，不解码像素）。
 - perf(mem)+bench(small): 权重单份化 + small 档全量对比。
   `Session::open`/`from_memory` 的 `initializers.clone()` 改 `mem::take`
   ——权重（small ≈33 MB、tiny ≈7 MB）原本双份常驻。实测 PeakWS：
