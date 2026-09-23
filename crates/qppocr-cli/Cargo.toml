@@ -1,0 +1,19 @@
+[package]
+name = "qppocr-cli"
+description = "qppocr 的参考命令行入口"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "qppocr"
+path = "src/main.rs"
+
+[dependencies]
+qppocr = { path = "../qppocr" }
+
+[lints]
+workspace = true

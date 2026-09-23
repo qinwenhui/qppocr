@@ -1,0 +1,16 @@
+[package]
+name = "qppocr-core"
+description = "qppocr 引擎主体：ONNX 解析、图优化、执行器、det/cls/rec 流水线"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+qppocr-kernels = { path = "../qppocr-kernels" }
+
+[lints]
+workspace = true
