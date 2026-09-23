@@ -23,6 +23,7 @@
 )]
 
 pub mod activation;
+pub mod buf;
 pub mod conv;
 pub mod elementwise;
 pub mod gemm;

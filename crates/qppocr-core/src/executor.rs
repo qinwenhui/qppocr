@@ -16,6 +16,7 @@ use std::io::Write;
 use crate::error::{Error, Result};
 use crate::onnx::model::{Attribute, Graph, Node};
 use crate::tensor::{DType, Tensor};
+use qppocr_kernels::buf::F32Buf;
 
 fn get_i(a: Option<&Attribute>, dflt: i64) -> i64 {
     a.filter(|x| x.has_i).map(|x| x.i).unwrap_or(dflt)
@@ -35,14 +36,21 @@ fn as_i64(t: &Tensor) -> Vec<i64> {
 }
 
 /// axes 可能是属性（opset ≤ 12）或输入张量（opset 13+）。
-fn axes_from(n: &Node, arena: &HashMap<String, Tensor>) -> Vec<i64> {
+fn axes_from(
+    n: &Node,
+    arena: &HashMap<String, Tensor>,
+    initializers: &HashMap<String, Tensor>,
+) -> Vec<i64> {
     if let Some(a) = n.attr("axes") {
         if !a.ints.is_empty() {
             return a.ints.clone();
         }
     }
     if n.inputs.len() >= 2 {
-        if let Some(t) = arena.get(&n.inputs[1]) {
+        if let Some(t) = arena
+            .get(&n.inputs[1])
+            .or_else(|| initializers.get(&n.inputs[1]))
+        {
             return as_i64(t);
         }
     }
@@ -159,13 +167,31 @@ impl Session {
         qppocr_kernels::par::enable_flush_denormals();
 
         let g = &self.graph;
-        let mut arena: HashMap<String, Tensor> = self.initializers.clone();
+        // ★ 权重不进 arena：每次 run 克隆全部 initializer（det 445K floats +
+        // 每个权重的 String 键）在 100ms 级的图上是纯浪费。arena 只放中间
+        // 张量；查找两级（arena → initializers），释放跳过 initializers
+        //（refs 计数那里已有该判断）。
+        let mut arena: HashMap<String, Tensor> = HashMap::new();
         for (name, t) in inputs {
             arena.insert(name, t);
+        }
+        // 两级查找：先中间张量、再权重。借用生命周期要显式统一到 arena。
+        macro_rules! get {
+            ($arena:expr, $name:expr) => {
+                match $arena.get($name) {
+                    Some(t) => Some(t),
+                    None => self.initializers.get($name),
+                }
+            };
         }
 
         // 对拍落盘（与 C++ LEAN_DUMP_DIR 同格式）
         let dump_dir = std::env::var("QPPOCR_DUMP_DIR").ok();
+
+        // per-op profile（QPPOCR_PROF=1）：按算子累计内核时间。
+        let prof = std::env::var("QPPOCR_PROF").is_ok();
+        let mut prof_acc: std::collections::HashMap<String, (f64, u32)> =
+            std::collections::HashMap::new();
 
         // 消费者引用计数
         let mut refs: HashMap<&str, i64> = HashMap::new();
@@ -189,7 +215,7 @@ impl Session {
                 let n = &g.nodes[i];
                 let mut ready = true;
                 for inn in &n.inputs {
-                    if !inn.is_empty() && !arena.contains_key(inn) {
+                    if !inn.is_empty() && get!(&arena, inn).is_none() {
                         ready = false;
                         break;
                     }
@@ -221,20 +247,47 @@ impl Session {
                 };
 
                 let op = n.op_type.as_str();
+                let op_t0 = if prof {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                let prof_key = if prof && op == "Conv" {
+                    let x = get!(&arena, &n.inputs[0]).unwrap();
+                    let w = get!(&arena, &n.inputs[1]).unwrap();
+                    format!(
+                        "Conv {}->{} k{}x{} @{}x{} g{}",
+                        x.shape[1],
+                        w.shape[0],
+                        w.shape[2],
+                        w.shape[3],
+                        x.shape[2],
+                        x.shape[3],
+                        get_i(n.attr("group"), 1)
+                    )
+                } else if prof {
+                    op.to_string()
+                } else {
+                    String::new()
+                };
                 let take0 = |arena: &mut HashMap<String, Tensor>| -> Tensor {
                     if takeable(0) {
                         arena.remove(&n.inputs[0]).unwrap()
                     } else {
-                        arena[&n.inputs[0]].clone()
+                        // 权重或共享输入：从两级里拷贝
+                        match arena.get(&n.inputs[0]) {
+                            Some(t) => t.clone(),
+                            None => self.initializers[&n.inputs[0]].clone(),
+                        }
                     }
                 };
 
                 match op {
                     "Conv" => {
-                        let x = &arena[&n.inputs[0]];
-                        let w = &arena[&n.inputs[1]];
-                        let bias: Option<Vec<f32>> = if n.inputs.len() > 2 {
-                            arena.get(&n.inputs[2]).map(|t| t.f32.clone())
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let w = get!(&arena, &n.inputs[1]).unwrap();
+                        let bias = if n.inputs.len() > 2 {
+                            get!(&arena, &n.inputs[2]).map(|t| t.f32.as_slice())
                         } else {
                             None
                         };
@@ -256,7 +309,7 @@ impl Session {
                                 );
                             }
                         }
-                        let mut y: Vec<f32> = Vec::new();
+                        let mut y = F32Buf::new();
                         let x4 = [x.shape[0], x.shape[1], x.shape[2], x.shape[3]];
                         let w4 = [w.shape[0], w.shape[1], w.shape[2], w.shape[3]];
                         let os = qppocr_kernels::conv::conv2d(
@@ -264,7 +317,7 @@ impl Session {
                             &x4,
                             &w.f32,
                             &w4,
-                            bias.as_deref(),
+                            bias,
                             &qppocr_kernels::conv::ConvParams {
                                 sh: sh as usize,
                                 sw: sw as usize,
@@ -291,11 +344,11 @@ impl Session {
                         );
                     }
                     "ConvTranspose" => {
-                        let x = &arena[&n.inputs[0]];
-                        let w = &arena[&n.inputs[1]];
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let w = get!(&arena, &n.inputs[1]).unwrap();
                         let (sh, sw) = strides_of(n);
                         let pads = pads_of(n);
-                        let mut y: Vec<f32> = Vec::new();
+                        let mut y = F32Buf::new();
                         let x4 = [x.shape[0], x.shape[1], x.shape[2], x.shape[3]];
                         let w4 = [w.shape[0], w.shape[1], w.shape[2], w.shape[3]];
                         let os = qppocr_kernels::conv::convtranspose2d(
@@ -324,13 +377,13 @@ impl Session {
                         // 输入是最后消费者时就地：batchnorm 先 `y = x` 再覆写
                         // 每个元素，能拿就别拷。
                         let (sc, bi, me, va) = (
-                            arena[&n.inputs[1]].f32.clone(),
-                            arena[&n.inputs[2]].f32.clone(),
-                            arena[&n.inputs[3]].f32.clone(),
-                            arena[&n.inputs[4]].f32.clone(),
+                            get!(&arena, &n.inputs[1]).unwrap().f32.to_vec(),
+                            get!(&arena, &n.inputs[2]).unwrap().f32.to_vec(),
+                            get!(&arena, &n.inputs[3]).unwrap().f32.to_vec(),
+                            get!(&arena, &n.inputs[4]).unwrap().f32.to_vec(),
                         );
                         let mut y = take0(&mut arena);
-                        let mut out = Vec::new();
+                        let mut out = F32Buf::new();
                         qppocr_kernels::shape::batchnorm(
                             &y.f32,
                             &y.shape,
@@ -351,16 +404,19 @@ impl Session {
                     }
                     "Sigmoid" => {
                         let mut y = take0(&mut arena);
-                        let mut out = vec![0f32; y.f32.len()];
-                        qppocr_kernels::activation::sigmoid_tensor(&y.f32, &mut out);
+                        // 原地拷贝语义：sigmoid(x) 写满新缓冲
+                        let src = y.f32.clone();
+                        let mut out = F32Buf::with_zeroed(src.len());
+                        qppocr_kernels::activation::sigmoid_tensor(&src, &mut out);
                         y.f32 = out;
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "HardSigmoid" => {
                         let mut y = take0(&mut arena);
-                        let mut out = vec![0f32; y.f32.len()];
+                        let src = y.f32.clone();
+                        let mut out = F32Buf::with_zeroed(src.len());
                         qppocr_kernels::activation::hardsigmoid(
-                            &y.f32,
+                            &src,
                             get_f(n.attr("alpha"), 0.2),
                             get_f(n.attr("beta"), 0.5),
                             &mut out,
@@ -398,14 +454,14 @@ impl Session {
                             hi = a.f;
                         }
                         if n.inputs.len() > 1 && !n.inputs[1].is_empty() {
-                            if let Some(t) = arena.get(&n.inputs[1]) {
+                            if let Some(t) = get!(&arena, &n.inputs[1]) {
                                 if t.numel() > 0 && !t.f32.is_empty() {
                                     lo = t.f32[0];
                                 }
                             }
                         }
                         if n.inputs.len() > 2 && !n.inputs[2].is_empty() {
-                            if let Some(t) = arena.get(&n.inputs[2]) {
+                            if let Some(t) = get!(&arena, &n.inputs[2]) {
                                 if t.numel() > 0 && !t.f32.is_empty() {
                                     hi = t.f32[0];
                                 }
@@ -427,22 +483,22 @@ impl Session {
                         // 省一次多 MB 分配和一整趟额外内存
                         let can_ip = takeable(0)
                             && qppocr_kernels::elementwise::binary_can_inplace(
-                                &arena[&n.inputs[0]].shape,
-                                &arena[&n.inputs[1]].shape,
+                                get!(&arena, &n.inputs[0]).unwrap().shape.as_slice(),
+                                get!(&arena, &n.inputs[1]).unwrap().shape.as_slice(),
                             );
                         let out = if can_ip {
                             let mut acc = arena.remove(&n.inputs[0]).unwrap();
                             qppocr_kernels::elementwise::binary_op_inplace(
                                 &mut acc.f32,
                                 &acc.shape,
-                                &arena[&n.inputs[1]].f32,
-                                &arena[&n.inputs[1]].shape,
+                                get!(&arena, &n.inputs[1]).unwrap().f32.as_slice(),
+                                get!(&arena, &n.inputs[1]).unwrap().shape.as_slice(),
                                 binop,
                             );
                             acc
                         } else {
-                            let a = &arena[&n.inputs[0]];
-                            let b = &arena[&n.inputs[1]];
+                            let a = get!(&arena, &n.inputs[0]).unwrap();
+                            let b = get!(&arena, &n.inputs[1]).unwrap();
                             let (data, shape) = qppocr_kernels::elementwise::binary_op(
                                 &a.f32, &a.shape, &b.f32, &b.shape, binop,
                             );
@@ -450,7 +506,7 @@ impl Session {
                                 name: String::new(),
                                 shape,
                                 dtype: DType::F32,
-                                f32: data,
+                                f32: F32Buf::from_vec(&data),
                                 i64: Vec::new(),
                             }
                         };
@@ -462,9 +518,9 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "GlobalAveragePool" => {
-                        let x = &arena[&n.inputs[0]];
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
                         let (nn, c) = (x.shape[0] as usize, x.shape[1] as usize);
-                        let mut out = Vec::new();
+                        let mut out = F32Buf::new();
                         qppocr_kernels::pool2d::global_avg_pool(&x.f32, nn, c, &mut out);
                         arena.insert(
                             n.outputs[0].clone(),
@@ -483,7 +539,7 @@ impl Session {
                             .filter(|a| a.ints.len() == 2)
                             .ok_or_else(|| Error::Graph(format!("{op}: kernel_shape required")))?;
                         let st = strides_of(n);
-                        let x = &arena[&n.inputs[0]];
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
                         let (nn, c, h, w) = (
                             x.shape[0] as usize,
                             x.shape[1] as usize,
@@ -493,7 +549,7 @@ impl Session {
                         let (ph, pw, peh, pew) = resolve_pads(
                             n, x.shape[2], x.shape[3], ks.ints[0], ks.ints[1], st.0, st.1, 1, 1,
                         );
-                        let mut out = Vec::new();
+                        let mut out = F32Buf::new();
                         let (oh, ow) = qppocr_kernels::pool2d::pool2d(
                             &x.f32,
                             nn,
@@ -523,10 +579,10 @@ impl Session {
                         );
                     }
                     "Resize" => {
-                        let x = &arena[&n.inputs[0]];
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
                         let (oh, ow): (usize, usize);
                         if n.inputs.len() >= 4 && !n.inputs[3].is_empty() {
-                            let sizes = arena.get(&n.inputs[3]).ok_or_else(|| {
+                            let sizes = get!(&arena, &n.inputs[3]).ok_or_else(|| {
                                 Error::Graph("Resize: missing sizes input".into())
                             })?;
                             // 按**扁平数组末两位**取 H/W（C++ 是 i64.size()-2），
@@ -535,7 +591,7 @@ impl Session {
                             oh = sv[sv.len() - 2] as usize;
                             ow = sv[sv.len() - 1] as usize;
                         } else if n.inputs.len() >= 3 && !n.inputs[2].is_empty() {
-                            let sc = arena.get(&n.inputs[2]).ok_or_else(|| {
+                            let sc = get!(&arena, &n.inputs[2]).ok_or_else(|| {
                                 Error::Graph("Resize: missing scales input".into())
                             })?;
                             let sh_ = sc.f32[sc.f32.len() - 2];
@@ -561,7 +617,7 @@ impl Session {
                             x.shape[2] as usize,
                             x.shape[3] as usize,
                         );
-                        let mut out = Vec::new();
+                        let mut out = F32Buf::new();
                         let shape = vec![nn as i64, c as i64, oh as i64, ow as i64];
                         match mode.as_str() {
                             "nearest" => qppocr_kernels::resize::resize_nearest(
@@ -594,7 +650,11 @@ impl Session {
                     "Concat" => {
                         let axis = get_i(n.attr("axis"), 0);
                         use qppocr_kernels::shape::PayloadRef;
-                        let xs: Vec<&Tensor> = n.inputs.iter().map(|inn| &arena[inn]).collect();
+                        let xs: Vec<&Tensor> = n
+                            .inputs
+                            .iter()
+                            .map(|inn| get!(&arena, inn).unwrap())
+                            .collect();
                         let xs_shape: Vec<&[i64]> = xs.iter().map(|t| t.shape.as_slice()).collect();
                         let payloads: Vec<PayloadRef<'_>> = xs
                             .iter()
@@ -604,7 +664,7 @@ impl Session {
                             })
                             .collect();
                         let mut out = match xs[0].dtype {
-                            DType::F32 => qppocr_kernels::shape::Payload::F32(Vec::new()),
+                            DType::F32 => qppocr_kernels::shape::Payload::F32(F32Buf::new()),
                             DType::I64 => qppocr_kernels::shape::Payload::I64(Vec::new()),
                         };
                         let shape =
@@ -621,7 +681,7 @@ impl Session {
                                 name: n.outputs[0].clone(),
                                 shape,
                                 dtype: DType::I64,
-                                f32: Vec::new(),
+                                f32: F32Buf::new(),
                                 i64: v,
                             },
                         };
@@ -670,7 +730,7 @@ impl Session {
                         } else {
                             Vec::new()
                         };
-                        let x = &arena[&n.inputs[0]];
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
                         use qppocr_kernels::shape::PayloadRef;
                         let (payload, shape) = match x.dtype {
                             DType::F32 => qppocr_kernels::shape::slice_tensor(
@@ -702,7 +762,7 @@ impl Session {
                                 name: n.outputs[0].clone(),
                                 shape,
                                 dtype: DType::I64,
-                                f32: Vec::new(),
+                                f32: F32Buf::new(),
                                 i64: v,
                             },
                         };
@@ -710,7 +770,7 @@ impl Session {
                     }
                     "Transpose" => {
                         let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
-                        let x = &arena[&n.inputs[0]];
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
                         use qppocr_kernels::shape::PayloadRef;
                         let (payload, shape) = match x.dtype {
                             DType::F32 => qppocr_kernels::shape::transpose_tensor(
@@ -736,7 +796,7 @@ impl Session {
                                 name: n.outputs[0].clone(),
                                 shape,
                                 dtype: DType::I64,
-                                f32: Vec::new(),
+                                f32: F32Buf::new(),
                                 i64: v,
                             },
                         };
@@ -746,12 +806,12 @@ impl Session {
                         // 只改形状：行主序元素序一致，无数据可搬。能拿就拿，
                         // 让赋值变自赋值。Squeeze 的 axes 可能在第二个输入。
                         let axes = if op == "Squeeze" {
-                            axes_from(n, &arena)
+                            axes_from(n, &arena, &self.initializers)
                         } else {
                             Vec::new()
                         };
                         let shp = if op == "Reshape" {
-                            let t = arena.get(&n.inputs[1]).ok_or_else(|| {
+                            let t = get!(&arena, &n.inputs[1]).ok_or_else(|| {
                                 Error::Graph("Reshape: missing shape input".into())
                             })?;
                             as_i64(t) // 按值取：take0 之后原槽位要失效
@@ -768,7 +828,7 @@ impl Session {
                     }
                     "Unsqueeze" => {
                         // 同上：只形状。先拿输入再算，避免读到移动后的槽位。
-                        let axes = axes_from(n, &arena);
+                        let axes = axes_from(n, &arena, &self.initializers);
                         let mut y = take0(&mut arena);
                         let xsh = y.shape.clone();
                         // 输出秩 = 输入秩 + axes 数。插入掩码按 max(axes)+1
@@ -796,9 +856,9 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "ReduceMean" => {
-                        let axes = axes_from(n, &arena);
-                        let x = &arena[&n.inputs[0]];
-                        let mut out = Vec::new();
+                        let axes = axes_from(n, &arena, &self.initializers);
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let mut out = F32Buf::new();
                         let shape = qppocr_kernels::shape::reduce_mean(
                             &x.f32,
                             &x.shape,
@@ -818,9 +878,9 @@ impl Session {
                         );
                     }
                     "MatMul" => {
-                        let a = &arena[&n.inputs[0]];
-                        let b = &arena[&n.inputs[1]];
-                        let mut out = Vec::new();
+                        let a = get!(&arena, &n.inputs[0]).unwrap();
+                        let b = get!(&arena, &n.inputs[1]).unwrap();
+                        let mut out = F32Buf::new();
                         let shape = qppocr_kernels::shape::matmul(
                             &a.f32, &a.shape, &b.f32, &b.shape, &mut out,
                         );
@@ -836,21 +896,24 @@ impl Session {
                         );
                     }
                     "Shape" => {
-                        let x = &arena[&n.inputs[0]];
+                        let x = get!(&arena, &n.inputs[0]).unwrap();
                         arena.insert(
                             n.outputs[0].clone(),
                             Tensor {
                                 name: n.outputs[0].clone(),
                                 shape: vec![x.rank() as i64],
                                 dtype: DType::I64,
-                                f32: Vec::new(),
+                                f32: F32Buf::new(),
                                 i64: x.shape.clone(),
                             },
                         );
                     }
                     "Cast" => {
                         let to = get_i(n.attr("to"), 1);
-                        let x = arena[&n.inputs[0]].clone();
+                        let x = match arena.get(&n.inputs[0]) {
+                            Some(t) => t.clone(),
+                            None => self.initializers[&n.inputs[0]].clone(),
+                        };
                         let mut y = Tensor {
                             name: n.outputs[0].clone(),
                             shape: x.shape.clone(),
@@ -861,7 +924,10 @@ impl Session {
                             y.dtype = DType::F32;
                             y.f32 = match x.dtype {
                                 DType::F32 => x.f32.clone(),
-                                DType::I64 => x.i64.iter().map(|&v| v as f32).collect(),
+                                DType::I64 => {
+                                    let v: Vec<f32> = x.i64.iter().map(|&v| v as f32).collect();
+                                    F32Buf::from_vec(&v)
+                                }
                             };
                         } else {
                             // to int（lround：四舍五入远离零）
@@ -874,7 +940,10 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "Identity" => {
-                        let t = arena[&n.inputs[0]].clone();
+                        let t = match arena.get(&n.inputs[0]) {
+                            Some(t) => t.clone(),
+                            None => self.initializers[&n.inputs[0]].clone(),
+                        };
                         arena.insert(n.outputs[0].clone(), t);
                     }
                     "Constant" => {
@@ -889,6 +958,11 @@ impl Session {
                     }
                 }
 
+                if let Some(t0) = op_t0 {
+                    let e = prof_acc.entry(prof_key).or_insert((0.0, 0));
+                    e.0 += t0.elapsed().as_secs_f64() * 1000.0;
+                    e.1 += 1;
+                }
                 // 对拍落盘（C++ LEAN_DUMP_DIR 同格式：%06d.f32 + manifest.tsv）
                 if let Some(dir) = &dump_dir {
                     if let Some(t) = arena.get(&n.outputs[0]) {
@@ -953,6 +1027,15 @@ impl Session {
             return Err(Error::Graph(format!(
                 "graph has unresolvable nodes:{missing}"
             )));
+        }
+
+        if prof {
+            let mut v: Vec<_> = prof_acc.into_iter().collect();
+            v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+            eprintln!("--- per-op profile [{}] ---", g.model_path);
+            for (op, (ms, cnt)) in v {
+                eprintln!("  {op:<16} {ms:8.1} ms  x{cnt}");
+            }
         }
 
         let mut outputs = Vec::with_capacity(g.outputs.len());

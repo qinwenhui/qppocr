@@ -16,6 +16,9 @@ pub enum DType {
 }
 
 /// 连续行主序张量。
+///
+/// F32 载荷走池化缓冲 [`F32Buf`]：图节点输出「分配→写满→读→释放」
+/// 每节点一次，池省掉的是每次 fresh 块的 soft page fault（不是 memset）。
 #[derive(Clone, Debug, Default)]
 pub struct Tensor {
     /// 名字（图里的 tensor 名）。
@@ -24,9 +27,9 @@ pub struct Tensor {
     pub shape: Vec<i64>,
     /// 数据类型。
     pub dtype: DType,
-    /// F32 载荷（`dtype == F32` 时有效）。
-    pub f32: Vec<f32>,
-    /// I64 载荷（`dtype == I64` 时有效）。
+    /// F32 载荷（`dtype == F32` 时有效；池化）。
+    pub f32: qppocr_kernels::buf::F32Buf,
+    /// I64 载荷（`dtype == I64` 时有效；shape 类小张量，不值得池化）。
     pub i64: Vec<i64>,
 }
 
@@ -49,6 +52,6 @@ impl Tensor {
     /// f32 视图；dtype 不是 F32 时 panic（内核入口的显式契约）。
     pub fn as_f32(&self) -> &[f32] {
         assert_eq!(self.dtype, DType::F32, "tensor {} is not F32", self.name);
-        &self.f32
+        self.f32.as_slice()
     }
 }

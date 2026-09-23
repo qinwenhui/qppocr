@@ -1,15 +1,16 @@
 //! 池化：global_avg_pool 与 pool2d（max/avg）。
 
+use crate::buf::F32Buf;
 use crate::par;
 
 /// 全局平均池化：`[N,C,H,W] -> [N,C,1,1]`。
 ///
 /// 累加用 **f64**（C++ 同款）：长归约在 f32 下会吃掉精度，test_ops 的
 /// 1e-5 相对容差过不去。返回长度 N*C 的输出。
-pub fn global_avg_pool(x: &[f32], n: usize, c: usize, out: &mut Vec<f32>) {
+pub fn global_avg_pool(x: &[f32], n: usize, c: usize, out: &mut F32Buf) {
     let plane = usize::checked_div(x.len(), n * c).unwrap_or(0);
-    out.clear();
-    out.resize(n * c, 0.0);
+    // SAFETY: 下方每元素写一次。
+    unsafe { out.resize_uninit(n * c) };
     let op = par::SyncPtr::new(out.as_mut_ptr());
     par::parallel_for_units(n * c, |b, e| {
         for i in b..e {
@@ -42,12 +43,12 @@ pub fn pool2d(
     peh: usize,
     pew: usize,
     max_pool: bool,
-    out: &mut Vec<f32>,
+    out: &mut F32Buf,
 ) -> (usize, usize) {
     let oh = (h + ph + peh).saturating_sub(kh) / sh + 1;
     let ow = (w + pw + pew).saturating_sub(kw) / sw + 1;
-    out.clear();
-    out.resize(n * c * oh * ow, 0.0);
+    // SAFETY: 每输出元素写一次。
+    unsafe { out.resize_uninit(n * c * oh * ow) };
     let op = par::SyncPtr::new(out.as_mut_ptr());
 
     // 2x2 max pool s1 SAME_UPPER——v6 每一个 MaxPool 的形状（det 的是

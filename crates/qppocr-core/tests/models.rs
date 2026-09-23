@@ -122,7 +122,7 @@ fn run_rec_tiny_forward() {
                 name: "x".into(),
                 shape: vec![1, 3, 48, 320],
                 dtype: DType::F32,
-                f32: data,
+                f32: qppocr_kernels::buf::F32Buf::from_vec(&data),
                 i64: Vec::new(),
             },
         )])
@@ -137,7 +137,10 @@ fn run_rec_tiny_forward() {
     // CTC 输出：[1, T, C]，C = 字典+1。tiny 字典 6904 → C = 6906
     assert_eq!(o.rank(), 3, "rec 输出 [1,T,C]");
     assert_eq!(o.shape[2], 6906, "tiny 字典 6904 + blank");
-    assert!(o.f32.iter().all(|v| v.is_finite()), "输出应全有限");
+    assert!(
+        o.f32.as_slice().iter().all(|v| v.is_finite()),
+        "输出应全有限"
+    );
 }
 
 /// det tiny 前向一遍：[1,3,H,W] → [1,1,H',W'] 概率图。
@@ -173,7 +176,7 @@ fn run_det_tiny_forward() {
                 name: "x".into(),
                 shape: vec![1, 3, 736, 960],
                 dtype: DType::F32,
-                f32: data,
+                f32: qppocr_kernels::buf::F32Buf::from_vec(&data),
                 i64: Vec::new(),
             },
         )])
