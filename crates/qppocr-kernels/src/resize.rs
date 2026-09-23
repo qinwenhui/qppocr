@@ -95,11 +95,13 @@ pub fn resize_bilinear(
                 for (oxx, yv) in yr.iter_mut().enumerate() {
                     let (x0, x1) = (ix0[oxx], ix1[oxx]);
                     let lx = fx[oxx];
-                    // 四角加权——项与顺序与 C++ 一致（位级）
-                    *yv = r0[x0] * (1.0 - lx) * (1.0 - ly)
-                        + r0[x1] * lx * (1.0 - ly)
-                        + r1[x0] * (1.0 - lx) * ly
-                        + r1[x1] * lx * ly;
+                    // 四角加权——项与顺序与 C++ 一致（位级）。★ 收缩形态：
+                    // GCC 把后续三项的「积 + 累加」收缩成 FMA（首项两个乘、
+                    // 每项的第一乘保留、第二乘折进 fma），Rust 显式 mul_add
+                    let t = r0[x0] * (1.0 - lx) * (1.0 - ly);
+                    let t = (r0[x1] * lx).mul_add(1.0 - ly, t);
+                    let t = (r1[x0] * (1.0 - lx)).mul_add(ly, t);
+                    *yv = (r1[x1] * lx).mul_add(ly, t);
                 }
             }
         }

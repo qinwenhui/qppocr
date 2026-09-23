@@ -32,7 +32,9 @@ pub fn exp1(x: f32) -> f32 {
     const INV_LN2: f32 = 1.442_695;
     let x = x.min(88.0).max(-88.0);
     let kf = (x * INV_LN2).round_ties_even();
-    let r = (x - kf * LN2_HI) - kf * LN2_LO;
+    // fnmadd 镜像（GCC 对 x86::exp256_ps 的收缩形态，见那里的注释）
+    let r = (-kf).mul_add(LN2_HI, x);
+    let r = (-kf).mul_add(LN2_LO, r);
     let mut p = 1.0f32 / 720.0;
     p = p.mul_add(r, 1.0 / 120.0);
     p = p.mul_add(r, 1.0 / 24.0);
@@ -48,17 +50,19 @@ pub fn exp1(x: f32) -> f32 {
 /// `erf(x)`：`erf256_ps` 的标量镜像（f32），A&S 7.1.26。
 #[inline]
 #[allow(clippy::approx_constant)] // 同上：0.3275911 等系数是 A&S 7.1.26 原文
+#[allow(clippy::excessive_precision)] // C++ 原字面值照抄：f32 舍入位级锁定
 pub fn erf1(x: f32) -> f32 {
     let ax = f32::from_bits(x.to_bits() & 0x7fff_ffff); // andnot(-0.0)
     let t = 1.0f32 / 0.327_591_1f32.mul_add(ax, 1.0);
     let mut p = 1.061_405_4f32;
-    p = p.mul_add(t, -1.453_152);
-    p = p.mul_add(t, 1.421_413_7);
-    p = p.mul_add(t, -0.284_496_74);
+    p = p.mul_add(t, -1.453152027);
+    p = p.mul_add(t, 1.421413741);
+    p = p.mul_add(t, -0.284496736);
     p = p.mul_add(t, 0.254_829_6);
     p *= t;
     let e = exp1(ax * (0.0 - ax));
-    let r = 1.0 - p * e;
+    // fnmadd 镜像（同上）
+    let r = (-p).mul_add(e, 1.0);
     f32::from_bits(r.to_bits() | (x.to_bits() & 0x8000_0000)) // 还原符号
 }
 
@@ -361,6 +365,60 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
 }
 
 use crate::par;
+
+/// 任意 axis 的 softmax 通用路径（`softmax_axis` 的非末维分支）。
+///
+/// 段布局：`seg(m) = t[(o·mid + m)·inner + i]`，m 是归约维。
+/// core 是 `forbid(unsafe_code)` 的，所以这条带裸指针并行路径住在 kernels。
+/// ★ C++ 原版这里用 libm exp；我们用 `exp1`（同一多项式），低 位差异
+/// ≤1 ulp——见模块头「已声明的偏差」。末维 softmax 别走这条，
+/// 用 [`softmax_last_dim`]（有向量内核）。
+pub fn softmax_axis_generic(t: &mut [f32], outer: i64, mid: i64, inner: i64) {
+    let tp = par::SyncPtr::new(t.as_mut_ptr());
+    par::parallel_for(outer.min(1 << 30) as usize, 1, |o0, o1| {
+        for o in o0 as i64..o1 as i64 {
+            for i in 0..inner {
+                // SAFETY: 每段跨 mid、步长 inner，与其他并行块不相交；
+                // 范围由 outer×mid×inner == t.len() 保证。
+                unsafe {
+                    let base = tp.get().offset(((o * mid) * inner + i) as isize);
+                    let mut mx = *base;
+                    for m in 1..mid {
+                        let v = *base.offset((m * inner) as isize);
+                        if v > mx {
+                            mx = v;
+                        }
+                    }
+                    let mut sum = 0f32;
+                    for m in 0..mid {
+                        let p = base.offset((m * inner) as isize);
+                        let ev = exp1(*p - mx);
+                        *p = ev;
+                        sum += ev;
+                    }
+                    let inv = 1.0f32 / sum;
+                    for m in 0..mid {
+                        let p = base.offset((m * inner) as isize);
+                        *p *= inv;
+                    }
+                }
+            }
+        }
+    });
+}
+/// `t = sqrt(t)`，就地。IEEE 精确（硬件指令），与 C++ 的 std::sqrt 逐位同。
+/// 放 kernels：core forbid(unsafe)，而并行就地遍历这里需要 SyncPtr。
+pub fn sqrt_inplace(t: &mut [f32]) {
+    let tp = par::SyncPtr::new(t.as_mut_ptr());
+    let n = t.len();
+    par::parallel_for(n, 256, |b, e| {
+        // SAFETY: 区间 [b, e) 与其他并行块不相交。
+        let seg = unsafe { tp.offset(b).slice(e - b) };
+        for v in seg.iter_mut() {
+            *v = v.sqrt();
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {

@@ -120,6 +120,25 @@ pub enum Payload {
     I64(Vec<i64>),
 }
 
+/// 载荷的借用视图：执行器传权重/中间量用，不克隆数据。
+#[derive(Debug, Clone, Copy)]
+pub enum PayloadRef<'a> {
+    /// f32。
+    F32(&'a [f32]),
+    /// i64。
+    I64(&'a [i64]),
+}
+
+impl Payload {
+    /// 借用视图。
+    pub fn as_ref(&self) -> PayloadRef<'_> {
+        match self {
+            Payload::F32(v) => PayloadRef::F32(v),
+            Payload::I64(v) => PayloadRef::I64(v),
+        }
+    }
+}
+
 /// slice 的区间解析（负索引、步长、钳位），镜像 C++ `slice_range`。
 fn slice_range(start: i64, end: i64, step: i64, n: i64) -> (i64, i64) {
     let mut start = start;
@@ -144,7 +163,7 @@ fn slice_range(start: i64, end: i64, step: i64, n: i64) -> (i64, i64) {
 /// Slice。`starts/ends/axes/steps` 与 ONNX 属性同名同义；`axes` 空表示
 /// 沿前 `starts.len()` 维。
 pub fn slice_tensor(
-    x: &Payload,
+    x: PayloadRef<'_>,
     x_shape: &[i64],
     starts: &[i64],
     ends: &[i64],
@@ -185,14 +204,14 @@ pub fn slice_tensor(
         count *= len;
     }
     let y = match x {
-        Payload::F32(d) => {
+        PayloadRef::F32(d) => {
             let mut out = vec![0f32; count as usize];
             if count > 0 {
                 slice_copy(x_shape, &shape, &b, &sp, CopyKind::F32(d, &mut out));
             }
             Payload::F32(out)
         }
-        Payload::I64(d) => {
+        PayloadRef::I64(d) => {
             let mut out = vec![0i64; count as usize];
             if count > 0 {
                 slice_copy(x_shape, &shape, &b, &sp, CopyKind::I64(d, &mut out));
@@ -256,7 +275,7 @@ fn slice_copy(x_shape: &[i64], out_shape: &[i64], b: &[i64], sp: &[i64], mut kin
 }
 
 /// Transpose。`perm` 空表示反转。
-pub fn transpose_tensor(x: &Payload, x_shape: &[i64], perm: &[i64]) -> (Payload, Vec<i64>) {
+pub fn transpose_tensor(x: PayloadRef<'_>, x_shape: &[i64], perm: &[i64]) -> (Payload, Vec<i64>) {
     let r = x_shape.len();
     let p: Vec<usize> = if perm.is_empty() {
         (0..r).rev().collect()
@@ -279,7 +298,7 @@ pub fn transpose_tensor(x: &Payload, x_shape: &[i64], perm: &[i64]) -> (Payload,
         1
     };
     match x {
-        Payload::F32(d) => {
+        PayloadRef::F32(d) => {
             let mut out = vec![0f32; total as usize];
             let dstp = par::SyncPtr::new(out.as_mut_ptr());
             par::parallel_for_elems(outer as usize, total as usize, |b, e| {
@@ -292,7 +311,7 @@ pub fn transpose_tensor(x: &Payload, x_shape: &[i64], perm: &[i64]) -> (Payload,
             });
             (Payload::F32(out), shape)
         }
-        Payload::I64(d) => {
+        PayloadRef::I64(d) => {
             let mut out = vec![0i64; total as usize];
             let dstp = par::SyncPtr::new(out.as_mut_ptr());
             par::parallel_for_elems(outer as usize, total as usize, |b, e| {
@@ -309,7 +328,12 @@ pub fn transpose_tensor(x: &Payload, x_shape: &[i64], perm: &[i64]) -> (Payload,
 }
 
 /// Concat（F32 或 I64，按第一个输入的种类）。`axis` 支持负索引。
-pub fn concat_any(xs: &[&Payload], xs_shape: &[&[i64]], axis: i64, out: &mut Payload) -> Vec<i64> {
+pub fn concat_any(
+    xs: &[PayloadRef<'_>],
+    xs_shape: &[&[i64]],
+    axis: i64,
+    out: &mut Payload,
+) -> Vec<i64> {
     assert!(!xs.is_empty(), "concat empty");
     let r = xs_shape[0].len();
     let axis = if axis < 0 { axis + r as i64 } else { axis } as usize;
@@ -332,8 +356,10 @@ pub fn concat_any(xs: &[&Payload], xs_shape: &[&[i64]], axis: i64, out: &mut Pay
     // （单核带宽的三分之一）。第 i 个输入对 outer o 的通道块在两侧都是
     // `shape[axis]·inner` 个连续元素——工作项是切成 ~128 KB 块的 (outer,
     // channel) 平面。只按通道切不够：两个输入的 concat 只有 2 个工作项。
-    let elem = matches!(xs[0], Payload::F32(_)) as usize * 4
-        + matches!(xs[0], Payload::I64(_)) as usize * 8;
+    let elem = match xs[0] {
+        PayloadRef::F32(_) => 4,
+        PayloadRef::I64(_) => 8,
+    };
     let mut offs = Vec::with_capacity(xs.len().min(16));
     {
         let mut acc = 0i64;
@@ -369,7 +395,7 @@ pub fn concat_any(xs: &[&Payload], xs_shape: &[&[i64]], axis: i64, out: &mut Pay
                     while si + 1 < xs.len().min(16) && offs[si + 1] <= ch {
                         si += 1;
                     }
-                    let Payload::F32(src) = &xs[si] else {
+                    let PayloadRef::F32(src) = xs[si] else {
                         unreachable!()
                     };
                     let d = xs_shape[si][axis];
@@ -411,7 +437,7 @@ pub fn concat_any(xs: &[&Payload], xs_shape: &[&[i64]], axis: i64, out: &mut Pay
                     while si + 1 < xs.len().min(16) && offs[si + 1] <= ch {
                         si += 1;
                     }
-                    let Payload::I64(src) = &xs[si] else {
+                    let PayloadRef::I64(src) = xs[si] else {
                         unreachable!()
                     };
                     let d = xs_shape[si][axis];
@@ -678,11 +704,14 @@ pub fn batchnorm(
         for nc in nb..ne {
             let ch = nc % c;
             let a = scale[ch] / (var[ch] + eps).sqrt();
-            let b = bias[ch] - mean[ch] * a;
+            // bias − mean·a 的 fnmadd 形态：GCC 把 c − a·b 收缩成
+            // vfnmadd（单次舍入）。(-m) 的符号翻转是精确的，等价。
+            let b = (-mean[ch]).mul_add(a, bias[ch]);
             // SAFETY: 平面 nc 与其他块不相交。
             let seg = unsafe { op.offset(nc * plane).slice(plane) };
             for (i, v) in seg.iter_mut().enumerate() {
-                *v = x[nc * plane + i] * a + b;
+                // x·a + b 的 fma 形态（GCC -ffp-contract 收缩，Rust 不收缩）
+                *v = x[nc * plane + i].mul_add(a, b);
             }
         }
     });

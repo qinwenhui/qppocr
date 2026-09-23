@@ -37,10 +37,12 @@ pub unsafe fn exp256_ps(x: __m256) -> __m256 {
         _mm256_mul_ps(x, inv_ln2),
         _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
     );
-    let r = _mm256_sub_ps(
-        _mm256_sub_ps(x, _mm256_mul_ps(kf, ln2_hi)),
-        _mm256_mul_ps(kf, ln2_lo),
-    );
+    // ★ GCC -ffp-contract=fast 把源码里的 sub(x, mul(kf,·)) 两处都收缩成
+    // vfnmadd（汇编实证：vroundps 后跟两条 vfnmadd231ps）。源码形态
+    // `_mm256_sub_ps(x, _mm256_mul_ps(...))` 在 GCC 下**不是**分立指令——
+    // 逐位对齐 C++ 必须显式 fnmadd。
+    let r = _mm256_fnmadd_ps(kf, ln2_hi, x);
+    let r = _mm256_fnmadd_ps(kf, ln2_lo, r);
     let mut p = _mm256_set1_ps(1.0 / 720.0);
     p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 120.0));
     p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.0 / 24.0));
@@ -58,18 +60,20 @@ pub unsafe fn exp256_ps(x: __m256) -> __m256 {
 /// 取 |x| 算、末尾还原符号。
 #[inline]
 #[target_feature(enable = "avx2,fma")]
+#[allow(clippy::excessive_precision)] // C++ 原字面值照抄
 pub unsafe fn erf256_ps(x: __m256) -> __m256 {
     let one = _mm256_set1_ps(1.0);
     let ax = _mm256_andnot_ps(_mm256_set1_ps(-0.0), x);
     let t = _mm256_div_ps(one, _mm256_fmadd_ps(_mm256_set1_ps(0.327_591_1), ax, one));
     let mut p = _mm256_set1_ps(1.061_405_4);
-    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-1.453_152));
-    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(1.421_413_7));
-    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-0.284_496_74));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-1.453152027));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(1.421413741));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(-0.284496736));
     p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(0.254_829_6));
     p = _mm256_mul_ps(p, t);
     let e = exp256_ps(_mm256_mul_ps(ax, _mm256_sub_ps(_mm256_setzero_ps(), ax)));
-    let r = _mm256_sub_ps(one, _mm256_mul_ps(p, e));
+    // ★ 同上：1 − p·e 被 GCC 收缩成 vfnmadd132ps（汇编实证）
+    let r = _mm256_fnmadd_ps(p, e, one);
     _mm256_or_ps(r, _mm256_and_ps(x, _mm256_set1_ps(-0.0)))
 }
 
