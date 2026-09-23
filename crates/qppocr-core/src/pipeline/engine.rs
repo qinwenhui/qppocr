@@ -172,6 +172,11 @@ impl Engine {
         dict: Dictionary,
         cfg: PipelineConfig,
     ) -> Result<Self> {
+        // 线程数要在首次并行算子前请求（池首用时定容；先建的引擎赢，
+        // 之后请求 no-op）。cfg.threads = 0 = 自动。
+        if cfg.threads > 0 {
+            qppocr_kernels::par::set_threads(cfg.threads);
+        }
         // 字典：blank 在 0、字典项、空格在末尾（ppocr 的约定）
         let raw: String = match dict {
             Dictionary::Embedded => {

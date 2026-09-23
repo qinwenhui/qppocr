@@ -83,6 +83,17 @@ pub fn threads() -> usize {
     }
 }
 
+/// 请求池的线程数（含主线程，0 = 自动）。必须在**第一次并行算子**之前
+/// 调用——池在首用时定容，之后请求不再生效（C++ `ThreadPool::get` 的
+/// 「最早调用者定容」语义）。显式数字不设 16 上限。
+///
+/// 环境变量 `QPPOCR_THREADS` 等价（优先级低于本函数；对标 C++ 的
+/// `LEAN_THREADS`）。
+#[cfg(feature = "parallel")]
+pub fn set_threads(n: usize) {
+    crate::pool::request_threads(n);
+}
+
 /// 在 x86 上打开 FTZ/DAZ（刷新非正规数）。
 ///
 /// 必须在 worker 线程诞生前于主线程调用；`qppocr-core` 在引擎构造时做这件事。
