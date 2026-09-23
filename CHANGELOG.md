@@ -26,3 +26,11 @@
 - 其余算子的 AVX2 向量路径与逐位对拍：激活五件套、二元平坦/run、
   depthwise 内层、convT interleave、softmax 向量相、pool 2x2 可分
   快路径（含钳制行哨兵修复）。5 组 bitexact 测试全绿。
+- ONNX 解析 + 图优化 + 执行器（阶段 2）：手写 protobuf 读取器
+  （opset 7/11/14 全实测）、Constant 折叠、Identity 消除、GELU 子图
+  坍缩、bias 折叠、conv+act 融合、带引用计数释放的 arena 执行器。
+  上游 det(opset 14)/rec 前向通过。
+- 逐位对拍（docs/CROSSCHECK.md）：cls 251/251 节点逐字节一致；rec
+  76/77、det 107/177（其余为同一 libm 尾巴根因的 ≤1 ulp 传播）。
+  抓出并修复七类真错误，其中 GCC「intrinsic 之间也做 FMA 收缩」
+  （汇编实证）是最大的一类。

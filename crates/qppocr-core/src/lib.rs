@@ -4,3 +4,17 @@
 //! 这里只经安全 API 调用（DESIGN.md §2 铁律 3）。
 
 #![forbid(unsafe_code)]
+// C++ 镜像代码：字面值/结构照抄（位级一致），不做惯用化改写
+#![allow(
+    clippy::excessive_precision,
+    clippy::field_reassign_with_default,
+    clippy::approx_constant,
+    clippy::needless_range_loop,
+    clippy::redundant_guards
+)]
+
+pub mod error;
+pub mod executor;
+pub mod graph;
+pub mod onnx;
+pub mod tensor;

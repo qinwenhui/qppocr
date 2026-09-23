@@ -1197,7 +1197,7 @@ fn shape_op_tests() {
     let total = 120usize;
     let mut x = vec![0f32; total];
     rng.fill(&mut x);
-    let (y, ys) = transpose_tensor(&Payload::F32(x.clone()), &shape, &[0, 2, 3, 1]);
+    let (y, ys) = transpose_tensor(PayloadRef::F32(&x), &shape, &[0, 2, 3, 1]);
     assert_eq!(ys, vec![2, 4, 5, 3]);
     let Payload::F32(yd) = y else { panic!() };
     // 朴素参考
@@ -1215,7 +1215,7 @@ fn shape_op_tests() {
     }
 
     // transpose 反转（默认 perm）
-    let (y2, ys2) = transpose_tensor(&Payload::F32(x.clone()), &shape, &[]);
+    let (y2, ys2) = transpose_tensor(PayloadRef::F32(&x), &shape, &[]);
     assert_eq!(ys2, vec![5, 4, 3, 2]);
     let Payload::F32(y2d) = y2 else { panic!() };
     for i in 0..total {
@@ -1233,7 +1233,7 @@ fn shape_op_tests() {
 
     // slice：整维 + 步长 + 负索引
     let (sy, ss) = slice_tensor(
-        &Payload::F32(x.clone()),
+        PayloadRef::F32(&x),
         &shape,
         &[1, -2],
         &[3, i64::MAX],
@@ -1261,10 +1261,9 @@ fn shape_op_tests() {
     let mut xb = vec![0f32; 40];
     rng.fill(&mut xa);
     rng.fill(&mut xb);
-    let xs = [Payload::F32(xa.clone()), Payload::F32(xb.clone())];
     let mut out = Payload::F32(Vec::new());
-    let xs_ref: Vec<&Payload> = xs.iter().collect();
-    let cshape = concat_any(&xs_ref, &xs_shape, 1, &mut out);
+    let payloads = [PayloadRef::F32(&xa), PayloadRef::F32(&xb)];
+    let cshape = concat_any(&payloads, &xs_shape, 1, &mut out);
     assert_eq!(cshape, vec![2, 8, 4]);
     let Payload::F32(cd) = out else { panic!() };
     for o in 0..2 {
