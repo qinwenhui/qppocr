@@ -628,21 +628,45 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "Slice" => {
-                        let grab = |nm: &str| -> Result<Vec<i64>> {
-                            let t = arena
-                                .get(nm)
-                                .ok_or_else(|| Error::Graph(format!("Slice: missing {nm}")))?;
-                            Ok(as_i64(t))
-                        };
-                        let starts = grab(&n.inputs[1])?;
-                        let ends = grab(&n.inputs[2])?;
-                        let axes = if n.inputs.len() > 3 && !n.inputs[3].is_empty() {
-                            grab(&n.inputs[3])?
+                        // opset 13+/11：starts/ends/axes/steps 是输入；
+                        // opset ≤9：starts/ends/axes 是**属性**（上游 cls
+                        // opset 7 正是这种——C++ 参考在这里越界读直接段错误，
+                        // 这是它跑不了上游 cls 的根因）。
+                        let (starts, ends, axes) = if n.inputs.len() >= 3
+                            && !n.inputs[1].is_empty()
+                            && !n.inputs[2].is_empty()
+                        {
+                            let grab = |nm: &str| -> Result<Vec<i64>> {
+                                let t = arena
+                                    .get(nm)
+                                    .ok_or_else(|| Error::Graph(format!("Slice: missing {nm}")))?;
+                                Ok(as_i64(t))
+                            };
+                            let axes = if n.inputs.len() > 3 && !n.inputs[3].is_empty() {
+                                grab(&n.inputs[3])?
+                            } else {
+                                Vec::new()
+                            };
+                            (grab(&n.inputs[1])?, grab(&n.inputs[2])?, axes)
                         } else {
-                            Vec::new()
+                            let attr_ints = |nm: &str| -> Vec<i64> {
+                                n.attr(nm).map(|a| a.ints.clone()).unwrap_or_default()
+                            };
+                            let starts = attr_ints("starts");
+                            let ends = attr_ints("ends");
+                            if starts.is_empty() || ends.is_empty() {
+                                return Err(Error::Graph(format!(
+                                    "Slice: neither inputs nor starts/ends attributes present (node {})",
+                                    n.name
+                                )));
+                            }
+                            (starts, ends, attr_ints("axes"))
                         };
                         let steps = if n.inputs.len() > 4 && !n.inputs[4].is_empty() {
-                            grab(&n.inputs[4])?
+                            let t = arena
+                                .get(&n.inputs[4])
+                                .ok_or_else(|| Error::Graph("Slice: missing steps".into()))?;
+                            as_i64(t)
                         } else {
                             Vec::new()
                         };
