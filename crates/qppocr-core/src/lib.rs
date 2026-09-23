@@ -14,6 +14,7 @@
 )]
 
 pub mod error;
+pub use error::Error;
 pub mod executor;
 pub mod graph;
 pub mod onnx;

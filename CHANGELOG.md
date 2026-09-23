@@ -55,3 +55,12 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- 公开 API（阶段 4）：`qppocr` 门面 crate——`Engine::new(tier, dir)`
+  三行上手；`EngineBuilder`（tier/preset/config/advanced/threads/
+  verify_sha256）；`Config`（Option 字段 = 预设覆盖语义）+ `Preset`
+  （Speed/Balanced/Accuracy）+ `Advanced`（不承诺稳定的基准常数，
+  只经 builder.advanced 进入）；`ModelSource::Dir/Bytes` + 上游官方
+  SHA-256 校验（手写 FIPS 180-4，零依赖，NIST 向量测试）；字典三路
+  查找（{tier}/dict.txt → dict.txt → ppocr_keys.txt → 内嵌）；
+  feature 门控（parallel/image-decode/serde）。`#![deny(missing_docs)]`
+  + `cargo doc` 零警告 + 不依赖模型的 doctest。

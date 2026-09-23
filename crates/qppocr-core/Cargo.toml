@@ -9,6 +9,11 @@ repository.workspace = true
 authors.workspace = true
 publish = false
 
+[features]
+default = ["parallel"]
+# 关掉 = 单线程（透传给 kernels）
+parallel = ["qppocr-kernels/parallel"]
+
 [dependencies]
 qppocr-kernels = { path = "../qppocr-kernels" }
 
