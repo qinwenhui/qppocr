@@ -55,6 +55,12 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- feat(api): `Advanced` 从 10 项补齐到全部 29 项行为参数（tuning.hpp
+  对账：C++ `OcrConfig` 30 个行为参数——除 cls_model 走构造参数外
+  全量同名同默认值；此前 19 项含 `enhance_contrast`/`upscale`/
+  `det_max_side` 在公开 API 不可达）。闭包初始值仍取预设生效后的值，
+  覆盖顺序 预设 → Config → Advanced 不变。功能验证：enhance+upscale=2
+  +det_max_side=1280 组合实跑通过。
 - perf(mem): det 前处理消除两处全图拷贝——`crop_src` 改借用（对齐
   C++ 的指针语义，仅 enhance_contrast 开启才物化）、超帽路径免
   「先克隆再被 resize 替换」的瞬时整份峰值、`work` 于 db_postprocess
