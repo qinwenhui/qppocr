@@ -475,7 +475,7 @@ pub enum Dictionary {
 [features]
 default   = ["std", "parallel", "image-decode"]
 std       = []
-parallel  = ["dep:rayon"]          # 关掉 = 单线程，WASM/嵌入式用
+parallel  = []                     # 关掉 = 单线程，WASM/嵌入式用（kernels 自带 fork-join 池）
 image-decode = ["dep:image"]       # 关掉 = 只吃已解码像素
 fetch     = ["dep:ureq", "dep:sha2"]
 serde     = ["dep:serde"]          # 结果的序列化
@@ -720,14 +720,16 @@ qppocr-core        单实例。算子内用线程池把单张图跑满。
 
 **具体：**
 
-- `parallel` feature 打开时用 `rayon`（或自建线程池）做**算子级并行**：
+- `parallel` feature 打开时用 kernels 自带的 **fork-join 线程池**（`util.hpp`
+  `ThreadPool` 的移植，见 `pool.rs` 模块注释——曾试过 rayon，多线程扩展
+  1.86x vs 池 2.07x，串行节点图的逐节点调度开销是原因）做**算子级并行**：
   GEMM 按 N-panel 切、逐元素按字节数阈值切。
 - ★ **并行阈值要照搬**：C++ 版本里 `fork_min_macs = 4e6`、`gemm_par_min = 2e5`、
   `elem_fork_min_bytes = 1<<20` 这些不是拍脑袋的——小特征图上起线程池的固定开销
   比 GEMM 本身还大（注释：fork 一次约 0.3ms）。
-- **嵌套并行是死锁**。C++ 版本里 `sgemm` 有个 `serial` 参数专门给已经在
-  `parallel_for` 里的调用方用。Rust 版要用类型或作用域表达这个约束
-  （例如 rayon 的 `scope`，或内部用一个"已在并行区"的标记）。
+- **嵌套并行是死锁**（池语义，与 C++ 相同）。C++ 版本里 `sgemm` 有个
+  `serial` 参数专门给已经在 `parallel_for` 里的调用方用——Rust 版对应
+  `sgemm_serial` / 串行 im2col，串行路径另有位级一致的作用（见 `gemm.rs`）。
 - `Engine` 必须 `Send + Sync`：模型权重是只读的，共享用 `Arc`。
 
 ---
@@ -826,7 +828,7 @@ qppocr-core        单实例。算子内用线程池把单张图跑满。
 | **semver** | `Config` / `OcrResult` 等公开类型全部 `#[non_exhaustive]`（枚举除外） |
 | **docs** | `#![deny(missing_docs)]`；每个公开项都要有文档；**要有不用模型的 doctest 例子** |
 | **lint** | `#![forbid(unsafe_code)]`（除 kernels）；CI 跑 `clippy -D warnings` 和 `rustfmt --check` |
-| **依赖** | 尽量为零。`rayon` / `image` / `serde` / `sha2` 全部 feature 门控 |
+| **依赖** | 尽量为零。`image` / `serde` / `sha2` 全部 feature 门控；并行用自建池（零依赖） |
 | **审计** | `cargo-deny` 查许可证与已知漏洞 |
 | **CHANGELOG** | 用 keep-a-changelog 格式；每个版本写清**行为变化**（尤其是默认值变化） |
 | **README** | 顶部要有：一句话是什么、性能数字（与 ort/tract 的对比）、三行上手例子、许可 |

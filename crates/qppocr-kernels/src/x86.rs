@@ -854,3 +854,54 @@ pub unsafe fn binary_run_alloc_vec(
         j += 1;
     }
 }
+
+// ================================================================ 双线性（f32 Resize 算子）
+
+/// resize_bilinear 的行内积向量化：8 个输出列一批。
+/// `ix0/ix1/fx` 是预计算的源列映射（每输出列一对），`r0/r1` 是上下两行。
+/// 权重结合顺序与 C++ 一致（首项两乘，其余 fma）。
+#[allow(clippy::too_many_arguments)] // 内核入参：两行 + 三张映射表 + 权重 + 目标 + 范围
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn bilinear_row_vec(
+    r0: *const f32,
+    r1: *const f32,
+    ix0: *const i32,
+    ix1: *const i32,
+    fx: *const f32,
+    ly: f32,
+    dst: *mut f32,
+    ox0: usize,
+    ox1: usize,
+) {
+    let only = _mm256_set1_ps(1.0);
+    let vly = _mm256_set1_ps(ly);
+    let mut ox = ox0;
+    // fx 的补集一次算好：inv = 1 - fx
+    while ox + 8 <= ox1 {
+        let j = ox - ox0;
+        let lix0 = _mm256_i32gather_ps(r0, _mm256_loadu_si256(ix0.add(j) as *const __m256i), 4);
+        let lix1 = _mm256_i32gather_ps(r0, _mm256_loadu_si256(ix1.add(j) as *const __m256i), 4);
+        let hix0 = _mm256_i32gather_ps(r1, _mm256_loadu_si256(ix0.add(j) as *const __m256i), 4);
+        let hix1 = _mm256_i32gather_ps(r1, _mm256_loadu_si256(ix1.add(j) as *const __m256i), 4);
+        let vfx = _mm256_loadu_ps(fx.add(j));
+        let invx = _mm256_sub_ps(only, vfx);
+        let invy = _mm256_sub_ps(only, vly);
+        let t = _mm256_mul_ps(_mm256_mul_ps(lix0, invx), invy);
+        let t = _mm256_fmadd_ps(_mm256_mul_ps(lix1, vfx), invy, t);
+        let t = _mm256_fmadd_ps(_mm256_mul_ps(hix0, invx), vly, t);
+        let r = _mm256_fmadd_ps(_mm256_mul_ps(hix1, vfx), vly, t);
+        _mm256_storeu_ps(dst.add(ox), r);
+        ox += 8;
+    }
+    while ox < ox1 {
+        let j = ox - ox0;
+        let lx = *fx.add(j);
+        let i0 = *ix0.add(j) as usize;
+        let i1 = *ix1.add(j) as usize;
+        let t = *r0.add(i0) * (1.0 - lx) * (1.0 - ly);
+        let t = (*r0.add(i1) * lx).mul_add(1.0 - ly, t);
+        let t = (*r1.add(i0) * (1.0 - lx)).mul_add(ly, t);
+        *dst.add(ox) = (*r1.add(i1) * lx).mul_add(ly, t);
+        ox += 1;
+    }
+}
