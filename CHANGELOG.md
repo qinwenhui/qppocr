@@ -55,6 +55,12 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- perf(mem): det 前处理消除两处全图拷贝——`crop_src` 改借用（对齐
+  C++ 的指针语义，仅 enhance_contrast 开启才物化）、超帽路径免
+  「先克隆再被 resize 替换」的瞬时整份峰值、`work` 于 db_postprocess
+  后显式释放。big.png（3000×2000）PeakWS 152.5→135.6 MB（反超
+  C++ 141.8 约 4.3%），receipt 122.3 MB 维持领先（C++ 129.8）；
+  文本逐字符一致、速度无回归（顺手省掉每 run 一次全图 memcpy）。
 - feat(par): 线程数管道接通——`par::set_threads`（池首用时定容，显式
   请求不设 16 上限，对齐 C++ `resolve_threads`）+ `QPPOCR_THREADS`
   环境变量（对标 `LEAN_THREADS`）+ `EngineBuilder::threads`/CLI

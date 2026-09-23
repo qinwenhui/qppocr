@@ -60,14 +60,22 @@ K=4 饱和后内存带宽接管，内核质量反超（0.959x）。
 
 ## 4. 内存峰值（PeakWorkingSet，轮询 15ms 采样）
 
-| 场景 | rust | cpp |
-|---|---|---|
-| receipt.png（--bench 12） | 123.1 MB | 130.3 MB |
-| big.png（大图） | 152.5 MB | 141.7 MB |
+| 场景 | rust | cpp | 判定 |
+|---|---|---|---|
+| receipt.png（--bench 12） | 122.3 MB | 129.8 MB | ✅ 低 5.8% |
+| big.png（3000×2000 大图） | **135.6 MB** | 141.8 MB | ✅ 低 4.3%（v3 为 152.5，高 7.6%） |
 
-同量级（±10%）。big.png 的差值来自 Rust 侧 det 前处理保留了原图 +
-工作副本两份（C++ 同样如此，但池策略不同：我们 256 MB 上限、
-drop 的大块还给 OS 后 peak 更高一次）。吞吐场景下内存不是瓶颈。
+v4 修复：`run_once` 前处理的两处全图拷贝——
+
+1. `crop_src` 从无条件 `img.clone()`（整程持有原图整份）改为**借用**
+   （对齐 C++ `const Image* crop_src = &img`；仅开 `enhance_contrast`
+   才物化副本）——big.png 上 −18 MB；
+2. 长边帽超帽路径直接把 resize 结果当 `work`，不再「先整图克隆、
+   马上被替换」（瞬时峰值 −18 MB，比 C++ 的 `Image work = img` 还省）；
+3. `work` 在 `db_postprocess` 后显式释放（未超帽的图它是原图整份克隆，
+   裁剪/识别阶段不再背着）。
+
+big.png 文本 12 行与 C++ 逐字符一致；准确率/速度无回归。
 
 ---
 
