@@ -28,6 +28,8 @@ pub mod conv;
 pub mod elementwise;
 pub mod gemm;
 pub mod par;
+#[cfg(feature = "parallel")]
+mod pool;
 pub mod pool2d;
 pub mod resize;
 pub mod scalar;

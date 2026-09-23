@@ -1,10 +1,11 @@
 //! 并行调度与 fork 阈值。
 //!
 //! C++ 参考实现自带一套 fork-join 线程池（`util.hpp` 的 `ThreadPool`，
-//! Windows 上用信号量唤醒、主线程参与、join 自旋）。Rust 版把同一角色交给
-//! rayon：fork-join 语义相同，且嵌套 `parallel_for` 不再死锁——C++ 里
-//! `sgemm` 专门为「调用方已在 parallel_for 里」准备的 `serial` 参数，
-//! 在 rayon 的 work-stealing 下自然消解。
+//! Windows 上用信号量唤醒、主线程参与、join 自旋）。Rust 版是它的直接移植
+//! （[`crate::pool`]）——多线程扩展从 rayon 的 1.86x 追到 C++ 池的 2.07x
+//! 靠的就是这套语义，不是内核本身。嵌套 `parallel_for` 与 C++ 一样是
+//! 死锁；`sgemm_serial` / 串行 im2col 这些「调用方已在并行区」的串行
+//! 路径因此是硬性的（它们还有位级一致的作用，见 `gemm.rs`）。
 //!
 //! ## 阈值照搬，不重调
 //!
@@ -17,8 +18,7 @@
 //! - `elem_fork_min_bytes = 1<<20`：纯搬运算子的字节门槛——单线程 memcpy 约
 //!   12 GB/s，1 MB ≈ 一次 fork 的工作量。
 //!
-//! rayon 的 fork 比 C++ 池便宜，所以这些门在 Rust 侧是**保守方向**的偏差
-//! （宁可少并行），不会引入性能回退。
+//! 池就是 C++ 那个池（`crate::pool`），fork 成本同量级，这些门两边一致。
 //!
 //! ## FTZ/DAZ
 //!
@@ -27,9 +27,9 @@
 //! ——MXCSR 是每线程的，子线程继承创建者的标志位。C++ 在 `ThreadPool`
 //! 构造函数里做同样的事。
 
-/// 每线程任务块数的乘子。`tuning.hpp` 的默认是 8（1/2/4/8/32 在实测里
-/// 差距在噪声内，1 是唯一的离群值）。rayon 自带 work-stealing，这里只决定
-/// 初始切分的粗细。
+/// 每线程任务块数的乘子（= `tuning.hpp` `tp_chunks`，语义随 `crate::pool`
+/// 的移植回归 C++：原子领票的动态负载均衡，不是 rayon 的静态微任务）。
+/// C++ rotated 实测 4/8/16/32 在噪声内，**1 是离群值**（16 线程 -8%）。
 const TP_CHUNKS: usize = 8;
 
 /// 并行门槛，照搬 `tuning.hpp`。
@@ -70,12 +70,11 @@ pub fn worth_forking_bytes(bytes: usize) -> bool {
     threads() > 1 && bytes >= thresholds().elem_fork_min_bytes
 }
 
-/// 可用线程数。`parallel` feature 关闭时恒为 1。
+/// 可用线程数（池大小，含主线程）。`parallel` feature 关闭时恒为 1。
 pub fn threads() -> usize {
     #[cfg(feature = "parallel")]
     {
-        static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *N.get_or_init(|| rayon::current_num_threads().max(1))
+        crate::pool::thread_count()
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -130,10 +129,11 @@ where
     {
         let nchunk = (t.saturating_mul(TP_CHUNKS)).min(n);
         let chunk = n.div_ceil(nchunk);
-        use rayon::prelude::*;
-        (0..nchunk).into_par_iter().for_each(|i| {
-            let b = i * chunk;
-            let e = (b + chunk).min(n);
+        let base = chunk; // 每 chunk 的步长
+        let total = n;
+        crate::pool::fork_join(nchunk, &|i, _e| {
+            let b = i * base;
+            let e = ((i + 1) * base).min(total);
             if b < e {
                 f(b, e);
             }
@@ -186,7 +186,7 @@ where
 /// 并行内核写的是「不相交但无法用 `split_at_mut` 表达」的区间（同一些行的
 /// 不同列段、按行切块的输出）。安全性**不**来自这个类型——它来自每个调用点
 /// 的区间不相交论证（见各内核的 SAFETY 注释）。这个类型只是让裸指针能过
-/// rayon 的线程安全检查。
+/// `fork_join` 闭包的线程安全检查。
 ///
 /// SAFETY（使用方责任）：通过 [`SyncPtr::get`] 取得的指针，其解引用与写入
 /// 必须与所有并发访问者不相交。

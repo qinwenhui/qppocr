@@ -58,8 +58,8 @@ pub fn resize_bilinear(
     let mut iy0 = vec![0usize; oh];
     let mut iy1 = vec![0usize; oh];
     let mut fy = vec![0f32; oh];
-    let mut ix0 = vec![0usize; ow];
-    let mut ix1 = vec![0usize; ow];
+    let mut ix0 = vec![0i32; ow];
+    let mut ix1 = vec![0i32; ow];
     let mut fx = vec![0f32; ow];
     for (i, (a, b)) in iy0.iter_mut().zip(&mut iy1).enumerate() {
         let v = if align_corners && oh > 1 {
@@ -79,8 +79,8 @@ pub fn resize_bilinear(
             ((i as f32 + 0.5) * w as f32 / ow as f32 - 0.5).max(0.0)
         };
         let base = (v.floor() as isize).clamp(0, w as isize - 1) as usize;
-        *a = base;
-        *b = (base + 1).min(w - 1);
+        *a = base as i32;
+        *b = ((base + 1).min(w - 1)) as i32;
         fx[i] = v - base as f32;
     }
 
@@ -93,8 +93,27 @@ pub fn resize_bilinear(
                 let r0 = &xnc[iy0[oy] * w..(iy0[oy] + 1) * w];
                 let r1 = &xnc[iy1[oy] * w..(iy1[oy] + 1) * w];
                 let ly = fy[oy];
+                #[cfg(target_arch = "x86_64")]
+                if crate::use_avx2() {
+                    // SAFETY: 输出行 nc 的这段与其他并行块不相交；映射表
+                    // 长度为 ow，源列界内（预计算时已钳制）。
+                    unsafe {
+                        crate::x86::bilinear_row_vec(
+                            r0.as_ptr(),
+                            r1.as_ptr(),
+                            ix0.as_ptr(),
+                            ix1.as_ptr(),
+                            fx.as_ptr(),
+                            ly,
+                            yr.as_mut_ptr(),
+                            0,
+                            ow,
+                        )
+                    };
+                    continue;
+                }
                 for (oxx, yv) in yr.iter_mut().enumerate() {
-                    let (x0, x1) = (ix0[oxx], ix1[oxx]);
+                    let (x0, x1) = (ix0[oxx] as usize, ix1[oxx] as usize);
                     let lx = fx[oxx];
                     // 四角加权——项与顺序与 C++ 一致（位级）。★ 收缩形态：
                     // GCC 把后续三项的「积 + 累加」收缩成 FMA（首项两个乘、

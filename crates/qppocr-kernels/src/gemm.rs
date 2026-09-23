@@ -51,10 +51,11 @@ pub fn sgemm(
 
 /// 从并行区里调用的 sgemm：**固定走串行面板路径**。
 ///
-/// C++ 里这是 `serial=true`。在 rayon 下嵌套并行不会死锁，但这个标志还有
-/// 第二重作用：面板分支与 M 行分支对同一元素的 bias 加法位置不同（见本文件
-/// 顶部的位级细节），**路径选择本身进位**。并行区内的调用必须与 C++ 走同一条
-/// 分支，输出才能逐位一致。
+/// C++ 里这是 `serial=true`，有两重作用：一是嵌套 `parallel_for` 在
+/// fork-join 池里是死锁（[`crate::pool`] 与 C++ 同款限制）；二是面板分支
+/// 与 M 行分支对同一元素的 bias 加法位置不同（见本文件顶部的位级细节），
+/// **路径选择本身进位**。并行区内的调用必须与 C++ 走同一条分支，输出才能
+/// 逐位一致。
 #[allow(clippy::too_many_arguments)]
 pub fn sgemm_serial(
     a: &[f32],
@@ -397,7 +398,7 @@ pub fn im2col(
     };
     // ★ 串行执行，调用方负责并行。C++ 的 im2col 带 serial 参数，conv 的
     // tile_body 总是传 true——因为 tile 本身已在 parallel_for 里，嵌套
-    // fork 是死锁（C++ 池）或微任务调度开销（rayon，实测 160 个 2 行的
-    // 微任务吃掉 1.2 ms）。这里直接执行与 C++ 的实际行为一致。
+    // fork 在 fork-join 池里是死锁（C++ 池与 `crate::pool` 同款限制）。
+    // 这里直接执行与 C++ 的实际行为一致。
     body(0, rows);
 }
