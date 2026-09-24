@@ -47,6 +47,10 @@ pub struct TextLine {
     pub confidence: f32,
     /// 0 或 180：分类器判定倒置并翻正过就是 180。
     pub rotation: i32,
+    /// 本行文本来自**区域重试**的第二遍（首遍弱行被整体替换，见
+    /// `retry_conf`）；false = 首遍直接读出。下游用它做逐行「重读过」
+    /// 标识——`num_det_retried` 只计整图次数，分不清是哪几行。
+    pub retried: bool,
     /// 四角点 TL/TR/BR/BL，**原图坐标**（不是检测器的工作副本）。
     pub pts: [[f32; 2]; 4],
 }
@@ -371,6 +375,7 @@ impl Engine {
             }
         }
         for mut l in second.lines {
+            l.retried = true; // 来自重试遍的替换行
             for p in &mut l.pts {
                 p[0] += rx0 as f32;
                 p[1] += ry0 as f32;
@@ -687,6 +692,7 @@ impl Engine {
                     chars: Vec::new(),
                     confidence: b.score,
                     rotation: 0,
+                    retried: false,
                     pts: [[0.0; 2]; 4],
                 };
                 to_image(&b.pts, &mut l.pts);
@@ -806,6 +812,7 @@ impl Engine {
                 chars: Vec::new(),
                 confidence: 0.0,
                 rotation: 0,
+                retried: false,
                 pts: [[0.0; 2]; 4],
             })
             .collect();
