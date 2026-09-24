@@ -482,7 +482,15 @@ impl Engine {
         nw = ((nw as f64 / 32.0).round_ties_even() as i32) * 32;
         nh = nh.max(32);
         nw = nw.max(32);
-        let det_img = resize_bilinear_img(&work, nw, nh);
+        // ★ 恒等 resize 跳过：目标尺寸 == work 尺寸时双线性插值是
+        // 逐字节拷贝（scale=1、fx=ly=0，位级等价），白付一遍全图插值
+        //（864×960 上 ~2ms，落在「未归类」桶里）。短边规则不放大、
+        // 长边帽刚卡住的图经常命中。C++ 无此守卫（ocr.cpp:1529）。
+        let det_img = if nw == work.w && nh == work.h {
+            work.clone()
+        } else {
+            resize_bilinear_img(&work, nw, nh)
+        };
         res.work_w = work.w;
         res.work_h = work.h;
         res.det_input_w = nw;
