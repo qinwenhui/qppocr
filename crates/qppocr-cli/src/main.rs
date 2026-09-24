@@ -238,6 +238,17 @@ fn process_one(engine: &Engine, o: &Options, path: &Path) -> Result<Outcome, Err
     }
     let res = result.unwrap();
 
+    let t = &res.timings;
+    let (det_pre, det_inf, det_post, crop, cls, rec_pre, rec_inf, rec_post) = (
+        t.det_pre_ms,
+        t.det_infer_ms,
+        t.det_post_ms,
+        t.crop_ms,
+        t.cls_ms,
+        t.rec_pre_ms,
+        t.rec_infer_ms,
+        t.rec_post_ms,
+    );
     let mut json = format!(
         "{{\"image\": \"{}\", \"width\": {}, \"height\": {}, \"lines\": [",
         json_escape(&path.display().to_string()),
@@ -260,7 +271,7 @@ fn process_one(engine: &Engine, o: &Options, path: &Path) -> Result<Outcome, Err
         ));
     }
     json.push_str(&format!(
-        "], \"timing\": {{\"decode_ms\": {decode_ms:.2}, \"total_ms\": {best_ms:.2}}}}}"
+        "], \"timing\": {{\"decode_ms\": {decode_ms:.2}, \"total_ms\": {best_ms:.2}, \"det_pre_ms\": {det_pre:.2}, \"det_infer_ms\": {det_inf:.2}, \"det_post_ms\": {det_post:.2}, \"crop_ms\": {crop:.2}, \"cls_ms\": {cls:.2}, \"rec_pre_ms\": {rec_pre:.2}, \"rec_infer_ms\": {rec_inf:.2}, \"rec_post_ms\": {rec_post:.2}}}}}"
     ));
 
     let mut stdout_text = String::new();
