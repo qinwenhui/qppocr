@@ -711,13 +711,29 @@ impl Engine {
         // 12 MP 照片上给识别器 4 倍线性分辨率。
         let mut crops: Vec<Image> = Vec::with_capacity(boxes.len());
         let mut wh_ratio: Vec<f32> = Vec::with_capacity(boxes.len());
-        for b in &boxes {
+        for b in boxes.iter_mut() {
             let mut pts = [[0f32; 2]; 4];
             to_image(&b.pts, &mut pts);
             // 边距杂波判定：unclip 加的框是背景还是杂波？难图.png 的
             // 分离信号（0.48 vs 语料 0.00-0.06）。命中则同中心同方向收窄。
             if self.cfg.unclip_margin_thresh > 0.0 && b.tight_h > 0.0 && !pred.f32.is_empty() {
                 let margin = box_margin_clutter(b, &pred.f32, nh, nw, crop_src);
+                if std::env::var("QPPOCR_DEBUG_MARGIN").is_ok() {
+                    eprintln!(
+                        "[margin] thresh={} tight_h={:.1} margin={:.3} nh={} nw={} img={}x{} box=({:.0},{:.0})-({:.0},{:.0})",
+                        self.cfg.unclip_margin_thresh,
+                        b.tight_h,
+                        margin,
+                        nh,
+                        nw,
+                        crop_src.w,
+                        crop_src.h,
+                        b.pts[0][0],
+                        b.pts[0][1],
+                        b.pts[2][0],
+                        b.pts[2][1]
+                    );
+                }
                 if margin > self.cfg.unclip_margin_thresh {
                     let c = [
                         (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) * 0.25,
@@ -740,6 +756,10 @@ impl Engine {
                             pts[k][0] = c[0] + sg[k][0] * hw * ex2[0] + sg[k][1] * hh * ey2[0];
                             pts[k][1] = c[1] + sg[k][0] * hw * ex2[1] + sg[k][1] * hh * ey2[1];
                         }
+                        // 收紧框写回 boxes[i]：不只是显示——区域重试的
+                        // 裁剪区域从这些 pts 计算，留肥框会把刚剔除的杂波
+                        // 又包回重试区域（难图实测：不写回时收紧只救一半）。
+                        b.pts = pts;
                         res.num_decluttered += 1;
                     }
                 }
