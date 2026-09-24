@@ -13,6 +13,17 @@ pub struct DecodeMark {
     pub off: usize,
 }
 
+/// `add_gap_spaces` 插入的一个空格：在最终文本里的字节偏移 + 裁剪图上
+/// 空白 run 的 x 区间（`TextLine::chars` 给空格真实框用）。
+pub struct SpaceSpan {
+    /// 最终文本字节偏移（指向插入的空格）。
+    pub off: usize,
+    /// 空白 run 左缘（裁剪图像素）。
+    pub x0: i32,
+    /// 空白 run 右缘。
+    pub x1: i32,
+}
+
 /// 贪心 CTC：`best != 0 && best != prev` 时追加字符。
 /// ★ 字典末尾的空格项是**能输出的**——不要在解码阶段剥掉它。
 ///
@@ -171,12 +182,13 @@ pub fn add_gap_spaces(
     ink: &[f32],
     crop_w: i32,
     min_gap_px: f32,
-) -> String {
+) -> (String, Vec<SpaceSpan>) {
     if marks.len() < 2 || cols.len() != marks.len() || text.is_empty() {
-        return text.to_string();
+        return (text.to_string(), Vec::new());
     }
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len() + marks.len());
+    let mut spaces = Vec::new();
     let mut prev_space = false;
     let mut prev_cp = 0u32;
     for (k, &m) in marks.iter().enumerate() {
@@ -202,17 +214,27 @@ pub fn add_gap_spaces(
             let (b, a) = (cols[k - 1], cols[k]);
             if a > b {
                 let (mut run, mut best) = (0i32, 0i32);
+                let (mut best_x0, mut best_x1) = (b, b);
                 for x in b..a {
                     if x < 0 || x >= crop_w || ink[x as usize] < EMPTY_INK {
                         run += 1;
                         if run > best {
                             best = run;
+                            best_x0 = x + 1 - run;
+                            best_x1 = x + 1;
                         }
                     } else {
                         run = 0;
                     }
                 }
                 if best as f32 >= min_gap_px {
+                    // 记录插入位置与空白 run 的区间——每字坐标（TextLine::chars）
+                    // 用它给空格一个真实的框，而不是借用相邻字符的边界。
+                    spaces.push(SpaceSpan {
+                        off: out.len(),
+                        x0: best_x0,
+                        x1: best_x1,
+                    });
                     out.push(' ');
                 }
             }
@@ -223,5 +245,5 @@ pub fn add_gap_spaces(
         prev_space = cur_space;
         prev_cp = cur_cp;
     }
-    out
+    (out, spaces)
 }

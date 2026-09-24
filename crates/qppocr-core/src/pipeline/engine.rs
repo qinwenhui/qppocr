@@ -16,6 +16,20 @@ use super::image::{Image, resize_bilinear_img, rotate_image};
 use super::rec::{add_gap_spaces, column_ink, ctc_decode};
 use qppocr_kernels::buf::F32Buf;
 
+/// 单个字符的坐标（[`TextLine::chars`] 的元素）。
+///
+/// `text` 恰好一个字符（含像素空格判定的空格——它的框是裁剪图上
+/// **真实空白 run** 的区间，不是借用相邻字符的边界）。
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CharSpan {
+    /// 字符本身（单 char）。
+    pub text: String,
+    /// 字符的四角点 TL/TR/BR/BL，**原图坐标**（与 [`TextLine::pts`] 同一
+    /// 约定、同一坐标系）。
+    pub pts: [[f32; 2]; 4],
+}
+
 /// 识别结果的一行。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -23,6 +37,12 @@ pub struct TextLine {
     /// 解码文本（可能为空 = 检测到但读不出；**保留**而不是丢弃——
     /// 丢掉会让「检测器打散了这行」伪装成完整结果）。
     pub text: String,
+    /// 逐字坐标（与 `text` 逐字符对齐；空文本为空 vec）。来自 CTC 时间步
+    /// → 裁剪图 x → 四边形角点插值的映射（PaddleOCR `return_word_box`
+    /// 同款近似：角点精确、内部沿边线性）。已穿过全部坐标变换链：
+    /// 长边帽缩放/补边/det 输入缩放/透视裁剪/竖条转正/cls 180° 翻转/
+    /// 区域重试偏移——**坐标永远在原图空间**。
+    pub chars: Vec<CharSpan>,
     /// CTC 置信度。
     pub confidence: f32,
     /// 0 或 180：分类器判定倒置并翻正过就是 180。
@@ -355,6 +375,13 @@ impl Engine {
                 p[0] += rx0 as f32;
                 p[1] += ry0 as f32;
             }
+            // 每字坐标同偏移：重试跑在子图上，line 与 chars 必须同链映射
+            for cs in &mut l.chars {
+                for p in &mut cs.pts {
+                    p[0] += rx0 as f32;
+                    p[1] += ry0 as f32;
+                }
+            }
             kept.push(l);
         }
         kept.sort_by(|a, b| {
@@ -370,6 +397,97 @@ impl Engine {
         first.timings.rec_infer_ms += second.timings.rec_infer_ms;
         first.timings.total_ms += second.timings.total_ms;
         Ok(first)
+    }
+
+    /// 每字四边形：最终文本（含插入空格）逐字符 → 裁剪图 x 区间 →
+    /// （cls 翻转还原）→ 沿行四边形上下边插值 → `to_image` 回原图。
+    ///
+    /// 竖条（`crop_text_box` 顺时针转正）的角点对应：裁剪图 TL/TR/BR/BL ↔
+    /// `pts[3]/[0]/[1]/[2]`。空格用 `add_gap_spaces` 记下的空白 run 区间。
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn build_char_spans(
+        text: &str,
+        marks: &[crate::pipeline::rec::DecodeMark],
+        cols: &[i32],
+        spaces: &[crate::pipeline::rec::SpaceSpan],
+        cr_w: i32,
+        flipped: bool,
+        quad: &[[f32; 2]; 4],
+        to_image: &dyn Fn(&[[f32; 2]; 4], &mut [[f32; 2]; 4]),
+    ) -> Vec<CharSpan> {
+        if text.is_empty() || cr_w <= 0 {
+            return Vec::new();
+        }
+        let n = marks.len();
+        // 第 k 个真实字符的左缘（crop 坐标）；cols 缺失时按字数均分。
+        let left = |k: usize| -> f32 {
+            if k < cols.len() {
+                cols[k] as f32
+            } else if n > 0 {
+                cr_w as f32 * k as f32 / n as f32
+            } else {
+                0.0
+            }
+        };
+        // 竖条判定与 crop_text_box 同款（ch/cw >= 1.5 顺时针转正）
+        let w1 = (quad[0][0] - quad[1][0]).hypot(quad[0][1] - quad[1][1]);
+        let w2 = (quad[2][0] - quad[3][0]).hypot(quad[2][1] - quad[3][1]);
+        let h1 = (quad[0][0] - quad[3][0]).hypot(quad[0][1] - quad[3][1]);
+        let h2 = (quad[1][0] - quad[2][0]).hypot(quad[1][1] - quad[2][1]);
+        let rotated = h1.max(h2) / w1.max(w2).max(1.0) >= 1.5;
+        let corners_src: [[f32; 2]; 4] = if rotated {
+            [quad[3], quad[0], quad[1], quad[2]]
+        } else {
+            [quad[0], quad[1], quad[2], quad[3]]
+        };
+        let mut q = [[0f32; 2]; 4];
+        to_image(&corners_src, &mut q);
+        let (tl, tr, br, bl) = (&q[0], &q[1], &q[2], &q[3]);
+        let lerp = |a: &[f32; 2], b: &[f32; 2], u: f32| {
+            [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u]
+        };
+
+        let mut out = Vec::with_capacity(text.chars().count());
+        let mut mi = 0usize; // 已消费的真实字符数
+        let mut off = 0usize; // 最终文本字节游标
+        for ch in text.chars() {
+            let sz = ch.len_utf8();
+            // 该字符在（未翻转）裁剪图上的 x 区间
+            let (mut l, mut r) = if let Some(sp) = spaces.iter().find(|s| s.off == off) {
+                (sp.x0 as f32, sp.x1 as f32)
+            } else {
+                let a = left(mi);
+                let b = if mi + 1 < n {
+                    left(mi + 1)
+                } else {
+                    cr_w as f32
+                };
+                mi += 1;
+                (a, b)
+            };
+            if r < l {
+                std::mem::swap(&mut l, &mut r);
+            }
+            if flipped {
+                // rec 看到的是 180° 翻转后的裁剪图；还原到裁剪时的方向
+                let (l2, r2) = (cr_w as f32 - r, cr_w as f32 - l);
+                l = l2;
+                r = r2;
+            }
+            let ul = (l / cr_w as f32).clamp(0.0, 1.0);
+            let ur = (r / cr_w as f32).clamp(0.0, 1.0);
+            out.push(CharSpan {
+                text: ch.to_string(),
+                pts: [
+                    lerp(tl, tr, ul),
+                    lerp(tl, tr, ur),
+                    lerp(bl, br, ur),
+                    lerp(bl, br, ul),
+                ],
+            });
+            off += sz;
+        }
+        out
     }
 
     /// 一遍 det+crop+rec。`run` 包这层以在首遍不确定时换尺度重试。
@@ -566,6 +684,7 @@ impl Engine {
             for b in &boxes {
                 let mut l = TextLine {
                     text: String::new(),
+                    chars: Vec::new(),
                     confidence: b.score,
                     rotation: 0,
                     pts: [[0.0; 2]; 4],
@@ -684,6 +803,7 @@ impl Engine {
         let mut lines: Vec<TextLine> = (0..boxes.len())
             .map(|_| TextLine {
                 text: String::new(),
+                chars: Vec::new(),
                 confidence: 0.0,
                 rotation: 0,
                 pts: [[0.0; 2]; 4],
@@ -766,41 +886,60 @@ impl Engine {
             for (k, &i) in order[beg..end].iter().enumerate() {
                 let (mut text, conf, marks) =
                     ctc_decode(&o.f32[k * t_len * c_len..], t_len, c_len, &self.charset);
-                // 「两字符间像素有空隙」→「文本里有空格」。只有这里知道
-                // 几何：识别器看的是 imgW 宽的张量，这行占 [0, content_w)，
-                // 其余是批 padding。
-                if want_gaps && marks.len() >= 2 {
-                    let cr = &crops[i];
-                    if cr.w > 0 && cr.h > 0 {
-                        let pad_only = crop_pads(cr, img_h, self.cfg.rec_pad_min_h);
-                        let content_w = if pad_only {
-                            cr.w.min(img_w)
-                        } else {
-                            ((img_h as f64 * cr.w as f64 / cr.h as f64).ceil()) as i32
-                        };
-                        let content_w = content_w.min(img_w);
-                        if content_w > 0 {
-                            let cols: Vec<i32> = marks
-                                .iter()
-                                .map(|m| {
-                                    let mut p = m.step as f64 / t_len as f64 * img_w as f64
-                                        / content_w as f64;
-                                    p = p.clamp(0.0, 1.0);
-                                    (p * cr.w as f64) as i32
-                                })
-                                .collect();
-                            let ink = column_ink(cr);
-                            text = add_gap_spaces(
-                                &text,
-                                &marks,
-                                &cols,
-                                &ink,
-                                cr.w,
-                                (self.cfg.rec_space_gap * cr.h as f64) as f32,
-                            );
-                        }
+                // 时间步 → 裁剪图 x 的左缘（像素空格与每字坐标共用这套映射）。
+                // 「识别器看的是 imgW 宽的张量，这行占 [0, content_w)，其余是
+                // 批 padding」——除以 content_w 再乘回裁剪宽。
+                let cr = &crops[i];
+                let cols: Vec<i32> = if cr.w > 0 && cr.h > 0 {
+                    let pad_only = crop_pads(cr, img_h, self.cfg.rec_pad_min_h);
+                    let content_w = if pad_only {
+                        cr.w.min(img_w)
+                    } else {
+                        ((img_h as f64 * cr.w as f64 / cr.h as f64).ceil()) as i32
+                    };
+                    let content_w = content_w.min(img_w);
+                    if content_w > 0 {
+                        marks
+                            .iter()
+                            .map(|m| {
+                                let p = (m.step as f64 / t_len as f64 * img_w as f64
+                                    / content_w as f64)
+                                    .clamp(0.0, 1.0);
+                                (p * cr.w as f64) as i32
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
                     }
+                } else {
+                    Vec::new()
+                };
+                let mut spaces = Vec::new();
+                if want_gaps && marks.len() >= 2 && cols.len() == marks.len() {
+                    let ink = column_ink(cr);
+                    let (t2, sp) = add_gap_spaces(
+                        &text,
+                        &marks,
+                        &cols,
+                        &ink,
+                        cr.w,
+                        (self.cfg.rec_space_gap * cr.h as f64) as f32,
+                    );
+                    text = t2;
+                    spaces = sp;
                 }
+                // ★ 每字坐标（原图空间；含全部逆变换，见 TextLine::chars 文档）
+                let chars = Self::build_char_spans(
+                    &text,
+                    &marks,
+                    &cols,
+                    &spaces,
+                    cr.w,
+                    flipped[i],
+                    &boxes[i].pts,
+                    &to_image,
+                );
+                lines[i].chars = chars;
                 lines[i].text = text;
                 lines[i].confidence = conf;
                 lines[i].rotation = if flipped[i] { 180 } else { 0 };
