@@ -71,6 +71,18 @@
     `Err`（原注释承诺过未实现；错字典曾静默整表错位——`ctc_decode`
     越界静默跳过）。删行字典实测拦截
   - 验证 example：`api_verify`（`--features serde`，七项断言全过）
+- feat(api): `TextLine::retried` 逐行区域重试标记——下游需要知道**哪几行**
+  被重读（此前只有整图 `num_det_retried`）。true = 来自重试遍（首遍弱行
+  被整体替换）；注意语义是「来自第二遍」而非「必然更好」（img-030 实测
+  替换行 conf 0.28 仍弱）。`retry_flags` example 八图验证不变量。
+- fix(api): 门面解码 re-export 挂 `image-decode` 门控——`default-features =
+  false` 时 `decode_file/decode_bytes/probe_dimensions` 不存在，无条件
+  `pub use` 让整个 crate 编不过（外部用户实测）。七组 feature 矩阵全过。
+- feat(api): **逐字坐标**（对标 PaddleOCR `return_word_box`）：
+  `TextLine.chars: Vec<CharSpan>`——每字符四角点四边形（原图坐标，
+  与 `pts` 同约定），空格框 = 裁剪图真实空白 run。CTC 时间步往回映射，
+  性能损耗 ≈ 0（rec_post 不变），穿过全部坐标变换链（翻转/竖排转正/
+  重试偏移等）；`char_boxes` example 三图全过，文本逐字符不变。
 - fix(api): SHA 校验失败从 `panic!` 改为 `Err(Error::Model)`——库不该替
   宿主应用决定崩掉（外部评估者实测报告；模型损坏/调包是数据问题，
   应用层要能接住并引导用户）。提示文案不变（期望/实际值 + 跳过校验
