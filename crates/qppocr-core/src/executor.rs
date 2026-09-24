@@ -190,7 +190,14 @@ impl Session {
         }
 
         // 对拍落盘（QPPOCR_DUMP_DIR 同格式）
-        let dump_dir = std::env::var("QPPOCR_DUMP_DIR").ok();
+        // 按会话分目录（s0_/s1_/s2_）：det/cls/rec 三个会话的节点索引都从
+        // 0 起，共用目录会互相覆盖——对拍时无法区分归属。
+        let dump_dir = std::env::var("QPPOCR_DUMP_DIR").ok().map(|d| {
+            let _ = std::fs::create_dir_all(&d);
+            static SESSION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let id = SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (d, id)
+        });
 
         // per-op profile（QPPOCR_PROF=1）：按算子累计内核时间。
         let prof = std::env::var("QPPOCR_PROF").is_ok();
@@ -984,7 +991,8 @@ impl Session {
                 if let Some(dir) = &dump_dir {
                     if let Some(t) = arena.get(&n.outputs[0]) {
                         if t.dtype == DType::F32 {
-                            let path = format!("{}/{:06}.f32", dir, i);
+                            let (ddir, sid) = dir;
+                            let path = format!("{}/s{}_{:06}.f32", ddir, sid, i);
                             if let Ok(file) = std::fs::File::create(&path) {
                                 let mut f = std::io::BufWriter::new(file);
                                 let _ = f.write_all(&(t.rank() as i32).to_le_bytes());
@@ -996,7 +1004,7 @@ impl Session {
                             let mf = std::fs::OpenOptions::new()
                                 .create(true)
                                 .append(true)
-                                .open(format!("{}/manifest.tsv", dir));
+                                .open(format!("{}/manifest.tsv", ddir));
                             if let Ok(mut mf) = mf {
                                 let _ = writeln!(mf, "{}\t{}\t{}", i, op, n.outputs[0]);
                             }

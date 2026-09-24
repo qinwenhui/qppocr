@@ -772,6 +772,25 @@ impl Engine {
             ));
             crops.push(crop);
         }
+        // 裁剪落盘（诊断，QPPOCR_SAVE_CROPS=<dir>；PPM，cls 翻转前——
+        // 与参考实现的落盘点一致）
+        if let Ok(dir) = std::env::var("QPPOCR_SAVE_CROPS") {
+            for (i, c) in crops.iter().enumerate() {
+                let path = std::path::Path::new(&dir).join(format!("crop_{i:02}.ppm"));
+                if let Ok(mut f) = std::fs::File::create(&path) {
+                    use std::io::Write as _;
+                    let _ = write!(
+                        f,
+                        "P6
+{} {}
+255
+",
+                        c.w, c.h
+                    );
+                    let _ = f.write_all(&c.data);
+                }
+            }
+        }
         res.timings.crop_ms = t_crop0.elapsed_ms();
 
         // ---- 方向分类：把读作倒置的裁剪翻 180° ----
@@ -797,6 +816,16 @@ impl Engine {
                         &mut batch_f32[(i - beg) * 3 * (ch as usize) * (cw as usize)..],
                         false,
                     );
+                }
+                if let Ok(dir) = std::env::var("QPPOCR_SAVE_CROPS") {
+                    let path =
+                        std::path::Path::new(&dir).join(format!("clsin_{:03}_{:03}.f32", beg, end));
+                    let bytes: Vec<u8> = batch_f32
+                        .as_slice()
+                        .iter()
+                        .flat_map(|f| f.to_le_bytes())
+                        .collect();
+                    let _ = std::fs::write(path, bytes);
                 }
                 let out = cls.run(vec![(
                     self.cls_in.clone(),
