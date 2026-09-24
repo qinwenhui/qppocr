@@ -1,12 +1,12 @@
-//! 执行器（`executor.cpp` 的移植）：带引用计数释放的 arena 逐节点执行。
+//! 执行器（设计文档 ）：带引用计数释放的 arena 逐节点执行。
 //!
-//! 就绪判定 = 输入都在 arena 里；按序扫描 + 最多 8 趟重试（C++ 同款）。
+//! 就绪判定 = 输入都在 arena 里；按序扫描 + 最多 8 趟重试。
 //! `take0`：输入是最后消费者时**移动**而不是拷贝——in-place 算子直接吃
 //! 原缓冲，省一次多 MB 的分配和一整趟内存。
 //!
 //! ## 逐节点落盘（阶段 2 判据的对拍机制）
 //!
-//! `QPPOCR_DUMP_DIR=<dir>` 时每个节点输出按 C++ `LEAN_DUMP_DIR` 相同的
+//! `QPPOCR_DUMP_DIR=<dir>` 时每个节点输出按  `QPPOCR_DUMP_DIR` 相同的
 //! 格式落盘（`%06d.f32`：i32 rank + i64×rank 形状 + f32 数据，manifest.tsv），
 //! 两侧目录逐文件 diff 即「中间张量逐位一致」的判据。
 
@@ -59,7 +59,7 @@ fn axes_from(
 
 /// 任意 axis 的 softmax（外维并行；exp 占大头，中等张量也值得并行）。
 /// axis 是最后一维时委托给向量化内核（rec 注意力的每个 softmax 都是）；
-/// 通用路径是逐元素标量。★ 通用路径 C++ 用 libm exp、我们用同一多项式
+/// 通用路径是逐元素标量。★ 通用路径  用 libm exp、我们用同一多项式
 /// （`exp1`），低 位差异 ≤1 ulp——声明过的偏差，对拍若在此翻车有据可查。
 fn softmax_axis(t: &mut Tensor, axis: isize) {
     let r = t.rank() as isize;
@@ -167,7 +167,7 @@ impl Session {
     /// 跑一遍图。`inputs` 是 (名字, 张量) 列表；返回按 `graph.outputs`
     /// 顺序排列的输出。
     pub fn run(&self, inputs: Vec<(String, Tensor)>) -> Result<Vec<Tensor>> {
-        // FTZ/DAZ：调用线程可能不是池的创建者（C++ 同款）
+        // FTZ/DAZ：调用线程可能不是池的创建者
         qppocr_kernels::par::enable_flush_denormals();
 
         let g = &self.graph;
@@ -189,7 +189,7 @@ impl Session {
             };
         }
 
-        // 对拍落盘（与 C++ LEAN_DUMP_DIR 同格式）
+        // 对拍落盘（QPPOCR_DUMP_DIR 同格式）
         let dump_dir = std::env::var("QPPOCR_DUMP_DIR").ok();
 
         // per-op profile（QPPOCR_PROF=1）：按算子累计内核时间。
@@ -594,7 +594,7 @@ impl Session {
                             let sizes = get!(&arena, &n.inputs[3]).ok_or_else(|| {
                                 Error::Graph("Resize: missing sizes input".into())
                             })?;
-                            // 按**扁平数组末两位**取 H/W（C++ 是 i64.size()-2），
+                            // 按**扁平数组末两位**取 H/W（基准是 i64.size()-2），
                             // 不是按 rank——rank-1 的 sizes 长度 4 很常见
                             let sv = as_i64(sizes);
                             oh = sv[sv.len() - 2] as usize;
@@ -699,7 +699,7 @@ impl Session {
                     "Slice" => {
                         // opset 13+/11：starts/ends/axes/steps 是输入；
                         // opset ≤9：starts/ends/axes 是**属性**（上游 cls
-                        // opset 7 正是这种——C++ 参考在这里越界读直接段错误，
+                        // opset 7 正是这种—— 参考在这里越界读直接段错误，
                         // 这是它跑不了上游 cls 的根因）。
                         let (starts, ends, axes) = if n.inputs.len() >= 3
                             && !n.inputs[1].is_empty()
@@ -980,7 +980,7 @@ impl Session {
                 {
                     let _ = &op_t0;
                 }
-                // 对拍落盘（C++ LEAN_DUMP_DIR 同格式：%06d.f32 + manifest.tsv）
+                // 对拍落盘（ QPPOCR_DUMP_DIR 同格式：%06d.f32 + manifest.tsv）
                 if let Some(dir) = &dump_dir {
                     if let Some(t) = arena.get(&n.outputs[0]) {
                         if t.dtype == DType::F32 {

@@ -1,4 +1,4 @@
-//! 手写的 protobuf wire-format 读取器（`onnx_parser.cpp` 的移植）。
+//! 手写的 protobuf wire-format 读取器（`onnx_parser.cpp` ）。
 //!
 //! ONNX 就是普通 protobuf，只走我们需要的字段，不引 libprotobuf/prost
 //! （DESIGN.md §5.3：`prost-build` 会让构建依赖 protoc，与「纯 Rust、
@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::onnx::model::{Attribute, Graph, Node};
 use crate::tensor::{DType, Tensor};
 
-/// 光标读取器。所有方法在越界时报**字节偏移**——C++ 同款，错误信息能直接
+/// 光标读取器。所有方法在越界时报**字节偏移**——同款，错误信息能直接
 /// 定位到文件的哪个位置。
 struct Reader<'a> {
     p: usize,
@@ -187,7 +187,7 @@ fn parse_tensor(r: &mut Reader, force_name: &str) -> Result<Tensor> {
                 // int32_data：protobuf 的 int32 是 VARINT 类型，packed 与
                 // 非 packed 两种形态都是 varint，不是 fixed32——按 fixed32
                 // 读会在短 payload 上越界并带偏整个流
-                //（C++ 注释：症状是 EOF 处 "truncated fixed32"）。
+                //（ 注释：症状是 EOF 处 "truncated fixed32"）。
                 if wire == 2 {
                     let (s, l) = r.bytes()?;
                     let mut rd = r.sub(s, l);
@@ -424,7 +424,7 @@ fn value_info_name(r: &mut Reader) -> Option<String> {
 }
 
 fn parse_graph(r: &mut Reader, g: &mut Graph) -> Result<()> {
-    // 先攒子块再解析：C++ 同款（节点解析与图级字段交错无影响，但保持顺序）
+    // 先攒子块再解析：同款（节点解析与图级字段交错无影响，但保持顺序）
     let mut node_chunks: Vec<(usize, usize)> = Vec::new();
     let mut init_chunks: Vec<(usize, usize)> = Vec::new();
     while !r.eof() {

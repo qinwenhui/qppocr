@@ -1,4 +1,4 @@
-//! 透视裁剪与 rec/cls 预处理（`ocr.cpp` crop 部分的移植）。
+//! 透视裁剪与 rec/cls 预处理（透视裁剪与预处理）。
 
 use super::image::Image;
 
@@ -23,7 +23,7 @@ pub fn crop_text_box(src: &Image, pts_in: &[[f32; 2]; 4]) -> Image {
         a[i * 2] = [dx, dy, 1.0, 0.0, 0.0, 0.0, -dx * sx, -dy * sx, sx];
         a[i * 2 + 1] = [0.0, 0.0, 0.0, dx, dy, 1.0, -dx * sy, -dy * sy, sy];
     }
-    // 高斯消元（f64，与 C++ 一致——这步的精度决定裁剪的亚像素位置）
+    // 高斯消元（f64，与基准一致——这步的精度决定裁剪的亚像素位置）
     for col in 0..8 {
         let mut piv = col;
         for r in col + 1..8 {

@@ -58,7 +58,7 @@ fn main() {
     }
 
     // 模型布局：models/{tiny,small,medium}/{det,rec}.onnx + cls.onnx；
-    // 兼容参考实现的平铺布局（PP-OCRv6_*_tiny.onnx + ppocr_cls.onnx）
+    // 兼容基准实现的平铺布局（PP-OCRv6_*_tiny.onnx + ppocr_cls.onnx）
     let tier_dir = if models_dir.join("tiny/det.onnx").exists() {
         models_dir.join("tiny")
     } else {

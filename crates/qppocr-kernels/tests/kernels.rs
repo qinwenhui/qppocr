@@ -1,10 +1,10 @@
-//! 内核单元测试：移植 `tools/test_ops.cpp` 的用例集，对拍朴素参考实现。
+//! 内核单元测试：形状随机的用例集，对拍朴素参考实现。
 //!
 //! 这是公开的、自包含的测试（DESIGN.md §8.2）——不需要模型、不需要语料。
-//! 判据与 C++ 版一致：相对误差 < 1e-5（长 f32 归约的绝对误差会超过 1e-4，
+//! 判据：相对误差 < 1e-5（长 f32 归约的绝对误差会超过 1e-4，
 //! 但相对量级是精确的）。
 //!
-//! 补充（C++ test_ops 未覆盖、这里补上的）：softmax / pool / resize /
+//! 补充覆盖：softmax / pool / resize /
 //! transpose / slice / concat / matmul / reduce_mean / gelu / sigmoid /
 //! hardsigmoid / convtranspose 的朴素参考测试。
 
@@ -12,7 +12,7 @@
     clippy::needless_range_loop,
     clippy::manual_clamp,
     clippy::manual_div_ceil,
-    clippy::approx_constant // 参考/被测双方的常数都照抄 C++ 字面值
+    clippy::approx_constant // 参考/被测双方的常数都照抄  字面值
 )]
 
 use qppocr_kernels::activation::*;
@@ -26,7 +26,7 @@ use qppocr_kernels::shape::*;
 
 // ---------------------------------------------------------------- 基础设施
 
-/// 与 test_ops.cpp 同款的确定性随机源（数值不同没关系：参考值在测试内算）。
+/// 确定性随机源（数值不同没关系：参考值在测试内算）。
 struct Rng(u64);
 impl Rng {
     fn new() -> Self {
@@ -47,7 +47,7 @@ impl Rng {
     }
 }
 
-/// 相对误差检查（C++ `check` 的移植）。返回 Err 描述首个超差位置。
+/// 相对误差检查（ `check` ）。返回 Err 描述首个超差位置。
 fn check(name: &str, got: &[f32], ref_: &[f32]) {
     assert_eq!(
         got.len(),
@@ -89,7 +89,7 @@ fn bits_eq(name: &str, got: &[f32], ref_: &[f32]) {
 
 // ---------------------------------------------------------------- conv2d
 
-/// 朴素 NCHW conv 参考（test_ops.cpp ref_conv 的移植，f64 累加）
+/// 朴素 NCHW conv 参考（f64 累加）
 #[allow(clippy::too_many_arguments)]
 fn ref_conv(
     x: &[f32],
@@ -665,7 +665,7 @@ struct BCase {
     op: BinOp,
 }
 
-/// 朴素右对齐广播参考（test_ops.cpp 同款）。
+/// 朴素右对齐广播参考。
 fn naive_broadcast(a: &[f32], a_shape: &[i64], b: &[f32], b_shape: &[i64], op: BinOp) -> Vec<f32> {
     let r = a_shape.len().max(b_shape.len());
     let fdim = |s: &[i64], i: usize| -> i64 {

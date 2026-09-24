@@ -47,14 +47,26 @@ jobs:
       - run: cargo build --workspace
       - run: cargo test --workspace --lib
 
-  no-default-features:
+  feature-matrix:
+    # 公开门面的 feature 组合矩阵（v0.1.0 前的教训：无门控 re-export 让
+    # default-features=false 编不过，CI 没覆盖到就带了出去）
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "std"
+          - "std,parallel"
+          - "image-decode"
+          - "std,parallel,image-decode"
+          - "serde,std"
+          - "serde,std,parallel,image-decode"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # std 能关（DESIGN.md §4.5）——当前还没有可选 feature，先确保
-      # --no-default-features 始终是可构建状态，后面加 feature 时不出回归。
+      - run: cargo build -p qppocr --no-default-features ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
       - run: cargo build -p qppocr-kernels --no-default-features
 
   deny:

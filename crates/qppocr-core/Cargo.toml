@@ -7,7 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-publish = false
 
 [features]
 default = ["parallel"]
@@ -17,7 +16,7 @@ parallel = ["qppocr-kernels/parallel"]
 serde = ["dep:serde"]
 
 [dependencies]
-qppocr-kernels = { path = "../qppocr-kernels" }
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.1.0" }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 
 [lints]

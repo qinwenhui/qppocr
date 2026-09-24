@@ -1,5 +1,5 @@
 //! 几何：凸包、最小面积外接矩形、四角排序、连通域、box_score、
-//! DB 后处理与框合并（`ocr.cpp` 对应部分的移植）。
+//! DB 后处理与框合并（设计文档 对应部分）。
 
 use super::image::Image;
 
@@ -120,7 +120,7 @@ pub fn min_area_rect(hull: &[Pt]) -> (Option<[Pt; 4]>, f32) {
 
 /// 四角排序为 TL, TR, BR, BL（ppocr get_mini_boxes 的次序）。
 pub fn order_box_tl_tr_br_bl(p: &mut [Pt; 4]) {
-    // 按 x 排序（C++ std::sort 不稳定——四个点 x 相等是退化情形，忽略）
+    // 按 x 排序（ std::sort 不稳定——四个点 x 相等是退化情形，忽略）
     p.sort_by(|a, b| a.x.partial_cmp(&b.x).unwrap());
     let i1 = if p[1].y > p[0].y { 0 } else { 1 };
     let i4 = if p[1].y > p[0].y { 1 } else { 0 };
@@ -425,7 +425,7 @@ fn box_frame(p: &[[f32; 2]; 4]) -> BoxFrame {
 ///
 /// 曾经比较轴对齐外接框的 y 范围——在倾斜文本上恰好是错的：300 px 行
 /// 倾斜 10° 的 AABB 有 91 px 高（凸包在两个轴上都为倾角付账），相邻两行
-/// 在 y 上重叠过半而被并成一个框。Simd 语料（93% 行倾斜）实测损失
+/// 在 y 上重叠过半而被并成一个框。倾斜语料（93% 行倾斜）实测损失
 /// 4.44 个 exact 行。沿行自身法向量分隔、沿行方向量间隙，水平文本上
 /// 退化为旧行为。
 fn mergeable(a: &TextBox, b: &TextBox, gap_ratio: f32) -> bool {

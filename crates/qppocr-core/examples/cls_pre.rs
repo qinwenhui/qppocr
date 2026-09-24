@@ -1,5 +1,5 @@
 //! 扫上游 cls 的预处理组合：画布 × 归一化 × 是否开窗。
-//! CROPS 指向含倒置行的裁剪目录（rot180 的 C++ 裁剪）。
+//! CROPS 指向含倒置行的裁剪目录（rot180 的  裁剪）。
 use qppocr_core::executor::Session;
 use qppocr_core::pipeline::crop::{cls_view, pack_crop};
 use qppocr_core::pipeline::image::{Image, rotate_image};

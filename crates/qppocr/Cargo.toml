@@ -7,7 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-readme = "../../README.md"
+
+keywords = ["ocr", "paddleocr", "onnx", "inference", "text-recognition"]
+categories = ["computer-vision", "text-processing"]
 
 [features]
 default = ["std", "parallel", "image-decode"]
@@ -20,7 +22,7 @@ image-decode = ["dep:image"]
 serde = ["dep:serde", "qppocr-core/serde"]
 
 [dependencies]
-qppocr-core = { path = "../qppocr-core" }
+qppocr-core = { path = "../qppocr-core", version = "0.1.0" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 

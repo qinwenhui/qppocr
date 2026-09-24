@@ -2,10 +2,10 @@
 //!
 //! 不做步长/视图系统——OCR 的图用不到，而步长系统会让每个内核都要处理
 //! 非连续输入，得不偿失（DESIGN.md §5.2）。有效载荷按 dtype 二选一，
-//! 与 C++ `onnx_model.hpp` 的 Tensor 一一对应。
+//! 张量结构与图协议一一对应。
 
 /// 数据类型。解析器在入口处归一化：I32/BOOL → [`DType::I64`]，
-/// F64 → [`DType::F32`]（C++ 同款——内核只吃这两种）。
+/// F64 → [`DType::F32`]（同款——内核只吃这两种）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DType {
     #[default]

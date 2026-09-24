@@ -24,7 +24,7 @@ pub fn resize_nearest(
             // SAFETY: 通道 nc 的输出平面与其他块不相交。
             let ync = unsafe { op.offset(nc * oh * ow).slice(oh * ow) };
             for oy in 0..oh {
-                // (int)((float)oy * H / oh)：float 乘除再截断，与 C++ 一致
+                // (int)((float)oy * H / oh)：float 乘除再截断，与基准一致
                 let iy = ((oy as f32 * h as f32 / oh as f32) as usize).min(h - 1);
                 let xr = &xnc[iy * w..(iy + 1) * w];
                 let yr = &mut ync[oy * ow..(oy + 1) * ow];
@@ -115,7 +115,7 @@ pub fn resize_bilinear(
                 for (oxx, yv) in yr.iter_mut().enumerate() {
                     let (x0, x1) = (ix0[oxx] as usize, ix1[oxx] as usize);
                     let lx = fx[oxx];
-                    // 四角加权——项与顺序与 C++ 一致（位级）。★ 收缩形态：
+                    // 四角加权——项与顺序与基准一致（位级）。★ 收缩形态：
                     // GCC 把后续三项的「积 + 累加」收缩成 FMA（首项两个乘、
                     // 每项的第一乘保留、第二乘折进 fma），Rust 显式 mul_add
                     let t = r0[x0] * (1.0 - lx) * (1.0 - ly);

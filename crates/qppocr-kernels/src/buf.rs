@@ -1,6 +1,6 @@
-//! 池化的张量缓冲（`pool.hpp` + `buf.hpp` 的移植）。
+//! 池化的张量缓冲（`pool.hpp` + `buf.hpp` ）。
 //!
-//! ## 为什么需要它（C++ 注释的实测结论，照抄）
+//! ## 为什么需要它（ 注释的实测结论，照抄）
 //!
 //! 图节点的输出缓冲：分配→写满→被几个消费者读→释放，每节点一次、每次
 //! 推理几百次。每次都还回 CRT 再要新的，代价是一对 VirtualFree/
@@ -17,7 +17,7 @@
 //!
 //! [`F32Buf::with_uninit`] / [`F32Buf::resize_uninit`] 跳过清零——
 //! **调用方必须在任何读之前写满每个元素**，否则读到的是池里上一任的
-//! 陈旧数据（位模式上可能是 NaN 陷阱值）。这个契约与 C++ `resize_uninit`
+//! 陈旧数据（位模式上可能是 NaN 陷阱值）。这个契约与 `resize_uninit`
 //! 相同，也是它只能住在 kernels crate（唯一 unsafe 边界）的原因。
 
 // 本模块是进程级内存池原语：每个 unsafe 块的合约都写在其所属函数的
@@ -38,7 +38,7 @@ unsafe impl Send for FreeBlockWrap {}
 struct PoolInner {
     free: Vec<Vec<FreeBlockWrap>>, // 每类一个桶
     held_bytes: usize,
-    // 上限（保守默认；DESIGN.md §6.3：C++ 的 256 MB 是为单机跑分调的，
+    // 上限（保守默认；DESIGN.md §6.3：基准的 256 MB 是为单机跑分调的，
     // Rust 版默认保守，让调用方显式开大）
     cap_bytes: usize,
     per_class_cap: [usize; 3], // small(<64KB) / mid(<4MB) / big
@@ -53,7 +53,7 @@ impl PoolInner {
             Mutex::new(PoolInner {
                 free: (0..=MAX_CLASS).map(|_| Vec::new()).collect(),
                 held_bytes: 0,
-                cap_bytes: 256 << 20, // 对齐 C++ 的 256 MB：det 的 concat/中间张量 95 MB 级，64 MB 上限会把最大块全部挤出池（实测端到端慢 1.4x 的主因之一）
+                cap_bytes: 256 << 20, // 对齐 基准的 256 MB：det 的 concat/中间张量 95 MB 级，64 MB 上限会把最大块全部挤出池（实测端到端慢 1.4x 的主因之一）
                 per_class_cap: [16, 8, 8],
             })
         })
@@ -167,7 +167,7 @@ impl F32Buf {
     /// # Safety
     ///
     /// 调用方合约：任何读（Deref 到的切片）之前必须写满全部元素；否则读到池里
-    /// 上一任的陈旧位模式。C++ `resize_uninit` 同款合约。
+    /// 上一任的陈旧位模式。 `resize_uninit` 同款合约。
     pub unsafe fn with_uninit(n: usize) -> Self {
         let mut b = Self::new();
         unsafe { b.resize_uninit(n) };

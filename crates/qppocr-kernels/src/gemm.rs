@@ -1,4 +1,4 @@
-//! sgemm 与 im2col：`ops.cpp` GEMM 部分的移植。
+//! sgemm 与 im2col：设计文档 GEMM 部分。
 //!
 //! C[M,N] = A[M,K] * B[K,N]，行主序。并行单元：N 宽时按 N 面板（32 列）切，
 //! 否则按 M 行切。微内核：4 行 × 4 个 AVX 向量、k 内层 broadcast+FMA
@@ -7,11 +7,11 @@
 //! # 位级细节（★ 不要"修"，见 DESIGN.md §5.4）
 //!
 //! 1. **没有清 C 步，也不需要**：每条路径都在寄存器里算满输出再 store，
-//!    没有任何路径先读 C。C++ 曾经 memset C（det 的 1x1 conv 输出 47 MB，
+//!    没有任何路径先读 C。 曾经 memset C（det 的 1x1 conv 输出 47 MB，
 //!    ~4 ms/节点的无效零填充），已删。
 //! 2. **bias 折进 store 阶段**，省掉最常见的一次 Add 的读改写。
-//! 3. **bias 的加法位置按路径不同**——C++ 原样如此，浮点加法不可结合，
-//!    两种顺序低位不同；阶段 2「中间张量与 C++ 逐位一致」依赖这套分支结构：
+//! 3. **bias 的加法位置按路径不同**—— 原样如此，浮点加法不可结合，
+//!    两种顺序低位不同；阶段 2「中间张量与基准值逐位一致」依赖这套分支结构：
 //!    - 4 行块、整面板（`nn == 32`）尾行、窄 N 路径 32 列主体：FMA 链从 0
 //!      累加，**最后**加 bias；
 //!    - 非整面板尾行、窄 N 路径 N%32 尾列：以 bias **起种**再走 FMA 链。
@@ -51,10 +51,10 @@ pub fn sgemm(
 
 /// 从并行区里调用的 sgemm：**固定走串行面板路径**。
 ///
-/// C++ 里这是 `serial=true`，有两重作用：一是嵌套 `parallel_for` 在
-/// fork-join 池里是死锁（[`crate::pool`] 与 C++ 同款限制）；二是面板分支
+/// 设计里这是 `serial=true`，有两重作用：一是嵌套 `parallel_for` 在
+/// fork-join 池里是死锁（[`crate::pool`] 与 同款限制）；二是面板分支
 /// 与 M 行分支对同一元素的 bias 加法位置不同（见本文件顶部的位级细节），
-/// **路径选择本身进位**。并行区内的调用必须与 C++ 走同一条分支，输出才能
+/// **路径选择本身进位**。并行区内的调用必须走同一条分支，输出才能
 /// 逐位一致。
 #[allow(clippy::too_many_arguments)]
 pub fn sgemm_serial(
@@ -105,7 +105,7 @@ fn sgemm_impl(
     #[cfg(not(target_arch = "x86_64"))]
     let avx2 = false;
 
-    // 小 GEMM 留在单线程——但仍然走同一内核。C++ 这里曾退化为标量三重循环，
+    // 小 GEMM 留在单线程——但仍然走同一内核。 这里曾退化为标量三重循环，
     // 让角度分类器和 FPN neck 里的每个小 conv 比算术该有的慢几个数量级。
     if serial || flops < par::thresholds().gemm_par_min || par::threads() == 1 {
         // SAFETY: 串行调用，无并发访问；形状已在上面的 assert 校验。
@@ -214,7 +214,7 @@ fn finish(c: &mut [f32], m: usize, n: usize, ldc: usize, act: &Activation) {
 /// `c` 的列区间 `[p*32, p*32+nn)`（所有行）必须与并发调用者不相交。
 ///
 /// 尾部面板只算它实际拥有的列：在 B 的行尾读满 32 个 float 会越过页边界
-/// 段错误——间歇性地（C++ 注释原话）。`nn` 是循环不变量，分支完美预测。
+/// 段错误——间歇性地（原注释）。`nn` 是循环不变量，分支完美预测。
 ///
 /// SAFETY: `c` 的列区间 `[p*32, p*32+nn)`（对所有行）必须与并发调用者
 /// 的区间不相交。
@@ -258,7 +258,7 @@ unsafe fn panel_body(
         }
         // 尾行（M%4 余数）：
         // - 整面板：1-row 内核语义——FMA 链从 0，bias 后置；
-        // - 非整面板：C++ 标量尾巴以 bias 起种（位级差异，原样保留）。
+        // - 非整面板： 标量尾巴以 bias 起种（位级差异，原样保留）。
         for row in m0..m {
             let arow = &a[row * k..];
             let bv = bias.map(|bs| bs[row]).unwrap_or(0.0f32);
@@ -371,7 +371,7 @@ pub fn im2col(
                     unsafe {
                         if iy < 0 || iy as usize >= h {
                             // 整行在 padding 里：零填充。★ 每个 kx 一段
-                            //（C++ 是 `for kx: memset`）——只填 ky*kw 那一段
+                            //（基准是 `for kx: memset`）——只填 ky*kw 那一段
                             // 会给 kx>0 的段留下复用缓冲里的陈旧数据。
                             for kx in 0..kw {
                                 std::ptr::write_bytes(colsp.get().add(base + kx * nout), 0, ow);
@@ -396,9 +396,9 @@ pub fn im2col(
             }
         }
     };
-    // ★ 串行执行，调用方负责并行。C++ 的 im2col 带 serial 参数，conv 的
+    // ★ 串行执行，调用方负责并行。基准的 im2col 带 serial 参数，conv 的
     // tile_body 总是传 true——因为 tile 本身已在 parallel_for 里，嵌套
-    // fork 在 fork-join 池里是死锁（C++ 池与 `crate::pool` 同款限制）。
-    // 这里直接执行与 C++ 的实际行为一致。
+    // fork 在 fork-join 池里是死锁（ 池与 `crate::pool` 同款限制）。
+    // 这里直接执行与 基准的实际行为一致。
     body(0, rows);
 }

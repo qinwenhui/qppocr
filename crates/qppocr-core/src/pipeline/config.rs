@@ -1,7 +1,7 @@
-//! 流水线配置：`tuning.hpp` 的 36 个行为参数，**数值一个不改**
+//! 流水线配置：调参基准 的 36 个行为参数，**数值一个不改**
 //!（DESIGN.md §6：这是三年基准测出来的资产）。
 
-/// 流水线配置（对应 C++ `OcrConfig` + tuning.hpp 默认值）。
+/// 流水线配置（默认值 = 调参基准（见 DESIGN.md §6））。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PipelineConfig {
@@ -58,7 +58,7 @@ pub struct PipelineConfig {
     pub cls_width: i32,
     /// 翻转阈值。
     pub cls_thresh: f32,
-    /// 超宽行是否取居中窗口再分类（C++ 给转换版 cls 打的补丁：30:1 的
+    /// 超宽行是否取居中窗口再分类（ 给转换版 cls 打的补丁：30:1 的
     /// 小长图压缩 7.6x 后分类器答错）。**对上游 PP-LCNet 有害**——倒置
     /// 英文行被窗口截断后特征不足会误判（实测 win=true 0.72 说正立、
     /// win=false 0.9998 说倒置）。默认关。
