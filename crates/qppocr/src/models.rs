@@ -147,8 +147,8 @@ impl ModelSource {
                     crate::Error::Model(format!("读不到识别模型 {}: {e}", rec_path.display()))
                 })?;
                 if verify {
-                    check_sha(&det, tier, Kind::Det, &det_path);
-                    check_sha(&rec, tier, Kind::Rec, &rec_path);
+                    check_sha(&det, tier, Kind::Det, &det_path)?;
+                    check_sha(&rec, tier, Kind::Rec, &rec_path)?;
                 }
                 let cls = std::fs::read(root.join("cls.onnx")).ok();
                 // 字典：rec 内嵌（转换版）或目录里的 dict.txt / ppocr_keys.txt
@@ -196,18 +196,26 @@ fn load_dict_file(root: &std::path::Path, tier_dir: &std::path::Path) -> Option<
 }
 
 /// 校验失败时报错（带两个已知值与跳过方法——防呆不挡路）。
-fn check_sha(data: &[u8], tier: Tier, kind: Kind, path: &std::path::Path) {
+fn check_sha(
+    data: &[u8],
+    tier: Tier,
+    kind: Kind,
+    path: &std::path::Path,
+) -> Result<(), crate::Error> {
     let want = match expected_sha(tier, kind) {
         Some(s) => s,
-        None => return,
+        None => return Ok(()),
     };
     let got = sha256(data).hex();
     if got != want {
-        // 「不要静默降级」与「不挡自备模型」的平衡：报错，但把出路写清楚
-        panic!(
+        // 「不要静默降级」与「不挡自备模型」的平衡：报错，但把出路写清楚。
+        // 是 Err 不是 panic——库不该替宿主应用决定「崩掉」（模型损坏/
+        // 被调包是数据问题，应用层要能接住并引导用户）。
+        return Err(crate::Error::Model(format!(
             "模型 SHA-256 不匹配（{}）:\n  期望（上游官方）: {want}\n  实际:            {got}\n\
              若这是你自己重导出的模型，用 EngineBuilder::verify_sha256(false) 跳过校验。",
             path.display()
-        );
+        )));
     }
+    Ok(())
 }

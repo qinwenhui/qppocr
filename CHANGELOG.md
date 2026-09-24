@@ -55,6 +55,10 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- fix(api): SHA 校验失败从 `panic!` 改为 `Err(Error::Model)`——库不该替
+  宿主应用决定崩掉（外部评估者实测报告；模型损坏/调包是数据问题，
+  应用层要能接住并引导用户）。提示文案不变（期望/实际值 + 跳过校验
+  的出路）。损坏模型复测：返回 Err 不再 panic。
 - feat(cli): 批量 `--workers`（进程扇出，C++ `auto_workers`/`proc_pool`
   的移植）——100 图 14.0→5.9 s（C++ 5.7 s，平手）。worker 数自动
   （头部探测平均 MP：大图 cap 2 / 小图 cap 8 / 核数减半）或显式；
