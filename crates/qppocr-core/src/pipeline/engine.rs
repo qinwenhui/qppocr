@@ -18,6 +18,7 @@ use qppocr_kernels::buf::F32Buf;
 
 /// 识别结果的一行。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TextLine {
     /// 解码文本（可能为空 = 检测到但读不出；**保留**而不是丢弃——
     /// 丢掉会让「检测器打散了这行」伪装成完整结果）。
@@ -32,6 +33,7 @@ pub struct TextLine {
 
 /// 一次 run 的结果。
 #[derive(Clone, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OcrResult {
     /// 文本行（阅读序）。
     pub lines: Vec<TextLine>,
@@ -61,6 +63,7 @@ pub struct OcrResult {
 
 /// 分阶段计时（字段与 C++ JSON 一致，便于两边对数）。
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Timings {
     /// det 预处理。
     pub det_pre_ms: f64,
@@ -737,6 +740,20 @@ impl Engine {
             let o = &out[0]; // [B, T, C]
             let t_len = o.shape[1] as usize;
             let c_len = o.shape[2] as usize;
+            // ★ 字典/模型配对硬校验。换错字典时 C 与字符表长度错位，
+            // ctc_decode 的越界索引是静默跳过——整表错位且不报错（曾用
+            // dict_small_medium.txt 配 small：少一个前导换行，18710→18709，
+            // 输出全部错一个字符）。from_sessions 的注释承诺过这里要硬校验，
+            // 一直没实现，这里补上。
+            if c_len != self.charset.len() {
+                return Err(crate::error::Error::Graph(format!(
+                    "识别输出类别数 {c_len} 与字符表 {} 不符：字典与 rec 模型不配对
+  期望行数：tiny 档 6904、small/medium 档 18708
+  检查 {}/dict.txt 的来源与行数",
+                    self.charset.len(),
+                    "rec"
+                )));
+            }
             let want_gaps = self.cfg.rec_space_gap > 0.0;
             for (k, &i) in order[beg..end].iter().enumerate() {
                 let (mut text, conf, marks) =

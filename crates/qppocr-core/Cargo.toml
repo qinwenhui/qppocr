@@ -13,9 +13,12 @@ publish = false
 default = ["parallel"]
 # 关掉 = 单线程（透传给 kernels）
 parallel = ["qppocr-kernels/parallel"]
+# 结果/配置的 serde 派生（facade 的同名 feature 透传到这里）
+serde = ["dep:serde"]
 
 [dependencies]
 qppocr-kernels = { path = "../qppocr-kernels" }
+serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 
 [lints]
 workspace = true

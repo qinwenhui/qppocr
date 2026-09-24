@@ -65,7 +65,10 @@ pub fn thread_count() -> usize {
 
 pub use models::{ModelSource, Tier};
 
-use qppocr_core::pipeline::{Engine as CoreEngine, PipelineConfig};
+use qppocr_core::pipeline::Engine as CoreEngine;
+/// 生效配置的完整快照（`Engine::config` 的返回类型；30 项全字段 pub，
+/// 设置页回显/预设导出用；`serde` feature 开启时可序列化）。
+pub use qppocr_core::pipeline::PipelineConfig;
 
 /// 错误。库不该强制调用方的错误类型——不用 `anyhow`（DESIGN.md §4.1）。
 #[derive(Debug)]
@@ -108,6 +111,8 @@ impl From<std::io::Error> for Error {
 
 /// 预设：三个经过整段基准验证的档位（DESIGN.md §4.2）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Preset {
     /// 速度优先：`rec_height` 40，关区域重试。
     Speed,
@@ -123,7 +128,9 @@ pub enum Preset {
 ///
 /// 判据（DESIGN.md §4.2）：用户不需要跑基准就能讲清楚该往哪边调吗？
 /// 能 → 进这里；不能（要量具）→ [`Advanced`]。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Config {
     /// 识别画布高度（像素）。40 更快、48 更准（sweep 见 DESIGN.md §6.1）。
@@ -134,7 +141,10 @@ pub struct Config {
     pub max_side_len: Option<u32>,
     /// 0 = 自动（按可用核数）。
     pub threads: usize,
-    /// 是否跑 0/180 方向分类。
+    /// 是否跑 0/180 方向分类（默认 **true**——倒置文本翻正是 OCR 引擎
+    /// 的预期默认行为，对齐 PaddleOCR 与本 crate 的 CLI；无 cls.onnx
+    /// 时该阶段自动跳过，开了也无害）。关掉即完全跳过该阶段（不加载、
+    /// 不推理、`rotation` 恒 0）。
     pub detect_orientation: bool,
     /// 极端宽高比时上下补边（PP-OCR 的 `use_vertical_padding`）。
     pub vertical_padding: Option<bool>,
@@ -147,6 +157,8 @@ pub struct Config {
 /// 这里的字段**不提供稳定性承诺**，任何一个小版本都可能变。
 /// 只能经 [`EngineBuilder::advanced`] 进入。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Advanced {
     /// DB 二值化阈值。上游 0.5；0.2 是帕累托改进。
@@ -211,6 +223,20 @@ pub struct Advanced {
     pub upscale: i32,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            rec_height: None,
+            det_max_side: None,
+            max_side_len: None,
+            threads: 0,
+            // 倒置翻正是预期默认（PaddleOCR 同款）；详见字段注释。
+            detect_orientation: true,
+            vertical_padding: None,
+        }
+    }
+}
+
 impl Default for Advanced {
     fn default() -> Self {
         // = PipelineConfig::default() 的对应字段（tuning.hpp 基准值）
@@ -252,6 +278,15 @@ impl Default for Advanced {
 pub struct Engine {
     core: CoreEngine,
     cfg: PipelineConfig,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 摘要式：权重不属于 Debug 输出；config 是全部行为参数。
+        f.debug_struct("Engine")
+            .field("config", &self.cfg)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Engine {
@@ -364,10 +399,17 @@ impl EngineBuilder {
         let preset = self.preset.unwrap_or_default();
         let loaded = source.load(tier, self.verify.unwrap_or(true))?;
         let cfg = resolve_config(preset, &self.cfg, self.advanced_fn);
+        // 关方向分类 = 真不装配 cls（不加载、不推理）。曾经只把 cls_thresh
+        // 设成 INFINITY：cls 照跑、时间照花、模型照占内存。
+        let cls_bytes = if self.cfg.detect_orientation {
+            loaded.cls.as_deref()
+        } else {
+            None
+        };
         let core = CoreEngine::open_bytes(
             &loaded.det,
             &loaded.rec,
-            loaded.cls.as_deref(),
+            cls_bytes,
             tier.label(),
             loaded.dict,
             cfg.clone(),
@@ -422,7 +464,8 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
         pc.threads = cfg.threads;
     }
     if !cfg.detect_orientation {
-        // 关分类 = 不给 cls 模型（引擎跳过整个阶段）
+        // 双保险：cls 不装配（见 build_with），阈值同时设无穷大——
+        // 直接用 core 的调用方只关阈值也能得到「永不翻转」。
         pc.cls_thresh = f32::INFINITY; // 永不翻转
     }
     if let Some(vp) = cfg.vertical_padding {

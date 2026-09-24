@@ -55,6 +55,22 @@
   serial 参数（conv 的 tile 调用全部传 true），我的移植丢了这层语义，
   每个 2 行 tile 又嵌套进 rayon（160 个微任务吃掉 1.2ms）。附带
   conv_bench / im2col_split 两个分解计时 example。
+- feat(api): 外部接入反馈的系统性修复（Tauri 评估 + GUI 勘误清单）：
+  - **serde 接线做实**（原为死开关）：`OcrResult`/`TextLine`/`Timings`/
+    `PipelineConfig`（core）与 `Tier`/`Preset`/`Config`/`Advanced`（facade）
+    挂派生；`Tier`/`Preset` 序列化为 `"tiny"`/`"balanced"` 小写字符串，
+    `Config`/`Advanced` 缺省字段取默认——**部分 JSON 即预设覆盖语义**，
+    下游不再需要手写镜像 DTO
+  - **`detect_orientation` 默认 false→true**（倒置翻正是 OCR 引擎的预期
+    默认，对齐 PaddleOCR 与本 crate CLI；无 cls.onnx 自动跳过）；
+    且 **false 现在真跳过 cls 阶段**（原来只把阈值设无穷大——cls 照
+    加载照推理，白付时间与内存）
+  - `PipelineConfig` 从 facade 导出（`engine.config()` 的返回类型可命名）
+  - `Engine` 手写 `Debug`（摘要式，支持 `expect_err` 等错误处理路径）
+  - **字典/模型错配硬校验**：rec 输出类别数 ≠ 字符表长度时首次 run 报
+    `Err`（原注释承诺过未实现；错字典曾静默整表错位——`ctc_decode`
+    越界静默跳过）。删行字典实测拦截
+  - 验证 example：`api_verify`（`--features serde`，七项断言全过）
 - fix(api): SHA 校验失败从 `panic!` 改为 `Err(Error::Model)`——库不该替
   宿主应用决定崩掉（外部评估者实测报告；模型损坏/调包是数据问题，
   应用层要能接住并引导用户）。提示文案不变（期望/实际值 + 跳过校验
