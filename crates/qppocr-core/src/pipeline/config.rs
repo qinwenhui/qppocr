@@ -3,6 +3,7 @@
 
 /// 流水线配置（对应 C++ `OcrConfig` + tuning.hpp 默认值）。
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PipelineConfig {
     // ---- 检测 ----
     /// 检测输入长边上限，0 = 不限。

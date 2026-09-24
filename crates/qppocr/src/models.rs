@@ -4,6 +4,8 @@ use crate::sha256::sha256;
 
 /// 模型档位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Tier {
     /// 最快。det 1.8 MB + rec 4.5 MB。
     Tiny,
