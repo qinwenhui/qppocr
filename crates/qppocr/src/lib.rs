@@ -55,7 +55,11 @@ mod sha256;
 pub use qppocr_core::Error as CoreError;
 pub use qppocr_core::pipeline::{Dictionary, OcrResult, TextLine, Timings};
 
-pub use image::{Image, decode_bytes, decode_file, probe_dimensions, rgb_from_bytes};
+pub use image::{Image, rgb_from_bytes};
+// 解码 trio 只在 image-decode feature 下存在——不门控这行时，
+// default-features=false 的下游整个 crate 编不过（外部用户实测报告）
+#[cfg(feature = "image-decode")]
+pub use image::{decode_bytes, decode_file, probe_dimensions};
 
 /// 引擎线程池的总线程数（含主线程；`parallel` feature 关闭时为 1）。
 /// 多进程批量部署按它折算每进程线程数（`thread_count / 进程数`）。
