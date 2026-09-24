@@ -5,7 +5,7 @@ use crate::par;
 
 /// 全局平均池化：`[N,C,H,W] -> [N,C,1,1]`。
 ///
-/// 累加用 **f64**（C++ 同款）：长归约在 f32 下会吃掉精度，test_ops 的
+/// 累加用 **f64**：长归约在 f32 下会吃掉精度，参考实现的
 /// 1e-5 相对容差过不去。返回长度 N*C 的输出。
 pub fn global_avg_pool(x: &[f32], n: usize, c: usize, out: &mut F32Buf) {
     let plane = usize::checked_div(x.len(), n * c).unwrap_or(0);

@@ -1,4 +1,4 @@
-//! 广播二元算子：`ops.cpp` elementwise 部分的移植。
+//! 广播二元算子：设计文档 elementwise 部分。
 //!
 //! numpy 风格广播，`y = a op b`。五条路径（`binary_op` 的）：
 //!
@@ -15,12 +15,12 @@
 //! 稠密 run 才救回来）。
 //!
 //! 位级说明：每条路径对每个元素恰好按同样顺序结合一次，路径间逐位一致
-//! （C++ 注释原话「bit-identical」的前提）。
+//! （原注释「bit-identical」的前提）。
 
 use crate::buf::F32Buf;
 use crate::par;
 
-/// 二元算子种类（对应 C++ 的 op 码 0..4）。
+/// 二元算子种类（对应 基准的 op 码 0..4）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     /// 加。
@@ -37,7 +37,7 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    /// C++ 的 op 码（0..4 = + - * / pow）；向量路径用。
+    /// 基准的 op 码（0..4 = + - * / pow）；向量路径用。
     #[inline]
     pub fn code(self) -> u8 {
         match self {
@@ -69,7 +69,7 @@ impl BinOp {
 /// 广播元数据：shape 与两侧步长，全部按**反转序**存（下标 0 = 最快变化维）。
 struct BroadcastMeta {
     shape: Vec<i64>,
-    /// 就地路径只读 `strb`；`binary_op` 自算两侧步长（与 C++ 一致）。
+    /// 就地路径只读 `strb`；`binary_op` 自算两侧步长（与基准一致）。
     #[allow(dead_code)]
     stra: Vec<i64>,
     strb: Vec<i64>,
@@ -176,7 +176,7 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
     }
     if k == 0 {
         // b 沿最内维变化且不稠密：没有可向量化的 run，纯逐元素走 b 的步长。
-        // （C++ 这里也是串行。）
+        // （ 这里也是串行。）
         let mut idx = vec![0i64; r];
         let mut ib: i64 = 0;
         for lin in 0..total {
@@ -206,7 +206,7 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
     let kern = |o0: usize, o1: usize| {
         let mut idx = vec![0i64; no.max(1)];
         let mut ib: i64 = 0;
-        // 把 odometer 推进到 o0（C++ 原样：每块从 0 起推）
+        // 把 odometer 推进到 o0（ 原样：每块从 0 起推）
         for _ in 0..o0 {
             for i in 0..no {
                 let di = k + i;
@@ -477,7 +477,7 @@ pub fn binary_op(
     let scalar_kernel = |b0: usize, e0: usize| {
         let mut idx = vec![0i64; r];
         let (mut ia, mut ib): (i64, i64) = (0, 0);
-        // 推进 odometer 到 b0（C++ 原样：从 0 起推，每块一次）
+        // 推进 odometer 到 b0（ 原样：从 0 起推，每块一次）
         for _ in 0..b0 {
             for i in 0..r {
                 idx[i] += 1;

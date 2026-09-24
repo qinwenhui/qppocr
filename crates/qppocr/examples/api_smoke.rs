@@ -4,7 +4,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let engine = qppocr::Engine::new(qppocr::Tier::Tiny, "models/")?;
     println!("load: {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
     let t0 = std::time::Instant::now();
-    let out = engine.run_image_file("D:/qinwh/code/myself/ocr-demo/testdata/mixed.png")?;
+    let img = std::env::args()
+        .nth(1)
+        .expect("用法: api_smoke <图片路径>")
+        .parse::<std::path::PathBuf>()
+        .unwrap();
+    let out = engine.run_image_file(img)?;
     println!("run: {:.0}ms", t0.elapsed().as_secs_f64() * 1000.0);
     for line in &out.lines {
         println!("{:.2}\t{}", line.confidence, line.text);

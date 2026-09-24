@@ -1,6 +1,6 @@
 //! `qppocr` —— 纯 Rust、手写内核的 PP-OCRv6 推理引擎。
 //!
-//! 不依赖 ONNX Runtime、不依赖 tract、不依赖任何 C/C++ 库：ONNX 解析、
+//! 不依赖 ONNX Runtime、不依赖 tract、不依赖任何 C/ 库：ONNX 解析、
 //! 图优化、算子、调度、检测/方向/识别流水线、后处理，全部自己实现。
 //!
 //! # 上手（三行）

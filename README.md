@@ -1,55 +1,105 @@
 # qppocr
 
-**纯 Rust 的手写内核 PP-OCRv6 推理引擎。** 不依赖 ONNX Runtime、不依赖 tract、
-不依赖任何 C/C++ 库——ONNX 解析、图优化、算子、调度、检测/方向/识别流水线、
-后处理，全部是自己实现的。
-
-> 🚧 **状态：设计中。** 本文档描述的是目标形态，代码尚未开始。
-> 完整设计与开发文档见 [`docs/DESIGN.md`](docs/DESIGN.md)。
-
-## 为什么
-
-通用的推理框架给你通用性，代价是你用不到的那部分。`qppocr` 只做一件事：
-**把 PP-OCRv6 跑到这台机器能给的最快、最准。**
-
-上游模型默认的检测二值化阈值是 0.5，我们测出 0.2 更好（exact 91.31% → 91.99%）。
-识别画布高度 48 在 32/40/48/56/64 里是个尖峰（87.16/91.02/**93.05**/90.06/84.65%）。
-这类结论有几百条，全部沉淀在默认值里——**`cargo add qppocr` 之后不配任何东西，
-拿到的就是我们能给出的最好结果。**
-
-## 设计要点
-
-- **引擎与 UI 无关。** 核心 API 是「一张图进、一个结果出」。批量、切片、多进程、
-  GUI 都是上层的事。
-- **`unsafe` 只有一个 crate。** `qppocr-kernels` 之外的每一行都编译期安全。
-- **默认值就是最优值**，外加一组命名预设（`Speed` / `Balanced` / `Accuracy`）。
-- **配置三档分层**：公开配置有 semver 承诺，调参常数在 `Advanced` 里明确不承诺。
-- **三档模型**：tiny / small / medium。
-
-## 计划中的 API
+**纯 Rust、手写内核的 PP-OCRv6 推理引擎。** 不依赖 ONNX Runtime、不依赖
+tract、不依赖任何原生库——ONNX 解析、图优化、算子（AVX2/NEON SIMD）、
+并行调度、检测/方向分类/识别流水线、后处理，全部自己实现，零 FFI。
 
 ```rust
-use qppocr::{Engine, Tier, Image};
+use qppocr::{Engine, Tier};
 
 let engine = Engine::new(Tier::Small, "models/")?;
-let out = engine.run(&Image::open("receipt.png")?)?;
-
-for line in &out.lines {
-    println!("{:.2}  {}", line.confidence, line.text);
+let result = engine.run_image_file("receipt.png")?;   // PNG/JPEG
+for line in &result.lines {
+    println!("[{:.2}] {}  @ {:?}", line.confidence, line.text, line.pts);
+    for ch in &line.chars { /* 逐字坐标（原图空间） */ }
 }
 ```
 
+## 为什么是它
+
+通用推理框架给你通用性，代价是你用不到的那部分。现有 Rust 方案多绑定
+ONNX Runtime（一个 C 库：跨平台部署带工具链、有 CVE 跟随、行为随版本
+漂移）。`qppocr` 只做一件事：**把 PP-OCRv6 上游官方模型跑到这台机器
+能给的最快、最准**——为此我们手写了全部内核。
+
+- **默认值就是最优值。** 上游检测阈值 0.5，我们实测 0.2 更好
+  （exact 91.31% → 91.99%）；识别画布高 48 在 32/40/48/56/64 里是尖峰
+  （87.16/91.02/**93.05**/90.06/84.65%）。这类结论有几百条，全部沉淀在
+  默认值里——`cargo add qppocr` 之后不配任何东西，拿到的就是我们能给出
+  的最好结果。
+- **逐字坐标。** `TextLine::chars` 每个字符一个原图坐标四边形（含空格
+  的真实空白区间），来自 CTC 时间步对齐，性能损耗 ≈ 0。
+- **并发安全。** `Engine` 是 `Send + Sync`，多线程共享一个实例并发
+  `run` 是官方支持的用法。
+- **透明计时。** 每次结果自带九项分阶段毫秒（det/cls/rec 的前后向与
+  后处理）——慢在哪一段，数据说话。
+- **配置三档分层**：`Preset`（Speed/Balanced/Accuracy，整段基准验证）
+  → `Config`（有 semver 承诺的公开项）→ `Advanced`（29 项调参常数，
+  明确不承诺稳定）。
+- **`unsafe` 只有一个 crate**（`qppocr-kernels`），其余每行编译期安全；
+  内核 crate 零第三方依赖。
+
 ## 模型
 
-**本仓库不包含模型文件。** PP-OCRv6 的权重来自
-[PaddlePaddle](https://github.com/PaddlePaddle/PaddleOCR)（Apache-2.0），
-请自行获取，见 [`NOTICE`](NOTICE)。
+仓库不含权重（上游 Apache-2.0，体积原因）。从 HuggingFace 组织
+`PaddlePaddle` 下载（文件一律叫 `inference.onnx`），按此布局摆放：
 
-## 许可
+```
+models/
+├── tiny/   det.onnx + rec.onnx     # 档位目录名 = Tier::dir_name()
+├── small/  det.onnx + rec.onnx
+├── cls.onnx                        # 可选：0/180 方向分类（三档共用）
+└── dict.txt                        # 字典（上游 rec 不带内嵌字典，实际必需）
+```
 
-MIT OR Apache-2.0 双许可，任选其一。见 [`LICENSE-MIT`](LICENSE-MIT) 与
-[`LICENSE-APACHE`](LICENSE-APACHE)。
+具体仓库名与 SHA-256 清单见 `docs/DESIGN.md` 附录 D。**装载时默认做
+SHA-256 校验**（防下载损坏与调包；自备重导出模型用
+`EngineBuilder::verify_sha256(false)`）。字典查找顺序：
+`{tier}/dict.txt` → `dict.txt` → `ppocr_keys.txt` → rec 内嵌。
 
----
+## 性能（16 逻辑核桌面机实测，多轮交错取中位）
 
-作者：qinwh · <https://github.com/qinwenhui/>
+| | tiny | small |
+|---|---|---|
+| 单图端到端（7 图语料） | ~80 ms | ~200 ms |
+| 100 图批量（CLI `--workers` 8 进程扇出） | 5.9 s | — |
+| 100 图批量（API 共享引擎 2 worker） | — | 18 s |
+| 进程内存峰值 | 114~128 MB | 181~191 MB |
+
+准确率在内部多语料 + 100 图独立合成数据集上复核（判据：行级精确
+匹配与 CER），tiny 与 small 档文本输出逐字符稳定。
+
+## CLI
+
+```bash
+cargo install --path crates/qppocr-cli   # 或直接 cargo run -p qppocr-cli
+qppocr img.png --tier small --json        # 单图
+qppocr *.jpg --workers 8                  # 批量：进程扇出，自动分图
+```
+
+## 已知限制（如实）
+
+- `medium` 档**未跑过精度基准**（能跑通，单图约 1.7 s）；预设值系从
+  small 照搬，无独立依据。
+- 位级输出依赖线程数（gemm 分轴规则）：同一图在不同 `--threads` 下
+  约 1/100 概率出现 ≤1 ulp 级的 box 微差（聚合指标不变）。同会话固定
+  线程数即稳定。
+- `Advanced` 的 29 项常数**无稳定性承诺**，小版本可能变。
+- WASM/嵌入式：`--no-default-features` 单线程构建可用；七组 feature
+  组合在 CI 矩阵内。
+
+## 文档与示例
+
+- 设计文档：`docs/DESIGN.md`（架构、API 语义与调参谱系）
+- 可运行示例（`crates/qppocr/examples/`）：`api_smoke`（三行上手）、
+  `api_verify`（serde/并发语义断言）、`char_boxes`（逐字坐标几何验证）、
+  `retry_flags`（区域重试标记）、`phase_breakdown`（分阶段计时）
+
+## License
+
+MIT OR Apache-2.0（下游任选其一遵守即可）。模型权重归 PaddleOCR 上游
+（Apache-2.0），见 `NOTICE`。
+
+## 作者
+
+qinwh · [GitHub](https://github.com/qinwenhui) · [博客](http://qinwh.cn)

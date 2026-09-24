@@ -147,7 +147,7 @@ impl Payload {
     }
 }
 
-/// slice 的区间解析（负索引、步长、钳位），镜像 C++ `slice_range`。
+/// slice 的区间解析（负索引、步长、钳位），镜像  `slice_range`。
 fn slice_range(start: i64, end: i64, step: i64, n: i64) -> (i64, i64) {
     let mut start = start;
     let mut end = end;
@@ -516,7 +516,7 @@ pub fn reduce_mean(
         let a = if a < 0 { a + r as i64 } else { a } as usize;
         red[a] = true;
     }
-    // 连续归约段拆成 outer / mid / inner（f64 累加与 C++ 一致）
+    // 连续归约段拆成 outer / mid / inner（f64 累加与基准一致）
     let (mut outer, mut mid, mut inner) = (1i64, 1i64, 1i64);
     let mut state = 0;
     for (i, &is_red) in red.iter().enumerate() {
@@ -678,7 +678,7 @@ pub fn matmul(
                 let av = arow[kk];
                 let braw = &bp[kk * n as usize..];
                 for (cj, cv) in crow.iter_mut().enumerate() {
-                    // fma：C++ 的 `C[n] += av*b` 在 -ffp-contract 下即此形态
+                    // fma：基准的 `C[n] += av*b` 在 -ffp-contract 下即此形态
                     *cv = av.mul_add(braw[cj], *cv);
                 }
             }
@@ -689,7 +689,7 @@ pub fn matmul(
 
 /// BatchNormalization（推断语义：scale/var 作用于通道维）。
 /// 一般会在图优化里折进 Conv；这里处理未折的情形。
-#[allow(clippy::too_many_arguments)] // C++ ops.hpp 签名镜像
+#[allow(clippy::too_many_arguments)] //  ops.hpp 签名镜像
 pub fn batchnorm(
     x: &[f32],
     x_shape: &[i64],

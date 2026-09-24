@@ -1,6 +1,6 @@
-//! AVX2 + FMA 内核：`ops.cpp` SIMD 部分的移植。
+//! AVX2 + FMA 内核：设计文档 SIMD 部分。
 //!
-//! 微内核逐句镜像 C++ 的结构——循环顺序、分块、寄存器分配意图。**不要**
+//! 微内核逐句镜像 基准的结构——循环顺序、分块、寄存器分配意图。**不要**
 //! 改写成更 Rust 的形式：这些内核的性能靠裸指针 + 精确的寄存器分配拿到
 //! （DESIGN.md §3.2），`#[target_feature]` 函数内的指针运算不越界由
 //! 分发层的形状校验保证。
@@ -11,7 +11,7 @@
 
 #![allow(clippy::missing_safety_doc)] // 见模块注释：安全性由分发层契约承担
 #![allow(clippy::approx_constant)]
-// 系数照抄 C++ 字面值：位级一致的要求
+// 系数照抄  字面值：位级一致的要求
 // 本模块全部是 #[target_feature] unsafe 内核，前置条件由各函数的
 // `# Safety` 段声明、由分发层保证；函数体内不再逐操作包 unsafe。
 #![allow(unsafe_op_in_unsafe_fn)]
@@ -22,7 +22,7 @@ use std::arch::x86_64::*;
 
 /// exp 的 8-lane 版：range-reduce 到 k·ln2 + r，r 上多项式，按 2^k 缩放。
 ///
-/// 系数与运算顺序与 C++ `exp256_ps` 逐字相同（含 ln2 两段拆分的固有
+/// 系数与运算顺序固定（含 ln2 两段拆分的固有
 /// 误差——见 `scalar::exp1` 的注释，照抄不改）。
 #[inline]
 #[target_feature(enable = "avx2,fma")]
@@ -40,7 +40,7 @@ pub unsafe fn exp256_ps(x: __m256) -> __m256 {
     // ★ GCC -ffp-contract=fast 把源码里的 sub(x, mul(kf,·)) 两处都收缩成
     // vfnmadd（汇编实证：vroundps 后跟两条 vfnmadd231ps）。源码形态
     // `_mm256_sub_ps(x, _mm256_mul_ps(...))` 在 GCC 下**不是**分立指令——
-    // 逐位对齐 C++ 必须显式 fnmadd。
+    // 逐位对齐  必须显式 fnmadd。
     let r = _mm256_fnmadd_ps(kf, ln2_hi, x);
     let r = _mm256_fnmadd_ps(kf, ln2_lo, r);
     let mut p = _mm256_set1_ps(1.0 / 720.0);
@@ -60,7 +60,7 @@ pub unsafe fn exp256_ps(x: __m256) -> __m256 {
 /// 取 |x| 算、末尾还原符号。
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-#[allow(clippy::excessive_precision)] // C++ 原字面值照抄
+#[allow(clippy::excessive_precision)] //  原字面值照抄
 pub unsafe fn erf256_ps(x: __m256) -> __m256 {
     let one = _mm256_set1_ps(1.0);
     let ax = _mm256_andnot_ps(_mm256_set1_ps(-0.0), x);
@@ -112,7 +112,7 @@ pub unsafe fn hmax256_ps(v: __m256) -> f32 {
 ///
 /// 4 行 × 4 向量、k 内层 broadcast+FMA（16 路独立 FMA 打满流水线）。
 /// 尾部面板只加载实际拥有的向量——在 B 的行尾读满 32 个 float 会越页
-/// 段错误（C++ 注释原话：间歇性地）。非整面板经 `t[32]` 暂存再拷 nn 列。
+/// 段错误（原注释：间歇性地）。非整面板经 `t[32]` 暂存再拷 nn 列。
 ///
 /// # Safety
 ///
@@ -239,7 +239,7 @@ pub unsafe fn sgemm_panel_avx2(
             m0 += 4;
         }
         // M%4 尾行：整面板走 1-row 向量内核；非整面板走标量（bias 起种，
-        // C++ 位级语义）。标量路径与 crate::gemm 的 panel_body 相同。
+        //  位级语义）。标量路径与 crate::gemm 的 panel_body 相同。
         for row in m0..m {
             let cp = c.add(row * ldc + n0);
             let bv = if has_bias { *bias.add(row) } else { 0.0 };
@@ -277,7 +277,7 @@ pub unsafe fn sgemm_panel_avx2(
                 _mm256_storeu_ps(cp.add(16), c2);
                 _mm256_storeu_ps(cp.add(24), c3);
             } else {
-                // 非整面板尾行：C++ 在 AVX2 构建里这段本来就是标量
+                // 非整面板尾行： 在 AVX2 构建里这段本来就是标量
                 // （bias 起种 + GCC 收缩的 FMA）。逐位语义两边共用。
                 return_to_scalar_tail(a, b, c, m, n, k, ldc, bias, p, row);
             }
@@ -287,7 +287,7 @@ pub unsafe fn sgemm_panel_avx2(
 
 /// 非整面板的 M%4 尾行回退：直接执行标量逻辑（bias 起种）。
 ///
-/// C++ 在 AVX2 构建里这段本来就是标量循环（GCC 收缩成 FMA），Rust 版
+///  在 AVX2 构建里这段本来就是标量循环（GCC 收缩成 FMA），Rust 版
 /// 把它放在 `gemm.rs::panel_tail_scalar` 里两边共用。
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
@@ -374,7 +374,7 @@ pub unsafe fn sgemm_mrows_avx2(
             _mm256_storeu_ps(cp.add(n_idx + 24), c3);
             n_idx += 32;
         }
-        // N%32 尾列：bias 起种的标量链（C++ 位级语义，与标量版共用）
+        // N%32 尾列：bias 起种的标量链（ 位级语义，与标量版共用）
         for j in n32..n {
             let mut sv = bv;
             for kk in 0..k {
@@ -535,7 +535,7 @@ pub unsafe fn binary_flat_inplace_vec(dst: *mut f32, src: *const f32, b: usize, 
 
 /// run 路径：`dst[j] op= cv`（b 侧常量广播）或 `dst[j] op= bsrc[j]`
 ///（b 侧稠密）。a_const=false 时为就地版（dst 是 a）。
-#[allow(clippy::too_many_arguments)] // 内核入参镜像 C++
+#[allow(clippy::too_many_arguments)] // 内核入参镜像
 #[target_feature(enable = "avx2")]
 pub unsafe fn binary_run_inplace_vec(
     dst: *mut f32,
@@ -724,7 +724,7 @@ pub unsafe fn pool2x2_row_vec(
 
 // ================================================================ 二元（分配路径）
 
-/// 同形平坦：`y[i] = a[i] op b[i]`（写新缓冲，非 inplace）。op 码同 C++。
+/// 同形平坦：`y[i] = a[i] op b[i]`（写新缓冲，非 inplace）。op 码同 。
 #[target_feature(enable = "avx2")]
 pub unsafe fn binary_flat_vec(
     pa: *const f32,
@@ -803,7 +803,7 @@ pub unsafe fn binary_scalar_vec(
 }
 
 /// run 路径：`y[o*runlen + j] = op(a值, b[j] 或 cv)`。b 稠密时 bsrc，否则 cv 广播。
-#[allow(clippy::too_many_arguments)] // 内核入参镜像 C++
+#[allow(clippy::too_many_arguments)] // 内核入参镜像
 #[target_feature(enable = "avx2")]
 pub unsafe fn binary_run_alloc_vec(
     py: *mut f32,
@@ -859,7 +859,7 @@ pub unsafe fn binary_run_alloc_vec(
 
 /// resize_bilinear 的行内积向量化：8 个输出列一批。
 /// `ix0/ix1/fx` 是预计算的源列映射（每输出列一对），`r0/r1` 是上下两行。
-/// 权重结合顺序与 C++ 一致（首项两乘，其余 fma）。
+/// 权重结合顺序与基准一致（首项两乘，其余 fma）。
 #[allow(clippy::too_many_arguments)] // 内核入参：两行 + 三张映射表 + 权重 + 目标 + 范围
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn bilinear_row_vec(

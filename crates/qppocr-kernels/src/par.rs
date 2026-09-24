@@ -1,15 +1,15 @@
 //! 并行调度与 fork 阈值。
 //!
-//! C++ 参考实现自带一套 fork-join 线程池（`util.hpp` 的 `ThreadPool`，
-//! Windows 上用信号量唤醒、主线程参与、join 自旋）。Rust 版是它的直接移植
-//! （[`crate::pool`]）——多线程扩展从 rayon 的 1.86x 追到 C++ 池的 2.07x
-//! 靠的就是这套语义，不是内核本身。嵌套 `parallel_for` 与 C++ 一样是
+//! 基准实现自带一套 fork-join 线程池（设计文档 的 `ThreadPool`，
+//! Windows 上用信号量唤醒、主线程参与、join 自旋）。Rust 版实现同一套语义
+//! （[`crate::pool`]）——多线程扩展从 rayon 的 1.86x 追到  池的 2.07x
+//! 靠的就是这套语义，不是内核本身。嵌套 `parallel_for` 与 基准一样是
 //! 死锁；`sgemm_serial` / 串行 im2col 这些「调用方已在并行区」的串行
 //! 路径因此是硬性的（它们还有位级一致的作用，见 `gemm.rs`）。
 //!
 //! ## 阈值照搬，不重调
 //!
-//! 这些门控来自 `tuning.hpp`，每一条都是量出来的（不是拍脑袋）：
+//! 这些门控来自 调参基准，每一条都是量出来的（不是拍脑袋）：
 //!
 //! - `fork_min_macs = 4e6`：fork 一次约 97 us（16 线程，`tools/fork_bench.cpp`），
 //!   低于 ~4M MAC 的算子并行收益盖不过 fork 本身。rec 的 depthwise conv 曾经
@@ -18,22 +18,22 @@
 //! - `elem_fork_min_bytes = 1<<20`：纯搬运算子的字节门槛——单线程 memcpy 约
 //!   12 GB/s，1 MB ≈ 一次 fork 的工作量。
 //!
-//! 池就是 C++ 那个池（`crate::pool`），fork 成本同量级，这些门两边一致。
+//! 池就是  那个池（`crate::pool`），fork 成本同量级，这些门两边一致。
 //!
 //! ## FTZ/DAZ
 //!
 //! x86 的 FMA 单元在非正规数上严重降速（实测 19 倍），推理中间量很容易踩中。
 //! [`enable_flush_denormals`] 必须在**任何 worker 线程诞生之前**于主线程调用
-//! ——MXCSR 是每线程的，子线程继承创建者的标志位。C++ 在 `ThreadPool`
+//! ——MXCSR 是每线程的，子线程继承创建者的标志位。 在 `ThreadPool`
 //! 构造函数里做同样的事。
 
-/// 每线程任务块数的乘子（= `tuning.hpp` `tp_chunks`，语义随 `crate::pool`
-/// 的移植回归 C++：原子领票的动态负载均衡，不是 rayon 的静态微任务）。
-/// C++ rotated 实测 4/8/16/32 在噪声内，**1 是离群值**（16 线程 -8%）。
+/// 每线程任务块数的乘子（= 调参基准 `tp_chunks`，语义随 `crate::pool`
+/// ：原子领票的动态负载均衡，不是 rayon 的静态微任务）。
+///  rotated 实测 4/8/16/32 在噪声内，**1 是离群值**（16 线程 -8%）。
 #[cfg(feature = "parallel")]
 const TP_CHUNKS: usize = 8;
 
-/// 并行门槛，照搬 `tuning.hpp`。
+/// 并行门槛，照搬 调参基准。
 #[derive(Clone, Copy, Debug)]
 pub struct Thresholds {
     /// 低于这么多 MAC 的算子不并行（`fork_min_macs`）。
@@ -84,18 +84,18 @@ pub fn threads() -> usize {
 }
 
 /// 池的总线程数（含主线程）。CLI 的批量 `--workers` 按它折算每进程
-/// 线程数（`pool / worker 数`），对齐 C++ `threads_each`。
+/// 线程数（`pool / worker 数`），对齐  `threads_each`。
 #[cfg(feature = "parallel")]
 pub fn pool_thread_count() -> usize {
     crate::pool::thread_count()
 }
 
 /// 请求池的线程数（含主线程，0 = 自动）。必须在**第一次并行算子**之前
-/// 调用——池在首用时定容，之后请求不再生效（C++ `ThreadPool::get` 的
+/// 调用——池在首用时定容，之后请求不再生效（ `ThreadPool::get` 的
 /// 「最早调用者定容」语义）。显式数字不设 16 上限。
 ///
-/// 环境变量 `QPPOCR_THREADS` 等价（优先级低于本函数；对标 C++ 的
-/// `LEAN_THREADS`）。
+/// 环境变量 `QPPOCR_THREADS` 等价（优先级低于本函数；对标 基准的
+/// `QPPOCR_THREADS`）。
 #[cfg(feature = "parallel")]
 pub fn set_threads(n: usize) {
     crate::pool::request_threads(n);
@@ -104,7 +104,7 @@ pub fn set_threads(n: usize) {
 /// 在 x86 上打开 FTZ/DAZ（刷新非正规数）。
 ///
 /// 必须在 worker 线程诞生前于主线程调用；`qppocr-core` 在引擎构造时做这件事。
-/// 这是与 C++ 参考实现**逐位一致**的前提之一：FTZ 改变非正规数结果的位模式。
+/// 这是与 基准实现**逐位一致**的前提之一：FTZ 改变非正规数结果的位模式。
 ///
 /// （`_mm_getcsr`/`_mm_setcsr` 内联函数已被 std 标记 deprecated，这里按其
 /// 建议改用内联汇编——语义就是 STMXCSR / LDMXCSR 两条指令。）
@@ -127,10 +127,10 @@ pub fn enable_flush_denormals() {
 
 /// fork-join 的 `fn(begin, end)` over `[0, n)`，主线程参与。
 ///
-/// `min_grain`：n 低于它就不 fork，直接串行跑（对齐 C++ `parallel_for`
+/// `min_grain`：n 低于它就不 fork，直接串行跑（对齐  `parallel_for`
 /// 的默认 grain 256；单元本身就是重活的调用方传 1）。
 ///
-/// 与 C++ 版一样**不保证**负载均衡的最优切分，只保证覆盖：每个 `begin..end`
+/// **不保证**负载均衡的最优切分，只保证覆盖：每个 `begin..end`
 /// 恰好执行一次，联合覆盖 `[0, n)`。输出不依赖切分（每个元素的累加顺序固定）。
 pub fn parallel_for<F>(n: usize, min_grain: usize, f: F)
 where
@@ -167,7 +167,7 @@ where
 
 /// 单元本身就是重活的 fork-join（整通道平面、整输出行、GEMM 面板）。
 ///
-/// C++ 里这是 `parallel_for_units`：默认 256 的 grain 是按**元素数**标定的，
+/// 设计里这是 `parallel_for_units`：默认 256 的 grain 是按**元素数**标定的，
 /// 会把 v6 的 N*C（16..320）判成「不值得并行」，让 pool2d/resize/GAP
 /// 单核跑完全场。
 pub fn parallel_for_units<F>(n: usize, f: F)
@@ -183,7 +183,7 @@ where
     parallel_for(n, 2, f);
 }
 
-/// 与 C++ `parallel_for_elems` 对应：`units` 是工作单元数（决定切分），
+/// 与 `parallel_for_elems` 对应：`units` 是工作单元数（决定切分），
 /// `elems` 是真实搬运量（决定**要不要** fork）。
 ///
 /// 两者必须分开：广播路径的单元数远小于元素数（batchnorm 的单元是通道平面，

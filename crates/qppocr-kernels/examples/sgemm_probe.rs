@@ -1,4 +1,4 @@
-//! 对拍探针：读 C++ 侧 dump 的 A/B/bias，跑本 crate 的 sgemm，写 C。
+//! 对拍探针：读  侧 dump 的 A/B/bias，跑本 crate 的 sgemm，写 C。
 //! 用法：`sgemm_probe M N K`（数据文件在当前目录）。
 
 use qppocr_kernels::activation::Activation;

@@ -1,6 +1,6 @@
-//! `qppocr` 参考命令行（对应 C++ 参考实现的 `main.cpp`）。
+//! `qppocr` 参考命令行（对应 基准实现的 设计文档）。
 //!
-//! 批量多图走**进程内 worker 线程共享一个引擎**：C++ 的多进程 worker 池
+//! 批量多图走**进程内 worker 线程共享一个引擎**：基准的多进程 worker 池
 //! （`proc_pool.hpp`）是被迫的——它的 `ThreadPool` 并发 `parallel_for`
 //! 会挂死；我们的池用 `fork_mu` 把并发 fork 串行化（`pool.rs` 模块注释），
 //! 同进程并发 `run` 是安全的，还省下 W 份权重内存与全部 IPC。
@@ -16,7 +16,7 @@ struct Options {
     tier: Tier,
     preset: Preset,
     threads: usize,
-    /// 批量并发 worker 数，0 = 自动（对齐 C++ `--workers`）。
+    /// 批量并发 worker 数，0 = 自动（对齐  `--workers`）。
     workers: usize,
     det_only: bool,
     show_boxes: bool,
@@ -163,15 +163,15 @@ fn main() {
     }
 }
 
-/// 批量并发的 worker 数：C++ `auto_workers`（main.cpp）的移植。
+/// 批量并发的 worker 数：按图幅与核数自动定。
 ///
 /// - 显式 `--workers N`：`min(N, 图数)`；
 /// - 自动：头部探测平均面积（按 max_side_len=960 的帽折算——两档默认
 ///   相同）——大图（≥1.5 MP）一张就吃满线程，cap 2；小图 cap 8；
-///   再受核数减半约束（C++ 实测：同 16 线程摊到更多 worker 优于集中）。
+///   再受核数减半约束（ 实测：同 16 线程摊到更多 worker 优于集中）。
 ///
-/// 与 C++ 的差异：**没有按内存收紧**。多进程每个 worker 是整份引擎
-/// （C++ 预算 512 MB/worker）；进程内共享引擎的增量只是图像缓冲 +
+/// 与 基准的差异：**没有按内存收紧**。多进程每个 worker 是整份引擎
+/// （多进程方案预算 512 MB/worker）；进程内共享引擎的增量只是图像缓冲 +
 /// arena（大图几十 MB 级），8 个并发也在单份引擎的量级内。
 fn auto_workers(o: &Options) -> usize {
     if o.images.len() < 2 {
@@ -345,7 +345,7 @@ fn run(o: &Options) -> Result<(), Error> {
             }
         }
     } else {
-        // ---- 并行：W 个子进程各持一份引擎（C++ proc_pool 的静态切分版）。
+        // ---- 并行：W 个子进程各持一份引擎（ proc_pool 的静态切分版）。
         // 为什么不是进程内多线程共享引擎：池的 fork_mu 把并发 fork 串行化，
         // 多图的并行算子排队——串行段可以重叠（实测 100 图 14→7.4 s），
         // 但独立小池才能真并发（实测子进程 5.8 s）。gemm 分轴规则还依赖

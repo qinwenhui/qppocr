@@ -1,8 +1,8 @@
-//! 激活与逐元素数值内核：`ops.cpp` 激活部分的移植。
+//! 激活与逐元素数值内核：设计文档 激活部分。
 //!
 //! # ★ 多项式近似——系数与运算顺序逐字照抄，不要换成 libm
 //!
-//! C++ 用手写的向量多项式（`erf256_ps` / `exp256_ps`），这既影响速度也影响
+//!  用手写的向量多项式（`erf256_ps` / `exp256_ps`），这既影响速度也影响
 //! **数值逐位一致**（DESIGN.md 附录 B）：
 //!
 //! - `erf`：Abramowitz & Stegun 7.1.26，|err| < 1.5e-7，branch-free。
@@ -12,10 +12,10 @@
 //!
 //! 标量版 [`erf1`] / [`exp1`] 是 AVX2 版的**逐 lane 镜像**（同样的
 //! `mul_add` 序列、同样的 round-ties-even），因此标量与 SIMD 逐位一致——
-//! 这是把 scalar 当判据的前提。C++ 的标量尾巴调 libm（`erff`/`exp`），
+//! 这是把 scalar 当判据的前提。基准的标量尾巴调 libm（`erff`/`exp`），
 //! 与其向量版本本来就不逐位一致；我们不沿用那个尾巴。
 //!
-//! ⚠ 已声明的与 C++ 的偏差：仅在 `inner % 8` 的标量尾巴上，C++ 用 libm、
+//! ⚠ 已声明的与 基准的偏差：仅在 `inner % 8` 的标量尾巴上， 用 libm、
 //! 我们用同一多项式，差异 ≤1 ulp。文本级对拍（阶段 3 判据）不受影响；
 //! 若阶段 2 的中间张量对拍在这里翻车，再局部处理。
 
@@ -25,7 +25,7 @@
 /// r = x − k·ln2_hi − k·ln2_lo（两段拆开保精度）→ 7 项多项式（Horner，
 /// mul_add）→ 乘 2^k（指数位直接拼）。
 #[inline]
-#[allow(clippy::approx_constant)] // C++ 字面值照抄：换 std 常数会破坏逐位一致
+#[allow(clippy::approx_constant)] //  字面值照抄：换 std 常数会破坏逐位一致
 pub fn exp1(x: f32) -> f32 {
     const LN2_HI: f32 = 0.693_147_2;
     const LN2_LO: f32 = -2.980_232_2e-8;
@@ -50,7 +50,7 @@ pub fn exp1(x: f32) -> f32 {
 /// `erf(x)`：`erf256_ps` 的标量镜像（f32），A&S 7.1.26。
 #[inline]
 #[allow(clippy::approx_constant)] // 同上：0.3275911 等系数是 A&S 7.1.26 原文
-#[allow(clippy::excessive_precision)] // C++ 原字面值照抄：f32 舍入位级锁定
+#[allow(clippy::excessive_precision)] //  原字面值照抄：f32 舍入位级锁定
 pub fn erf1(x: f32) -> f32 {
     let ax = f32::from_bits(x.to_bits() & 0x7fff_ffff); // andnot(-0.0)
     let t = 1.0f32 / 0.327_591_1f32.mul_add(ax, 1.0);
@@ -66,7 +66,7 @@ pub fn erf1(x: f32) -> f32 {
     f32::from_bits(r.to_bits() | (x.to_bits() & 0x8000_0000)) // 还原符号
 }
 
-/// 内核可以折进自己输出的激活（对应 C++ 的 `Activation`，
+/// 内核可以折进自己输出的激活（对应 基准的 `Activation`，
 /// 让图优化能删掉紧随其后的激活节点）。
 ///
 /// 它作用在**已写出的输出**上，不是累加器上——变换累加器会把 erf 的除法和
@@ -94,7 +94,7 @@ pub enum ActKind {
 }
 
 impl Default for Activation {
-    #![allow(clippy::approx_constant)] // C++ ops.hpp 的默认值照抄
+    #![allow(clippy::approx_constant)] //  ops.hpp 的默认值照抄
     fn default() -> Self {
         Self {
             kind: ActKind::None,
@@ -132,7 +132,7 @@ pub fn apply_act(p: &mut [f32], act: &Activation) {
     gelu_inplace(p, act.c1, act.c2, act.c3);
 }
 
-/// `y = max(0, x)`，就地。`v > 0 ? v : 0` 的写法保留 C++ 的 NaN→0 语义。
+/// `y = max(0, x)`，就地。`v > 0 ? v : 0` 的写法保留 基准的 NaN→0 语义。
 pub fn relu_inplace(t: &mut [f32]) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
@@ -184,7 +184,7 @@ pub fn hardsigmoid(x: &[f32], alpha: f32, beta: f32, y: &mut [f32]) {
 
 /// `y = 1 / (1 + exp(-x))`（整张量，拷贝语义）。
 ///
-/// det 的 sigmoid 面是 1x1x1504x1984（3M 元素）：C++ 标量版逐元素调 libm
+/// det 的 sigmoid 面是 1x1x1504x1984（3M 元素）： 标量版逐元素调 libm
 /// 实测 17 ms，向量版 ~2 ms。
 pub fn sigmoid_tensor(x: &[f32], y: &mut [f32]) {
     assert_eq!(x.len(), y.len(), "sigmoid: size mismatch");
@@ -241,7 +241,7 @@ pub fn erf_inplace(t: &mut [f32]) {
     });
 }
 
-/// `t = clip(t, lo, hi)`，就地。比较写法与 C++ 标量版一致（NaN 穿透）。
+/// `t = clip(t, lo, hi)`，就地。比较写法与标量版一致（NaN 穿透）。
 pub fn clip_inplace(t: &mut [f32], lo: f32, hi: f32) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
@@ -361,7 +361,7 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
                 sum += row[i2];
                 i2 += 1;
             }
-            // 除法拆成乘 1/sum（与 C++ 一致：inv = 1.f/sum 然后逐元素乘）
+            // 除法拆成乘 1/sum（与基准一致：inv = 1.f/sum 然后逐元素乘）
             let inv = 1.0f32 / sum;
             for v in row.iter_mut() {
                 *v *= inv;
@@ -376,7 +376,7 @@ use crate::par;
 ///
 /// 段布局：`seg(m) = t[(o·mid + m)·inner + i]`，m 是归约维。
 /// core 是 `forbid(unsafe_code)` 的，所以这条带裸指针并行路径住在 kernels。
-/// ★ C++ 原版这里用 libm exp；我们用 `exp1`（同一多项式），低 位差异
+/// ★  原版这里用 libm exp；我们用 `exp1`（同一多项式），低 位差异
 /// ≤1 ulp——见模块头「已声明的偏差」。末维 softmax 别走这条，
 /// 用 [`softmax_last_dim`]（有向量内核）。
 pub fn softmax_axis_generic(t: &mut [f32], outer: i64, mid: i64, inner: i64) {
@@ -412,7 +412,7 @@ pub fn softmax_axis_generic(t: &mut [f32], outer: i64, mid: i64, inner: i64) {
         }
     });
 }
-/// `t = sqrt(t)`，就地。IEEE 精确（硬件指令），与 C++ 的 std::sqrt 逐位同。
+/// `t = sqrt(t)`，就地。IEEE 精确（硬件指令），与 基准的 std::sqrt 逐位同。
 /// 放 kernels：core forbid(unsafe)，而并行就地遍历这里需要 SyncPtr。
 pub fn sqrt_inplace(t: &mut [f32]) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
@@ -462,7 +462,7 @@ mod tests {
         // 2. kf·hi 是 f32 乘法，自身半个 ulp 的舍入（kf≈100 时 ~3e-6）——
         //    hi 是满精度 f32，kf·hi 并不精确（Cody-Waite 会选少位数的 hi）；
         // 3. 多项式截断 + Horner 舍入 ~1e-7。
-        // ★ 照抄不改：修掉任何一项都会破坏与 C++ 的逐位一致（DESIGN.md §5.5）。
+        // ★ 照抄不改：修掉任何一项都会破坏与 基准的逐位一致（DESIGN.md §5.5）。
         // 容差按最坏情况设 1e-5。
         let mut x = -80.0f32;
         while x <= 80.0 {
@@ -472,7 +472,7 @@ mod tests {
             assert!(rel < 1e-5, "exp({x}) = {got}, rel {rel}");
             x += 0.07;
         }
-        // 截断边界：与 C++ 相同的 ±88 饱和行为
+        // 截断边界：±88 饱和行为
         assert_eq!(exp1(100.0), exp1(88.0));
         assert_eq!(exp1(-100.0), exp1(-88.0));
         // erf 奇函数与符号还原（位级：erf(-x) 与 -erf(x) 逐位相同）

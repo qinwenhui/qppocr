@@ -88,7 +88,7 @@ fn parse_upstream_models() {
 }
 
 /// rec tiny 前向一遍：固定输入、确定性输出形状 + 基本健全性。
-/// 逐位对拍在 dump 对比测试里做（需要 C++ 侧黄金值）。
+/// 逐位对拍在 dump 对比测试里做（需要  侧黄金值）。
 #[test]
 fn run_rec_tiny_forward() {
     let p = models_dir().join("tiny/rec.onnx");

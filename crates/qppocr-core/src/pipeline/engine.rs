@@ -1,4 +1,4 @@
-//! OCR 引擎（`ocr.cpp` OcrEngine 的移植）：det → cls → rec 主流程。
+//! OCR 引擎（OCR 引擎主流程）：det → cls → rec 主流程。
 //!
 //! ★ 字典是一等输入（DESIGN.md §4.4）：上游 rec 模型不带内嵌字典
 //!（medium 一个元数据都没有），所以 [`Engine::open`] 接受
@@ -85,7 +85,7 @@ pub struct OcrResult {
     pub timings: Timings,
 }
 
-/// 分阶段计时（字段与 C++ JSON 一致，便于两边对数）。
+/// 分阶段计时（字段名即 JSON 导出约定）。
 #[derive(Clone, Copy, Debug, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Timings {
@@ -109,7 +109,7 @@ pub struct Timings {
     pub total_ms: f64,
 }
 
-/// 计时起点（`start.elapsed_ms()` 得毫秒）。字段命名的 `*_ms` 与 C++ 对齐。
+/// 计时起点（`start.elapsed_ms()` 得毫秒）。字段命名的 `*_ms` 与基准对齐。
 trait ElapsedMs {
     fn elapsed_ms(&self) -> f64;
 }
@@ -342,7 +342,7 @@ impl Engine {
         };
         for y in 0..sub.h {
             let src_row = img.row(ry0 + y);
-            // 行内偏移是 rx0*3（C++: img.row(ry0+y) + rx0*3），不是全图平铺
+            // 行内偏移是 rx0*3（: img.row(ry0+y) + rx0*3），不是全图平铺
             let off = (rx0 as usize) * 3;
             let len = (sub.w as usize) * 3;
             let dst_row = &mut sub.data[(y as usize) * len..(y as usize + 1) * len];
@@ -527,8 +527,8 @@ impl Engine {
         if self.cfg.enhance_contrast {
             super::image::auto_levels(&mut work);
         }
-        // ★ 识别器从原图裁（增强后），不从缩过的 work 裁。与 C++ 相同用
-        // 借用（C++ 是 `const Image* crop_src = &img`）——默认路径零拷贝，
+        // ★ 识别器从原图裁（增强后），不从缩过的 work 裁。这里用
+        // 借用（基准是 `const Image* crop_src = &img`）——默认路径零拷贝，
         // 只有开增强才物化整图副本。
         let mut enhanced_full: Image;
         let crop_src: &Image = if self.cfg.enhance_contrast {
@@ -608,7 +608,7 @@ impl Engine {
         // ★ 恒等 resize 跳过：目标尺寸 == work 尺寸时双线性插值是
         // 逐字节拷贝（scale=1、fx=ly=0，位级等价），白付一遍全图插值
         //（864×960 上 ~2ms，落在「未归类」桶里）。短边规则不放大、
-        // 长边帽刚卡住的图经常命中。C++ 无此守卫（ocr.cpp:1529）。
+        // 长边帽刚卡住的图经常命中。 无此守卫。
         let det_img = if nw == work.w && nh == work.h {
             work.clone()
         } else {

@@ -10,7 +10,12 @@ fn main() -> anyhow_lite::Result<()> {
     println!("1 Engine Debug 摘要: {:?}", &engine as &dyn std::fmt::Debug);
 
     // 2) detect_orientation 默认 true：倒置翻正路径可用
-    let r = engine.run_image_file("D:/qinwh/code/myself/ocr-demo/testdata/receipt.png")?;
+    let img: std::path::PathBuf = std::env::args()
+        .nth(1)
+        .expect("用法: api_verify <图片路径>")
+        .parse()
+        .unwrap();
+    let r = engine.run_image_file(&img)?;
     println!(
         "2 默认 detect_orientation=true: cls_ms={:.2} lines={}",
         r.timings.cls_ms,
@@ -49,7 +54,7 @@ fn main() -> anyhow_lite::Result<()> {
         .tier(Tier::Tiny)
         .detect_orientation(false)
         .build("models")?;
-    let r2 = off.run_image_file("D:/qinwh/code/myself/ocr-demo/testdata/receipt.png")?;
+    let r2 = off.run_image_file(&img)?;
     assert_eq!(r2.timings.cls_ms, 0.0);
     assert_eq!(r2.num_flipped, 0);
     println!("7 关方向分类: cls_ms=0, num_flipped=0（阶段真跳过）");

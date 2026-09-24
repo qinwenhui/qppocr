@@ -1,4 +1,4 @@
-//! 图像与基础图像算子（`ocr.cpp` 图像部分的移植）。
+//! 图像与基础图像算子（见 DESIGN.md）。
 //!
 //! 不引 image crate：流水线核心只吃已解码的 RGB 像素（DESIGN.md §4.1，
 //! 解码与推理解耦）。解码是门面（`qppocr` crate）feature 门控的事。
@@ -10,7 +10,7 @@ pub struct Image {
     pub w: i32,
     /// 高（像素）。
     pub h: i32,
-    /// 通道数（恒 3，保留字段以镜像 C++）。
+    /// 通道数（恒 3，保留字段以镜像 ）。
     pub c: i32,
     /// 磁盘上的原始尺寸（解码期间无缩放，当前恒等于 w/h）。
     pub orig_w: i32,
@@ -46,7 +46,7 @@ impl Image {
 }
 
 /// 双线性缩放，半像素中心（cv2.INTER_LINEAR 语义）。u8 进 u8 出，
-/// 结果 `+0.5` 后截断——与 C++ 的 resize_bilinear_img 逐位一致。
+/// 结果 `+0.5` 后截断——与 基准的 resize_bilinear_img 逐位一致。
 pub fn resize_bilinear_img(src: &Image, dw: i32, dh: i32) -> Image {
     let mut dst = Image {
         w: dw,
@@ -96,7 +96,7 @@ pub fn resize_bilinear_img(src: &Image, dw: i32, dh: i32) -> Image {
                 let t = (p01 * lx).mul_add(1.0 - fy, t);
                 let t = (p10 * (1.0 - lx)).mul_add(fy, t);
                 let val = (p11 * lx).mul_add(fy, t);
-                // C++：(uint8_t)min(255, max(0, val + 0.5f))——四舍五入后截断
+                // ：(uint8_t)min(255, max(0, val + 0.5f))——四舍五入后截断
                 out[x as usize * c + ch] = (val + 0.5).clamp(0.0, 255.0) as u8;
             }
         }
@@ -182,7 +182,7 @@ pub fn auto_levels(img: &mut Image) {
         return;
     }
     let clipped = n / 200; // 0.5%
-    // C++ 的 for(v; (acc += hist[v]) < kClipped; ++v) lo = v + 1;
+    // 基准的 for(v; (acc += hist[v]) < kClipped; ++v) lo = v + 1;
     // ——条件处在累加后判断，为真（acc 还小）才更新 lo 并继续
     let mut lo = 0usize;
     let mut acc: u64 = 0;
