@@ -52,12 +52,16 @@ fn pool_survives_panic_and_still_works() {
     });
     assert!(r.is_err(), "panic 必须传回调用方");
 
-    // 池必须毫发无损：紧接着的正常并行要能完成且结果正确（用原子
-    // 计数绕开 FnMut 限制）
+    // 池必须毫发无损：紧接着的正常并行要能完成且结果正确。按**单元**
+    // 计数（不是块调用数——parallel_for 会把 n 个单元合并成
+    // min(线程数×8, n) 个块，块数随机器核数变：本机 16 核恰好全 64，
+    // CI 的 4 核 runner 是 32 块，曾经的按块断言在 CI 必挂）
     use std::sync::atomic::{AtomicUsize, Ordering};
     let hit = AtomicUsize::new(0);
-    par::parallel_for(n, 1, |_b, _e| {
-        hit.fetch_add(1, Ordering::Relaxed);
+    par::parallel_for(n, 1, |b, e| {
+        for _i in b..e {
+            hit.fetch_add(1, Ordering::Relaxed);
+        }
     });
     assert_eq!(hit.load(Ordering::Relaxed), n, "panic 后池必须继续正确工作");
 }
