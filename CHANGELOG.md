@@ -59,6 +59,10 @@
 - 诊断工具：`QPPOCR_DUMP_DIR` 按会话分文件、`QPPOCR_SAVE_CROPS`
   落盘裁剪与方向分类输入、`QPPOCR_DEBUG_MARGIN` 逐框边跟能量。
 
+- 修复 depthwise 快路径 `ox1` 的 usize 下溢 panic：输入小于核宽
+  （如 1×1 防盗链占位图遇 3×3 核 + 尾部 padding）时整批识别中断；
+  越界列本就零贡献，饱和后落入既有跳过分支，含固定数字回归测试。
+
 ### 工程面
 
 - CI：三平台构建+测试、MSRV 1.85、clippy、rustfmt、cargo-deny、
