@@ -1,6 +1,6 @@
-//! 图像与基础图像算子（见 DESIGN.md）。
+//! 图像与基础图像算子。
 //!
-//! 不引 image crate：流水线核心只吃已解码的 RGB 像素（DESIGN.md §4.1，
+//! 不引 image crate：流水线核心只吃已解码的 RGB 像素（，
 //! 解码与推理解耦）。解码是门面（`qppocr` crate）feature 门控的事。
 
 /// 已解码图像：RGB、行主序。

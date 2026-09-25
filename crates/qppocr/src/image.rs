@@ -1,4 +1,4 @@
-//! 图像输入（DESIGN.md §4.1）：核心只吃已解码的 RGB 像素，
+//! 图像输入：核心只吃已解码的 RGB 像素，
 //! 解码与推理解耦——`image` crate 是 feature 门控的可选项。
 
 pub use qppocr_core::pipeline::image::Image;

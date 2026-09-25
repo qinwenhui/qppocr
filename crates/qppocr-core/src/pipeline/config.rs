@@ -1,7 +1,7 @@
 //! 流水线配置：调参基准 的 36 个行为参数，**数值一个不改**
-//!（DESIGN.md §6：这是三年基准测出来的资产）。
+//!。
 
-/// 流水线配置（默认值 = 调参基准（见 DESIGN.md §6））。
+/// 流水线配置（默认值 = 调参基准）。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PipelineConfig {
@@ -20,7 +20,7 @@ pub struct PipelineConfig {
     pub box_thresh: f32,
     /// unclip 扩张比例。
     pub unclip_ratio: f32,
-    /// unclip 垂直分量比例。⚠ 最敏感的一个（见 DESIGN.md §6.2）。
+    /// unclip 垂直分量比例。⚠ 最敏感的一个。
     pub unclip_perp: f32,
     /// 边距杂波判定阈值，0 = 关。
     pub unclip_margin_thresh: f32,

@@ -1,4 +1,4 @@
-//! 模型来源与校验（DESIGN.md §4.4）。
+//! 模型来源与校验。
 
 use crate::sha256::sha256;
 
@@ -12,7 +12,7 @@ pub enum Tier {
     /// 默认。准确率与速度的平衡点。
     #[default]
     Small,
-    /// 最准（⚠ 未经基准验证，见 DESIGN.md §11-1）。
+    /// 最准（⚠ 未经基准验证，）。
     Medium,
 }
 
@@ -28,7 +28,7 @@ impl Tier {
 }
 
 /// 上游官方原件的 SHA-256（PaddleOCR 发布，HuggingFace `inference.onnx`）。
-/// 来源：DESIGN.md 附录 D，全部已下载核对。
+/// 来源：附录 D，全部已下载核对。
 const UPSTREAM_SHA: &[(Tier, Kind, &str)] = &[
     (
         Tier::Tiny,
