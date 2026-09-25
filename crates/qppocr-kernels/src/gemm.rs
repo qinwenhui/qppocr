@@ -97,21 +97,17 @@ fn sgemm_impl(
     if let Some(b) = bias {
         assert!(b.len() >= m, "sgemm: bias too small");
     }
+    #[cfg(target_arch = "x86_64")]
     let bptr = |bias: Option<&[f32]>| bias.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
 
     // AVX2 与标量共用同一套分发；内核选择见 panel_body/m_rows_body 的注释。
-    #[cfg(target_arch = "x86_64")]
-    let avx2 = crate::use_avx2();
-    #[cfg(not(target_arch = "x86_64"))]
-    let avx2 = false;
 
     // 小 GEMM 留在单线程——但仍然走同一内核。 这里曾退化为标量三重循环，
     // 让角度分类器和 FPN neck 里的每个小 conv 比算术该有的慢几个数量级。
     if serial || flops < par::thresholds().gemm_par_min || par::threads() == 1 {
         // SAFETY: 串行调用，无并发访问；形状已在上面的 assert 校验。
         unsafe {
-            #[cfg(target_arch = "x86_64")]
-            if avx2 {
+            crate::arch_dispatch!(
                 crate::x86::sgemm_panel_avx2(
                     a.as_ptr(),
                     b.as_ptr(),
@@ -123,10 +119,9 @@ fn sgemm_impl(
                     bptr(bias),
                     0,
                     np,
-                )
-            } else {
+                ),
                 panel_body(a, b, c.as_mut_ptr(), m, n, k, ldc, bias, 0, np)
-            }
+            )
         };
         finish(c, m, n, ldc, act);
         return;
@@ -141,9 +136,7 @@ fn sgemm_impl(
         par::parallel_for(np, 1, |pb, pe| {
             // SAFETY: 各面板写不相交的列区间 [p*32, p*32+nn)，元素两两不重叠。
             unsafe {
-                #[cfg(target_arch = "x86_64")]
-                if avx2 {
-                    let bp = bptr(bias);
+                crate::arch_dispatch!(
                     crate::x86::sgemm_panel_avx2(
                         a.as_ptr(),
                         b.as_ptr(),
@@ -152,13 +145,12 @@ fn sgemm_impl(
                         n,
                         k,
                         ldc,
-                        bp,
+                        bptr(bias),
                         pb,
                         pe,
-                    )
-                } else {
+                    ),
                     panel_body(a, b, cp.get(), m, n, k, ldc, bias, pb, pe)
-                }
+                )
             };
         });
     } else {
@@ -167,9 +159,7 @@ fn sgemm_impl(
         par::parallel_for(m, 1, |mb, me| {
             // SAFETY: 各块写不相交的行区间 [mb, me)。
             unsafe {
-                #[cfg(target_arch = "x86_64")]
-                if avx2 {
-                    let bp = bptr(bias);
+                crate::arch_dispatch!(
                     crate::x86::sgemm_mrows_avx2(
                         a.as_ptr(),
                         b.as_ptr(),
@@ -177,13 +167,12 @@ fn sgemm_impl(
                         n,
                         k,
                         ldc,
-                        bp,
+                        bptr(bias),
                         mb,
                         me,
-                    )
-                } else {
+                    ),
                     m_rows_body(a, b, cp.get(), m, n, k, ldc, bias, mb, me)
-                }
+                )
             };
         });
     }

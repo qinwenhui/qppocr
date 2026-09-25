@@ -288,16 +288,8 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
     assert!(t.len() % inner == 0, "softmax: size not multiple of inner");
     let outer = t.len() / inner;
     let tp = par::SyncPtr::new(t.as_mut_ptr());
-    let use_vec = inner >= 8 && {
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::use_avx2()
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            false
-        }
-    };
+    #[cfg(target_arch = "x86_64")]
+    let use_vec = inner >= 8 && crate::use_avx2();
     par::parallel_for_units(outer, |b, e| {
         for o in b..e {
             #[cfg(target_arch = "x86_64")]

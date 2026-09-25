@@ -2,3 +2,4 @@
 # CI 里有单独的 job 用 MSRV 构建；日常开发钉在当前稳定版。
 [toolchain]
 channel = "1.97.1"
+components = ["rustfmt", "clippy"]
