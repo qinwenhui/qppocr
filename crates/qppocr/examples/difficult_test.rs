@@ -1,8 +1,9 @@
 //! 难图.png A/B:默认 vs 监控截图参数(unclip_perp=0.5, unclip_margin_thresh=0.45)
 fn main() {
-    let img_path =
-        "D:/qinwh/code/myself/sku-manager/ocr-tool/bench/simdpaddleocr-dataset-v1/dataset/难图.png";
-    let img = qppocr::decode_file(img_path).unwrap();
+    let img_path = std::env::args()
+        .nth(1)
+        .expect("用法: difficult_test <图片路径>");
+    let img = qppocr::decode_file(&img_path).unwrap();
     // 增加 small 档测试 + rec_height 变体
     for &(tier_s, tag2, perp, margin) in &[
         ("tiny", "监控tiny  ", 0.5, 0.45),
