@@ -77,6 +77,8 @@ struct Job {
     next: AtomicUsize,
     /// 已完成的**参与者**数（每线程 bump 一次，不是 chunk 数）。
     done: AtomicUsize,
+    /// panic 隔离槽：worker/主侧 chunk panic 的原载荷（首个获胜）。
+    panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
 }
 
 /// `Mutex<Shared>` 跨线程共享需要 `Send`。
@@ -182,7 +184,25 @@ fn worker_loop() {
         // SAFETY: epoch!=seen 时 job 指针必为当前 epoch 的发布值；栈上
         // Job 的生存期由参与者 join 保证——本 worker bump done 之前发布方
         // 不可能返回/销毁它。
-        unsafe { run_chunks(&*job) };
+        //
+        // ★ panic 隔离（生产事故 2026-09-25：内核 panic 杀死 worker 线程，
+        //   参与者屏障永远凑不齐，进程级池从此毒化——同进程重建引擎也
+        //   救不回）。接住 panic：线程活着回等待循环、done 照常 bump
+        //   （屏障放行）、原载荷暂存——主线程 join 后 resume_unwind 还给
+        //   调用方。部分写入的输出不会被当作有效结果消费（调用方拿到
+        //   panic，不是 Ok）。
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            run_chunks(&*job)
+        })) {
+            // SAFETY: 与上方 run_chunks 同一生存期论证——join 未完成前
+            // 发布方不可能销毁 Job。
+            let j = unsafe { &*job };
+            let mut slot = j.panic.lock().unwrap();
+            if slot.is_none() {
+                *slot = Some(payload);
+            }
+            j.done.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -223,6 +243,7 @@ pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
         nchunk,
         next: AtomicUsize::new(0),
         done: AtomicUsize::new(0),
+        panic: Mutex::new(None),
     };
     let _fk = p.fork_mu.lock().unwrap();
     {
@@ -233,9 +254,21 @@ pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
     }
     // 锁外唤醒（对齐 ：publish → ReleaseSemaphore(N-1) → 主线程干活）
     p.wake.notify_all();
-    // 主线程参与（ run_job）
+    // 主线程参与（run_job）。同样包 catch_unwind：主侧 panic 若直接
+    // 展开，Job（本栈对象）在 worker 仍持有指针时被销毁——悬垂 UB。
+    // 接住后屏障照常完成，再统一把首个 panic 还给调用方。
     // SAFETY: job 在本栈上，刚初始化。
-    unsafe { run_chunks(&job) };
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { run_chunks(&job) }))
+        .is_err()
+    {
+        // 主线程也是参与者：panic 路径同样要 bump done，否则屏障少一人、
+        // 下面的自旋 join 永远等不齐（毒化测试实测挂死点）。
+        let mut slot = job.panic.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(Box::new("panic in fork_join main chunks".to_string()));
+        }
+        job.done.fetch_add(1, Ordering::Release);
+    }
     // 自旋 join：等全部参与者（含自己）各 bump 一次 done。
     // Release/Acquire 对保证：所有 worker 的 chunk 写入对返回后的主线程可见。
     //
@@ -252,5 +285,18 @@ pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
             std::thread::yield_now();
         }
     }
-    // 不清 job 指针：下一次发布覆盖。`_fk` 在此释放，放行下一个调用方。
+    // 不清 job 指针：下一次发布覆盖。
+    //
+    // ★ 屏障完成后：如有 panic，在本线程原样重抛——调用方（executor →
+    // Engine::run）看到原 panic（应用层可 catch_unwind 转提示），而池
+    // 毫发无损地服务下一次调用。
+    //
+    // 先取载荷、释放 fork_mu，再重抛：带着 MutexGuard 展开会把锁标毒
+    // （毒化测试实测：下一次 fork_join 的 lock().unwrap() 直接
+    // PoisonError——这就是「panic 一次、整个进程池报废」的第二种形态）。
+    let payload = job.panic.into_inner().unwrap();
+    drop(_fk);
+    if let Some(p) = payload {
+        std::panic::resume_unwind(p);
+    }
 }

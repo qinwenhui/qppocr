@@ -43,7 +43,13 @@ fn copy_strided_f32(
         off += idx[i] * stride[i];
     }
     for o in outer_begin..outer_end {
-        let d = &mut dst[(o * inner) as usize..((o + 1) * inner) as usize];
+        // ★ dst 是调用方给的**相对切片**（从 outer_begin 起，长
+        //   (outer_end-outer_begin)·inner）——必须用相对 o 索引。曾经用
+        //   绝对 o：单块路径（outer_begin=0，tiny/small 的日常张量都走它）
+        //   恰好掩住错位；大张量并行多块后 ob>0 即越界 panic（3918×2772
+        //   照片 + medium 档稳定复现，2026-09-25）。
+        let d = &mut dst
+            [((o - outer_begin) * inner) as usize..((o - outer_begin + 1) * inner) as usize];
         if istr == 1 {
             d.copy_from_slice(&src[off as usize..(off + inner) as usize]);
         } else {
@@ -92,7 +98,8 @@ fn copy_strided_i64(
         off += idx[i] * stride[i];
     }
     for o in outer_begin..outer_end {
-        let d = &mut dst[(o * inner) as usize..((o + 1) * inner) as usize];
+        let d = &mut dst
+            [((o - outer_begin) * inner) as usize..((o - outer_begin + 1) * inner) as usize];
         if istr == 1 {
             d.copy_from_slice(&src[off as usize..(off + inner) as usize]);
         } else {
