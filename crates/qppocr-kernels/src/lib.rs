@@ -1,6 +1,6 @@
 //! qppocr 的算子内核。
 //!
-//! 这是整个 workspace 里**唯一允许 `unsafe` 的 crate**（DESIGN.md §2 铁律 3）：
+//! 这是整个 workspace 里**唯一允许 `unsafe` 的 crate**：
 //! SIMD 内核靠裸指针 + 精确的寄存器分配拿性能，写成惯用的 slice 下标会引入
 //! bounds check。且并行切分写的是不相交但无法用 `split_at_mut` 表达的区间
 //! （同一些行的不同列段），只能用裸指针。边界全部集中在内核分发层，
@@ -10,12 +10,12 @@
 //! 有明确约定，注释里的实测结论一并携带。
 //!
 //! `scalar`（本 crate 的标量参考实现）不是备用方案，是判据：SIMD 版与它
-//! 逐位比对（DESIGN.md §3.2、§8.3）。
+//! 逐位比对。
 
 #![deny(unsafe_op_in_unsafe_fn)]
 // 内核保持下标循环与手写 clamp 的结构——f32::clamp 的 NaN 行为不同，
 // 惯用改写会改变位级语义。见
-// DESIGN.md §3.2「不要顺手改成更 Rust 的写法」。
+// Rust 的写法」。
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_clamp,

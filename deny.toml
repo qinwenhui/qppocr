@@ -1,4 +1,4 @@
-# cargo-deny 配置：许可与依赖审计（DESIGN.md §10）。
+# cargo-deny 配置：许可与依赖审计。
 # 本项目刻意保持极少依赖且全部 feature 门控，这里把清单收紧。
 
 [graph]

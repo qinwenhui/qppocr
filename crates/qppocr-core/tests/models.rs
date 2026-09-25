@@ -2,7 +2,7 @@
 
 //! 真实模型解析验证（阶段 2）。
 //!
-//! 对照 DESIGN.md §4.4 / 附录 D 的已知事实：
+//! 对照 / 附录 D 的已知事实：
 //! - 上游 det：opset **14**、242 节点、169 权重（转换版才是 opset 11/464/213）
 //! - rec：opset 11、219 节点；tiny rec 自带 `character` 元数据（6904 字典）
 //! - small/medium rec 的字典 18708 项；medium rec **无内嵌字典**

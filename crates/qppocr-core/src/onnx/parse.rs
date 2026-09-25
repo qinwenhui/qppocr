@@ -1,9 +1,9 @@
 //! 手写的 protobuf wire-format 读取器（`onnx_parser.cpp` ）。
 //!
 //! ONNX 就是普通 protobuf，只走我们需要的字段，不引 libprotobuf/prost
-//! （DESIGN.md §5.3：`prost-build` 会让构建依赖 protoc，与「纯 Rust、
+//! （ 会让构建依赖 protoc，与「纯 Rust、
 //! 无外部依赖」的定位矛盾）。**支持 opset 14**——上游 det 就是 opset 14
-//! （DESIGN.md §4.4）。
+//! 。
 //!
 //! 字段号（onnx.proto）：
 //! - ModelProto：ir_version=1, producer_name=2, producer_version=3,

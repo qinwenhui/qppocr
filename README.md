@@ -52,9 +52,24 @@ models/
 └── dict.txt                        # 字典（上游 rec 不带内嵌字典，实际必需）
 ```
 
-具体仓库名与 SHA-256 清单见 `docs/DESIGN.md` 附录 D。**装载时默认做
-SHA-256 校验**（防下载损坏与调包；自备重导出模型用
-`EngineBuilder::verify_sha256(false)`）。字典查找顺序：
+从 HuggingFace 组织 [`PaddlePaddle`](https://huggingface.co/PaddlePaddle)
+下载（文件一律叫 `inference.onnx`，重命名为上表布局）：
+
+| 档 | 模型 | HF 仓库名 | SHA-256（装载时自动校验） |
+|---|---|---|---|
+| tiny | det | `PP-OCRv6_tiny_det_onnx` | `193bab7a…9dafb19f8` |
+| tiny | rec | `PP-OCRv6_tiny_rec_onnx` | `9ef676d6…091563e6` |
+| small | det | `PP-OCRv6_small_det_onnx` | `d73e0058…fe9c9410e` |
+| small | rec | `PP-OCRv6_small_rec_onnx` | `5435fd74…2fa24634` |
+| medium | det | `PP-OCRv6_medium_det_onnx` | `eb13b44b…65d086e1` |
+| medium | rec | `PP-OCRv6_medium_rec_onnx` | `9c09abf0…71b673ba` |
+| 三档共用 | cls | `PP-LCNet_x0_25_textline_ori_onnx_infer` | `dd8b2b61…d74d2cf2` |
+
+字典（上游 rec 不带内嵌字典，必需）：tiny 用 `PP-OCRv6_tiny_rec_onnx`
+仓库内附的字典文件；small/medium 共用一份 18,708 行字典
+（SHA `118d0f07…5b3365d8e`）。完整 SHA-256 值在引擎内建校验表里
+（`qppocr/src/models.rs`），下载不符会直接报错并给出两个哈希——自备
+重导出模型用 `EngineBuilder::verify_sha256(false)` 跳过。字典查找顺序：
 `{tier}/dict.txt` → `dict.txt` → `ppocr_keys.txt` → rec 内嵌。
 
 ## 性能（16 逻辑核桌面机实测，多轮交错取中位）
@@ -72,10 +87,17 @@ SHA-256 校验**（防下载损坏与调包；自备重导出模型用
 ## CLI
 
 ```bash
-cargo install --path crates/qppocr-cli   # 或直接 cargo run -p qppocr-cli
-qppocr img.png --tier small --json        # 单图
+cargo install --path crates/qppocr-cli
+qppocr img.png --tier small --json        # 单图（--json 含九项分阶段耗时）
 qppocr *.jpg --workers 8                  # 批量：进程扇出，自动分图
 ```
+
+常用参数：`--models <dir>`（默认 `models/`）· `--tier tiny|small|medium`
+（默认 small）· `--preset speed|balanced|accuracy` · `--threads <n>`
+（0=自动）· `--workers <n>`（批量并发进程数，0=自动）· `--bench <n>`
+（每图跑 n 次取最好）· `--det-only`（只要框）· `--boxes`（输出带坐标）
+· `--no-cls`（关方向分类）。环境变量 `QPPOCR_THREADS` 等价 `--threads`；
+`QPPOCR_PROF=1` 输出逐算子耗时剖析。
 
 ## 已知限制（如实）
 
@@ -90,7 +112,7 @@ qppocr *.jpg --workers 8                  # 批量：进程扇出，自动分图
 
 ## 文档与示例
 
-- 设计文档：`docs/DESIGN.md`（架构、API 语义与调参谱系）
+- API 文档：rustdoc（`cargo doc --open`；发布 crates.io 后 docs.rs 自动生成）
 - 可运行示例（`crates/qppocr/examples/`）：`api_smoke`（三行上手）、
   `api_verify`（serde/并发语义断言）、`char_boxes`（逐字坐标几何验证）、
   `retry_flags`（区域重试标记）、`phase_breakdown`（分阶段计时）、

@@ -4,7 +4,7 @@ use super::image::Image;
 
 /// ctc_decode 输出的每个字符：它在哪个时间步发射、在返回串里的字节起点。
 /// 时间步能把「两个字之间有没有空格」映射回裁剪图的列，从而问图像那列
-/// 是不是空的——见 rec_space_gap（DESIGN.md §6.4）。
+/// 是不是空的——见 rec_space_gap。
 #[derive(Clone, Copy, Debug)]
 pub struct DecodeMark {
     /// 时间步（[0, T)）。

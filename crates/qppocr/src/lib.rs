@@ -37,7 +37,7 @@
 //!
 //! 本仓库不含模型：PP-OCRv6 权重来自 PaddlePaddle（Apache-2.0），自行
 //! 获取后按 [`ModelSource::Dir`] 的布局摆放；SHA-256 默认与官方原件
-//! 核对（DESIGN.md 附录 D 的值内嵌在实现里）。
+//! 核对。
 //!
 //! # 为什么「默认值就是最优值」
 //!
@@ -74,7 +74,7 @@ use qppocr_core::pipeline::Engine as CoreEngine;
 /// 设置页回显/预设导出用；`serde` feature 开启时可序列化）。
 pub use qppocr_core::pipeline::PipelineConfig;
 
-/// 错误。库不该强制调用方的错误类型——不用 `anyhow`（DESIGN.md §4.1）。
+/// 错误。库不该强制调用方的错误类型——不用 `anyhow`。
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
@@ -113,14 +113,14 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// 预设：三个经过整段基准验证的档位（DESIGN.md §4.2）。
+/// 预设：三个经过整段基准验证的档位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Preset {
     /// 速度优先：`rec_height` 40，关区域重试。
     Speed,
-    /// 默认：全部基准值（36 参数的测量结果，见 DESIGN.md §6）。
+    /// 默认：全部基准值（36 参数的测量结果，）。
     #[default]
     Balanced,
     /// 精度优先：`rec_height` 48，开区域重试与边距判定。
@@ -130,14 +130,14 @@ pub enum Preset {
 /// 公开配置。字段全部是 `Option`：`None` = 跟预设走，
 /// 设了就**只覆盖这一项**，其余仍跟预设。
 ///
-/// 判据（DESIGN.md §4.2）：用户不需要跑基准就能讲清楚该往哪边调吗？
+/// 判据：用户不需要跑基准就能讲清楚该往哪边调吗？
 /// 能 → 进这里；不能（要量具）→ [`Advanced`]。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Config {
-    /// 识别画布高度（像素）。40 更快、48 更准（sweep 见 DESIGN.md §6.1）。
+    /// 识别画布高度（像素）。40 更快、48 更准（sweep）。
     pub rec_height: Option<u32>,
     /// 检测输入长边上限。
     pub det_max_side: Option<u32>,
@@ -155,7 +155,7 @@ pub struct Config {
 }
 
 /// 基准测出来的常数。**不要改**——每一项都有实测依据
-/// （DESIGN.md §6.2 的表与 docs/TUNING.md）。
+/// 。
 ///
 /// 保留它是为了让我们自己能继续调参，以及极少数有自己量具的用户一条路。
 /// 这里的字段**不提供稳定性承诺**，任何一个小版本都可能变。
@@ -171,7 +171,7 @@ pub struct Advanced {
     pub box_thresh: f32,
     /// unclip 扩张比例。
     pub unclip_ratio: f32,
-    /// unclip 垂直分量。⚠ 最敏感的一个（DESIGN.md §6.2）。
+    /// unclip 垂直分量。⚠ 最敏感的一个。
     pub unclip_perp: f32,
     /// 边距杂波判定阈值。0 = 关。
     pub unclip_margin_thresh: f32,
@@ -181,7 +181,7 @@ pub struct Advanced {
     pub merge_line_gap: f64,
     /// 批内最宽/最窄行长宽比上限。
     pub rec_batch_ratio: f64,
-    /// 像素空格阈值（DESIGN.md §6.4）。
+    /// 像素空格阈值。
     pub rec_space_gap: f64,
     /// 方向分类翻转阈值。
     pub cls_thresh: f32,
@@ -435,7 +435,7 @@ impl Tier {
 
 /// 预设 → 公开覆盖 → Advanced 覆盖，得到最终 PipelineConfig。
 fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>) -> PipelineConfig {
-    // 1) 基准值（tuning.hpp，DESIGN.md §6）
+    // 1) 基准值（tuning.hpp，）
     let mut pc = PipelineConfig::default();
     // 2) 预设补丁
     match preset {

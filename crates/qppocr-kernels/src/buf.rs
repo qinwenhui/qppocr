@@ -38,7 +38,7 @@ unsafe impl Send for FreeBlockWrap {}
 struct PoolInner {
     free: Vec<Vec<FreeBlockWrap>>, // 每类一个桶
     held_bytes: usize,
-    // 上限（保守默认；DESIGN.md §6.3：基准的 256 MB 是为单机跑分调的，
+    // 上限（保守默认； 256 MB 是为单机跑分调的，
     // Rust 版默认保守，让调用方显式开大）
     cap_bytes: usize,
     per_class_cap: [usize; 3], // small(<64KB) / mid(<4MB) / big

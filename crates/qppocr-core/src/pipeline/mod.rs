@@ -1,6 +1,6 @@
 //! det → cls → rec 流水线（设计文档 ）。
 //!
-//! 模块划分对应 DESIGN.md §3.2：
+//! 模块划分对应
 //! - [`image`]：Image、缩放、旋转、自动色阶
 //! - [`geometry`]：凸包/最小面积矩形/连通域/DB 后处理/框合并/杂波判定
 //! - [`crop`]：透视裁剪、pack_crop、cls_view

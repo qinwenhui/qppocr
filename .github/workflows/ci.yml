@@ -31,7 +31,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # 内核单元测试是自包含的：不需要模型、不需要语料（DESIGN.md §8.2）。
+      # 内核单元测试是自包含的：不需要模型、不需要语料。
       - run: cargo build --workspace --all-targets
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets
