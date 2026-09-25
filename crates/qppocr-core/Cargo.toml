@@ -1,0 +1,26 @@
+[package]
+name = "qppocr-core"
+description = "qppocr 引擎主体：ONNX 解析、图优化、执行器、det/cls/rec 流水线"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["parallel"]
+# 关掉 = 单线程（透传给 kernels）
+parallel = ["qppocr-kernels/parallel"]
+# 结果/配置的 serde 派生（facade 的同名 feature 透传到这里）
+serde = ["dep:serde"]
+
+[dependencies]
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.1.0" }
+serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

@@ -1,0 +1,26 @@
+qppocr
+Copyright (c) qinwh
+
+------------------------------------------------------------------------------
+第三方模型
+------------------------------------------------------------------------------
+
+本仓库**不包含**任何模型权重。运行时需要用户自行获取 PP-OCRv6 的 ONNX 模型。
+
+PP-OCRv6 (PaddleOCR)
+  来源：  https://github.com/PaddlePaddle/PaddleOCR
+  发布方：PaddlePaddle
+  许可：  Apache License 2.0
+  模型页：https://huggingface.co/PaddlePaddle
+          （PP-OCRv6_{tiny,small,medium}_{det,rec}_onnx）
+
+各档模型的 SHA-256 校验值随发布版本附在
+下载后请校验再使用。
+
+------------------------------------------------------------------------------
+第三方 Rust 依赖
+------------------------------------------------------------------------------
+
+本项目刻意保持极少的依赖，且全部通过 feature 门控。
+实际依赖清单与许可见 Cargo.toml 与各 crate 的 Cargo.lock；
+`cargo deny check licenses` 可用于审计。
