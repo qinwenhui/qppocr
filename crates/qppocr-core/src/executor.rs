@@ -269,8 +269,14 @@ impl Session {
                     None
                 };
                 let prof_key = if prof && op == "Conv" {
-                    let x = get!(&arena, &n.inputs[0]).unwrap();
-                    let w = get!(&arena, &n.inputs[1]).unwrap();
+                    // ★ 极端输入下张量可能缺失（不该发生，但缺了要报错而不是 panic）：
+                    //   整个 run 的错误契约是 Err(Graph)，panic 会让整批识别中断。
+                    let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                        Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                    })?;
+                    let w = get!(&arena, &n.inputs[1]).ok_or_else(|| {
+                        Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                    })?;
                     format!(
                         "Conv {}->{} k{}x{} @{}x{} g{}",
                         x.shape[1],
@@ -286,22 +292,34 @@ impl Session {
                 } else {
                     String::new()
                 };
-                let take0 = |arena: &mut HashMap<String, Tensor>| -> Tensor {
+                let take0 = |arena: &mut HashMap<String, Tensor>| -> Result<Tensor> {
                     if takeable(0) {
-                        arena.remove(&n.inputs[0]).unwrap()
+                        arena.remove(&n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })
                     } else {
                         // 权重或共享输入：从两级里拷贝
                         match arena.get(&n.inputs[0]) {
-                            Some(t) => t.clone(),
-                            None => self.initializers[&n.inputs[0]].clone(),
+                            Some(t) => Ok(t.clone()),
+                            None => self
+                                .initializers
+                                .get(&n.inputs[0])
+                                .ok_or_else(|| {
+                                    Error::Graph(format!("{op}: missing weight {}", n.inputs[0]))
+                                })
+                                .cloned(),
                         }
                     }
                 };
 
                 match op {
                     "Conv" => {
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
-                        let w = get!(&arena, &n.inputs[1]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
+                        let w = get!(&arena, &n.inputs[1]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                        })?;
                         let bias = if n.inputs.len() > 2 {
                             get!(&arena, &n.inputs[2]).map(|t| t.f32.as_slice())
                         } else {
@@ -360,8 +378,12 @@ impl Session {
                         );
                     }
                     "ConvTranspose" => {
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
-                        let w = get!(&arena, &n.inputs[1]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
+                        let w = get!(&arena, &n.inputs[1]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                        })?;
                         let (sh, sw) = strides_of(n);
                         let pads = pads_of(n);
                         let mut y = F32Buf::new();
@@ -393,12 +415,32 @@ impl Session {
                         // 输入是最后消费者时就地：batchnorm 先 `y = x` 再覆写
                         // 每个元素，能拿就别拷。
                         let (sc, bi, me, va) = (
-                            get!(&arena, &n.inputs[1]).unwrap().f32.to_vec(),
-                            get!(&arena, &n.inputs[2]).unwrap().f32.to_vec(),
-                            get!(&arena, &n.inputs[3]).unwrap().f32.to_vec(),
-                            get!(&arena, &n.inputs[4]).unwrap().f32.to_vec(),
+                            get!(&arena, &n.inputs[1])
+                                .ok_or_else(|| {
+                                    Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                                })?
+                                .f32
+                                .to_vec(),
+                            get!(&arena, &n.inputs[2])
+                                .ok_or_else(|| {
+                                    Error::Graph(format!("{op}: missing input {}", n.inputs[2]))
+                                })?
+                                .f32
+                                .to_vec(),
+                            get!(&arena, &n.inputs[3])
+                                .ok_or_else(|| {
+                                    Error::Graph(format!("{op}: missing input {}", n.inputs[3]))
+                                })?
+                                .f32
+                                .to_vec(),
+                            get!(&arena, &n.inputs[4])
+                                .ok_or_else(|| {
+                                    Error::Graph(format!("{op}: missing input {}", n.inputs[4]))
+                                })?
+                                .f32
+                                .to_vec(),
                         );
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         let mut out = F32Buf::new();
                         qppocr_kernels::shape::batchnorm(
                             &y.f32,
@@ -414,12 +456,12 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "Relu" => {
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         qppocr_kernels::activation::relu_inplace(&mut y.f32);
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "Sigmoid" => {
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         // 原地拷贝语义：sigmoid(x) 写满新缓冲
                         let src = y.f32.clone();
                         let mut out = F32Buf::with_zeroed(src.len());
@@ -428,7 +470,7 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "HardSigmoid" => {
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         let src = y.f32.clone();
                         let mut out = F32Buf::with_zeroed(src.len());
                         qppocr_kernels::activation::hardsigmoid(
@@ -441,7 +483,7 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "FusedGelu" => {
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         let (c1, c2, c3) = (
                             get_f(n.attr("c1"), 1.414_213_5),
                             get_f(n.attr("c2"), 1.0),
@@ -451,12 +493,12 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "Erf" => {
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         qppocr_kernels::activation::erf_inplace(&mut y.f32);
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "Sqrt" => {
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         qppocr_kernels::activation::sqrt_inplace(&mut y.f32);
                         arena.insert(n.outputs[0].clone(), y);
                     }
@@ -483,7 +525,7 @@ impl Session {
                                 }
                             }
                         }
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         qppocr_kernels::activation::clip_inplace(&mut y.f32, lo, hi);
                         arena.insert(n.outputs[0].clone(), y);
                     }
@@ -499,22 +541,49 @@ impl Session {
                         // 省一次多 MB 分配和一整趟额外内存
                         let can_ip = takeable(0)
                             && qppocr_kernels::elementwise::binary_can_inplace(
-                                get!(&arena, &n.inputs[0]).unwrap().shape.as_slice(),
-                                get!(&arena, &n.inputs[1]).unwrap().shape.as_slice(),
+                                get!(&arena, &n.inputs[0])
+                                    .ok_or_else(|| {
+                                        Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                                    })?
+                                    .shape
+                                    .as_slice(),
+                                get!(&arena, &n.inputs[1])
+                                    .ok_or_else(|| {
+                                        Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                                    })?
+                                    .shape
+                                    .as_slice(),
                             );
                         let out = if can_ip {
-                            let mut acc = arena.remove(&n.inputs[0]).unwrap();
+                            // can_ip 已含 takeable(0)（存在性），缺了就显式报错
+                            let mut acc = arena.remove(&n.inputs[0]).ok_or_else(|| {
+                                Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                            })?;
                             qppocr_kernels::elementwise::binary_op_inplace(
                                 &mut acc.f32,
                                 &acc.shape,
-                                get!(&arena, &n.inputs[1]).unwrap().f32.as_slice(),
-                                get!(&arena, &n.inputs[1]).unwrap().shape.as_slice(),
+                                get!(&arena, &n.inputs[1])
+                                    .ok_or_else(|| {
+                                        Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                                    })?
+                                    .f32
+                                    .as_slice(),
+                                get!(&arena, &n.inputs[1])
+                                    .ok_or_else(|| {
+                                        Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                                    })?
+                                    .shape
+                                    .as_slice(),
                                 binop,
                             );
                             acc
                         } else {
-                            let a = get!(&arena, &n.inputs[0]).unwrap();
-                            let b = get!(&arena, &n.inputs[1]).unwrap();
+                            let a = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                                Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                            })?;
+                            let b = get!(&arena, &n.inputs[1]).ok_or_else(|| {
+                                Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                            })?;
                             let (data, shape) = qppocr_kernels::elementwise::binary_op(
                                 &a.f32, &a.shape, &b.f32, &b.shape, binop,
                             );
@@ -529,12 +598,14 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), out);
                     }
                     "Softmax" => {
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         softmax_axis(&mut y, get_i(n.attr("axis"), -1) as isize);
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "GlobalAveragePool" => {
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
                         let (nn, c) = (x.shape[0] as usize, x.shape[1] as usize);
                         let mut out = F32Buf::new();
                         qppocr_kernels::pool2d::global_avg_pool(&x.f32, nn, c, &mut out);
@@ -555,7 +626,9 @@ impl Session {
                             .filter(|a| a.ints.len() == 2)
                             .ok_or_else(|| Error::Graph(format!("{op}: kernel_shape required")))?;
                         let st = strides_of(n);
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
                         let (nn, c, h, w) = (
                             x.shape[0] as usize,
                             x.shape[1] as usize,
@@ -595,7 +668,9 @@ impl Session {
                         );
                     }
                     "Resize" => {
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
                         let (oh, ow): (usize, usize);
                         if n.inputs.len() >= 4 && !n.inputs[3].is_empty() {
                             let sizes = get!(&arena, &n.inputs[3]).ok_or_else(|| {
@@ -669,8 +744,12 @@ impl Session {
                         let xs: Vec<&Tensor> = n
                             .inputs
                             .iter()
-                            .map(|inn| get!(&arena, inn).unwrap())
-                            .collect();
+                            .map(|inn| {
+                                get!(&arena, inn).ok_or_else(|| {
+                                    Error::Graph(format!("{op}: missing input {inn}"))
+                                })
+                            })
+                            .collect::<Result<Vec<&Tensor>>>()?;
                         let xs_shape: Vec<&[i64]> = xs.iter().map(|t| t.shape.as_slice()).collect();
                         let payloads: Vec<PayloadRef<'_>> = xs
                             .iter()
@@ -750,7 +829,9 @@ impl Session {
                         } else {
                             Vec::new()
                         };
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
                         use qppocr_kernels::shape::PayloadRef;
                         let (payload, shape) = match x.dtype {
                             DType::F32 => qppocr_kernels::shape::slice_tensor(
@@ -790,7 +871,9 @@ impl Session {
                     }
                     "Transpose" => {
                         let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
                         use qppocr_kernels::shape::PayloadRef;
                         let (payload, shape) = match x.dtype {
                             DType::F32 => qppocr_kernels::shape::transpose_tensor(
@@ -838,7 +921,7 @@ impl Session {
                         } else {
                             Vec::new()
                         };
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         y.shape = if op == "Reshape" {
                             qppocr_kernels::shape::reshape_shape(&y.shape, &shp)
                         } else {
@@ -849,7 +932,7 @@ impl Session {
                     "Unsqueeze" => {
                         // 同上：只形状。先拿输入再算，避免读到移动后的槽位。
                         let axes = axes_from(n, &arena, &self.initializers);
-                        let mut y = take0(&mut arena);
+                        let mut y = take0(&mut arena)?;
                         let xsh = y.shape.clone();
                         // 输出秩 = 输入秩 + axes 数。插入掩码按 max(axes)+1
                         // 尺寸会悄悄丢尾维（axes=[1] 落在中间时）。
@@ -877,7 +960,9 @@ impl Session {
                     }
                     "ReduceMean" => {
                         let axes = axes_from(n, &arena, &self.initializers);
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
                         let mut out = F32Buf::new();
                         let shape = qppocr_kernels::shape::reduce_mean(
                             &x.f32,
@@ -898,8 +983,12 @@ impl Session {
                         );
                     }
                     "MatMul" => {
-                        let a = get!(&arena, &n.inputs[0]).unwrap();
-                        let b = get!(&arena, &n.inputs[1]).unwrap();
+                        let a = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
+                        let b = get!(&arena, &n.inputs[1]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                        })?;
                         let mut out = F32Buf::new();
                         let shape = qppocr_kernels::shape::matmul(
                             &a.f32, &a.shape, &b.f32, &b.shape, &mut out,
@@ -916,7 +1005,9 @@ impl Session {
                         );
                     }
                     "Shape" => {
-                        let x = get!(&arena, &n.inputs[0]).unwrap();
+                        let x = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
                         arena.insert(
                             n.outputs[0].clone(),
                             Tensor {
@@ -932,7 +1023,15 @@ impl Session {
                         let to = get_i(n.attr("to"), 1);
                         let x = match arena.get(&n.inputs[0]) {
                             Some(t) => t.clone(),
-                            None => self.initializers[&n.inputs[0]].clone(),
+                            // ★ 缺键曾是 Index panic —— 换显式 Err（极端输入的
+                            //   健壮性契约：任何图错误都走 Err(Graph) 而不是 panic）
+                            None => self
+                                .initializers
+                                .get(&n.inputs[0])
+                                .ok_or_else(|| {
+                                    Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                                })?
+                                .clone(),
                         };
                         let mut y = Tensor {
                             name: n.outputs[0].clone(),
@@ -960,9 +1059,19 @@ impl Session {
                         arena.insert(n.outputs[0].clone(), y);
                     }
                     "Identity" => {
+                        // ★ 与 Cast 同款：缺键曾是 Index panic。解析器折叠
+                        //   Identity 后执行器不该再见到它，见到就带名报错。
                         let t = match arena.get(&n.inputs[0]) {
                             Some(t) => t.clone(),
-                            None => self.initializers[&n.inputs[0]].clone(),
+                            None => match self.initializers.get(&n.inputs[0]) {
+                                Some(w) => w.clone(),
+                                None => {
+                                    return Err(Error::Graph(format!(
+                                        "{op}: missing input {}",
+                                        n.inputs[0]
+                                    )));
+                                }
+                            },
                         };
                         arena.insert(n.outputs[0].clone(), t);
                     }
@@ -1060,7 +1169,7 @@ impl Session {
                 .unwrap_or(0.0);
             let kernel: f64 = prof_acc.values().map(|(ms, _)| *ms).sum();
             let mut v: Vec<_> = prof_acc.into_iter().collect();
-            v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+            v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
             eprintln!(
                 "--- per-op profile [{}] (kernel {kernel:.1} ms, wall {wall:.1} ms, executor {:.1} ms = {:.1}%) ---",
                 g.model_path,
