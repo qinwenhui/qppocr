@@ -71,6 +71,7 @@ pub fn decode_bytes(bytes: &[u8]) -> Result<Image, crate::Error> {
 
 /// 从 JPEG 字节流读 EXIF Orientation（无 EXIF/解析失败返回 1 = 不转）。
 /// 只扫 APP1 段与 IFD0 的 0x0112 短整数——手写解析，零依赖。
+#[cfg(feature = "image-decode")]
 fn exif_orientation(jpeg: &[u8]) -> u8 {
     let rd16 = |b: &[u8], le: bool| -> u16 {
         if le {
@@ -134,6 +135,7 @@ fn exif_orientation(jpeg: &[u8]) -> u8 {
 }
 
 /// 按方向值转正像素（1-8；1 原样返回不拷贝）。消费原 `Image`。
+#[cfg(feature = "image-decode")]
 fn apply_orientation(mut img: Image, o: u8) -> Image {
     if o <= 1 {
         return img;
@@ -171,7 +173,7 @@ fn apply_orientation(mut img: Image, o: u8) -> Image {
     img
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "image-decode"))]
 mod exif_tests {
     use super::*;
 
