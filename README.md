@@ -93,7 +93,8 @@ qppocr *.jpg --workers 8                  # 批量：进程扇出，自动分图
 - 设计文档：`docs/DESIGN.md`（架构、API 语义与调参谱系）
 - 可运行示例（`crates/qppocr/examples/`）：`api_smoke`（三行上手）、
   `api_verify`（serde/并发语义断言）、`char_boxes`（逐字坐标几何验证）、
-  `retry_flags`（区域重试标记）、`phase_breakdown`（分阶段计时）
+  `retry_flags`（区域重试标记）、`phase_breakdown`（分阶段计时）、
+  `monitor_preset`（监控截图场景完整配方）
 
 ## License
 

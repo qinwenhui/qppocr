@@ -53,6 +53,12 @@
 - 参考命令行：单图/批量（`--workers` 进程扇出自动分图）、`--json`
   含九项阶段耗时、场景参数透传。
 
+- 监控截图场景配方（`monitor_preset` example）：`unclip_perp=0.5` +
+  `unclip_margin_thresh=0.45` + 关方向分类——白字压栏杆/栅栏纹理的
+  时间戳行 0.44 → 0.94 完整读出。
+- 诊断工具：`QPPOCR_DUMP_DIR` 按会话分文件、`QPPOCR_SAVE_CROPS`
+  落盘裁剪与方向分类输入、`QPPOCR_DEBUG_MARGIN` 逐框边跟能量。
+
 ### 工程面
 
 - CI：三平台构建+测试、MSRV 1.85、clippy、rustfmt、cargo-deny、

@@ -10,7 +10,12 @@ fn main() {
         println!("== cls_window={win}");
         for n in imgs {
             let r = eng
-                .run_image_file(format!("D:/qinwh/code/myself/ocr-demo/testdata/{n}.png"))
+                .run_image_file(format!(
+                    "{dir}/{n}.png",
+                    dir = std::env::args()
+                        .nth(1)
+                        .expect("用法: rot_cls_test <testdata目录>")
+                ))
                 .unwrap();
             let flip = r.num_flipped;
             let t: Vec<&str> = r.lines.iter().map(|l| l.text.as_str()).collect();
