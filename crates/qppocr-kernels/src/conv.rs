@@ -175,8 +175,9 @@ pub fn conv2d(
                                 }
                                 let yseg = &mut yr[ox0..ox1];
                                 let xseg = &xr[ox0 + kx - p.pw..ox1 + kx - p.pw];
-                                #[cfg(target_arch = "x86_64")]
-                                if crate::use_avx2() {
+                                // SAFETY: 段 [ox0, ox1) 属于本通道平面，
+                                // 与其他并行块不相交；xseg 同长。
+                                crate::arch_dispatch!(
                                     // SAFETY: 段 [ox0, ox1) 属于本通道平面，
                                     // 与其他并行块不相交；xseg 同长。
                                     unsafe {
@@ -186,13 +187,14 @@ pub fn conv2d(
                                             ox1 - ox0,
                                             wv,
                                         )
-                                    };
-                                } else {
-                                    for (d, sv) in yseg.iter_mut().zip(xseg) {
-                                        // y += w * x（fma，与 AVX2 一致）
-                                        *d = wv.mul_add(*sv, *d);
+                                    },
+                                    {
+                                        for (d, sv) in yseg.iter_mut().zip(xseg) {
+                                            // y += w * x（fma，与 AVX2 一致）
+                                            *d = wv.mul_add(*sv, *d);
+                                        }
                                     }
-                                }
+                                );
                             }
                         } else {
                             for kx in 0..kw {

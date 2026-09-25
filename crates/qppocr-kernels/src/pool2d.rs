@@ -69,10 +69,6 @@ pub fn pool2d(
         && oh == h
         && ow == w;
     if pool2x2_s1 {
-        #[cfg(target_arch = "x86_64")]
-        let avx2 = crate::use_avx2();
-        #[cfg(not(target_arch = "x86_64"))]
-        let avx2 = false;
         par::parallel_for_units(n * c * oh, |b, e| {
             let mut vm = vec![0f32; w + 1]; // 每块一行，跨本块的行复用
             for u in b..e {
@@ -89,21 +85,21 @@ pub fn pool2d(
                     } else {
                         std::ptr::null()
                     };
-                    #[cfg(target_arch = "x86_64")]
-                    if avx2 {
-                        crate::x86::pool2x2_row_vec(r0, r1, vm.as_mut_ptr(), outp, w);
-                    } else {
-                        for j in 0..w {
-                            vm[j] = match r1 {
-                                p if !p.is_null() => (*r0.add(j)).max(*p.add(j)),
-                                _ => *r0.add(j),
-                            };
+                    crate::arch_dispatch!(
+                        crate::x86::pool2x2_row_vec(r0, r1, vm.as_mut_ptr(), outp, w),
+                        {
+                            for j in 0..w {
+                                vm[j] = match r1 {
+                                    p if !p.is_null() => (*r0.add(j)).max(*p.add(j)),
+                                    _ => *r0.add(j),
+                                };
+                            }
+                            vm[w] = -f32::MAX;
+                            for oxx in 0..w {
+                                *outp.add(oxx) = vm[oxx].max(vm[oxx + 1]);
+                            }
                         }
-                        vm[w] = -f32::MAX;
-                        for oxx in 0..w {
-                            *outp.add(oxx) = vm[oxx].max(vm[oxx + 1]);
-                        }
-                    }
+                    );
                 }
             }
         });

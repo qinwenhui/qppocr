@@ -140,19 +140,19 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
     if a_shape == b_shape {
         let pa = par::SyncPtr::new(a.as_mut_ptr());
         let opc = op.code();
+        let _ = opc; // 仅 x86_64 的向量臂使用
         par::parallel_for_elems(total, total, |b0, e0| {
-            #[cfg(target_arch = "x86_64")]
-            #[cfg(target_arch = "x86_64")]
-            if crate::use_avx2() && opc <= 3 {
+            crate::arch_dispatch!(
                 // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
-                unsafe { crate::x86::binary_flat_inplace_vec(pa.get(), b.as_ptr(), b0, e0, opc) };
-                return;
-            }
-            // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
-            let dst = unsafe { pa.offset(b0).slice(e0 - b0) };
-            for (d, sb) in dst.iter_mut().zip(&b[b0..e0]) {
-                *d = op.apply_inplace_rev(*d, *sb);
-            }
+                unsafe { crate::x86::binary_flat_inplace_vec(pa.get(), b.as_ptr(), b0, e0, opc) },
+                {
+                    // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
+                    let dst = unsafe { pa.offset(b0).slice(e0 - b0) };
+                    for (d, sb) in dst.iter_mut().zip(&b[b0..e0]) {
+                        *d = op.apply_inplace_rev(*d, *sb);
+                    }
+                }
+            )
         });
         return;
     }
@@ -219,11 +219,11 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
                 ib -= sb[di] * shape[di];
             }
         }
+        let opc = op.code(); // 向量臂/标量臂共用
+        let _ = (opc, b_dense_run);
         for o in o0..o1 {
             let cv = b[ib as usize];
-            #[cfg(target_arch = "x86_64")]
-            #[cfg(target_arch = "x86_64")]
-            if crate::use_avx2() && op.code() <= 3 {
+            crate::arch_dispatch!(
                 // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
                 // b 稠密时 bsrc 从 ib 起有 runlen 个元素（步长 1 的保证）。
                 unsafe {
@@ -235,17 +235,18 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
                         ib as usize,
                         b_dense_run,
                         cv,
-                        op.code(),
+                        opc,
                     )
-                };
-            } else {
-                // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交。
-                let dst = unsafe { pa.offset(o * runlen as usize).slice(runlen as usize) };
-                for (j, d) in dst.iter_mut().enumerate() {
-                    let bv = if b_dense_run { b[ib as usize + j] } else { cv };
-                    *d = op.apply_inplace_rev(*d, bv);
+                },
+                {
+                    // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交。
+                    let dst = unsafe { pa.offset(o * runlen as usize).slice(runlen as usize) };
+                    for (j, d) in dst.iter_mut().enumerate() {
+                        let bv = if b_dense_run { b[ib as usize + j] } else { cv };
+                        *d = op.apply_inplace_rev(*d, bv);
+                    }
                 }
-            }
+            );
             for i in 0..no {
                 let di = k + i;
                 idx[i] += 1;
@@ -316,6 +317,8 @@ pub fn binary_op(
         let sv = if a_is_scalar { a[0] } else { b[0] };
         let v = if a_is_scalar { b } else { a };
         let opc = op.code();
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = opc;
         par::parallel_for_elems(total, total, |b0, e0| {
             #[cfg(target_arch = "x86_64")]
             if crate::use_avx2() && opc <= 3 {
@@ -394,6 +397,8 @@ pub fn binary_op(
                 }
                 let opc = op.code();
                 let b_dense_run = b_dense_inner;
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = (opc, b_dense_run);
                 for o in o0..o1 {
                     let cv = if a_const {
                         a[ia as usize]
@@ -514,6 +519,8 @@ pub fn binary_op(
             par::SyncPtr::new(b.as_ptr() as *mut f32),
         );
         let opc = op.code();
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (opc, pa_src, pb_src);
         par::parallel_for_elems(total, total, |b0, e0| {
             #[cfg(target_arch = "x86_64")]
             if crate::use_avx2() && opc <= 3 {

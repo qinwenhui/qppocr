@@ -77,6 +77,7 @@ pub fn force_backend(b: Option<Backend>) {
 }
 
 /// 当前生效后端（含强制覆盖）。
+#[allow(dead_code)] // 诊断用；非 x86_64 目标上无调用方
 pub(crate) fn current_backend() -> Backend {
     match FORCED_BACKEND.load(std::sync::atomic::Ordering::Relaxed) {
         1 => Backend::Scalar,
@@ -85,7 +86,38 @@ pub(crate) fn current_backend() -> Backend {
     }
 }
 
-/// AVX2 是否可用（含强制覆盖）。
+/// AVX2 是否可用（含强制覆盖）。非 x86_64 恒 false（编译期折叠）。
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn use_avx2() -> bool {
     current_backend() == Backend::Avx2
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)] // 分发宏的标量臂不调用它（编译期即知无 SIMD）
+pub(crate) fn use_avx2() -> bool {
+    false
+}
+
+/// SIMD/标量双臂分发：x86_64 上运行时探测，其他架构编译期取标量臂。
+///
+/// 曾经的写法 `#[cfg(target_arch = "x86_64")] if use_avx2() {vec} else
+/// {scalar}` 把 **else 臂一起 cfg 掉了**——非 x86 目标上内核什么都不算
+/// （能编译、输出错，CI 的 aarch64 -D warnings 才暴露出来）。这个宏保证
+/// 标量臂在所有架构都编译且执行。
+macro_rules! arch_dispatch {
+    ($avx2_arm:expr, $scalar_arm:expr) => {{
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::use_avx2() {
+                $avx2_arm
+            } else {
+                $scalar_arm
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            $scalar_arm
+        }
+    }};
+}
+pub(crate) use arch_dispatch;
