@@ -1,0 +1,5 @@
+# 开发用工具链。MSRV 声明在根 Cargo.toml 的 rust-version（1.85），
+# CI 里有单独的 job 用 MSRV 构建；日常开发钉在当前稳定版。
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

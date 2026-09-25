@@ -1,0 +1,116 @@
+name: Release
+
+# 推 v* tag 触发：多平台构建 CLI 二进制 → 打包 → 创建 GitHub Release
+# （发行说明从 CHANGELOG.md 对应版本段落自动提取）
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.os }} ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: 'x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu'
+            cross: 'aarch64'
+          - os: windows-latest
+            targets: 'x86_64-pc-windows-msvc'
+            cross: ''
+          # macos-latest 是 ARM：本机 aarch64 + 交叉编 x86_64（Xcode 工具链
+          # 原生支持，无需额外 linker）
+          - os: macos-latest
+            targets: 'aarch64-apple-darwin x86_64-apple-darwin'
+            cross: ''
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install targets
+        run: rustup target add ${{ matrix.targets }}
+      - name: Install aarch64-linux cross toolchain
+        if: matrix.cross == 'aarch64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        # 发行二进制跑在未知用户的机器上：不强制 AVX2 基线（.cargo 的
+        # rustflags 只服务本仓库开发构建；SIMD 内核本就有运行时探测，
+        # AVX2 机器上照样走 AVX2 路径），并剥符号减体积。
+      - name: Build
+        shell: bash
+        run: |
+          set -ex
+          for t in ${{ matrix.targets }}; do
+            flags="-C strip=symbols"
+            case "$t" in
+              *x86_64*) flags="$flags -C target-cpu=x86-64";;
+              *) :;;
+            esac
+            if [ "$t" = "aarch64-unknown-linux-gnu" ]; then
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            fi
+            RUSTFLAGS="$flags" cargo build --release -p qppocr-cli --target "$t"
+          done
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -ex
+          V=${GITHUB_REF_NAME#v}
+          for t in ${{ matrix.targets }}; do
+            dir="qppocr-$V-$t"
+            mkdir -p "$dir"
+            bin=target/$t/release/qppocr
+            cp "$bin" "$dir/"
+            cp README.md LICENSE-MIT LICENSE-APACHE NOTICE "$dir/"
+            tar czf "$dir.tar.gz" "$dir"
+          done
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = $env:GITHUB_REF_NAME.TrimStart('v')
+          $t = 'x86_64-pc-windows-msvc'
+          $dir = "qppocr-$v-$t"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "target/$t/release/qppocr.exe" $dir/
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE, NOTICE $dir/
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: |
+            qppocr-*.tar.gz
+            qppocr-*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Extract release notes from CHANGELOG
+        run: |
+          V=${GITHUB_REF_NAME#v}
+          awk -v v="$V" '
+            /^## \[/ {
+              if ($0 ~ "\\["v"\\]") { p=1; next }
+              else if (p) exit
+            }
+            p
+          ' CHANGELOG.md > notes.md
+          # CHANGELOG 段落缺失时不阻塞发布（空 notes 也可以建 release）
+          [ -s notes.md ] || echo "qppocr ${GITHUB_REF_NAME}" > notes.md
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md \
+          || gh release upload "$GITHUB_REF_NAME" dist/* --clobber
