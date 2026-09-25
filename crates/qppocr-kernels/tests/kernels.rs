@@ -259,6 +259,25 @@ fn conv2d_kernel_tests() {
             bias: true,
         },
         Case {
+            // ★ 回归：1×1 输入的 depthwise。ph=pw=1 时输出恰好 1×1（合法），
+            //   极小输入走的是同一份快路径代码。真正带 kx 越界的场景见下方
+            //   tiny_depthwise_end_pad 测试（Case 表表达不了 end padding）。
+            name: "depthwise 3x3 s1 p1 on 1x1 (tiny input)",
+            n: 1,
+            c: 4,
+            m: 4,
+            h: 1,
+            w: 1,
+            kh: 3,
+            kw: 3,
+            sh: 1,
+            sw: 1,
+            ph: 1,
+            pw: 1,
+            group: 4,
+            bias: false,
+        },
+        Case {
             name: "depthwise 3x3 s2 p1",
             n: 1,
             c: 32,
@@ -562,6 +581,55 @@ fn conv2d_kernel_tests() {
         );
         check(c.name, &y.to_vec(), &ref_);
     }
+}
+
+/// ★ 回归：1×1 输入 + 尾部 padding 的 depthwise —— `kx > wdim+pw` 的列输入
+///   完全在图外，快路径的 `ox1 = ow.min(wdim + pw - kx)` 若不饱和会在 usize
+///   上下溢 panic。真实事故（2026-09-25）：1688 防盗链占位图 spaceball.gif
+///   是 1×1 透明 GIF，det 网络在它上面直接把整批图片识别打断
+///   （生产 18 张图全部失败）。Case 表表达不了 end padding，这里单独构造：
+///   `w=1, pw=0, pew=2, kw=3, sw=1` → ow=(1+0+2-3)+1=1 合法，而 kx=2 时
+///   `wdim+pw-kx = -1`。
+#[test]
+fn tiny_depthwise_end_pad_tests() {
+    // 固定数字，diff 直接暴露内核实际算了哪些 tap：
+    // x[0]=1.0；bias[och]=och；wt 全部 0，唯独每个核的 (0,0) tap = 10.0+och。
+    // 期望输出 = bias + (10+och)*1 —— 任何别的 tap 被算进来都会立刻显形。
+    let (n, c, h, w) = (1usize, 4, 1, 1);
+    let (m, kh, kw) = (4usize, 3, 3);
+    let x = vec![1.0f32; n * c * h * w];
+    let mut wt = vec![0f32; m * kh * kw];
+    for och in 0..m {
+        wt[och * kh * kw] = 10.0 + och as f32;
+    }
+    let bias: Vec<f32> = (0..m).map(|i| i as f32).collect();
+
+    let params = ConvParams {
+        sh: 1,
+        sw: 1,
+        ph: 0,
+        pw: 0,
+        peh: 2,
+        pew: 2,
+        dh: 1,
+        dw: 1,
+        group: c,
+    };
+    let mut y = F32Buf::new();
+    let out_shape = conv2d(
+        &x,
+        &[n as i64, c as i64, h as i64, w as i64],
+        &wt,
+        &[m as i64, 1, kh as i64, kw as i64],
+        Some(&bias),
+        &params,
+        &Activation::default(),
+        &mut y,
+    );
+    assert_eq!(out_shape, [n as i64, m as i64, 1, 1], "shape");
+
+    let ref_: Vec<f32> = (0..m).map(|och| och as f32 + 10.0 + och as f32).collect();
+    check("tiny depthwise end pad", &y.to_vec(), &ref_);
 }
 
 // ---------------------------------------------------------------- sgemm

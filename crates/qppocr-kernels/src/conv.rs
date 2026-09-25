@@ -169,7 +169,12 @@ pub fn conv2d(
                                 let wv = wrow[kx];
                                 // 段外整条贡献为零；中段连续可向量化
                                 let ox0 = p.pw.saturating_sub(kx);
-                                let ox1 = ow.min(wdim + p.pw - kx);
+                                // ★ ox1 同样要饱和：kx > wdim+pw 时这一列输入完全在
+                                //   图外、贡献为零，本该被下面的 `ox1 <= ox0` 跳过。
+                                //   真实事故：1688 的防盗链占位图 spaceball.gif 是
+                                //   1×1，pw=0、kx≥2 时 `wdim+pw-kx` 在 usize 上直接
+                                //   下溢 panic（生产 18 张图全部识别失败，2026-09-25）。
+                                let ox1 = ow.min((wdim + p.pw).saturating_sub(kx));
                                 if ox1 <= ox0 {
                                     continue;
                                 }
