@@ -62,7 +62,7 @@ pub fn depthwise_plane_scalar(
 /// 所以复用时不需要重新 memset。返回的行距由调用方按需要算好传进来。
 #[allow(clippy::too_many_arguments)]
 fn pad_channel(
-    pad: &mut Vec<f32>,
+    pad: &mut F32Buf,
     xch: &[f32],
     h: usize,
     wdim: usize,
@@ -70,15 +70,33 @@ fn pad_channel(
     pw: usize,
     pheight: usize,
     pwidth: usize,
+    pew: usize,
 ) {
     let need = pheight * pwidth;
     if pad.len() != need {
-        pad.clear();
-        pad.resize(need, 0.0);
+        // ★ 只清**边距**，不清整片。内区每次都被下面的 copy 覆盖，清它
+        //   是白烧内存带宽：s2 的深度卷积一个平面就是 403×513 = 827 KB，
+        //   而 `units = n·c` 会让每个并行块各分配一次——32 个块就是 26 MB
+        //   的 memset，实测占那个算子 16 线程耗时（2.09 ms）的**全部**。
+        //   边距只有 (ph+peh)·pwidth + h·(pw + pwidth-pw-wdim) ≈ 55 KB。
+        // SAFETY: 下面把每个元素都写满——边距清零、内区拷入。
+        unsafe { pad.resize_uninit(need) };
+        let p = pad.as_mut_slice();
+        let (top, bot) = (ph * pwidth, (ph + h) * pwidth);
+        p[..top].fill(0.0);
+        p[bot..].fill(0.0);
+        for y in 0..h {
+            let row = (ph + y) * pwidth;
+            p[row..row + pw].fill(0.0);
+            let right = row + pw + wdim;
+            p[right..row + pwidth].fill(0.0);
+        }
+        let _ = pew;
     }
+    let p = pad.as_mut_slice();
     for y in 0..h {
         let dst = (ph + y) * pwidth + pw;
-        pad[dst..dst + wdim].copy_from_slice(&xch[y * wdim..(y + 1) * wdim]);
+        p[dst..dst + wdim].copy_from_slice(&xch[y * wdim..(y + 1) * wdim]);
     }
     crate::gemm::DW_PAD_BYTES.fetch_add(
         (h * wdim * 4 * 2) as u64,
@@ -218,14 +236,14 @@ pub fn conv2d(
         // 行距要够向量读：sw=2 时一发读 16 宽，最右一发在 ox=ow-8。
         let pwidth = (p.pw + wdim + p.pew).max(ow * p.sw + kw + 8);
         let chan_body = |ub: usize, ue: usize| {
-            let mut pad: Vec<f32> = Vec::new();
+            let mut pad = F32Buf::new();
             for u in ub..ue {
                 let (bn, ch) = (u / c, u % c);
                 let xn = &x[bn * c * h * wdim..];
                 let xch = &xn[ch * h * wdim..(ch + 1) * h * wdim];
                 let wc = &wt[ch * kh * kw..(ch + 1) * kh * kw];
                 let bv = bias.map_or(0.0, |b| b[ch]);
-                pad_channel(&mut pad, xch, h, wdim, p.ph, p.pw, pheight, pwidth);
+                pad_channel(&mut pad, xch, h, wdim, p.ph, p.pw, pheight, pwidth, p.pew);
                 // SAFETY: (n, c) 通道平面与其他块不相交；pad 长度 = pheight*pwidth。
                 let yc = unsafe { yp.offset((bn * m + ch) * ohw).slice(ohw) };
                 crate::arch_dispatch!(
