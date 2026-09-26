@@ -1316,10 +1316,19 @@ impl Session {
             // ★ 搬运量：每个节点「读全部输入 + 写输出」的字节数之和。
             //   这是判断「算子慢」还是「内存墙」的尺子——有效带宽 = 搬运量
             //   / 墙钟。若它贴着实测带宽上限，那再怎么调内核也没用。
+            let im2col =
+                qppocr_kernels::gemm::IM2COL_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let dwpad =
+                qppocr_kernels::gemm::DW_PAD_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let internal = (im2col + dwpad) as f64 / 1e6;
             eprintln!(
-                "--- 搬运 {} MB，有效带宽 {:.1} GB/s（读+写 / 墙钟）",
+                "--- 搬运 {:.1} MB（节点级）+ {:.1} MB（im2col {:.1} / 补零 {:.1}）= {:.1} MB，有效带宽 {:.1} GB/s",
                 prof_bytes as f64 / 1e6,
-                prof_bytes as f64 / wall.max(0.001) / 1e6
+                internal,
+                im2col as f64 / 1e6,
+                dwpad as f64 / 1e6,
+                (prof_bytes as f64 / 1e6) + internal,
+                ((prof_bytes + im2col + dwpad) as f64) / wall.max(0.001) / 1e6
             );
             let mut v: Vec<_> = prof_acc.into_iter().collect();
             v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));

@@ -49,6 +49,69 @@ pub fn sgemm(
     sgemm_impl(a, b, c, m, n, k, ldc, bias, act, false);
 }
 
+/// implicit-GEMM 的串行入口：`B` 不是稠密矩阵，而是**每个 k 一行一个指针**
+/// （行内步长 `sw`，1 = 连续、2 = 隔一个取一个）。于是卷积不再需要先把
+/// patch 矩阵 materialize 出来——那是输入的 kh·kw 倍。
+///
+/// 与 [`sgemm_serial`] 走**同一条面板路径、同一个 k 序**（ch → ky → kx），
+/// 输出逐位一致。
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_bptrs_serial(
+    a: &[f32],
+    bptrs: &[*const f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    bias: Option<&[f32]>,
+    act: &Activation,
+    sw: usize,
+) {
+    assert_eq!(bptrs.len(), k, "sgemm_bptrs: 指针数应等于 k");
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+    assert!(ldc >= n, "sgemm_bptrs: ldc < n");
+    assert!(a.len() >= m * k, "sgemm_bptrs: A too small");
+    assert!(c.len() >= (m - 1) * ldc + n, "sgemm_bptrs: C too small");
+    let np = n.div_ceil(32);
+    let bp = bias.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+    // SAFETY: 形状已断言；面板区间 [p*32, p*32+nn) 两两不相交；B 的指针由
+    // 调用方保证指向可读的 slab（含右侧 slack）。
+    unsafe {
+        if sw == 2 {
+            crate::x86::sgemm_panel_bptrs_avx2::<2>(
+                a.as_ptr(),
+                bptrs.as_ptr(),
+                c.as_mut_ptr(),
+                m,
+                n,
+                k,
+                ldc,
+                bp,
+                0,
+                np,
+            );
+        } else {
+            crate::x86::sgemm_panel_bptrs_avx2::<1>(
+                a.as_ptr(),
+                bptrs.as_ptr(),
+                c.as_mut_ptr(),
+                m,
+                n,
+                k,
+                ldc,
+                bp,
+                0,
+                np,
+            );
+        }
+    }
+    finish(c, m, n, ldc, act);
+}
+
 /// 从并行区里调用的 sgemm：**固定走串行面板路径**。
 ///
 /// 设计里这是 `serial=true`，有两重作用：一是嵌套 `parallel_for` 在
@@ -326,6 +389,15 @@ unsafe fn m_rows_body(
 ///
 /// `cols` 布局：`cols[(c*kh*kw + ky*kw + kx) * (rows*ow) + r*ow + ox]`。
 #[allow(clippy::too_many_arguments)]
+/// 全进程累计的 **im2col 搬运字节数**（写 patch + 读输入）。诊断用：
+/// 这是节点级统计看不见的一块——patch 矩阵比输入大 k 倍。
+pub static IM2COL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 全进程累计的**深度卷积补零平面**字节数（写 slab + 读原图）。
+pub static DW_PAD_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 把 patch 矩阵摊成 `[k][n]`（行主序）。
+#[allow(clippy::too_many_arguments)]
 pub fn im2col(
     x: &[f32],
     c: usize,
@@ -344,6 +416,11 @@ pub fn im2col(
 ) {
     let nout = rows * ow;
     assert!(cols.len() >= c * kh * kw * nout, "im2col: cols too small");
+    // 写 patch（c·kh·kw·nout）+ 读输入（约一半的 patch 量，边界有零填充）
+    IM2COL_BYTES.fetch_add(
+        (c * kh * kw * nout * 4 + c * kh * nout * 4) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let colsp = par::SyncPtr::new(cols.as_mut_ptr());
     let body = |ob: usize, oe: usize| {
         for r in ob..oe {
