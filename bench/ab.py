@@ -29,15 +29,23 @@ ROUNDS = 4
 
 
 def ours(tier, extra=(), quiet=True):
-    """一遍 100 张，返回 (均值, 阶段均值, 每秒张数)。"""
+    """一遍 100 张，返回 (均值, 阶段均值, 每秒张数)。
+
+    ⚠ **必须在一个进程里跑完 100 张。** 曾经每张图起一个独立进程，看着
+    「更干净」，实际是把每次冷启动的开销平摊到每一张：同图同配置实测
+    det 44.4 ms（独立进程）vs 33.7 ms（同进程第二张起），整体 89 → 75。
+    对方的 runner 是一个进程跑 100 张（`--count 100`），拿我们的冷进程
+    去比它等于白送 19%。两边都得是热的。
+    """
     tot, det, line = [], [], []
+    imgs = [str(DS / f"img-{i:03d}.jpg") for i in range(1, 101)]
     t0 = time.time()
-    for i in range(1, 101):
-        r = subprocess.run(
-            [str(OURS), str(DS / f"img-{i:03d}.jpg"), "--tier", tier, "--json",
-             "--quiet", "--bench", "1", "--workers", "1", *extra],
-            capture_output=True, timeout=900, cwd=OURS_CWD)
-        t = json.loads(r.stdout.decode("utf-8", "replace"))[0]["timing"]
+    r = subprocess.run(
+        [str(OURS), *imgs, "--tier", tier, "--json",
+         "--quiet", "--bench", "1", "--workers", "1", *extra],
+        capture_output=True, timeout=3600, cwd=OURS_CWD)
+    for x in json.loads(r.stdout.decode("utf-8", "replace")):
+        t = x["timing"]
         tot.append(t["total_ms"])
         det.append(t["det_infer_ms"])
         line.append(t["rec_infer_ms"] + t["cls_ms"])
