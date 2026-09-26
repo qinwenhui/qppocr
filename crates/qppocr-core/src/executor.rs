@@ -296,15 +296,21 @@ impl Session {
                     let w = get!(&arena, &n.inputs[1]).ok_or_else(|| {
                         Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
                     })?;
+                    // strides 缺省是 (1,1)。深度卷积在不同 stride 下走的是
+                    // 完全不同的分支（s1 有向量化 x 向快路径、s≠1 退回逐元素），
+                    // 不带 stride 的键会把两者混成一个数。
+                    let st = strides_of(n);
                     format!(
-                        "Conv {}->{} k{}x{} @{}x{} g{}",
+                        "Conv {}->{} k{}x{} @{}x{} g{} s{},{}",
                         x.shape[1],
                         w.shape[0],
                         w.shape[2],
                         w.shape[3],
                         x.shape[2],
                         x.shape[3],
-                        get_i(n.attr("group"), 1)
+                        get_i(n.attr("group"), 1),
+                        st.0,
+                        st.1
                     )
                 } else if prof {
                     op.to_string()

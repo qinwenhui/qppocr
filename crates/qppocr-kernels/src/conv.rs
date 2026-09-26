@@ -10,14 +10,76 @@
 //! 3. **通用：分组 im2col + GEMM，按输出行 tile**。补丁矩阵整图一次性建
 //!    要几百 MB（v6 的 2x2 conv 在 992x752 图上 ~190 MB），tile 限制工作集。
 //!
-//! 只有 depthwise 分支累加进 y（tap 上 `+=`）；GEMM 分支在寄存器里算满输出
-//! 再 store，先清零是浪费的一趟（det 1x1 conv 47 MB、~4 ms/节点）。
-//! ⚠ 当前实现 `resize` 清零——缓冲池（阶段 2/3）落地时换成不清零分配。
+//! 三条路径都在寄存器里算满输出再 store，没有一条需要预清零 y
+//! （det 1x1 conv 47 MB、~4 ms/节点，白扫一趟）。
 
 use crate::activation::Activation;
 use crate::buf::F32Buf;
 use crate::gemm::{im2col, sgemm, sgemm_serial};
 use crate::par;
+
+/// 深度卷积一个 (n, channel) 平面的**标量参考实现**（非 x86 的兜底，
+/// 也是 AVX2 路径位级对拍的基准）。输入是**已补零的平面**。
+///
+/// 补零平面：`(ph + h + peh) × pwidth`，行距 `pwidth`，原始像素放在
+/// `[ph + y][pw + x]`，其余全是 0。这样卷积本身可以完全不带边界判断——
+/// 越界的 tap 读到的就是 0，贡献 `w * 0.0`。旧写法是逐 tap 判断越界再跳过，
+/// 那几列（占列数 4%）实测吃掉 30-60% 的时间。
+///
+/// 累加顺序：ky 外层、kx 内层、从 0 起，最后加 bias。
+#[allow(clippy::too_many_arguments)]
+pub fn depthwise_plane_scalar(
+    yc: &mut [f32],
+    xp: &[f32],
+    wc: &[f32],
+    oh: usize,
+    ow: usize,
+    pwidth: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    bias: f32,
+) {
+    for oy in 0..oh {
+        let base = oy * sh * pwidth;
+        for ox in 0..ow {
+            let mut acc = 0.0f32;
+            for ky in 0..kh {
+                let row = &xp[base + ky * pwidth..];
+                for kx in 0..kw {
+                    acc = wc[ky * kw + kx].mul_add(row[ox * sw + kx], acc);
+                }
+            }
+            yc[oy * ow + ox] = acc + bias;
+        }
+    }
+}
+
+/// 把一个 (h, wdim) 通道平面补零成 `(ph+h+peh) × pwidth`（行距 pwidth）。
+///
+/// 边距只在**首次分配**时清一次零：内区每次都被原样覆盖，边距永远是 0，
+/// 所以复用时不需要重新 memset。返回的行距由调用方按需要算好传进来。
+fn pad_channel(
+    pad: &mut Vec<f32>,
+    xch: &[f32],
+    h: usize,
+    wdim: usize,
+    ph: usize,
+    pw: usize,
+    pheight: usize,
+    pwidth: usize,
+) {
+    let need = pheight * pwidth;
+    if pad.len() != need {
+        pad.clear();
+        pad.resize(need, 0.0);
+    }
+    for y in 0..h {
+        let dst = (ph + y) * pwidth + pw;
+        pad[dst..dst + wdim].copy_from_slice(&xch[y * wdim..(y + 1) * wdim]);
+    }
+}
 
 /// 卷积参数（对应 ONNX Conv 属性；`peh/pew` 是 end padding，
 /// `auto_pad=SAME_*` 下 begin ≠ end）。
@@ -93,13 +155,10 @@ pub fn conv2d(
     let out_elems = n * m * ohw;
 
     let depthwise = group > 1 && cg == 1;
-    if depthwise {
-        y.resize_zeroed(out_elems); // 唯一需要预清零的路径（tap 上 +=）
-    } else {
-        // SAFETY: GEMM 路径（1x1/分块 im2col）每元素都由 sgemm 的 store
-        // 写满，无任何先读。
-        unsafe { y.resize_uninit(out_elems) };
-    }
+    // SAFETY: 两条路径都**写满**每一个输出元素——GEMM 路径由 sgemm 的 store
+    // 写满，depthwise 路径由 `depthwise_plane_*` 逐 ox 写满（内点与两端
+    // 三段合起来恰好覆盖 [0, ow)）。没有先读。
+    unsafe { y.resize_uninit(out_elems) };
     let yp = par::SyncPtr::new(y.as_mut_slice().as_mut_ptr());
     let wt = w;
 
@@ -144,77 +203,45 @@ pub fn conv2d(
             }
         }
     } else if depthwise {
-        // depthwise 直积。x 向快路径只看 sw（sh 已折进 iy 查表，两者可以不同，
-        // 例如 s[1,2]）。中段无边界检查可向量化；段外贡献为零。
-        bias_in_gemm = false;
+        // depthwise 直积：先把这个通道平面补零，再交给**完全无边界判断**
+        // 的内核。累加器在寄存器里，每个输出只写一次。
+        //
+        // 数值与旧的逐 tap 写法等价：顺序仍是 ky 外层、kx 内层、从 0 起，
+        // bias 最后加。越界的 tap 从「跳过」变成「加 w*0.0」——有限权重下
+        // `x + 0.0 == x`（唯一例外 `-0.0 + 0.0 == +0.0`，靠逐字符对拍兜底）。
+        let pheight = p.ph + h + p.peh;
+        // 行距要够向量读：sw=2 时一发读 16 宽，最右一发在 ox=ow-8。
+        let pwidth = (p.pw + wdim + p.pew).max(ow * p.sw + kw + 8);
         let chan_body = |ub: usize, ue: usize| {
+            let mut pad: Vec<f32> = Vec::new();
             for u in ub..ue {
                 let (bn, ch) = (u / c, u % c);
                 let xn = &x[bn * c * h * wdim..];
                 let xch = &xn[ch * h * wdim..(ch + 1) * h * wdim];
                 let wc = &wt[ch * kh * kw..(ch + 1) * kh * kw];
-                // SAFETY: (n, c) 通道平面与其他块不相交。
+                let bv = bias.map_or(0.0, |b| b[ch]);
+                pad_channel(&mut pad, xch, h, wdim, p.ph, p.pw, pheight, pwidth);
+                // SAFETY: (n, c) 通道平面与其他块不相交；pad 长度 = pheight*pwidth。
                 let yc = unsafe { yp.offset((bn * m + ch) * ohw).slice(ohw) };
-                for oy in 0..oh {
-                    let yr = &mut yc[oy * ow..(oy + 1) * ow];
-                    for ky in 0..kh {
-                        let iy = oy as isize * p.sh as isize - p.ph as isize + ky as isize;
-                        if iy < 0 || iy as usize >= h {
-                            continue;
-                        }
-                        let xr = &xch[iy as usize * wdim..(iy as usize + 1) * wdim];
-                        let wrow = &wc[ky * kw..];
-                        if p.sw == 1 {
-                            for kx in 0..kw {
-                                let wv = wrow[kx];
-                                // 段外整条贡献为零；中段连续可向量化
-                                let ox0 = p.pw.saturating_sub(kx);
-                                // ★ ox1 同样要饱和：kx > wdim+pw 时这一列输入完全在
-                                //   图外、贡献为零，本该被下面的 `ox1 <= ox0` 跳过。
-                                //   真实事故：1688 的防盗链占位图 spaceball.gif 是
-                                //   1×1，pw=0、kx≥2 时 `wdim+pw-kx` 在 usize 上直接
-                                //   下溢 panic（生产 18 张图全部识别失败，2026-09-25）。
-                                let ox1 = ow.min((wdim + p.pw).saturating_sub(kx));
-                                if ox1 <= ox0 {
-                                    continue;
-                                }
-                                let yseg = &mut yr[ox0..ox1];
-                                let xseg = &xr[ox0 + kx - p.pw..ox1 + kx - p.pw];
-                                // SAFETY: 段 [ox0, ox1) 属于本通道平面，
-                                // 与其他并行块不相交；xseg 同长。
-                                crate::arch_dispatch!(
-                                    // SAFETY: 段 [ox0, ox1) 属于本通道平面，
-                                    // 与其他并行块不相交；xseg 同长。
-                                    unsafe {
-                                        crate::x86::depthwise_fma_vec(
-                                            yseg.as_mut_ptr(),
-                                            xseg.as_ptr(),
-                                            ox1 - ox0,
-                                            wv,
-                                        )
-                                    },
-                                    {
-                                        for (d, sv) in yseg.iter_mut().zip(xseg) {
-                                            // y += w * x（fma，与 AVX2 一致）
-                                            *d = wv.mul_add(*sv, *d);
-                                        }
-                                    }
-                                );
-                            }
-                        } else {
-                            for kx in 0..kw {
-                                let wv = wrow[kx];
-                                for (ox, d) in yr.iter_mut().enumerate() {
-                                    let ix =
-                                        ox as isize * p.sw as isize - p.pw as isize + kx as isize;
-                                    if ix >= 0 && (ix as usize) < wdim {
-                                        *d = wv.mul_add(xr[ix as usize], *d);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                crate::arch_dispatch!(
+                    // SAFETY: yc 是本块独占的通道平面；pad/wc 只读且不与之重叠。
+                    unsafe {
+                        crate::x86::depthwise_plane_padded_avx2(
+                            yc.as_mut_ptr(),
+                            pad.as_ptr(),
+                            wc.as_ptr(),
+                            oh,
+                            ow,
+                            pwidth,
+                            kh,
+                            kw,
+                            p.sh,
+                            p.sw,
+                            bv,
+                        )
+                    },
+                    depthwise_plane_scalar(yc, &pad, wc, oh, ow, pwidth, kh, kw, p.sh, p.sw, bv,)
+                );
             }
         };
         let units = n * c;

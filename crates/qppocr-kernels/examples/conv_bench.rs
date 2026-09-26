@@ -1,5 +1,10 @@
-//! conv 独立基准：固定 shape、固定数据、「9 轮取最好」。
-//! cargo run --release -p qppocr-kernels --example conv_bench -- <case-idx>
+//! conv 独立基准：**模型里真实存在的那些形状**，固定数据、「9 轮取最好」。
+//!
+//! cargo run --release -p qppocr-kernels --example conv_bench [-- <线程数>]
+//!
+//! 形状取自 PP-OCRv6 tiny/small 的 det（`QPPOCR_PROF=1` 的逐算子表）。
+//! **单线程数字才是内核效率的判据**——多线程下算子互相争核，逐算子耗时
+//! 没有可比性。默认 1 线程。
 
 use qppocr_kernels::activation::Activation;
 use qppocr_kernels::buf::F32Buf;
@@ -8,111 +13,67 @@ use qppocr_kernels::conv::{ConvParams, conv2d};
 struct Case {
     name: &'static str,
     c: usize,
-    m: usize,
     h: usize,
     w: usize,
-    kh: usize,
-    kw: usize,
-    sh: usize,
-    sw: usize,
-    ph: usize,
-    pw: usize,
+    k: usize,
+    s: usize,
     group: usize,
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let idx: usize = args[1].parse().unwrap();
-    let cases = [
-        Case {
-            name: "dw 32->32 k3x3 @80x240 g32",
-            c: 32,
-            m: 32,
-            h: 80,
-            w: 240,
-            kh: 3,
-            kw: 3,
-            sh: 1,
-            sw: 1,
-            ph: 1,
-            pw: 1,
-            group: 32,
-        },
-        Case {
-            name: "dw 48->48 k3x3 @40x120 g48",
-            c: 48,
-            m: 48,
-            h: 40,
-            w: 120,
-            kh: 3,
-            kw: 3,
-            sh: 1,
-            sw: 1,
-            ph: 1,
-            pw: 1,
-            group: 48,
-        },
-        Case {
-            name: "dw 64->64 k5x5 @80x240 g64",
-            c: 64,
-            m: 64,
-            h: 80,
-            w: 240,
-            kh: 5,
-            kw: 5,
-            sh: 1,
-            sw: 1,
-            ph: 2,
-            pw: 2,
-            group: 64,
-        },
-        Case {
-            name: "im2col 3->16 k3x3 @320x960 s2 p1",
-            c: 3,
-            m: 16,
-            h: 320,
-            w: 960,
-            kh: 3,
-            kw: 3,
-            sh: 2,
-            sw: 2,
-            ph: 1,
-            pw: 1,
-            group: 1,
-        },
-        Case {
-            name: "im2col 64->16 k3x3 @80x240 p1",
-            c: 64,
-            m: 16,
-            h: 80,
-            w: 240,
-            kh: 3,
-            kw: 3,
-            sh: 1,
-            sw: 1,
-            ph: 1,
-            pw: 1,
-            group: 1,
-        },
-        Case {
-            name: "im2col 32->16 k3x3 @160x480 s2 p1",
-            c: 32,
-            m: 16,
-            h: 160,
-            w: 480,
-            kh: 3,
-            kw: 3,
-            sh: 2,
-            sw: 2,
-            ph: 1,
-            pw: 1,
-            group: 1,
-        },
-    ];
-    let c = &cases[idx];
+/// 输入尺寸由**输出**尺寸反推：`oh = (h + 2p - k)/s + 1`，`p=(k-1)/2`。
+const fn case(
+    name: &'static str,
+    c: usize,
+    oh: usize,
+    ow: usize,
+    k: usize,
+    s: usize,
+    group: usize,
+) -> Case {
+    let p = (k - 1) / 2;
+    Case {
+        name,
+        c,
+        h: (oh - 1) * s + k - 2 * p,
+        w: (ow - 1) * s + k - 2 * p,
+        k,
+        s,
+        group,
+    }
+}
 
-    // mt19937(777) + uniform_real_distribution<float>(-1,1) 的位级复刻做不到，
-    // 但 bench 不对数值——数据任意即可（两边各自随机）。
+fn main() {
+    let threads: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    qppocr_kernels::par::set_threads(threads);
+
+    #[rustfmt::skip]
+    let cases = [
+        // ---- tiny det 深度卷积（输出尺寸写在名字里）----
+        case("dw 32->32  k3x3 @200x240 s1", 32, 200, 240, 3, 1, 32),
+        case("dw 32->32  k3x3 @200x240 s2", 32, 200, 240, 3, 2, 32),
+        case("dw 48->48  k3x3 @100x120 s1", 48, 100, 120, 3, 1, 48),
+        case("dw 48->48  k3x3 @100x120 s2", 48, 100, 120, 3, 2, 48),
+        case("dw 64->64  k3x3 @ 50x 60 s1", 64,  50,  60, 3, 1, 64),
+        case("dw 64->64  k3x3 @ 50x 60 s2", 64,  50,  60, 3, 2, 64),
+        case("dw 160->160 k3x3 @ 25x 30 s1", 160, 25, 30, 3, 1, 160),
+        case("dw 64->64  k5x5 @200x240 s1", 64, 200, 240, 5, 1, 64),
+        case("dw 64->64  k5x5 @100x120 s1", 64, 100, 120, 5, 1, 64),
+        // ---- small det 深度卷积 ----
+        case("dw 48->48  k3x3 @200x240 s1", 48, 200, 240, 3, 1, 48),
+        case("dw 96->96  k3x3 @100x120 s1", 96, 100, 120, 3, 1, 96),
+        case("dw 96->96  k3x3 @100x120 s2", 96, 100, 120, 3, 2, 96),
+        case("dw 192->192 k3x3 @ 50x 60 s1", 192, 50, 60, 3, 1, 192),
+        case("dw 192->192 k3x3 @ 50x 60 s2", 192, 50, 60, 3, 2, 192),
+        case("dw 384->384 k3x3 @ 25x 30 s1", 384, 25, 30, 3, 1, 384),
+        case("dw 96->96  k7x7 @200x240 s1", 96, 200, 240, 7, 1, 96),
+        case("dw 96->96  k7x7 @ 50x 60 s1", 96,  50,  60, 7, 1, 96),
+        // ---- 窄 N 的普通卷积（tiny det 最大的一项）----
+        case("g1 64->16   k3x3 @200x240 s1", 64, 200, 240, 3, 1, 1),
+    ];
+
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut next = || {
         rng ^= rng >> 12;
@@ -121,40 +82,54 @@ fn main() {
         let v = rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
         (((v >> 40) as i64 - (1 << 23)) as f64 / (1i64 << 23) as f64) as f32
     };
-    let x: Vec<f32> = (0..c.c * c.h * c.w).map(|_| next()).collect();
-    let w: Vec<f32> = (0..c.m * (c.c / c.group) * c.kh * c.kw)
-        .map(|_| next())
-        .collect();
-    let bias: Vec<f32> = vec![0.0; c.m];
 
-    let params = ConvParams {
-        sh: c.sh,
-        sw: c.sw,
-        ph: c.ph,
-        pw: c.pw,
-        peh: c.ph,
-        pew: c.pw,
-        dh: 1,
-        dw: 1,
-        group: c.group,
-    };
-    let mut y = F32Buf::new();
-    let mut best = f64::MAX;
-    for _ in 0..9 {
-        let t0 = std::time::Instant::now();
-        conv2d(
-            &x,
-            &[1, c.c as i64, c.h as i64, c.w as i64],
-            &w,
-            &[c.m as i64, (c.c / c.group) as i64, c.kh as i64, c.kw as i64],
-            Some(&bias),
-            &params,
-            &Activation::default(),
-            &mut y,
+    println!("threads = {threads}\n");
+    let mut grand = 0.0;
+    for c in &cases {
+        let oh = c.h.div_ceil(c.s);
+        let ow = c.w.div_ceil(c.s);
+        let out_c = if c.group == 1 { c.c } else { c.c };
+        let x: Vec<f32> = (0..c.c * c.h * c.w).map(|_| next()).collect();
+        let w: Vec<f32> = (0..out_c * (c.c / c.group) * c.k * c.k)
+            .map(|_| next())
+            .collect();
+        let bias: Vec<f32> = (0..out_c).map(|_| next()).collect();
+        let params = ConvParams {
+            sh: c.s,
+            sw: c.s,
+            ph: (c.k - 1) / 2,
+            pw: (c.k - 1) / 2,
+            peh: (c.k - 1) / 2,
+            pew: (c.k - 1) / 2,
+            dh: 1,
+            dw: 1,
+            group: c.group,
+        };
+        let mut y = F32Buf::new();
+        let mut best = f64::MAX;
+        for _ in 0..9 {
+            let t0 = std::time::Instant::now();
+            conv2d(
+                &x,
+                &[1, c.c as i64, c.h as i64, c.w as i64],
+                &w,
+                &[out_c as i64, (c.c / c.group) as i64, c.k as i64, c.k as i64],
+                Some(&bias),
+                &params,
+                &Activation::default(),
+                &mut y,
+            );
+            best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let macs = (out_c * c.k * c.k * oh * ow) as f64;
+        // chk 只用来发现「输出全一样 / 压根没写」这类低级错误
+        let chk = y[y.len() / 2];
+        grand += best;
+        println!(
+            "{:<30} {best:8.3} ms  {:7.2} GMAC/s   chk={chk:.4}",
+            c.name,
+            macs / best / 1e6
         );
-        let ms = t0.elapsed().as_secs_f64() * 1000.0;
-        best = best.min(ms);
     }
-    let chk = y[y.len() / 2];
-    println!("rust {:<36} best {best:8.3} ms  chk={chk:.6}", c.name);
+    println!("\n{:<30} {grand:8.3} ms", "—— 合计");
 }
