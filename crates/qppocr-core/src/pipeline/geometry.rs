@@ -245,37 +245,38 @@ pub fn db_postprocess(
     max_candidates: usize,
     use_dilation: bool,
 ) -> Vec<TextBox> {
+    let dbg = std::env::var("QPPOCR_DEBUG_DB").is_ok();
+    let t0 = std::time::Instant::now();
     let n = (nh as usize) * (nw as usize);
     let mut mask = vec![0u8; n];
     for (m, &p) in mask.iter_mut().zip(pred.iter()) {
         *m = if p > thresh { 1 } else { 0 };
     }
+    let t_bin = t0.elapsed().as_secs_f64() * 1000.0;
 
     if use_dilation {
         // cv2.dilate 2x2 核：anchor=(1,1)，窗口 [y-1..y]×[x-1..x]，
-        // 越界样本忽略（morphology 边界语义）
+        // 越界样本忽略（morphology 边界语义）。走 kernels 的 AVX2 逐行
+        // 并行版（max 可交换 ⇒ 与标量**逐位相同**）；标量版 832×832
+        // 掩码实测 3.8 ms，是 DB 后处理最大的一项。
         let mut dil = vec![0u8; n];
-        for y in 0..nh {
-            for x in 0..nw {
-                let mut v = 0u8;
-                for dy in -1..=0 {
-                    for dx in -1..=0 {
-                        let ny = y + dy;
-                        let nx = x + dx;
-                        if ny < 0 || ny >= nh || nx < 0 || nx >= nw {
-                            continue;
-                        }
-                        v = v.max(mask[(ny as usize) * (nw as usize) + nx as usize]);
-                    }
-                }
-                dil[(y as usize) * (nw as usize) + x as usize] = v;
-            }
-        }
+        qppocr_kernels::resize::dilate2x2_max(&mask, &mut dil, nh as usize, nw as usize);
         mask = dil;
     }
 
+    let t_dil = t0.elapsed().as_secs_f64() * 1000.0;
     let mut comps = connected_components(&mask, nh, nw, 1);
+    let t_cc = t0.elapsed().as_secs_f64() * 1000.0;
     comps.truncate(max_candidates);
+    let ncomp = comps.len();
+    let npix: usize = comps.iter().map(|c| c.len()).sum();
+    if dbg {
+        eprintln!(
+            "[db] binarize={t_bin:.2} dilate={:.2} cc={:.2} comps={ncomp} pix={npix} nh={nh} nw={nw}",
+            t_dil - t_bin,
+            t_cc - t_dil
+        );
+    }
 
     let min_size = 3.0f32;
     let mut boxes = Vec::new();
@@ -344,6 +345,13 @@ pub fn db_postprocess(
             tb_pt[1] = by.clamp(0.0, dest_h as f32);
         }
         boxes.push(tb);
+    }
+    if dbg {
+        eprintln!(
+            "[db] per-box(含 hull/rect/score/unclip)={:.2} boxes={}",
+            t0.elapsed().as_secs_f64() * 1000.0 - t_cc,
+            boxes.len()
+        );
     }
     boxes
 }

@@ -44,3 +44,35 @@ fn resize_parallel_bitexact() {
         assert_eq!(got, want, "resize {dw}x{dh} 与标量不一致");
     }
 }
+
+/// 2×2 膨胀的 AVX2 版 vs 标量参考逐位一致。
+#[test]
+fn dilate2x2_bitexact() {
+    fn scalar(mask: &[u8], h: usize, w: usize) -> Vec<u8> {
+        let mut d = vec![0u8; h * w];
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let mut v = 0u8;
+                for dy in -1..=0i32 {
+                    for dx in -1..=0i32 {
+                        let (ny, nx) = (y + dy, x + dx);
+                        if ny < 0 || ny >= h as i32 || nx < 0 || nx >= w as i32 {
+                            continue;
+                        }
+                        v = v.max(mask[ny as usize * w + nx as usize]);
+                    }
+                }
+                d[y as usize * w + x as usize] = v;
+            }
+        }
+        d
+    }
+    for &(h, w) in &[(832usize, 832usize), (37, 129), (1, 1), (5, 300), (300, 5)] {
+        let mask: Vec<u8> = (0..h * w)
+            .map(|i| ((i * 2654435761usize) >> 24) as u8 % 3)
+            .collect();
+        let mut got = vec![0u8; h * w];
+        qppocr_kernels::resize::dilate2x2_max(&mask, &mut got, h, w);
+        assert_eq!(got, scalar(&mask, h, w), "dilate {h}x{w}");
+    }
+}

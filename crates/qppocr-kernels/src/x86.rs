@@ -905,3 +905,41 @@ pub unsafe fn bilinear_row_vec(
         ox += 1;
     }
 }
+
+/// 2×2 最大值膨胀的行内核（`x ∈ [1, w)`）：`out[x] = max(cur[x-1], cur[x],
+/// up[x-1], up[x])`（`up` 为空 = 第一行）。max 可交换 ⇒ 与标量逐位相同。
+///
+/// # Safety
+///
+/// `cur` 至少 `w` 字节；`up` 非空时至少 `w` 字节；`out` 至少 `w` 字节。
+#[target_feature(enable = "avx2")]
+pub unsafe fn dilate2x2_row_avx2(cur: &[u8], up: Option<&[u8]>, out: *mut u8, w: usize) {
+    let mut x = 1usize;
+    // 32 字节一批：cur[x-1..x+31] 与 cur[x..x+32] 两个未对齐载入取 max
+    while x + 32 <= w {
+        // SAFETY: x+32 <= w，两个 32 字节载入都在 cur 界内；out 有 w 字节。
+        unsafe {
+            use std::arch::x86_64::*;
+            let a = _mm256_loadu_si256(cur.as_ptr().add(x) as *const __m256i);
+            let b = _mm256_loadu_si256(cur.as_ptr().add(x - 1) as *const __m256i);
+            let mut v = _mm256_max_epu8(a, b);
+            if let Some(u) = up {
+                let c = _mm256_loadu_si256(u.as_ptr().add(x) as *const __m256i);
+                let d = _mm256_loadu_si256(u.as_ptr().add(x - 1) as *const __m256i);
+                v = _mm256_max_epu8(v, _mm256_max_epu8(c, d));
+            }
+            _mm256_storeu_si256(out.add(x) as *mut __m256i, v);
+        }
+        x += 32;
+    }
+    for xx in x..w {
+        // SAFETY: xx < w，全部在界内。
+        unsafe {
+            let mut v = (*cur.as_ptr().add(xx - 1)).max(*cur.as_ptr().add(xx));
+            if let Some(u) = up {
+                v = v.max(*u.as_ptr().add(xx - 1)).max(*u.as_ptr().add(xx));
+            }
+            *out.add(xx) = v;
+        }
+    }
+}

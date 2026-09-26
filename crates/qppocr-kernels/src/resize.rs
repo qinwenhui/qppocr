@@ -190,3 +190,45 @@ pub fn resize_bilinear_rgb_u8(
         }
     });
 }
+
+/// DB 后处理的 2×2 膨胀（`cv2.dilate` 2×2 核、anchor=(1,1)、越界忽略）。
+///
+/// 逐位语义：`out[y][x] = max(窗口内所有界内样本)`。max 可交换，
+/// 所以向量化不改变结果——与标量三重循环**逐位相同**。
+///
+/// 标量版在 832×832 掩码上实测 3.8 ms（DB 后处理里最大的一项）。
+pub fn dilate2x2_max(mask: &[u8], dst: &mut [u8], h: usize, w: usize) {
+    assert_eq!(mask.len(), h * w);
+    assert_eq!(dst.len(), h * w);
+    let dp = par::SyncPtr::new(dst.as_mut_ptr());
+    par::parallel_for(h, 16, |yb, ye| {
+        for y in yb..ye {
+            let cur = &mask[y * w..(y + 1) * w];
+            let up = if y > 0 {
+                Some(&mask[(y - 1) * w..y * w])
+            } else {
+                None
+            };
+            // SAFETY: 输出行 y 与其他并行块不相交。
+            let out = unsafe { dp.offset(y * w).slice(w) };
+            // x = 0：左侧越界，只有 (y,x) 与 (y-1,x)
+            out[0] = match up {
+                Some(u) => cur[0].max(u[0]),
+                None => cur[0],
+            };
+            #[cfg(target_arch = "x86_64")]
+            if crate::use_avx2() {
+                // SAFETY: x ∈ [1, w) 段内所有访问都在界内（w 由调用方保证）。
+                unsafe { crate::x86::dilate2x2_row_avx2(cur, up, out.as_mut_ptr(), w) };
+                continue;
+            }
+            for x in 1..w {
+                let mut v = cur[x - 1].max(cur[x]);
+                if let Some(u) = up {
+                    v = v.max(u[x - 1]).max(u[x]);
+                }
+                out[x] = v;
+            }
+        }
+    });
+}
