@@ -960,7 +960,7 @@ impl Engine {
             res.timings.cls_ms = t_ri.elapsed_ms();
         }
         let t_ri = now(); // ★ 重新起表：cls 的墙钟不能算进 rec
-        let outs = Self::run_batches(&batches, |beg, end| -> Result<Vec<RecLineOut>> {
+        let rec_fn = |beg: usize, end: usize| -> Result<Vec<RecLineOut>> {
             let mut batch_lines = Vec::with_capacity(end - beg);
             let mut max_wh_ratio = self.cfg.rec_min_width as f32 / img_h as f32;
             for &i in &order[beg..end] {
@@ -1070,7 +1070,14 @@ impl Engine {
                 });
             }
             Ok(batch_lines)
-        })?;
+        };
+        // ★ 两种并行的切法只能二选一（池不支持嵌套 fork）：**行间并行**
+        //   （一批一个线程、批内串行，即 `run_batches`）还是**行内并行**
+        //   （批次顺序执行、算子内部 fork 铺满池）。100 图逐图交错实测，
+        //   行间并行在两档都赢，行内并行最强的一档也慢 1.06x（small）到
+        //   1.43x（tiny）——rec 的算子虽大，但每行 ~80 个算子顺序依赖，
+        //   每次 fork ~97 us 的协调开销乘上去不划算。换方案前先看这条。
+        let outs = Self::run_batches(&batches, rec_fn)?;
         res.timings.rec_infer_ms += t_ri.elapsed_ms();
 
         // ---- 合并（串行）：并行段只产出结果，这里统一写回 ----
