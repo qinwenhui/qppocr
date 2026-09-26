@@ -43,7 +43,7 @@ options:
   --json            emit JSON
   --bench <n>       run n times per image and report the best
   --no-cls          turn off the 0/180 direction classifier
-  --rec-shards <n>  rec 两级并行的外层分片数（0 = 关，默认）
+  --rec-shards <n>  rec 两级并行的外层分片数（0 = 关，不传 = 按档位自动）
   --quiet           suppress the per-line listing
   -h, --help        this help"
     );
@@ -63,7 +63,8 @@ fn parse_args() -> Option<Options> {
         quiet: false,
         bench: 1,
         no_cls: false,
-        rec_shards: 0,
+        // `usize::MAX` = 自动（按档位），`0` = 关，其余 = 显式分片数。
+        rec_shards: usize::MAX,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -338,10 +339,11 @@ fn run(o: &Options) -> Result<(), Error> {
     if o.threads > 0 {
         builder = builder.threads(o.threads);
     }
-    if o.rec_shards > 0 {
-        let n = o.rec_shards;
-        builder = builder.advanced(move |a| a.rec_shards = n);
-    }
+    // ⚠ 这里曾经写成 `if o.rec_shards > 0 { ... }`，于是**显式的 `--rec-shards 0`
+    // 也被忽略**、默认值落到自动分片——「关分片」的对照实验全程在测同一个配置，
+    // 得出来的「无差别」是假的。显式值必须原样透传，`0` 就是「关」。
+    let n = o.rec_shards;
+    builder = builder.advanced(move |a| a.rec_shards = n);
     let engine = builder.build(&o.models_dir)?;
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if !o.json {
