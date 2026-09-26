@@ -23,6 +23,7 @@ struct Options {
     quiet: bool,
     bench: usize,
     no_cls: bool,
+    rec_shards: usize,
 }
 
 fn print_usage() {
@@ -42,6 +43,7 @@ options:
   --json            emit JSON
   --bench <n>       run n times per image and report the best
   --no-cls          turn off the 0/180 direction classifier
+  --rec-shards <n>  rec 两级并行的外层分片数（0 = 关，默认）
   --quiet           suppress the per-line listing
   -h, --help        this help"
     );
@@ -61,6 +63,7 @@ fn parse_args() -> Option<Options> {
         quiet: false,
         bench: 1,
         no_cls: false,
+        rec_shards: 0,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -115,6 +118,10 @@ fn parse_args() -> Option<Options> {
                 o.bench = args.get(i)?.parse().ok()?;
             }
             "--no-cls" => o.no_cls = true,
+            "--rec-shards" => {
+                i += 1;
+                o.rec_shards = args.get(i)?.parse().ok()?;
+            }
             "--quiet" => o.quiet = true,
             _ => o.images.push(a.clone().into()),
         }
@@ -330,6 +337,10 @@ fn run(o: &Options) -> Result<(), Error> {
         .detect_orientation(!o.no_cls);
     if o.threads > 0 {
         builder = builder.threads(o.threads);
+    }
+    if o.rec_shards > 0 {
+        let n = o.rec_shards;
+        builder = builder.advanced(move |a| a.rec_shards = n);
     }
     let engine = builder.build(&o.models_dir)?;
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;

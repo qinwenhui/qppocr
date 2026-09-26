@@ -222,6 +222,9 @@ pub struct Advanced {
     pub cls_window: bool,
     /// 一次方向分类前向塞几行（纯性能旋钮，输出不变）。
     pub cls_batch: usize,
+    /// rec 外层分片数（两级并行）。`usize::MAX` = 按档位自动，
+    /// `0` = 强制不分片（纯性能旋钮，输出不变）。
+    pub rec_shards: usize,
     /// 自动色阶预处理。⚠ 改变检测器所见（默认关）。
     pub enhance_contrast: bool,
     /// 检测放大倍数（成本 ~N²；裁剪仍取原图，默认 1）。
@@ -277,9 +280,26 @@ impl Default for Advanced {
             cls_width: 192,
             cls_window: false,
             cls_batch: 1,
+            rec_shards: usize::MAX,
             enhance_contrast: false,
             upscale: 1,
         }
+    }
+}
+
+/// 分片数的自动规则：识别网络**每层的算子规模**决定两级并行划不划算。
+///
+/// 实测（100 图语料、逐图交错）：小档每层 ~10M MAC，分片后每片只有
+/// 2 个参与者，fork 的协调成本盖过收益——慢 6%；大档每层 ~100M MAC，
+/// 分片快 10%。判据用档位而不是量出来的 MAC（构造期拿不到逐层形状），
+/// 两者在本项目的三个档位上是一致的。
+fn auto_rec_shards(tier: Tier, want: usize) -> usize {
+    if want != usize::MAX {
+        return want;
+    }
+    match tier {
+        Tier::Tiny => 0,
+        Tier::Small | Tier::Medium => 4,
     }
 }
 
@@ -407,7 +427,8 @@ impl EngineBuilder {
         let tier = self.tier.unwrap_or_default();
         let preset = self.preset.unwrap_or_default();
         let loaded = source.load(tier, self.verify.unwrap_or(true))?;
-        let cfg = resolve_config(preset, &self.cfg, self.advanced_fn);
+        let mut cfg = resolve_config(preset, &self.cfg, self.advanced_fn);
+        cfg.rec_shards = auto_rec_shards(tier, cfg.rec_shards);
         // 关方向分类 = 真不装配 cls（不加载、不推理）。曾经只把 cls_thresh
         // 设成 INFINITY：cls 照跑、时间照花、模型照占内存。
         let cls_bytes = if self.cfg.detect_orientation {
@@ -510,6 +531,7 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
         cls_width: pc.cls_width,
         cls_window: pc.cls_window,
         cls_batch: pc.cls_batch,
+        rec_shards: pc.rec_shards,
         enhance_contrast: pc.enhance_contrast,
         upscale: pc.upscale,
     };
@@ -544,6 +566,7 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
     pc.cls_width = adv.cls_width;
     pc.cls_window = adv.cls_window;
     pc.cls_batch = adv.cls_batch;
+    pc.rec_shards = adv.rec_shards;
     pc.enhance_contrast = adv.enhance_contrast;
     pc.upscale = adv.upscale;
     pc

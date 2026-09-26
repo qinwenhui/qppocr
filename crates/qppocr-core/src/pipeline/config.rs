@@ -91,6 +91,18 @@ pub struct PipelineConfig {
     /// 检测放大倍数（成本 ~N²，默认 1）。
     pub upscale: i32,
 
+    /// rec 阶段的**分片数**（两级并行的外层宽度）。
+    ///
+    /// 分片 = 外层若干线程各自负责若干行，每行一个**独立小池**，其算子
+    /// 再在该池内 fork。单池做不到这一点：`fork_mu` 会把并发 fork 串起来，
+    /// 外层线程互相排队。池数 = 分片数，池大小 = 总线程数 / 分片数。
+    ///
+    /// - `usize::MAX`（默认）= **按档位自动**：识别网络每层算子够大才划算，
+    ///   小档每层只有 ~10M MAC，fork 的协调成本盖过收益，实测分片反而慢 6%；
+    ///   大档每层 ~100M MAC，分片快 10%。自动规则见 facade 的 `auto_rec_shards`。
+    /// - `0` = 强制不分片。`n` = 强制 n 片。
+    pub rec_shards: usize,
+
     /// 线程数，0 = 自动。
     pub threads: usize,
 }
@@ -128,6 +140,7 @@ impl Default for PipelineConfig {
             retry_conf: 0.85,
             enhance_contrast: false,
             upscale: 1,
+            rec_shards: usize::MAX,
             threads: 0,
         }
     }
