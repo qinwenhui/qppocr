@@ -450,7 +450,16 @@ impl Engine {
         if n == 0 {
             return Ok(Vec::new());
         }
-        let nthreads = qppocr_kernels::par::threads().min(n).max(1);
+        let cap = std::env::var("QPPOCR_ROW_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(usize::MAX);
+        let nthreads = qppocr_kernels::par::threads().min(n).min(cap).max(1);
+        let row_dbg = std::env::var_os("QPPOCR_ROW_DEBUG").is_some();
+        if row_dbg {
+            eprintln!("[row] batches={n} nthreads={nthreads}");
+        }
         if nthreads == 1 {
             // 单线程：直接顺序跑，不走线程创建
             let mut out = Vec::with_capacity(n);
@@ -463,6 +472,7 @@ impl Engine {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let next = AtomicUsize::new(0);
         let slots: Vec<Mutex<Option<Result<T>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+        let t_scope = std::time::Instant::now();
         std::thread::scope(|s| {
             for _ in 0..nthreads {
                 s.spawn(|| {
@@ -473,11 +483,25 @@ impl Engine {
                             break;
                         }
                         let (b, e) = batches[i];
-                        *slots[i].lock().unwrap() = Some(f(b, e));
+                        let t1 = std::time::Instant::now();
+                        let r = f(b, e);
+                        if row_dbg {
+                            eprintln!(
+                                "[row]  batch {i} [{b},{e}) {:.2} ms",
+                                t1.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        *slots[i].lock().unwrap() = Some(r);
                     }
                 });
             }
         });
+        if row_dbg {
+            eprintln!(
+                "[row]  fan-out wall {:.2} ms",
+                t_scope.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let mut out = Vec::with_capacity(n);
         for slot in slots {
             match slot.into_inner().unwrap() {
@@ -766,14 +790,20 @@ impl Engine {
         let mut in_f32 =
             qppocr_kernels::buf::F32Buf::with_zeroed(3 * (nh as usize) * (nw as usize));
         let (scale, mean, istd) = (1.0f32 / 255.0, 0.5f32, 1.0f32 / 0.5f32);
-        for y in 0..nh {
-            let r = det_img.row(y);
-            for x in 0..nw {
-                for c in 0..3 {
-                    let v = r[(x as usize) * 3 + c] as f32 * scale;
-                    in_f32[c * (nh as usize) * (nw as usize)
-                        + (y as usize) * (nw as usize)
-                        + x as usize] = (v - mean) * istd;
+        // ★ 通道在外层：三个平面各自连续写。写成「行外层、通道内层」时
+        //   每个像素要在相隔 nh·nw 的三个地址间跳一次，等于同时开 3 条
+        //   远隔的写流——960×832 上实测 2.3 ms，比算术该有的慢一个量级。
+        //   逐元素算术**一字不改**（同样的 `*scale`、`-mean`、`*istd` 顺序），
+        //   所以逐位不变。
+        let plane = (nh as usize) * (nw as usize);
+        for c in 0..3 {
+            let dst = &mut in_f32[c * plane..(c + 1) * plane];
+            for y in 0..nh as usize {
+                let r = det_img.row(y as i32);
+                let drow = &mut dst[y * nw as usize..(y + 1) * nw as usize];
+                for (x, d) in drow.iter_mut().enumerate() {
+                    let v = r[x * 3 + c] as f32 * scale;
+                    *d = (v - mean) * istd;
                 }
             }
         }
@@ -954,20 +984,31 @@ impl Engine {
         //   耗时（~14 ms），而「批串行 + 批内并行」在 16 线程上只拿到
         //   3.2x（fork 协调开销盖过了收益）。行数多时仍按 rec_batch 分组
         //   （批内存与 padding 效率）。
-        let per_batch = self
-            .cfg
-            .rec_batch
-            .min(order.len().div_ceil(qppocr_kernels::par::threads().max(1)))
-            .max(1);
+        let rec_batch_cfg = std::env::var("QPPOCR_REC_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(self.cfg.rec_batch);
+        let per_batch = if std::env::var_os("QPPOCR_REC_BATCH_NOCLAMP").is_some() {
+            rec_batch_cfg.max(1)
+        } else {
+            rec_batch_cfg
+                .min(order.len().div_ceil(qppocr_kernels::par::threads().max(1)))
+                .max(1)
+        };
+        let batch_ratio = std::env::var("QPPOCR_REC_BATCH_RATIO")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(self.cfg.rec_batch_ratio);
         let mut batches: Vec<(usize, usize)> = Vec::new();
         let mut beg = 0usize;
         while beg < order.len() {
             let mut end = beg + 1;
-            if self.cfg.rec_batch_ratio > 0.0 {
+            if batch_ratio > 0.0 {
                 let base = wh_ratio[order[beg]].max(1e-6);
                 while end < order.len()
                     && end - beg < per_batch
-                    && wh_ratio[order[end]] as f64 <= base as f64 * self.cfg.rec_batch_ratio
+                    && wh_ratio[order[end]] as f64 <= base as f64 * batch_ratio
                 {
                     end += 1;
                 }
