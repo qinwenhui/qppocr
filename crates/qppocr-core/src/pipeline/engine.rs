@@ -956,6 +956,7 @@ impl Engine {
             }
             res.timings.cls_ms = t_ri.elapsed_ms();
         }
+        let t_ri = now(); // ★ 重新起表：cls 的墙钟不能算进 rec
         let outs = Self::run_batches(&batches, |beg, end| -> Result<Vec<RecLineOut>> {
             let mut batch_lines = Vec::with_capacity(end - beg);
             let mut max_wh_ratio = self.cfg.rec_min_width as f32 / img_h as f32;
