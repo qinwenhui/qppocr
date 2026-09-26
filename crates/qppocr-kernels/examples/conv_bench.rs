@@ -12,7 +12,8 @@ use qppocr_kernels::conv::{ConvParams, conv2d};
 
 struct Case {
     name: &'static str,
-    c: usize,
+    c_in: usize,
+    c_out: usize,
     h: usize,
     w: usize,
     k: usize,
@@ -30,15 +31,40 @@ const fn case(
     s: usize,
     group: usize,
 ) -> Case {
+    // 深度卷积：c_in == c_out == group
     let p = (k - 1) / 2;
     Case {
         name,
-        c,
+        c_in: c,
+        c_out: c,
         h: (oh - 1) * s + k - 2 * p,
         w: (ow - 1) * s + k - 2 * p,
         k,
         s,
         group,
+    }
+}
+
+/// 普通（g=1）卷积：输入 c_in 通道、输出 c_out 通道。
+const fn conv(
+    name: &'static str,
+    c_in: usize,
+    c_out: usize,
+    oh: usize,
+    ow: usize,
+    k: usize,
+    s: usize,
+) -> Case {
+    let p = (k - 1) / 2;
+    Case {
+        name,
+        c_in,
+        c_out,
+        h: (oh - 1) * s + k - 2 * p,
+        w: (ow - 1) * s + k - 2 * p,
+        k,
+        s,
+        group: 1,
     }
 }
 
@@ -70,8 +96,25 @@ fn main() {
         case("dw 384->384 k3x3 @ 25x 30 s1", 384, 25, 30, 3, 1, 384),
         case("dw 96->96  k7x7 @200x240 s1", 96, 200, 240, 7, 1, 96),
         case("dw 96->96  k7x7 @ 50x 60 s1", 96,  50,  60, 7, 1, 96),
-        // ---- 窄 N 的普通卷积（tiny det 最大的一项）----
-        case("g1 64->16   k3x3 @200x240 s1", 64, 200, 240, 3, 1, 1),
+        // ---- 普通卷积：tiny/small det 里最大的几项（N 都很窄）----
+        conv("g1  64->16 k3x3 @200x240 s1", 64, 16, 200, 240, 3, 1),
+        conv("g1  32->16 k3x3 @400x480 s2", 32, 16, 400, 480, 3, 2),
+        conv("g1   3->16 k3x3 @800x960 s2", 3, 16, 800, 960, 3, 2),
+        conv("g1  32->64 k1x1 @200x240 s1", 32, 64, 200, 240, 1, 1),
+        conv("g1  64->128 k1x1 @25x30 s1", 64, 128, 25, 30, 1, 1),
+        conv("g1 384->384 k1x1 @25x30 s1", 384, 384, 25, 30, 1, 1),
+        // ---- 诊断：同 im2col、不同 N；同 N、有无 im2col ----
+        conv("diag 64->64 k3x3 @200x240 s1", 64, 64, 200, 240, 3, 1),
+        conv("diag 64->32 k3x3 @200x240 s1", 64, 32, 200, 240, 3, 1),
+        conv("diag 64->16 k1x1 @200x240 s1", 64, 16, 200, 240, 1, 1),
+        conv("diag 64->128 k3x3 @200x240 s1", 64, 128, 200, 240, 3, 1),
+        // ---- rec 的一行（tiny，3x22 是 22 个时间步）----
+        conv("rec 160->320 k1x1 @ 3x22 s1", 160, 320, 3, 22, 1, 1),
+        conv("rec 320->160 k1x1 @ 3x22 s1", 320, 160, 3, 22, 1, 1),
+        conv("rec  96->192 k1x1 @ 6x22 s1", 96, 192, 6, 22, 1, 1),
+        conv("rec   3-> 24 k3x3 @48x85 s2", 3, 24, 48, 85, 3, 2),
+        conv("rec 160->320 k1x1 @ 3x63 s1", 160, 320, 3, 63, 1, 1),
+        conv("rec 320->160 k1x1 @ 3x211 s1", 320, 160, 3, 211, 1, 1),
     ];
 
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -88,12 +131,11 @@ fn main() {
     for c in &cases {
         let oh = c.h.div_ceil(c.s);
         let ow = c.w.div_ceil(c.s);
-        let out_c = if c.group == 1 { c.c } else { c.c };
-        let x: Vec<f32> = (0..c.c * c.h * c.w).map(|_| next()).collect();
-        let w: Vec<f32> = (0..out_c * (c.c / c.group) * c.k * c.k)
+        let x: Vec<f32> = (0..c.c_in * c.h * c.w).map(|_| next()).collect();
+        let w: Vec<f32> = (0..c.c_out * (c.c_in / c.group) * c.k * c.k)
             .map(|_| next())
             .collect();
-        let bias: Vec<f32> = (0..out_c).map(|_| next()).collect();
+        let bias: Vec<f32> = (0..c.c_out).map(|_| next()).collect();
         let params = ConvParams {
             sh: c.s,
             sw: c.s,
@@ -111,9 +153,14 @@ fn main() {
             let t0 = std::time::Instant::now();
             conv2d(
                 &x,
-                &[1, c.c as i64, c.h as i64, c.w as i64],
+                &[1, c.c_in as i64, c.h as i64, c.w as i64],
                 &w,
-                &[out_c as i64, (c.c / c.group) as i64, c.k as i64, c.k as i64],
+                &[
+                    c.c_out as i64,
+                    (c.c_in / c.group) as i64,
+                    c.k as i64,
+                    c.k as i64,
+                ],
                 Some(&bias),
                 &params,
                 &Activation::default(),
@@ -121,7 +168,7 @@ fn main() {
             );
             best = best.min(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        let macs = (out_c * c.k * c.k * oh * ow) as f64;
+        let macs = (c.c_out * (c.c_in / c.group) * c.k * c.k * oh * ow) as f64;
         // chk 只用来发现「输出全一样 / 压根没写」这类低级错误
         let chk = y[y.len() / 2];
         grand += best;
