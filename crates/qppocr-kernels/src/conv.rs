@@ -60,6 +60,7 @@ pub fn depthwise_plane_scalar(
 ///
 /// 边距只在**首次分配**时清一次零：内区每次都被原样覆盖，边距永远是 0，
 /// 所以复用时不需要重新 memset。返回的行距由调用方按需要算好传进来。
+#[allow(clippy::too_many_arguments)]
 fn pad_channel(
     pad: &mut Vec<f32>,
     xch: &[f32],

@@ -138,6 +138,78 @@ pub unsafe fn sgemm_panel_avx2(
         let nn = 32.min(n - n0);
         let full = nn == 32;
         let mut m0 = 0;
+
+        // ★ 窄面板专用路径（nn ≤ 16）。通用路径固定用 4 个列向量累加器，
+        //   nn ≤ 16 时后两个的 B 是零、它们的 8 条 FMA 全是空转——正好一半。
+        //   PP-OCRv6 det 的最大几项都是 16 输出通道（64->16 / 32->16 / 3->16），
+        //   实测 N=16 的效率只有 N=64 的 60%。这里按实际列数只用 1-2 个累加器。
+        //
+        //   数值不变：c0/c1 的 FMA 序列与通用路径逐条相同（同样的 bv0/bv1、
+        //   同样的 k 序），c2/c3 本来也进不了 nn 宽的 store。
+        if nn <= 16 {
+            let two = nn > 8;
+            while m0 + 4 <= m {
+                let (mut c00, mut c01) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+                let (mut c10, mut c11) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+                let (mut c20, mut c21) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+                let (mut c30, mut c31) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+                let a0 = a.add(m0 * k);
+                let a1 = a.add((m0 + 1) * k);
+                let a2 = a.add((m0 + 2) * k);
+                let a3 = a.add((m0 + 3) * k);
+                for kk in 0..k {
+                    let bp = b.add(kk * n + n0);
+                    let bv0 = _mm256_loadu_ps(bp);
+                    let bv1 = if two { _mm256_loadu_ps(bp.add(8)) } else { bv0 };
+                    let mut av = _mm256_broadcast_ss(&*a0.add(kk));
+                    c00 = _mm256_fmadd_ps(av, bv0, c00);
+                    if two {
+                        c01 = _mm256_fmadd_ps(av, bv1, c01);
+                    }
+                    av = _mm256_broadcast_ss(&*a1.add(kk));
+                    c10 = _mm256_fmadd_ps(av, bv0, c10);
+                    if two {
+                        c11 = _mm256_fmadd_ps(av, bv1, c11);
+                    }
+                    av = _mm256_broadcast_ss(&*a2.add(kk));
+                    c20 = _mm256_fmadd_ps(av, bv0, c20);
+                    if two {
+                        c21 = _mm256_fmadd_ps(av, bv1, c21);
+                    }
+                    av = _mm256_broadcast_ss(&*a3.add(kk));
+                    c30 = _mm256_fmadd_ps(av, bv0, c30);
+                    if two {
+                        c31 = _mm256_fmadd_ps(av, bv1, c31);
+                    }
+                }
+                let mut t = [0f32; 16];
+                for (row, (r0, r1)) in [
+                    (m0, (c00, c01)),
+                    (m0 + 1, (c10, c11)),
+                    (m0 + 2, (c20, c21)),
+                    (m0 + 3, (c30, c31)),
+                ] {
+                    let cp = c.add(row * ldc + n0);
+                    let (mut v0, mut v1) = (r0, r1);
+                    if has_bias {
+                        let bv = _mm256_set1_ps(*bias.add(row));
+                        v0 = _mm256_add_ps(v0, bv);
+                        v1 = _mm256_add_ps(v1, bv);
+                    }
+                    // 非整面板：先落 t 再拷 nn 列（与通用路径同一套写法）
+                    _mm256_storeu_ps(t.as_mut_ptr(), v0);
+                    _mm256_storeu_ps(t.as_mut_ptr().add(8), v1);
+                    std::ptr::copy_nonoverlapping(t.as_ptr(), cp, nn);
+                }
+                m0 += 4;
+            }
+            // M%4 尾行：nn < 32 恒走标量回退（与通用路径一致）
+            for row in m0..m {
+                return_to_scalar_tail(a, b, c, m, n, k, ldc, bias, p, row);
+            }
+            continue;
+        }
+
         while m0 + 4 <= m {
             // 16 个累加器 = 4 行 × 4 向量：k 内层每步 16 路独立 FMA
             let (mut c00, mut c01, mut c02, mut c03) = (
