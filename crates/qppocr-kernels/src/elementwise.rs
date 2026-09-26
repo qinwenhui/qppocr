@@ -121,6 +121,65 @@ pub fn binary_can_inplace(a_shape: &[i64], b_shape: &[i64]) -> bool {
     (0..a_shape.len()).all(|i| a_shape[i] == m.shape[a_shape.len() - 1 - i])
 }
 
+/// `out[n,c,s] = feature[n,c,s] · gate[n,c] + residual[n,c,s]`。
+///
+/// 对应「门控块」`Add(Mul(特征, 门), 残差)`——PP-OCRv6 主干里每个大核块都有
+/// 一个：门是 `[1,C,1,1]` 的逐通道标量（SE 路径算出来的），单独跑 Mul 再接
+/// Add 要多写一趟、多读一趟中间的 12 MB 特征图。
+///
+/// ⚠ **不能用 fma**：独立的 Mul 先舍入一次、Add 再舍入一次，融合版必须复现
+/// 这两次舍入（`(f·g) + r`），否则低位就分叉。Rust 默认不做浮点收缩，照字面
+/// 写即可。
+///
+/// `hw` 是每个通道平面的元素数，`c` 是通道数（gate 的长度）。
+#[allow(clippy::too_many_arguments)]
+pub fn mul_add_scale(
+    feature: &[f32],
+    gate: &[f32],
+    residual: &[f32],
+    out: &mut [f32],
+    c: usize,
+    hw: usize,
+) {
+    if hw == 0 || c == 0 || feature.is_empty() {
+        return;
+    }
+    assert_eq!(feature.len(), residual.len(), "mul_add_scale: 输入不等长");
+    assert_eq!(feature.len(), out.len(), "mul_add_scale: 输出不等长");
+    let planes = feature.len() / hw;
+    let op = par::SyncPtr::new(out.as_mut_ptr());
+    par::parallel_for_units(planes, |b, e| {
+        for p in b..e {
+            let gv = gate[p % c];
+            let s = p * hw;
+            // SAFETY: 平面 p 的区间与其他并行块不相交。
+            let o = unsafe { op.offset(s).slice(hw) };
+            let f = &feature[s..s + hw];
+            let r = &residual[s..s + hw];
+            for i in 0..hw {
+                o[i] = f[i] * gv + r[i];
+            }
+        }
+    });
+}
+
+/// [`mul_add_scale`] 的**分配输出**版本。core 是 `forbid(unsafe_code)`，
+/// 拿不到未初始化缓冲；这里把「分配 + 写满」封在 kernels 内部，省掉
+/// `with_zeroed` 那趟 12 MB 的清零。
+pub fn mul_add_scale_alloc(
+    feature: &[f32],
+    gate: &[f32],
+    residual: &[f32],
+    c: usize,
+    hw: usize,
+) -> F32Buf {
+    let mut out = F32Buf::new();
+    // SAFETY: mul_add_scale 对每个输出元素恰好写一次（hw·c == len 时写满）。
+    unsafe { out.resize_uninit(feature.len()) };
+    mul_add_scale(feature, gate, residual, out.as_mut_slice(), c, hw);
+    out
+}
+
 /// `a`（稠密、已持有广播输出形状）`op= b`（广播到 a 上）。
 ///
 /// 最内若干维上 b 为常量时构成一个可向量化的 run；b 非常量但沿该维稠密
