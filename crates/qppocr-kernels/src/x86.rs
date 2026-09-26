@@ -585,22 +585,91 @@ pub unsafe fn binary_run_inplace_vec(
 
 // ================================================================ conv 相关
 
-/// depthwise 的 sw==1 内层：`yd[i] = fma(wv, xd[i], yd[i])`，len 个元素。
+/// 深度卷积**一整个 (n, channel) 输出平面**的 AVX2 路径，输入是
+/// **已补零的平面**（`(ph+h+peh) × pwidth`，行距 `pwidth`，见
+/// `conv::depthwise_plane_scalar` 的说明）。
+///
+/// 补零之后整个卷积**没有任何边界判断**：内层就是
+/// `acc = fma(w[k], load(row + ox*sw + kx), acc)`，一趟写回。
+/// 旧的逐 tap 写法每个 tap 都把整行 y 读回来再写回去（k3x3 是 9 读 + 9 写，
+/// 共 18 趟内存往返，实际只需要 1 趟写），而且每个 tap 一次 `arch_dispatch!`
+/// 调用；边界列还得逐元素带两个越界判断——实测边界那几列（占列数 4%）
+/// 吃掉 30-60% 的时间。
+///
+/// 数值与旧写法**等价**：累加顺序仍是 ky 外层、kx 内层、从 0 起，
+/// bias 最后加。越界的 tap 旧写法整个跳过、这里是加一个 `w * 0.0`——
+/// 有限权重下 `x + 0.0 == x`（唯一的例外 `-0.0 + 0.0 == +0.0`，要靠
+/// 逐字符对拍兜底）。
+///
+/// SAFETY: `yc` 指向 `oh*ow` 个可写元素；`xp` 指向
+/// `((oh-1)*sh+kh) * pwidth` 个可读元素；`wc` 指向 `kh*kw` 个可读元素。
 #[target_feature(enable = "avx2,fma")]
-pub unsafe fn depthwise_fma_vec(yd: *mut f32, xd: *const f32, len: usize, wv: f32) {
-    let vw = _mm256_set1_ps(wv);
-    let mut i = 0usize;
-    while i + 8 <= len {
-        let p = yd.add(i);
-        _mm256_storeu_ps(
-            p,
-            _mm256_fmadd_ps(vw, _mm256_loadu_ps(xd.add(i)), _mm256_loadu_ps(p)),
-        );
-        i += 8;
-    }
-    while i < len {
-        *yd.add(i) = wv.mul_add(*xd.add(i), *yd.add(i));
-        i += 1;
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn depthwise_plane_padded_avx2(
+    yc: *mut f32,
+    xp: *const f32,
+    wc: *const f32,
+    oh: usize,
+    ow: usize,
+    pwidth: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    bias: f32,
+) {
+    let vbias = _mm256_set1_ps(bias);
+    let vec_ok = (sw == 1 || sw == 2) && ow >= 8;
+    for oy in 0..oh {
+        let yrow = yc.add(oy * ow);
+        let base = xp.add(oy * sh * pwidth);
+        if !vec_ok {
+            for ox in 0..ow {
+                let mut acc = 0.0f32;
+                for ky in 0..kh {
+                    let row = base.add(ky * pwidth);
+                    for kx in 0..kw {
+                        acc = (*wc.add(ky * kw + kx)).mul_add(*row.add(ox * sw + kx), acc);
+                    }
+                }
+                *yrow.add(ox) = acc + bias;
+            }
+            continue;
+        }
+        // 一发 8 个输出。尾部用**重叠的一发**收掉（写在 [ow-8, ow)，与已写
+        // 列重叠但值相同，幂等），于是 [0, ow) 全被覆盖、一个标量都不剩。
+        let emit = |ox: usize| {
+            let mut acc = _mm256_setzero_ps();
+            for ky in 0..kh {
+                let row = base.add(ky * pwidth);
+                for kx in 0..kw {
+                    let wv = _mm256_set1_ps(*wc.add(ky * kw + kx));
+                    let p = row.add(ox * sw + kx);
+                    let xv = if sw == 1 {
+                        _mm256_loadu_ps(p)
+                    } else {
+                        // 读 [p, p+16)，抽偶数位 → p0,p2,…,p14。
+                        // shuffle_ps 按 128 位道得 [a0,a2,b0,b2|a4,a6,b4,b6]，
+                        // 再按 64 位道重排成 [a0,a2,a4,a6|b0,b2,b4,b6]。
+                        // SAFETY: 调用方按 `ow*sw + kw + 8` 保证 pwidth 够读。
+                        let a = _mm256_loadu_ps(p);
+                        let b = _mm256_loadu_ps(p.add(8));
+                        let t = _mm256_shuffle_ps(a, b, 0b10_00_10_00);
+                        _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(t), 0b11_01_10_00))
+                    };
+                    acc = _mm256_fmadd_ps(wv, xv, acc);
+                }
+            }
+            _mm256_storeu_ps(yrow.add(ox), _mm256_add_ps(acc, vbias));
+        };
+        let mut ox = 0usize;
+        while ox + 8 <= ow {
+            emit(ox);
+            ox += 8;
+        }
+        if ox < ow {
+            emit(ow - 8);
+        }
     }
 }
 
