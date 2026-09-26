@@ -130,6 +130,40 @@ pub fn order_box_tl_tr_br_bl(p: &mut [Pt; 4]) {
     p.copy_from_slice(&r);
 }
 
+/// 对切片并行 map（连通域彼此独立）。core 是 `forbid(unsafe_code)`，
+/// 用「结果槽 + 原子领票」而不是裸指针切分。
+fn par_map<T: Sync, U: Send, F>(items: &[T], f: F) -> Vec<U>
+where
+    F: Fn(&T) -> U + Sync,
+{
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n = items.len();
+    let nthreads = qppocr_kernels::par::threads().min(n).max(1);
+    if nthreads <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<U>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    *slots[i].lock().unwrap() = Some(f(&items[i]));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .filter_map(|m| m.into_inner().unwrap())
+        .collect()
+}
+
 /// 8 连通域标记；每个连通域返回一个点表（带尺寸下限过滤）。
 fn connected_components(mask: &[u8], hh: i32, ww: i32, min_pixels: usize) -> Vec<Vec<Pt>> {
     let mut label = vec![-1i32; (hh as usize) * (ww as usize)];
@@ -268,21 +302,23 @@ pub fn db_postprocess(
     let mut comps = connected_components(&mask, nh, nw, 1);
     let t_cc = t0.elapsed().as_secs_f64() * 1000.0;
     comps.truncate(max_candidates);
-    let ncomp = comps.len();
-    let npix: usize = comps.iter().map(|c| c.len()).sum();
     if dbg {
         eprintln!(
-            "[db] binarize={t_bin:.2} dilate={:.2} cc={:.2} comps={ncomp} pix={npix} nh={nh} nw={nw}",
+            "[db] binarize={t_bin:.2} dilate={:.2} cc={:.2} comps={}",
             t_dil - t_bin,
-            t_cc - t_dil
+            t_cc - t_dil,
+            comps.len()
         );
     }
 
     let min_size = 3.0f32;
     let mut boxes = Vec::new();
-    for comp in comps {
-        let hull = convex_hull(comp);
-        let (Some(mut rect), sside) = min_area_rect(&hull) else {
+    // ★ 凸包并行预算：每个连通域的凸包要对它全部像素排序（一行 5000+ 点），
+    //   而连通域彼此独立——实测这是 per-box 的 92%（2.17/2.36 ms）。
+    let hulls: Vec<Vec<Pt>> = par_map(&comps, |c| convex_hull(c.clone()));
+    for (ci, _comp) in comps.iter().enumerate() {
+        let hull = &hulls[ci];
+        let (Some(mut rect), sside) = min_area_rect(hull) else {
             continue;
         };
         if sside < min_size {
@@ -345,13 +381,6 @@ pub fn db_postprocess(
             tb_pt[1] = by.clamp(0.0, dest_h as f32);
         }
         boxes.push(tb);
-    }
-    if dbg {
-        eprintln!(
-            "[db] per-box(含 hull/rect/score/unclip)={:.2} boxes={}",
-            t0.elapsed().as_secs_f64() * 1000.0 - t_cc,
-            boxes.len()
-        );
     }
     boxes
 }
