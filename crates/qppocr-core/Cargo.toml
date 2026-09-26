@@ -16,7 +16,7 @@ parallel = ["qppocr-kernels/parallel"]
 serde = ["dep:serde"]
 
 [dependencies]
-qppocr-kernels = { path = "../qppocr-kernels", version = "0.1.1" }
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.1.2" }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 
 [lints]
