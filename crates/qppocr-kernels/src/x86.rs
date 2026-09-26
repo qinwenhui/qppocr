@@ -118,11 +118,22 @@ pub unsafe fn hmax256_ps(v: __m256) -> f32 {
 /// 与 `crate::gemm` 里的标量 `panel_body` 相同：`c` 的列区间
 /// `[p*32, p*32+nn)` 必须与并发调用者不相交；`a`/`b`/`bias` 长度已由
 /// 分发层校验。
+/// 面板微内核的**统一实现**。`BP = false` 走原来的稠密 B（行距 `n`）；
+/// `BP = true` 走 implicit-GEMM 的 B：**每个 k 一行一个指针**、行内步长
+/// `SW`（1 = 连续、2 = 隔一个取一个）。
+///
+/// 为什么需要后者：im2col 会把 patch 矩阵**materialize** 出来，而它是输入的
+/// kh·kw 倍（k3x3 就是 9 倍）——实测 det 单图的 im2col 搬运 359 MB，占全部
+/// 搬运的 30%，而整机已经跑在 DRAM 带宽上限上。给 B 换成「每 k 一个指针」
+/// 之后，patch 直接是输入上的取数，一个字节都不用额外搬。
+///
+/// 累加顺序逐 k 不变（ch → ky → kx），所以输出**逐位一致**。
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
-pub unsafe fn sgemm_panel_avx2(
+pub unsafe fn sgemm_panel_impl<const BP: bool, const SW: usize>(
     a: *const f32,
     b: *const f32,
+    bptrs: *const *const f32,
     c: *mut f32,
     m: usize,
     n: usize,
@@ -132,6 +143,32 @@ pub unsafe fn sgemm_panel_avx2(
     pb: usize,
     pe: usize,
 ) {
+    // 第 kk 个 k 行、第 n0 列起的指针。稠密时是 b + kk·n + n0；implicit 时
+    // 是指针数组里的那一行 + n0·SW。
+    macro_rules! brow {
+        ($kk:expr, $n0:expr) => {
+            if BP {
+                (*bptrs.add($kk)).add($n0 * SW)
+            } else {
+                b.add($kk * n + $n0)
+            }
+        };
+    }
+    // 载入 8 个**连续 n** 的 B 值。SW=2 时它们在内存上隔一个取一个：
+    // 读 16 宽再抽偶数位（同 depthwise 的 stride-2 gather）。
+    macro_rules! load8 {
+        ($p:expr) => {
+            if SW == 1 {
+                _mm256_loadu_ps($p)
+            } else {
+                let _p = $p;
+                let _a = _mm256_loadu_ps(_p);
+                let _b = _mm256_loadu_ps(_p.add(8));
+                let _t = _mm256_shuffle_ps(_a, _b, 0b10_00_10_00);
+                _mm256_castpd_ps(_mm256_permute4x64_pd(_mm256_castps_pd(_t), 0b11_01_10_00))
+            }
+        };
+    }
     let has_bias = !bias.is_null();
     for p in pb..pe {
         let n0 = p * 32;
@@ -158,9 +195,9 @@ pub unsafe fn sgemm_panel_avx2(
                 let a2 = a.add((m0 + 2) * k);
                 let a3 = a.add((m0 + 3) * k);
                 for kk in 0..k {
-                    let bp = b.add(kk * n + n0);
-                    let bv0 = _mm256_loadu_ps(bp);
-                    let bv1 = if two { _mm256_loadu_ps(bp.add(8)) } else { bv0 };
+                    let bp = brow!(kk, n0);
+                    let bv0 = load8!(bp);
+                    let bv1 = if two { load8!(bp.add(8 * SW)) } else { bv0 };
                     let mut av = _mm256_broadcast_ss(&*a0.add(kk));
                     c00 = _mm256_fmadd_ps(av, bv0, c00);
                     if two {
@@ -205,7 +242,7 @@ pub unsafe fn sgemm_panel_avx2(
             }
             // M%4 尾行：nn < 32 恒走标量回退（与通用路径一致）
             for row in m0..m {
-                return_to_scalar_tail(a, b, c, m, n, k, ldc, bias, p, row);
+                return_to_scalar_tail::<BP, SW>(a, b, bptrs, c, m, n, k, ldc, bias, p, row);
             }
             continue;
         }
@@ -241,20 +278,20 @@ pub unsafe fn sgemm_panel_avx2(
             let a2 = a.add((m0 + 2) * k);
             let a3 = a.add((m0 + 3) * k);
             for kk in 0..k {
-                let bp = b.add(kk * n + n0);
-                let bv0 = _mm256_loadu_ps(bp);
+                let bp = brow!(kk, n0);
+                let bv0 = load8!(bp);
                 let bv1 = if nn > 8 {
-                    _mm256_loadu_ps(bp.add(8))
+                    load8!(bp.add(8 * SW))
                 } else {
                     _mm256_setzero_ps()
                 };
                 let bv2 = if nn > 16 {
-                    _mm256_loadu_ps(bp.add(16))
+                    load8!(bp.add(16 * SW))
                 } else {
                     _mm256_setzero_ps()
                 };
                 let bv3 = if nn > 24 {
-                    _mm256_loadu_ps(bp.add(24))
+                    load8!(bp.add(24 * SW))
                 } else {
                     _mm256_setzero_ps()
                 };
@@ -323,17 +360,17 @@ pub unsafe fn sgemm_panel_avx2(
                 );
                 let ar = a.add(row * k);
                 for kk in 0..k {
-                    let bp = b.add(kk * n + n0);
+                    let bp = brow!(kk, n0);
                     let av = _mm256_broadcast_ss(&*ar.add(kk));
-                    c0 = _mm256_fmadd_ps(av, _mm256_loadu_ps(bp), c0);
+                    c0 = _mm256_fmadd_ps(av, load8!(bp), c0);
                     if nn > 8 {
-                        c1 = _mm256_fmadd_ps(av, _mm256_loadu_ps(bp.add(8)), c1);
+                        c1 = _mm256_fmadd_ps(av, load8!(bp.add(8 * SW)), c1);
                     }
                     if nn > 16 {
-                        c2 = _mm256_fmadd_ps(av, _mm256_loadu_ps(bp.add(16)), c2);
+                        c2 = _mm256_fmadd_ps(av, load8!(bp.add(16 * SW)), c2);
                     }
                     if nn > 24 {
-                        c3 = _mm256_fmadd_ps(av, _mm256_loadu_ps(bp.add(24)), c3);
+                        c3 = _mm256_fmadd_ps(av, load8!(bp.add(24 * SW)), c3);
                     }
                 }
                 if has_bias {
@@ -350,10 +387,46 @@ pub unsafe fn sgemm_panel_avx2(
             } else {
                 // 非整面板尾行： 在 AVX2 构建里这段本来就是标量
                 // （bias 起种 + GCC 收缩的 FMA）。逐位语义两边共用。
-                return_to_scalar_tail(a, b, c, m, n, k, ldc, bias, p, row);
+                return_to_scalar_tail::<BP, SW>(a, b, bptrs, c, m, n, k, ldc, bias, p, row);
             }
         }
     }
+}
+
+/// 稠密 B 的面板内核（原样，调用点不变）。
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn sgemm_panel_avx2(
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    bias: *const f32,
+    pb: usize,
+    pe: usize,
+) {
+    sgemm_panel_impl::<false, 1>(a, b, std::ptr::null(), c, m, n, k, ldc, bias, pb, pe)
+}
+
+/// implicit-GEMM 的面板内核：B 每 k 一行一个指针，行内步长 `SW`。
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn sgemm_panel_bptrs_avx2<const SW: usize>(
+    a: *const f32,
+    bptrs: *const *const f32,
+    c: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    bias: *const f32,
+    pb: usize,
+    pe: usize,
+) {
+    sgemm_panel_impl::<true, SW>(a, std::ptr::null(), bptrs, c, m, n, k, ldc, bias, pb, pe)
 }
 
 /// 非整面板的 M%4 尾行回退：直接执行标量逻辑（bias 起种）。
@@ -362,9 +435,10 @@ pub unsafe fn sgemm_panel_avx2(
 /// 把它放在 `gemm.rs::panel_tail_scalar` 里两边共用。
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn return_to_scalar_tail(
+unsafe fn return_to_scalar_tail<const BP: bool, const SW: usize>(
     a: *const f32,
     b: *const f32,
+    bptrs: *const *const f32,
     c: *mut f32,
     m: usize,
     n: usize,
@@ -385,7 +459,12 @@ unsafe fn return_to_scalar_tail(
             // bias 起种 + fma 链（与标量 panel_body 的非整面板分支逐位相同）
             let mut s = bv;
             for kk in 0..k {
-                s = ar.add(kk).read().mul_add(b.add(kk * n + n0 + j).read(), s);
+                let bv1 = if BP {
+                    (*bptrs.add(kk)).add((n0 + j) * SW).read()
+                } else {
+                    b.add(kk * n + n0 + j).read()
+                };
+                s = ar.add(kk).read().mul_add(bv1, s);
             }
             cp.add(j).write(s);
         }

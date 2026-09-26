@@ -15,7 +15,7 @@
 
 use crate::activation::Activation;
 use crate::buf::F32Buf;
-use crate::gemm::{im2col, sgemm, sgemm_serial};
+use crate::gemm::{im2col, sgemm, sgemm_bptrs_serial, sgemm_serial};
 use crate::par;
 
 /// 深度卷积一个 (n, channel) 平面的**标量参考实现**（非 x86 的兜底，
@@ -80,6 +80,10 @@ fn pad_channel(
         let dst = (ph + y) * pwidth + pw;
         pad[dst..dst + wdim].copy_from_slice(&xch[y * wdim..(y + 1) * wdim]);
     }
+    crate::gemm::DW_PAD_BYTES.fetch_add(
+        (h * wdim * 4 * 2) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// 卷积参数（对应 ONNX Conv 属性；`peh/pew` 是 end padding，
@@ -291,6 +295,70 @@ pub fn conv2d(
                     yp.offset((bn * m + g * mg) * ohw + oy0 * ow)
                         .slice((mg - 1) * ohw + rows * ow)
                 };
+                // ★ implicit GEMM：sw ∈ {1,2} 时**不再 materialize patch 矩阵**。
+                //   patch 是输入的 kh·kw 倍（k3x3 就是 9 倍），实测 det 单图
+                //   光 im2col 就搬 359 MB、占全部搬运的 30%，而整机已经跑在
+                //   DRAM 带宽上限上。改成「把这一块要用到的输入行补零成一张
+                //   slab，B 的每个 k 行给一个指向 slab 的指针」——一个字节的
+                //   patch 都不用写。
+                #[cfg(target_arch = "x86_64")]
+                if (p.sw == 1 || p.sw == 2) && crate::use_avx2() {
+                    // slab：cg × slab_rows × pwidth，行距 pwidth，原始像素落在
+                    // [pw, pw+wdim)，其余（上下补边、左右补边、右端 slack）是 0。
+                    let slab_rows = (rows - 1) * p.sh + kh;
+                    let pwidth = (ow - 1) * p.sw + kw + 32;
+                    let mut slab = vec![0f32; cg * slab_rows * pwidth];
+                    for ch in 0..cg {
+                        let xch = &xg[ch * h * wdim..];
+                        for y in 0..slab_rows {
+                            let iy = (oy0 * p.sh) as isize - p.ph as isize + y as isize;
+                            if iy < 0 || iy as usize >= h {
+                                continue;
+                            }
+                            let src = &xch[iy as usize * wdim..(iy as usize + 1) * wdim];
+                            let dst = (ch * slab_rows + y) * pwidth + p.pw;
+                            slab[dst..dst + wdim].copy_from_slice(src);
+                        }
+                    }
+                    // 每个输出行一次 GEMM，n = ow。B 的第 k 行 = slab 里
+                    // (ch, r*sh+ky, ·+kx) 那一行，k 序与 im2col 完全一致
+                    // （ch → ky → kx），所以逐位相同。
+                    let mut ptrs: Vec<*const f32> = Vec::with_capacity(kk);
+                    for r in 0..rows {
+                        ptrs.clear();
+                        for ch in 0..cg {
+                            for ky in 0..kh {
+                                for kx in 0..kw {
+                                    // SAFETY: slab 在本次循环内不变；偏移落在
+                                    // cg × slab_rows × pwidth 之内（r < rows）。
+                                    ptrs.push(unsafe {
+                                        slab.as_ptr()
+                                            .add((ch * slab_rows + r * p.sh + ky) * pwidth + kx)
+                                    });
+                                }
+                            }
+                        }
+                        // SAFETY: 行 (bn, g·mg.., oy0+r) 与其他块不相交；
+                        // 片长覆盖 mg 行、行距 ohw、末行 ow 个。
+                        let ysub = unsafe {
+                            yp.offset((bn * m + g * mg) * ohw + (oy0 + r) * ow)
+                                .slice((mg - 1) * ohw + ow)
+                        };
+                        sgemm_bptrs_serial(
+                            wg,
+                            &ptrs,
+                            ysub,
+                            mg,
+                            ow,
+                            kk,
+                            ohw,
+                            bias.map(|b| &b[g * mg..]),
+                            act,
+                            p.sw,
+                        );
+                    }
+                    continue;
+                }
                 cols.resize(kk * rows * ow, 0.0);
                 im2col(
                     xg, cg, h, wdim, kh, kw, p.sh, p.sw, p.ph, p.pw, ow, oy0, rows, &mut cols,
