@@ -44,10 +44,15 @@ pub struct PipelineConfig {
     pub rec_width_grain: i32,
     /// 补白到画布高度的比例下限，0 = 总是放大。
     pub rec_pad_min_h: f64,
-    /// 每批行数（每批固定开销 ~8.6 ms）。批次**串行**执行，批越大
-    /// 串行步数越少；批内行按 `rec_batch_ratio` 分组，宽度相近才同批。
-    /// 实测 6→16：100 图输出逐字符一致、耗时约 -4%；32 再省 2%。
-    /// ⚠ 上限受内存约束（批宽 = 批内最宽行，显存/内存随宽度线性）。
+    /// 识别**一批最多几行**。⚠ 现在的扇出是「一批一个线程、批内串行」，
+    /// 所以这个值只在**行数远多于线程数**时才有意义（`per_batch =
+    /// min(rec_batch, ceil(行数/线程数))`）——行数不超线程数时恒为
+    /// 「一行一批」，它和 `rec_batch_ratio` 都不生效。
+    ///
+    /// 默认 1（纯逐行）。旧默认 16 是为了「批串行 + 批内并行」那套，
+    /// 换成逐行扇出之后批起来只会**降低并行度**：实测 16 图的 rec 阶段
+    /// 中位 48.2 → 43.2 ms（-10%），small 档无变化，100 图输出逐字符一致。
+    /// 批内的 padding 浪费（批宽 = 批内最宽行）也随之一并消失。
     pub rec_batch: usize,
     /// 批内最宽/最窄行比例上限（0 = 不限）。⚠ 不是越小越好（§6.2）。
     pub rec_batch_ratio: f64,
@@ -111,7 +116,7 @@ impl Default for PipelineConfig {
             rec_min_width: 16,
             rec_width_grain: 0,
             rec_pad_min_h: 0.0,
-            rec_batch: 16,
+            rec_batch: 1,
             rec_batch_ratio: 1.1,
             rec_space_gap: 0.3,
             cls_height: 48,
