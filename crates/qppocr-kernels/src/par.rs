@@ -57,6 +57,37 @@ static THRESHOLDS: std::sync::OnceLock<Thresholds> = std::sync::OnceLock::new();
 
 /// 当前生效的并行门槛。
 pub fn thresholds() -> &'static Thresholds {
+    // 诊断用：QPPOCR_FORK_MACS / QPPOCR_GEMM_MIN / QPPOCR_ELEM_MIN 可覆盖，
+    // 用来扫并行门槛（默认值在 Thresholds::default）。
+    {
+        static ENV: std::sync::OnceLock<Thresholds> = std::sync::OnceLock::new();
+        ENV.get_or_init(|| {
+            let mut t = Thresholds::default();
+            if let Some(v) = std::env::var("QPPOCR_FORK_MACS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                t.fork_min_macs = v;
+            }
+            if let Some(v) = std::env::var("QPPOCR_GEMM_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                t.gemm_par_min = v;
+            }
+            if let Some(v) = std::env::var("QPPOCR_ELEM_MIN")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                t.elem_fork_min_bytes = v;
+            }
+            t
+        })
+    }
+}
+
+#[allow(dead_code)]
+fn thresholds_orig() -> &'static Thresholds {
     THRESHOLDS.get_or_init(Thresholds::default)
 }
 
