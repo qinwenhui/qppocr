@@ -132,7 +132,7 @@ pub fn order_box_tl_tr_br_bl(p: &mut [Pt; 4]) {
 
 /// 对切片并行 map（连通域彼此独立）。core 是 `forbid(unsafe_code)`，
 /// 用「结果槽 + 原子领票」而不是裸指针切分。
-fn par_map<T: Sync, U: Send, F>(items: &[T], f: F) -> Vec<U>
+pub(crate) fn par_map<T: Sync, U: Send, F>(items: &[T], f: F) -> Vec<U>
 where
     F: Fn(&T) -> U + Sync,
 {
