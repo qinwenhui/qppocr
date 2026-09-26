@@ -364,7 +364,10 @@ pub fn fuse_conv_activation(g: &mut Graph) -> i64 {
             None => continue,
         };
         let an = &g.nodes[cu];
-        if an.op_type != "FusedGelu" || an.inputs.len() != 1 || an.outputs.len() != 1 {
+        if (an.op_type != "FusedGelu" && an.op_type != "Relu")
+            || an.inputs.len() != 1
+            || an.outputs.len() != 1
+        {
             continue;
         }
         if an.inputs[0] != co {
@@ -384,27 +387,30 @@ pub fn fuse_conv_activation(g: &mut Graph) -> i64 {
     let mut drop: HashSet<usize> = HashSet::new();
     for &(ci, ai) in &fuse {
         let an_attrs = g.nodes[ai].attrs.clone();
+        let is_gelu = g.nodes[ai].op_type == "FusedGelu";
         let an_out = g.nodes[ai].outputs[0].clone();
         let cn = &mut g.nodes[ci];
         let mut kind = Attribute::default();
         kind.name = "act".into();
         kind.has_i = true;
-        kind.i = 1; // 1 = gelu
+        kind.i = if is_gelu { 1 } else { 2 }; // 1 = gelu，2 = relu
         cn.attrs.push(kind);
-        // 移动 c1/c2/c3 → act_c1/act_c2/act_c3
-        for (from, to, dflt) in [
-            ("c1", "act_c1", 1.414_213_5f32),
-            ("c2", "act_c2", 1.0),
-            ("c3", "act_c3", 0.5),
-        ] {
-            let v = act_f(an_attrs.iter().find(|a| a.name == from), dflt);
-            cn.attrs.retain(|x| x.name != to);
-            cn.attrs.push(Attribute {
-                name: to.into(),
-                f: v,
-                has_f: true,
-                ..Default::default()
-            });
+        if is_gelu {
+            // 移动 c1/c2/c3 → act_c1/act_c2/act_c3
+            for (from, to, dflt) in [
+                ("c1", "act_c1", 1.414_213_5f32),
+                ("c2", "act_c2", 1.0),
+                ("c3", "act_c3", 0.5),
+            ] {
+                let v = act_f(an_attrs.iter().find(|a| a.name == from), dflt);
+                cn.attrs.retain(|x| x.name != to);
+                cn.attrs.push(Attribute {
+                    name: to.into(),
+                    f: v,
+                    has_f: true,
+                    ..Default::default()
+                });
+            }
         }
         cn.outputs[0] = an_out; // 保留激活的输出名，消费者才能解析
         drop.insert(ai);

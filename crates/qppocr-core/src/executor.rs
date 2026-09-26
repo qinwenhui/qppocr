@@ -203,11 +203,13 @@ impl Session {
         let prof = std::env::var("QPPOCR_PROF").is_ok();
         let mut prof_acc: std::collections::HashMap<String, (f64, u32)> =
             std::collections::HashMap::new();
+        let mut prof_b: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let prof_t0 = if prof {
             Some(std::time::Instant::now())
         } else {
             None
         };
+        let mut prof_bytes: u64 = 0;
 
         // 消费者引用计数
         let mut refs: HashMap<&str, i64> = HashMap::new();
@@ -377,12 +379,16 @@ impl Session {
                         // 输出施加它，独立节点（和它的分叉）消失。
                         let mut act = qppocr_kernels::activation::Activation::default();
                         if let Some(aa) = n.attr("act").filter(|a| a.has_i) {
-                            if aa.i == 1 {
-                                act = qppocr_kernels::activation::Activation::gelu(
-                                    get_f(n.attr("act_c1"), 1.414_213_5),
-                                    get_f(n.attr("act_c2"), 1.0),
-                                    get_f(n.attr("act_c3"), 0.5),
-                                );
+                            match aa.i {
+                                1 => {
+                                    act = qppocr_kernels::activation::Activation::gelu(
+                                        get_f(n.attr("act_c1"), 1.414_213_5),
+                                        get_f(n.attr("act_c2"), 1.0),
+                                        get_f(n.attr("act_c3"), 0.5),
+                                    )
+                                }
+                                2 => act = qppocr_kernels::activation::Activation::relu(),
+                                _ => {}
                             }
                         }
                         let mut y = F32Buf::new();
@@ -1149,9 +1155,23 @@ impl Session {
                             None => prof_key.clone(),
                         }
                     };
+                    let key2 = key.clone();
                     let e = prof_acc.entry(key).or_insert((0.0, 0));
                     e.0 += t0.elapsed().as_secs_f64() * 1000.0;
                     e.1 += 1;
+                    let mut this = 0u64;
+                    if let Some(t) = arena.get(&n.outputs[0]) {
+                        let esz = if t.dtype == DType::I64 { 8 } else { 4 };
+                        this += (t.f32.len() + t.i64.len()) as u64 * esz;
+                        for inn in &n.inputs {
+                            if let Some(it) = get!(&arena, inn) {
+                                let iesz = if it.dtype == DType::I64 { 8 } else { 4 };
+                                this += (it.f32.len() + it.i64.len()) as u64 * iesz;
+                            }
+                        }
+                    }
+                    prof_bytes += this;
+                    *prof_b.entry(key2).or_insert(0) += this;
                 }
                 #[allow(unused_assignments)]
                 {
@@ -1240,6 +1260,14 @@ impl Session {
                 .map(|t| t.elapsed().as_secs_f64() * 1000.0)
                 .unwrap_or(0.0);
             let kernel: f64 = prof_acc.values().map(|(ms, _)| *ms).sum();
+            // ★ 搬运量：每个节点「读全部输入 + 写输出」的字节数之和。
+            //   这是判断「算子慢」还是「内存墙」的尺子——有效带宽 = 搬运量
+            //   / 墙钟。若它贴着实测带宽上限，那再怎么调内核也没用。
+            eprintln!(
+                "--- 搬运 {} MB，有效带宽 {:.1} GB/s（读+写 / 墙钟）",
+                prof_bytes as f64 / 1e6,
+                prof_bytes as f64 / wall.max(0.001) / 1e6
+            );
             let mut v: Vec<_> = prof_acc.into_iter().collect();
             v.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
             eprintln!(
@@ -1249,7 +1277,8 @@ impl Session {
                 100.0 * (wall - kernel) / wall.max(0.001)
             );
             for (op, (ms, cnt)) in v {
-                eprintln!("  {op:<16} {ms:8.1} ms  x{cnt}");
+                let mb = prof_b.get(&op).copied().unwrap_or(0) as f64 / 1e6;
+                eprintln!("  {op:<16} {ms:8.1} ms  {mb:7.1} MB  x{cnt}");
             }
         }
 
