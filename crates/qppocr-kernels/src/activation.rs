@@ -91,6 +91,8 @@ pub enum ActKind {
     None,
     /// `c3·x·(erf(x/c1) + c2)`。
     Gelu,
+    /// `max(0, x)`。常量不用，但留着 c1/c2/c3 让 `Activation` 保持 Copy+定长。
+    Relu,
 }
 
 impl Default for Activation {
@@ -119,6 +121,13 @@ impl Activation {
             c3,
         }
     }
+    /// 构造一个 ReLU 激活。
+    pub fn relu() -> Self {
+        Self {
+            kind: ActKind::Relu,
+            ..Default::default()
+        }
+    }
 }
 
 /// 就地施加 `act` 到 `p`（`apply_act`）。
@@ -129,7 +138,11 @@ pub fn apply_act(p: &mut [f32], act: &Activation) {
     if !act.is_on() || p.is_empty() {
         return;
     }
-    gelu_inplace(p, act.c1, act.c2, act.c3);
+    match act.kind {
+        ActKind::Gelu => gelu_inplace(p, act.c1, act.c2, act.c3),
+        ActKind::Relu => relu_inplace(p),
+        ActKind::None => {}
+    }
 }
 
 /// `y = max(0, x)`，就地。`v > 0 ? v : 0` 的写法保留 NaN→0 的语义。
