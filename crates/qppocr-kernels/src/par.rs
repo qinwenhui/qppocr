@@ -138,6 +138,17 @@ pub fn set_threads(n: usize) {
     crate::pool::request_threads(n);
 }
 
+/// 按当前配置算线程数但**不建池**（给「先请求布局再使用」的调用方）。
+#[cfg(feature = "parallel")]
+pub fn planned_threads() -> usize {
+    crate::pool::planned_threads()
+}
+#[cfg(not(feature = "parallel"))]
+#[inline]
+pub fn planned_threads() -> usize {
+    1
+}
+
 /// 请求池布局：`sizes[0]` 是默认池（det 与所有非分片调用走它），
 /// 其余是**分片池**，供两级并行用——外层每个线程占一个，其算子再在本池内
 /// fork，互不排队。必须在第一次 fork 之前调用（池首用定容）。

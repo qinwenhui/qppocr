@@ -147,6 +147,12 @@ thread_local! {
 /// `sizes[0]` 是默认池（det 与所有非分片调用走它），其余是分片池。
 /// 全部线程在首次使用时一次性创建，空闲的池只在 condvar 上等，不占 CPU。
 pub(crate) fn request_pools(sizes: &[usize]) {
+    if std::env::var_os("QPPOCR_POOL_DEBUG").is_some() {
+        eprintln!(
+            "[pool] request_pools({sizes:?}) 已建池={}",
+            POOLS.get().is_some()
+        );
+    }
     if sizes.is_empty() {
         return;
     }
@@ -225,6 +231,14 @@ pub(crate) fn thread_count() -> usize {
 /// 1/64，调度开销盖过收益。
 pub(crate) fn pool_thread_count() -> usize {
     pool().threads
+}
+
+/// 按当前配置**算**线程数，但**不建池**。给「先请求布局、再首次使用」的
+/// 调用方用——用 `thread_count()` 会顺手把池建成默认布局，之后的
+/// `request_pools` 就成了 no-op（这个坑真的踩过一次：分片请求永远不生效，
+/// 8 个分片线程全挤在 0 号池上被 fork_mu 串行化）。
+pub(crate) fn planned_threads() -> usize {
+    resolve_threads()
 }
 
 fn resolve_threads() -> usize {

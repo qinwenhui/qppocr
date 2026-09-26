@@ -223,7 +223,10 @@ impl Engine {
         //   布局 = [全尺寸默认池, 分片池 × k]，k*分片大小 ≈ 总线程数。
         let shards = cfg.rec_shards;
         if shards > 1 {
-            let total = qppocr_kernels::par::threads();
+            // ★ 必须用 planned_threads()：threads() 会顺手把池按**默认布局**
+            //   建起来，之后 request_pools 就成了 no-op——分片线程会全部挤在
+            //   0 号池上被 fork_mu 串行化（实测逐算子耗时翻倍）。
+            let total = qppocr_kernels::par::planned_threads();
             let m = (total / shards).max(2);
             let mut sizes = vec![total];
             sizes.extend(std::iter::repeat_n(m, shards));

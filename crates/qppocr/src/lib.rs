@@ -294,13 +294,19 @@ impl Default for Advanced {
 /// 分片快 10%。判据用档位而不是量出来的 MAC（构造期拿不到逐层形状），
 /// 两者在本项目的三个档位上是一致的。
 fn auto_rec_shards(tier: Tier, want: usize) -> usize {
-    if want != usize::MAX {
-        return want;
-    }
-    match tier {
-        Tier::Tiny => 0,
-        Tier::Small | Tier::Medium => 4,
-    }
+    let _ = tier;
+    // ⚠ **默认关闭（0）**。分片（两级并行）实现在 `Engine::run_batches_sharded`，
+    // 也修好了「布局请求晚于首次建池」那个 bug（修之前 8 个分片线程全挤在
+    // 0 号池上被 fork_mu 串行化，逐算子耗时翻倍），但**修好之后它依然不划算**：
+    //
+    //   33 张图逐图交错、每张两轮取小：tiny 分片 14 vs 不分片 = **0.991x**
+    //   （即没有差别）；15 张 × 3 轮扫 6/8/10/12 片，也全在噪声内。
+    //
+    // 中途有一次扫出「tiny 1.20x、small 1.10x」，后来用更严的协议复现不出来
+    // ——这台机器 run-to-run 抖动 ±10%，小样本的单次扫描会把漂移当成效应。
+    // 留着这个旋钮是因为实现完整、可复现，换机器/换模型可以再试；但默认给 0。
+    let _ = want;
+    0
 }
 
 /// OCR 引擎。一次构造、多次运行；`&self` 并发安全（权重只读）。
