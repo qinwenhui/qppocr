@@ -313,7 +313,24 @@ impl Session {
                         st.1
                     )
                 } else if prof {
-                    op.to_string()
+                    // 池化/转置这类「形状即行为」的算子，属性不打印就分不清
+                    // 走的是哪条分支（MaxPool 的 2x2s1 快路径与 3x3 通用路径
+                    // 差 10 倍以上）。
+                    match op {
+                        "MaxPool" | "AveragePool" | "GlobalAveragePool" => {
+                            let ks = n
+                                .attr("kernel_shape")
+                                .map(|a| a.ints.clone())
+                                .unwrap_or_default();
+                            let st = n
+                                .attr("strides")
+                                .map(|a| a.ints.clone())
+                                .unwrap_or_default();
+                            let pd = n.attr("pads").map(|a| a.ints.clone()).unwrap_or_default();
+                            format!("{op} k{ks:?} s{st:?} p{pd:?}")
+                        }
+                        _ => op.to_string(),
+                    }
                 } else {
                     String::new()
                 };
