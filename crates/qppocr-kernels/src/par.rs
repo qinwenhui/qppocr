@@ -90,6 +90,31 @@ pub fn pool_thread_count() -> usize {
     crate::pool::thread_count()
 }
 
+/// 本线程后续的 `parallel_for` 走**串行执行**（不发布任务、不唤醒
+/// worker，直接在本线程跑完全部 chunk）。
+///
+/// 切分决策不变——`threads()` 仍报池的真实大小，因此各内核的分块与
+/// 累加序与并行路径完全一致（逐位可验证）。用途是「逐行并行」：每行
+/// 一个线程、行内串行，避免行内的 fork 争用 `fork_mu` 互相排队。
+pub fn set_serial_execution(on: bool) {
+    #[cfg(feature = "parallel")]
+    crate::pool::set_serial_exec(on);
+    #[cfg(not(feature = "parallel"))]
+    let _ = on;
+}
+
+/// 本线程是否处于串行执行模式（见 [`set_serial_execution`]）。
+pub fn serial_execution() -> bool {
+    #[cfg(feature = "parallel")]
+    {
+        crate::pool::serial_exec()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        false
+    }
+}
+
 /// 请求池的线程数（含主线程，0 = 自动）。必须在**第一次并行算子**之前
 /// 调用——池在首用时定容，之后请求不再生效（ `ThreadPool::get` 的
 /// 「最早调用者定容」语义）。显式数字不设 16 上限。

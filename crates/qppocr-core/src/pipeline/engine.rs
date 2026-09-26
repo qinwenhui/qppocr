@@ -30,6 +30,19 @@ pub struct CharSpan {
     pub pts: [[f32; 2]; 4],
 }
 
+/// rec 一批的产出（并行段只产出、串行段统一合并——core 是
+/// `forbid(unsafe_code)`，不能靠裸指针把 `lines` 切给多线程写）。
+struct RecLineOut {
+    /// 该行在 `lines`/`boxes` 里的下标（`order` 里存的就是它）。
+    idx: usize,
+    /// 解码文本（可能为空 = 检测到但读不出）。
+    text: String,
+    /// 逐字坐标（原图空间）。
+    chars: Vec<CharSpan>,
+    /// CTC 置信度。
+    confidence: f32,
+}
+
 /// 识别结果的一行。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -402,6 +415,62 @@ impl Engine {
         first.timings.rec_infer_ms += second.timings.rec_infer_ms;
         first.timings.total_ms += second.timings.total_ms;
         Ok(first)
+    }
+
+    /// 把 `batches`（`(begin, end)` 下标对）分给 N 个线程并行执行，
+    /// **每个线程内部串行**（`par::set_serial_execution(true)`）。
+    ///
+    /// 为什么不是每批一个 `parallel_for`：行内的算子级 fork 会争池子的
+    /// `fork_mu` 互相排队（实测 batch=1 时 16 线程只拿到 2.4x）。改成
+    /// 「每行一个线程、行内串行」后，墙钟 ≈ 最慢单行的耗时。
+    ///
+    /// 串行执行**不改切分决策**（`par::threads()` 仍报真实池大小），
+    /// 因此各内核的分块与累加序与并行路径完全一致——逐位可验证。
+    fn run_batches<T, F>(batches: &[(usize, usize)], f: F) -> Result<Vec<T>>
+    where
+        T: Send,
+        F: Fn(usize, usize) -> Result<T> + Sync,
+    {
+        let n = batches.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let nthreads = qppocr_kernels::par::threads().min(n).max(1);
+        if nthreads == 1 {
+            // 单线程：直接顺序跑，不走线程创建
+            let mut out = Vec::with_capacity(n);
+            for &(b, e) in batches {
+                out.push(f(b, e)?);
+            }
+            return Ok(out);
+        }
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<T>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..nthreads {
+                s.spawn(|| {
+                    qppocr_kernels::par::set_serial_execution(true);
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let (b, e) = batches[i];
+                        *slots[i].lock().unwrap() = Some(f(b, e));
+                    }
+                });
+            }
+        });
+        let mut out = Vec::with_capacity(n);
+        for slot in slots {
+            match slot.into_inner().unwrap() {
+                Some(r) => out.push(r?),
+                None => return Err(Error::Graph("run_batches: 批次槽未回填（内部错误）".into())),
+            }
+        }
+        Ok(out)
     }
 
     /// 每字四边形：最终文本（含插入空格）逐字符 → 裁剪图 x 区间 →
@@ -793,63 +862,11 @@ impl Engine {
         }
         res.timings.crop_ms = t_crop0.elapsed_ms();
 
-        // ---- 方向分类：把读作倒置的裁剪翻 180° ----
+        // ---- 方向分类：并入下方逐行扇出（每行先分类后识别，见 run_batches）
+        // 旧实现是独立的一串串行 cls 批（~8.5 ms 纯串行），现在每行在自己
+        // 的线程里先做 cls 再做 rec——分类结论直接用于该行的裁剪与旋转，
+        // 不需要跨线程回写 `crops`（core 是 forbid(unsafe_code)）。
         let mut flipped = vec![false; crops.len()];
-        if let Some(cls) = &self.cls {
-            let tc0 = now();
-            let (ch, cw) = (self.cfg.cls_height, self.cfg.cls_width);
-            let mut beg = 0usize;
-            while beg < crops.len() {
-                let end = (beg + self.cfg.rec_batch).min(crops.len());
-                let bsz = end - beg;
-                let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (ch as usize) * (cw as usize));
-                for i in beg..end {
-                    let view = if self.cfg.cls_window {
-                        cls_view(&crops[i], cw, ch)
-                    } else {
-                        crops[i].clone()
-                    };
-                    pack_crop(
-                        &view,
-                        ch,
-                        cw,
-                        &mut batch_f32[(i - beg) * 3 * (ch as usize) * (cw as usize)..],
-                        false,
-                    );
-                }
-                if let Ok(dir) = std::env::var("QPPOCR_SAVE_CROPS") {
-                    let path =
-                        std::path::Path::new(&dir).join(format!("clsin_{:03}_{:03}.f32", beg, end));
-                    let bytes: Vec<u8> = batch_f32
-                        .as_slice()
-                        .iter()
-                        .flat_map(|f| f.to_le_bytes())
-                        .collect();
-                    let _ = std::fs::write(path, bytes);
-                }
-                let out = cls.run(vec![(
-                    self.cls_in.clone(),
-                    Tensor {
-                        name: String::new(),
-                        shape: vec![bsz as i64, 3, ch as i64, cw as i64],
-                        dtype: DType::F32,
-                        f32: batch_f32,
-                        i64: Vec::new(),
-                    },
-                )])?;
-                let o = &out[0]; // [B, 2]
-                for i in beg..end {
-                    let p = &o.f32[(i - beg) * 2..];
-                    if p[1] > p[0] && p[1] >= self.cfg.cls_thresh {
-                        crops[i] = rotate_image(&crops[i], 180);
-                        flipped[i] = true;
-                        res.num_flipped += 1;
-                    }
-                }
-                beg = end;
-            }
-            res.timings.cls_ms = tc0.elapsed_ms();
-        }
 
         // ---- 按长宽比排序（ppocr 减少批内 padding 浪费）----
         let mut order: Vec<usize> = (0..crops.len()).collect();
@@ -869,20 +886,78 @@ impl Engine {
         // 批按宽度相近切，不只按数量。一批一个张量，批内行都 pad 到最宽
         // 行的宽——行被撑到自身 3 倍宽时识别器读它的方式会变（CJK 与数字
         // 间的空格不再输出，值 4.7 个点）。
+        //
+        // ★ 批次划分：行数少时切细到「每行一批」，逐行 fan-out 吃满并行
+        //   ——行与行完全独立，每行在自己线程里**串行**执行的墙钟 ≈ 单行
+        //   耗时（~14 ms），而「批串行 + 批内并行」在 16 线程上只拿到
+        //   3.2x（fork 协调开销盖过了收益）。行数多时仍按 rec_batch 分组
+        //   （批内存与 padding 效率）。
+        let per_batch = self
+            .cfg
+            .rec_batch
+            .min(order.len().div_ceil(qppocr_kernels::par::threads().max(1)))
+            .max(1);
+        let mut batches: Vec<(usize, usize)> = Vec::new();
         let mut beg = 0usize;
         while beg < order.len() {
             let mut end = beg + 1;
             if self.cfg.rec_batch_ratio > 0.0 {
                 let base = wh_ratio[order[beg]].max(1e-6);
                 while end < order.len()
-                    && end - beg < self.cfg.rec_batch
+                    && end - beg < per_batch
                     && wh_ratio[order[end]] as f64 <= base as f64 * self.cfg.rec_batch_ratio
                 {
                     end += 1;
                 }
             } else {
-                end = (beg + self.cfg.rec_batch).min(order.len());
+                end = (beg + per_batch).min(order.len());
             }
+            batches.push((beg, end));
+            beg = end;
+        }
+
+        let t_ri = now();
+        // 每行的处理裁剪（cls 判定倒置时是旋转过的副本）
+        let mut line_crop: Vec<std::borrow::Cow<'_, Image>> =
+            crops.iter().map(std::borrow::Cow::Borrowed).collect();
+        if let Some(cls) = &self.cls {
+            let (ch, cw) = (self.cfg.cls_height, self.cfg.cls_width);
+            // cls 也用同一套扇出：每行一个批次，行内串行
+            let cls_batches: Vec<(usize, usize)> = (0..crops.len()).map(|i| (i, i + 1)).collect();
+            let (ch, cw) = (ch, cw);
+            let decisions = Self::run_batches(&cls_batches, |b, _e| -> Result<bool> {
+                let i = b;
+                let view = if self.cfg.cls_window {
+                    cls_view(&crops[i], cw, ch)
+                } else {
+                    crops[i].clone()
+                };
+                let mut buf = F32Buf::with_zeroed(3 * (ch as usize) * (cw as usize));
+                pack_crop(&view, ch, cw, &mut buf, false);
+                let out = cls.run(vec![(
+                    self.cls_in.clone(),
+                    Tensor {
+                        name: String::new(),
+                        shape: vec![1, 3, ch as i64, cw as i64],
+                        dtype: DType::F32,
+                        f32: buf,
+                        i64: Vec::new(),
+                    },
+                )])?;
+                let o = &out[0]; // [1, 2]
+                Ok(o.f32[1] > o.f32[0] && o.f32[1] >= self.cfg.cls_thresh)
+            })?;
+            for (i, &flip) in decisions.iter().enumerate() {
+                if flip {
+                    flipped[i] = true;
+                    res.num_flipped += 1;
+                    line_crop[i] = std::borrow::Cow::Owned(rotate_image(&crops[i], 180));
+                }
+            }
+            res.timings.cls_ms = t_ri.elapsed_ms();
+        }
+        let outs = Self::run_batches(&batches, |beg, end| -> Result<Vec<RecLineOut>> {
+            let mut batch_lines = Vec::with_capacity(end - beg);
             let mut max_wh_ratio = self.cfg.rec_min_width as f32 / img_h as f32;
             for &i in &order[beg..end] {
                 max_wh_ratio = max_wh_ratio.max(wh_ratio[i]);
@@ -893,21 +968,19 @@ impl Engine {
                     * self.cfg.rec_width_grain;
             }
 
-            let t_batch0 = now();
             let bsz = end - beg;
             let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (img_h as usize) * (img_w as usize));
             for (k, &i) in order[beg..end].iter().enumerate() {
+                let c = &line_crop[i];
                 pack_crop(
-                    &crops[i],
+                    c,
                     img_h,
                     img_w,
                     &mut batch_f32[k * 3 * (img_h as usize) * (img_w as usize)..],
-                    crop_pads(&crops[i], img_h, self.cfg.rec_pad_min_h),
+                    crop_pads(c, img_h, self.cfg.rec_pad_min_h),
                 );
             }
-            res.timings.rec_pre_ms += t_batch0.elapsed_ms();
 
-            let t_ri = now();
             let out = self.rec.run(vec![(
                 self.rec_in.clone(),
                 Tensor {
@@ -918,24 +991,16 @@ impl Engine {
                     i64: Vec::new(),
                 },
             )])?;
-            res.timings.rec_infer_ms += t_ri.elapsed_ms();
 
-            let t_rp = now();
             let o = &out[0]; // [B, T, C]
             let t_len = o.shape[1] as usize;
             let c_len = o.shape[2] as usize;
             // ★ 字典/模型配对硬校验。换错字典时 C 与字符表长度错位，
-            // ctc_decode 的越界索引是静默跳过——整表错位且不报错（曾用
-            // dict_small_medium.txt 配 small：少一个前导换行，18710→18709，
-            // 输出全部错一个字符）。from_sessions 的注释承诺过这里要硬校验，
-            // 一直没实现，这里补上。
+            // ctc_decode 的越界索引是静默跳过——整表错位且不报错。
             if c_len != self.charset.len() {
                 return Err(crate::error::Error::Graph(format!(
-                    "识别输出类别数 {c_len} 与字符表 {} 不符：字典与 rec 模型不配对
-  期望行数：tiny 档 6904、small/medium 档 18708
-  检查 {}/dict.txt 的来源与行数",
-                    self.charset.len(),
-                    "rec"
+                    "识别输出类别数 {c_len} 与字符表 {} 不符：字典与 rec 模型不配对\n  期望行数：tiny 档 6904、small/medium 档 18708",
+                    self.charset.len()
                 )));
             }
             let want_gaps = self.cfg.rec_space_gap > 0.0;
@@ -943,9 +1008,7 @@ impl Engine {
                 let (mut text, conf, marks) =
                     ctc_decode(&o.f32[k * t_len * c_len..], t_len, c_len, &self.charset);
                 // 时间步 → 裁剪图 x 的左缘（像素空格与每字坐标共用这套映射）。
-                // 「识别器看的是 imgW 宽的张量，这行占 [0, content_w)，其余是
-                // 批 padding」——除以 content_w 再乘回裁剪宽。
-                let cr = &crops[i];
+                let cr = &line_crop[i];
                 let cols: Vec<i32> = if cr.w > 0 && cr.h > 0 {
                     let pad_only = crop_pads(cr, img_h, self.cfg.rec_pad_min_h);
                     let content_w = if pad_only {
@@ -995,14 +1058,27 @@ impl Engine {
                     &boxes[i].pts,
                     &to_image,
                 );
-                lines[i].chars = chars;
-                lines[i].text = text;
-                lines[i].confidence = conf;
+                batch_lines.push(RecLineOut {
+                    idx: i,
+                    text,
+                    chars,
+                    confidence: conf,
+                });
+            }
+            Ok(batch_lines)
+        })?;
+        res.timings.rec_infer_ms += t_ri.elapsed_ms();
+
+        // ---- 合并（串行）：并行段只产出结果，这里统一写回 ----
+        for batch_out in outs {
+            for lo in batch_out {
+                let i = lo.idx;
+                lines[i].chars = lo.chars;
+                lines[i].text = lo.text;
+                lines[i].confidence = lo.confidence;
                 lines[i].rotation = if flipped[i] { 180 } else { 0 };
                 to_image(&boxes[i].pts, &mut lines[i].pts);
             }
-            res.timings.rec_post_ms += t_rp.elapsed_ms();
-            beg = end;
         }
         res.timings.total_ms = t_start.elapsed_ms();
 

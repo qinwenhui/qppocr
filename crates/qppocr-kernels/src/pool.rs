@@ -26,6 +26,7 @@
 //! 两个引擎在两个线程上各跑推理，基准的单调用方假设在库里不成立。
 //! worker 永不触碰 `fork_mu`，无递归问题。
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -41,6 +42,27 @@ static THREADS_REQ: AtomicUsize = AtomicUsize::new(0);
 /// 「要 24 的人在做实验，悄悄给他 16 会让测量描述一个没人选过的配置」）。
 pub(crate) fn request_threads(n: usize) {
     THREADS_REQ.store(n, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// 本线程的**串行执行**开关：置位后 `fork_join` 不发布任务、不唤醒
+    /// worker，就在调用线程里顺序跑完全部 chunk。
+    ///
+    /// 用途：逐行并行（每行一个线程）时，行内若仍 fork 会争 `fork_mu`
+    /// 互相排队。开关只改**执行方式**，不改切分决策——`par::threads()`
+    /// 仍报真实池大小，所以 gemm 的分轴、各内核的分块全部与并行路径
+    /// 一致，**逐位可验证**。
+    static SERIAL_EXEC: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 置位/清除本线程的串行执行开关（见 `SERIAL_EXEC`）。
+pub(crate) fn set_serial_exec(on: bool) {
+    SERIAL_EXEC.with(|c| c.set(on));
+}
+
+/// 本线程是否处于串行执行模式。
+pub(crate) fn serial_exec() -> bool {
+    SERIAL_EXEC.with(|c| c.get())
 }
 
 /// 一次 fork 的协调成本对齐（16 线程实测 ~97us，`tools/fork_bench.cpp`）。
@@ -231,7 +253,7 @@ pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
         return;
     }
     let p = pool();
-    if p.threads == 1 {
+    if p.threads == 1 || serial_exec() {
         for i in 0..nchunk {
             f(i, i + 1);
         }
