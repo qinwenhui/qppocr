@@ -778,31 +778,18 @@ impl Engine {
         // ——scan_small（4000x3000 帽到 2000 宽）裁出 20-34 px 高的条再
         // 放大到 48，文本回来是烂的。经同一组比率映射回原图不花钱，
         // 12 MP 照片上给识别器 4 倍线性分辨率。
-        let mut crops: Vec<Image> = Vec::with_capacity(boxes.len());
-        let mut wh_ratio: Vec<f32> = Vec::with_capacity(boxes.len());
-        for b in boxes.iter_mut() {
+        // ★ 每个框的裁剪彼此独立，并行做。`crop_text_box` 的透视反采样
+        //   每个输出像素要一次除法（8×8 单应求逆后按需算），9 行串行
+        //   实测 4.2 ms。并行段只产出结果，写回 boxes（收紧框）与计数
+        //   在下面的串行合并里做。
+        let cropped = super::geometry::par_map(&boxes, |b| {
             let mut pts = [[0f32; 2]; 4];
             to_image(&b.pts, &mut pts);
             // 边距杂波判定：unclip 加的框是背景还是杂波？难图.png 的
             // 分离信号（0.48 vs 语料 0.00-0.06）。命中则同中心同方向收窄。
+            let mut tightened = false;
             if self.cfg.unclip_margin_thresh > 0.0 && b.tight_h > 0.0 && !pred.f32.is_empty() {
                 let margin = box_margin_clutter(b, &pred.f32, nh, nw, crop_src);
-                if std::env::var("QPPOCR_DEBUG_MARGIN").is_ok() {
-                    eprintln!(
-                        "[margin] thresh={} tight_h={:.1} margin={:.3} nh={} nw={} img={}x{} box=({:.0},{:.0})-({:.0},{:.0})",
-                        self.cfg.unclip_margin_thresh,
-                        b.tight_h,
-                        margin,
-                        nh,
-                        nw,
-                        crop_src.w,
-                        crop_src.h,
-                        b.pts[0][0],
-                        b.pts[0][1],
-                        b.pts[2][0],
-                        b.pts[2][1]
-                    );
-                }
                 if margin > self.cfg.unclip_margin_thresh {
                     let c = [
                         (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0]) * 0.25,
@@ -825,21 +812,25 @@ impl Engine {
                             pts[k][0] = c[0] + sg[k][0] * hw * ex2[0] + sg[k][1] * hh * ey2[0];
                             pts[k][1] = c[1] + sg[k][0] * hw * ex2[1] + sg[k][1] * hh * ey2[1];
                         }
-                        // 收紧框写回 boxes[i]：不只是显示——区域重试的
-                        // 裁剪区域从这些 pts 计算，留肥框会把刚剔除的杂波
-                        // 又包回重试区域（难图实测：不写回时收紧只救一半）。
-                        b.pts = pts;
-                        res.num_decluttered += 1;
+                        tightened = true;
                     }
                 }
             }
             let crop = crop_text_box(crop_src, &pts);
-            wh_ratio.push(batch_ratio(
-                &crop,
-                self.cfg.rec_height,
-                self.cfg.rec_pad_min_h,
-            ));
+            let wr = batch_ratio(&crop, self.cfg.rec_height, self.cfg.rec_pad_min_h);
+            (crop, wr, tightened, pts)
+        });
+        let mut crops: Vec<Image> = Vec::with_capacity(boxes.len());
+        let mut wh_ratio: Vec<f32> = Vec::with_capacity(boxes.len());
+        for (i, (crop, wr, tightened, pts)) in cropped.into_iter().enumerate() {
+            if tightened {
+                // 收紧框写回 boxes[i]：不只是显示——区域重试的裁剪区域
+                // 从这些 pts 计算，留肥框会把刚剔除的杂波又包回重试区域。
+                boxes[i].pts = pts;
+                res.num_decluttered += 1;
+            }
             crops.push(crop);
+            wh_ratio.push(wr);
         }
         // 裁剪落盘（诊断，QPPOCR_SAVE_CROPS=<dir>；PPM，cls 翻转前——
         // 与参考实现的落盘点一致）
