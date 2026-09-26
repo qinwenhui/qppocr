@@ -370,14 +370,38 @@ pub fn im2col(
                         let xr = &xc[iy as usize * w..(iy as usize + 1) * w];
                         for kx in 0..kw {
                             let d0 = (ch * kh * kw + ky * kw + kx) * nout + r * ow;
-                            for ox in 0..ow {
-                                let ix = ox as isize * sw as isize - pw as isize + kx as isize;
-                                let v = if ix >= 0 && (ix as usize) < w {
-                                    xr[ix as usize]
-                                } else {
-                                    0.0
-                                };
-                                *colsp.get().add(d0 + ox) = v;
+                            let dst = colsp.get().add(d0);
+                            // ★ 有效 ox 是**一段连续区间**：ix = ox*sw - pw + kx 落在
+                            //   [0, w) 等价于 ox ∈ [ceil((pw-kx)/sw), floor((w-1+pw-kx)/sw)]。
+                            //   旧写法逐元素判断越界，是纯搬运里最贵的一种写法——
+                            //   实测 im2col 只有 6-10 GB/s，而它占 k3x3 卷积的 50-65%。
+                            let lo = ((pw as isize - kx as isize + sw as isize - 1)
+                                .div_euclid(sw as isize))
+                            .max(0) as usize;
+                            let hi = ((w as isize - 1 + pw as isize - kx as isize)
+                                .div_euclid(sw as isize)
+                                + 1)
+                            .clamp(0, ow as isize) as usize;
+                            let lo = lo.min(ow);
+                            let hi = hi.max(lo);
+                            if sw == 1 {
+                                // 连续段：两端补零 + 中间一次 memcpy
+                                std::ptr::write_bytes(dst, 0, lo);
+                                std::ptr::copy_nonoverlapping(
+                                    xr.as_ptr().add(lo + kx - pw),
+                                    dst.add(lo),
+                                    hi - lo,
+                                );
+                                std::ptr::write_bytes(dst.add(hi), 0, ow - hi);
+                            } else {
+                                // 带步长：仍逐元素，但没有逐元素的越界分支
+                                std::ptr::write_bytes(dst, 0, lo);
+                                std::ptr::write_bytes(dst.add(hi), 0, ow - hi);
+                                let mut ox = lo;
+                                while ox < hi {
+                                    *dst.add(ox) = *xr.as_ptr().add(ox * sw - pw + kx);
+                                    ox += 1;
+                                }
                             }
                         }
                     }
