@@ -1,4 +1,4 @@
-//! 广播二元算子：设计文档 elementwise 部分。
+//! 广播二元算子。
 //!
 //! numpy 风格广播，`y = a op b`。五条路径（`binary_op` 的）：
 //!
@@ -20,7 +20,7 @@
 use crate::buf::F32Buf;
 use crate::par;
 
-/// 二元算子种类（对应 基准的 op 码 0..4）。
+/// 二元算子种类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinOp {
     /// 加。
@@ -37,7 +37,7 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    /// 基准的 op 码（0..4 = + - * / pow）；向量路径用。
+    /// op 码（0..4 = + - * / pow）；向量路径用。
     #[inline]
     pub fn code(self) -> u8 {
         match self {
@@ -69,7 +69,7 @@ impl BinOp {
 /// 广播元数据：shape 与两侧步长，全部按**反转序**存（下标 0 = 最快变化维）。
 struct BroadcastMeta {
     shape: Vec<i64>,
-    /// 就地路径只读 `strb`；`binary_op` 自算两侧步长（与基准一致）。
+    /// 就地路径只读 `strb`；`binary_op` 自算两侧步长。
     #[allow(dead_code)]
     stra: Vec<i64>,
     strb: Vec<i64>,

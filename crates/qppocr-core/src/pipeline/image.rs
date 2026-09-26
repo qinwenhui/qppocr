@@ -46,7 +46,7 @@ impl Image {
 }
 
 /// 双线性缩放，半像素中心（cv2.INTER_LINEAR 语义）。u8 进 u8 出，
-/// 结果 `+0.5` 后截断——与 基准的 resize_bilinear_img 逐位一致。
+/// 结果 `+0.5` 后截断——与标量实现逐位一致。
 pub fn resize_bilinear_img(src: &Image, dw: i32, dh: i32) -> Image {
     let mut dst = Image {
         w: dw,
@@ -195,7 +195,7 @@ pub fn auto_levels(img: &mut Image) {
         return;
     }
     let clipped = n / 200; // 0.5%
-    // 基准的 for(v; (acc += hist[v]) < kClipped; ++v) lo = v + 1;
+    // 写法等价于 for(v; (acc += hist[v]) < kClipped; ++v) lo = v + 1;
     // ——条件处在累加后判断，为真（acc 还小）才更新 lo 并继续
     let mut lo = 0usize;
     let mut acc: u64 = 0;

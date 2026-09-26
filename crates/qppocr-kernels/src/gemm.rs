@@ -1,4 +1,4 @@
-//! sgemm 与 im2col：设计文档 GEMM 部分。
+//! sgemm 与 im2col。
 //!
 //! C[M,N] = A[M,K] * B[K,N]，行主序。并行单元：N 宽时按 N 面板（32 列）切，
 //! 否则按 M 行切。微内核：4 行 × 4 个 AVX 向量、k 内层 broadcast+FMA
@@ -10,8 +10,8 @@
 //!    没有任何路径先读 C。 曾经 memset C（det 的 1x1 conv 输出 47 MB，
 //!    ~4 ms/节点的无效零填充），已删。
 //! 2. **bias 折进 store 阶段**，省掉最常见的一次 Add 的读改写。
-//! 3. **bias 的加法位置按路径不同**—— 原样如此，浮点加法不可结合，
-//!    两种顺序低位不同；阶段 2「中间张量与基准值逐位一致」依赖这套分支结构：
+//! 3. **bias 的加法位置按路径不同**——浮点加法不可结合，
+//!    两种顺序低位不同；「中间张量逐位一致」的判据依赖这套分支结构：
 //!    - 4 行块、整面板（`nn == 32`）尾行、窄 N 路径 32 列主体：FMA 链从 0
 //!      累加，**最后**加 bias；
 //!    - 非整面板尾行、窄 N 路径 N%32 尾列：以 bias **起种**再走 FMA 链。
@@ -360,7 +360,7 @@ pub fn im2col(
                     unsafe {
                         if iy < 0 || iy as usize >= h {
                             // 整行在 padding 里：零填充。★ 每个 kx 一段
-                            //（基准是 `for kx: memset`）——只填 ky*kw 那一段
+                            //（不是 `for kx: memset`）——只填 ky*kw 那一段
                             // 会给 kx>0 的段留下复用缓冲里的陈旧数据。
                             for kx in 0..kw {
                                 std::ptr::write_bytes(colsp.get().add(base + kx * nout), 0, ow);
@@ -385,9 +385,8 @@ pub fn im2col(
             }
         }
     };
-    // ★ 串行执行，调用方负责并行。基准的 im2col 带 serial 参数，conv 的
-    // tile_body 总是传 true——因为 tile 本身已在 parallel_for 里，嵌套
-    // fork 在 fork-join 池里是死锁（ 池与 `crate::pool` 同款限制）。
-    // 这里直接执行与 基准的实际行为一致。
+    // ★ 串行执行，调用方负责并行。conv 的 tile_body 调用它时恒为串行
+    // ——tile 本身已在 `parallel_for` 里，嵌套 fork 在 fork-join 池里是
+    // 死锁（见 `crate::pool` 的模块注释）。
     body(0, rows);
 }

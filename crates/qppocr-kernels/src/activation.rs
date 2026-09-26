@@ -1,4 +1,4 @@
-//! 激活与逐元素数值内核：设计文档 激活部分。
+//! 激活函数与归约类数值内核（softmax / 层归一化）。
 //!
 //! # ★ 多项式近似——系数与运算顺序逐字照抄，不要换成 libm
 //!
@@ -12,10 +12,10 @@
 //!
 //! 标量版 [`erf1`] / [`exp1`] 是 AVX2 版的**逐 lane 镜像**（同样的
 //! `mul_add` 序列、同样的 round-ties-even），因此标量与 SIMD 逐位一致——
-//! 这是把 scalar 当判据的前提。基准的标量尾巴调 libm（`erff`/`exp`），
+//! 这是把 scalar 当判据的前提。标量尾巴调 libm（`erff`/`exp`），
 //! 与其向量版本本来就不逐位一致；我们不沿用那个尾巴。
 //!
-//! ⚠ 已声明的与 基准的偏差：仅在 `inner % 8` 的标量尾巴上， 用 libm、
+//! ⚠ 已声明的偏差：仅在 `inner % 8` 的标量尾巴上，用 libm、
 //! 我们用同一多项式，差异 ≤1 ulp。文本级对拍（阶段 3 判据）不受影响；
 //! 若阶段 2 的中间张量对拍在这里翻车，再局部处理。
 
@@ -66,7 +66,7 @@ pub fn erf1(x: f32) -> f32 {
     f32::from_bits(r.to_bits() | (x.to_bits() & 0x8000_0000)) // 还原符号
 }
 
-/// 内核可以折进自己输出的激活（对应 基准的 `Activation`，
+/// 内核可以折进自己输出的激活（
 /// 让图优化能删掉紧随其后的激活节点）。
 ///
 /// 它作用在**已写出的输出**上，不是累加器上——变换累加器会把 erf 的除法和
@@ -94,7 +94,7 @@ pub enum ActKind {
 }
 
 impl Default for Activation {
-    #![allow(clippy::approx_constant)] //  ops.hpp 的默认值照抄
+    #![allow(clippy::approx_constant)] // erf 的多项式常数
     fn default() -> Self {
         Self {
             kind: ActKind::None,
@@ -132,7 +132,7 @@ pub fn apply_act(p: &mut [f32], act: &Activation) {
     gelu_inplace(p, act.c1, act.c2, act.c3);
 }
 
-/// `y = max(0, x)`，就地。`v > 0 ? v : 0` 的写法保留 基准的 NaN→0 语义。
+/// `y = max(0, x)`，就地。`v > 0 ? v : 0` 的写法保留 NaN→0 的语义。
 pub fn relu_inplace(t: &mut [f32]) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
@@ -353,7 +353,7 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
                 sum += row[i2];
                 i2 += 1;
             }
-            // 除法拆成乘 1/sum（与基准一致：inv = 1.f/sum 然后逐元素乘）
+            // 除法拆成乘 1/sum（inv = 1.f/sum 然后逐元素乘）
             let inv = 1.0f32 / sum;
             for v in row.iter_mut() {
                 *v *= inv;
@@ -404,7 +404,7 @@ pub fn softmax_axis_generic(t: &mut [f32], outer: i64, mid: i64, inner: i64) {
         }
     });
 }
-/// `t = sqrt(t)`，就地。IEEE 精确（硬件指令），与 基准的 std::sqrt 逐位同。
+/// `t = sqrt(t)`，就地。IEEE 精确（硬件指令）。
 /// 放 kernels：core forbid(unsafe)，而并行就地遍历这里需要 SyncPtr。
 pub fn sqrt_inplace(t: &mut [f32]) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
@@ -454,7 +454,7 @@ mod tests {
         // 2. kf·hi 是 f32 乘法，自身半个 ulp 的舍入（kf≈100 时 ~3e-6）——
         //    hi 是满精度 f32，kf·hi 并不精确（Cody-Waite 会选少位数的 hi）；
         // 3. 多项式截断 + Horner 舍入 ~1e-7。
-        // ★ 照抄不改：修掉任何一项都会破坏与 基准的逐位一致。
+        // ★ 不要改任何一个常数：改了就破坏位级一致。
         // 容差按最坏情况设 1e-5。
         let mut x = -80.0f32;
         while x <= 80.0 {

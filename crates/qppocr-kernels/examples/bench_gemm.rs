@@ -1,9 +1,8 @@
-//! GEMM 性能对拍入口（tools/migration-bench 的 Rust 侧孪生）。
-// GEMM A/B — Rust 侧（qppocr-kernels 的 sgemm）。
-// 与 bench.cpp 同形状、同数据、同「7 轮取最好」口径；交错运行对比。
-// 构建：rustc -O -C target-feature=+avx2,+fma -o bench_rust bench_rs_qppocr.rs
-//       --extern qppocr_kernels=<path-to-libqppocr_kernels.rlib> -L <deps>
-// （或直接用 cargo 里的 benches/下例程；此文件保持与 bench.cpp 对应的独立性）
+//! GEMM 独立基准：固定形状、固定数据、「7 轮取最好」。
+//!
+//! 与仓库其它基准同口径，可交错运行对比不同实现/不同线程数的 GEMM。
+//! 构建：rustc -O -C target-feature=+avx2,+fma -o bench_rust bench_gemm.rs
+//!       --extern qppocr_kernels=<path-to-libqppocr_kernels.rlib> -L <deps>
 
 use std::time::Instant;
 
