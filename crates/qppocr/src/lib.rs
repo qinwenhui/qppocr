@@ -270,9 +270,9 @@ impl Default for Advanced {
             rec_width_grain: 0,
             rec_pad_min_h: 0.0,
             // ⚠ 必须与 PipelineConfig::default() 一致：`.advanced(
-            // Advanced::default())` 会**整份覆盖**，这里写 6 会让显式传
-            // 默认 Advanced 的人悄悄退回旧默认。
-            rec_batch: 16,
+            // Advanced::default())` 会**整份覆盖**，这里写别的值会让
+            // 显式传默认 Advanced 的人悄悄换一套行为。
+            rec_batch: 1,
             cls_height: 48,
             cls_width: 192,
             cls_window: false,
