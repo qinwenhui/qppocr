@@ -98,6 +98,8 @@ pub struct Graph {
     pub dropped_identity: i64,
     /// fuse_conv_activation 融合的 conv+act 对数。
     pub fused_conv_act: i64,
+    /// 门控块坍缩（Add(Mul,·) → MulAddScale）的节点数。
+    pub fused_mul_add: i64,
 }
 
 impl Graph {

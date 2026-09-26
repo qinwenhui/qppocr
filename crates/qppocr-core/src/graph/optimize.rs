@@ -428,6 +428,76 @@ pub fn fuse_conv_activation(g: &mut Graph) -> i64 {
     n
 }
 
+/// 门控块坍缩：`Add(Mul(特征, 门), 残差)` → 单个 `MulAddScale`。
+///
+/// PP-OCRv6 的大核主干里每个块都有这么一个（SE 路径算出 `[1,C,1,1]` 的门），
+/// 分开跑要写一趟、再读一趟中间的 12 MB 特征图。融合成一次「读三写一」。
+///
+/// 形状在优化期拿不到（图里只有名字），所以**不在这里判形状**：节点照建，
+/// 执行期看门的元素数是否等于通道数，是就走逐通道标量的快路径、不是就退回
+/// 通用的「先 Mul 再 Add」——两条路数值都等价。
+pub fn fuse_mul_add(g: &mut Graph) -> i64 {
+    let consumers = consumer_map(g);
+    let mut producer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for o in &n.outputs {
+            producer_of.insert(o.clone(), i);
+        }
+    }
+
+    let mut fuse: Vec<(usize, usize, bool)> = Vec::new(); // (Add 下标, Mul 下标, Mul 是否是 Add 的第 0 个输入)
+    for i in 0..g.nodes.len() {
+        let an = &g.nodes[i];
+        if an.op_type != "Add" || an.inputs.len() != 2 || an.outputs.len() != 1 {
+            continue;
+        }
+        for side in 0..2 {
+            let mo = &an.inputs[side];
+            if mo.is_empty() || consumers.get(mo).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(&mi) = producer_of.get(mo) else {
+                continue;
+            };
+            let mn = &g.nodes[mi];
+            if mn.op_type != "Mul" || mn.inputs.len() != 2 || mn.outputs.len() != 1 {
+                continue;
+            }
+            fuse.push((i, mi, side == 0));
+            break;
+        }
+    }
+    if fuse.is_empty() {
+        return 0;
+    }
+
+    let mut drop: HashSet<usize> = HashSet::new();
+    for &(ai, mi, mul_first) in &fuse {
+        let mn = g.nodes[mi].clone();
+        let an = g.nodes[ai].clone();
+        let residual = an.inputs[if mul_first { 1 } else { 0 }].clone();
+        let out_name = an.outputs[0].clone();
+        let cn = &mut g.nodes[ai];
+        cn.op_type = "MulAddScale".into();
+        cn.inputs = vec![mn.inputs[0].clone(), mn.inputs[1].clone(), residual];
+        cn.outputs = vec![out_name];
+        cn.attrs.clear();
+        cn.name = format!("fused:{}", an.name);
+        drop.insert(mi);
+    }
+
+    let n = fuse.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if drop.contains(&i) {
+            continue;
+        }
+        kept.push(node);
+    }
+    g.nodes = kept;
+    n
+}
+
 /// Conv 后紧跟单消费者 Add(bias)：bias 折进 Conv 第三输入。
 /// 省掉最常见的一次 Add 的读改写——转换版模型把 bias 拆成独立 Add
 ///（上游原件折在 Conv 里，这个 pass 对它们是 no-op）。

@@ -577,6 +577,59 @@ impl Session {
                         qppocr_kernels::activation::clip_inplace(&mut y.f32, lo, hi);
                         arena.insert(n.outputs[0].clone(), y);
                     }
+                    "MulAddScale" => {
+                        // 图优化把 `Add(Mul(特征, 门), 残差)` 坍缩成这一个节点。
+                        // 门是 [1,C,1,1] 时走逐通道标量的快路径（读三写一，
+                        // 省掉中间那趟「写 12 MB + 读 12 MB」）；形状不匹配就
+                        // 退回「先 Mul 再 Add」——与坍缩前逐位相同。
+                        let f = get!(&arena, &n.inputs[0]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[0]))
+                        })?;
+                        let gm = get!(&arena, &n.inputs[1]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[1]))
+                        })?;
+                        let rs = get!(&arena, &n.inputs[2]).ok_or_else(|| {
+                            Error::Graph(format!("{op}: missing input {}", n.inputs[2]))
+                        })?;
+                        let shape = f.shape.clone();
+                        let fast = f.shape.len() == 4
+                            && gm.f32.len() == f.shape[1] as usize
+                            && rs.shape == f.shape
+                            && !f.f32.is_empty();
+                        let y = if fast {
+                            let c = f.shape[1] as usize;
+                            let hw = f.f32.len() / c;
+                            qppocr_kernels::elementwise::mul_add_scale_alloc(
+                                &f.f32, &gm.f32, &rs.f32, c, hw,
+                            )
+                        } else {
+                            let (mut t, shp) = qppocr_kernels::elementwise::binary_op(
+                                &f.f32,
+                                &f.shape,
+                                &gm.f32,
+                                &gm.shape,
+                                qppocr_kernels::elementwise::BinOp::Mul,
+                            );
+                            qppocr_kernels::elementwise::binary_op_inplace(
+                                &mut t,
+                                &shp,
+                                &rs.f32,
+                                &rs.shape,
+                                qppocr_kernels::elementwise::BinOp::Add,
+                            );
+                            t
+                        };
+                        arena.insert(
+                            n.outputs[0].clone(),
+                            Tensor {
+                                name: n.outputs[0].clone(),
+                                shape,
+                                dtype: DType::F32,
+                                f32: y,
+                                i64: Vec::new(),
+                            },
+                        );
+                    }
                     "Add" | "Sub" | "Mul" | "Div" | "Pow" => {
                         let binop = match op {
                             "Add" => qppocr_kernels::elementwise::BinOp::Add,
