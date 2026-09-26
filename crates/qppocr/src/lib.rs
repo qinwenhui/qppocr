@@ -113,14 +113,14 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// 预设：三个经过整段基准验证的档位。
+/// 预设：三个经过整段语料验证的档位。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Preset {
     /// 速度优先：`rec_height` 40，关区域重试。
     Speed,
-    /// 默认：全部基准值（36 参数的测量结果，）。
+    /// 默认：全部默认值（36 项参数的测量结果）。
     #[default]
     Balanced,
     /// 精度优先：`rec_height` 48，开区域重试与边距判定。
@@ -154,8 +154,7 @@ pub struct Config {
     pub vertical_padding: Option<bool>,
 }
 
-/// 基准测出来的常数。**不要改**——每一项都有实测依据
-/// 。
+/// 实测标出来的常数。**不要改**——每一项都有实测依据。
 ///
 /// 保留它是为了让我们自己能继续调参，以及极少数有自己量具的用户一条路。
 /// 这里的字段**不提供稳定性承诺**，任何一个小版本都可能变。
@@ -186,7 +185,7 @@ pub struct Advanced {
     /// 方向分类翻转阈值。
     pub cls_thresh: f32,
 
-    // ---- 以下与 `PipelineConfig` 同名同义（tuning.hpp 基准值）----
+    // ---- 以下与 `PipelineConfig` 同名同义 ----
     /// 检测输入长边上限。⚠ 双向帽：低于工作图长边会把检测输入**缩小**。
     pub det_max_side: i32,
     /// 检测输入像素上限（原图的倍数，只在补边时生效）。
@@ -221,6 +220,8 @@ pub struct Advanced {
     pub cls_width: i32,
     /// 超宽行取居中窗口分类。⚠ 对上游 PP-LCNet 有害（默认关）。
     pub cls_window: bool,
+    /// 一次方向分类前向塞几行（纯性能旋钮，输出不变）。
+    pub cls_batch: usize,
     /// 自动色阶预处理。⚠ 改变检测器所见（默认关）。
     pub enhance_contrast: bool,
     /// 检测放大倍数（成本 ~N²；裁剪仍取原图，默认 1）。
@@ -243,7 +244,7 @@ impl Default for Config {
 
 impl Default for Advanced {
     fn default() -> Self {
-        // = PipelineConfig::default() 的对应字段（tuning.hpp 基准值）
+        // = PipelineConfig::default() 的对应字段
         Advanced {
             det_thresh: 0.2,
             box_thresh: 0.5,
@@ -268,10 +269,14 @@ impl Default for Advanced {
             rec_min_width: 16,
             rec_width_grain: 0,
             rec_pad_min_h: 0.0,
-            rec_batch: 6,
+            // ⚠ 必须与 PipelineConfig::default() 一致：`.advanced(
+            // Advanced::default())` 会**整份覆盖**，这里写 6 会让显式传
+            // 默认 Advanced 的人悄悄退回旧默认。
+            rec_batch: 16,
             cls_height: 48,
             cls_width: 192,
             cls_window: false,
+            cls_batch: 1,
             enhance_contrast: false,
             upscale: 1,
         }
@@ -435,7 +440,7 @@ impl Tier {
 
 /// 预设 → 公开覆盖 → Advanced 覆盖，得到最终 PipelineConfig。
 fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>) -> PipelineConfig {
-    // 1) 基准值（tuning.hpp，）
+    // 1) 默认值
     let mut pc = PipelineConfig::default();
     // 2) 预设补丁
     match preset {
@@ -450,7 +455,7 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
             pc.rec_height = 48;
             pc.retry_conf = 0.85;
             // 边距杂波判定：实测难图 0.48 vs 语料 0.00–0.06，
-            // 0.15 在两者之间留了余量（值无基准 sweep，注释在案）
+            // 0.15 在两者之间留了余量（该值未做 sweep，依据见注释）
             pc.unclip_margin_thresh = 0.15;
         }
     }
@@ -504,6 +509,7 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
         cls_height: pc.cls_height,
         cls_width: pc.cls_width,
         cls_window: pc.cls_window,
+        cls_batch: pc.cls_batch,
         enhance_contrast: pc.enhance_contrast,
         upscale: pc.upscale,
     };
@@ -537,6 +543,7 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
     pc.cls_height = adv.cls_height;
     pc.cls_width = adv.cls_width;
     pc.cls_window = adv.cls_window;
+    pc.cls_batch = adv.cls_batch;
     pc.enhance_contrast = adv.enhance_contrast;
     pc.upscale = adv.upscale;
     pc

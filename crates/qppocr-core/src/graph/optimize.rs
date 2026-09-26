@@ -1,4 +1,4 @@
-//! 图优化（`graph_opt.cpp` ）。
+//! 图优化：常量折叠、算子消除、子图坍缩、bias 折叠、conv+act 融合。
 //!
 //! ONNX Runtime 必须通用：任意算子、任意拓扑、任意 dtype，融合要运行时决定。
 //! 我们只跑 PP-OCR（v4/v6，det/rec/cls），可以认出这些导出器吐的**确切

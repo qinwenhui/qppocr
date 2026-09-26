@@ -29,7 +29,7 @@ fn main() -> anyhow_lite::Result<()> {
     assert_eq!(back.lines[0].text, r.lines[0].text);
     println!("3 OcrResult serde 往返: {} bytes, 行数一致", json.len());
 
-    // 4) Advanced 部分 JSON = 预设覆盖语义（缺省字段取基准值）
+    // 4) Advanced 部分 JSON = 预设覆盖语义（缺省字段取默认值）
     let adv: Advanced = serde_json::from_str(r#"{"upscale": 2}"#)?;
     assert_eq!(adv.upscale, 2);
     assert_eq!(adv.det_thresh, 0.2); // 未给 → 默认

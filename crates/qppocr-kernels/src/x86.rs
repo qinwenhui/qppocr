@@ -1,9 +1,8 @@
-//! AVX2 + FMA 内核：设计文档 SIMD 部分。
+//! AVX2 + FMA 微内核。
 //!
-//! 微内核逐句镜像 基准的结构——循环顺序、分块、寄存器分配意图。**不要**
-//! 改写成更 Rust 的形式：这些内核的性能靠裸指针 + 精确的寄存器分配拿到
-//! ，`#[target_feature]` 函数内的指针运算不越界由
-//! 分发层的形状校验保证。
+//! 微内核的循环顺序、分块、寄存器分配都是刻意写死的。**不要**改写成更
+//! Rust 的形式：这些内核的性能就靠裸指针 + 精确的寄存器分配，而
+//! `#[target_feature]` 函数内的指针运算不越界由分发层的形状校验保证。
 //!
 //! 数值上这些内核与 `scalar` 版**逐位一致**：标量版就是按这里的表达式树
 //! （`mul_add` 序列、round-ties-even、hsum 结合顺序）写的。对拍测试
@@ -859,7 +858,7 @@ pub unsafe fn binary_run_alloc_vec(
 
 /// resize_bilinear 的行内积向量化：8 个输出列一批。
 /// `ix0/ix1/fx` 是预计算的源列映射（每输出列一对），`r0/r1` 是上下两行。
-/// 权重结合顺序与基准一致（首项两乘，其余 fma）。
+/// 权重结合顺序固定（首项两乘，其余 fma）。
 #[allow(clippy::too_many_arguments)] // 内核入参：两行 + 三张映射表 + 权重 + 目标 + 范围
 #[target_feature(enable = "avx2,fma")]
 pub unsafe fn bilinear_row_vec(

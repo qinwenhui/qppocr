@@ -1,7 +1,7 @@
-//! 流水线配置：调参基准 的 36 个行为参数，**数值一个不改**
-//!。
+//! 流水线配置：det / rec / cls 的全部行为参数与默认值。
 
-/// 流水线配置（默认值 = 调参基准）。
+/// 流水线配置。默认值是**实测标定**的结果——每一项的取值依据见字段注释
+/// 与 CHANGELOG，改默认值等于改产品行为。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PipelineConfig {
@@ -61,11 +61,18 @@ pub struct PipelineConfig {
     pub cls_width: i32,
     /// 翻转阈值。
     pub cls_thresh: f32,
-    /// 超宽行是否取居中窗口再分类（ 给转换版 cls 打的补丁：30:1 的
-    /// 小长图压缩 7.6x 后分类器答错）。**对上游 PP-LCNet 有害**——倒置
-    /// 英文行被窗口截断后特征不足会误判（实测 win=true 0.72 说正立、
+    /// 超宽行是否取居中窗口再分类（针对 30:1 的小长图：整行压到 192 px
+    /// 宽时压缩 7.6x，分类器答错）。**对上游 PP-LCNet 有害**——倒置英文行
+    /// 被窗口截断后特征不足会误判（实测 win=true 0.72 说正立、
     /// win=false 0.9998 说倒置）。默认关。
     pub cls_window: bool,
+    /// 一次方向分类前向塞几行（批数 = `ceil(行数 / cls_batch)`）。
+    /// ⚠ **1 就是最优，调大只会更慢**——16 图实测：1→4.12、2→4.76、
+    /// 4→6.09、8→10.09、16→11.95 ms/图。cls 的画布固定 48×192，单行
+    /// 前向本来就只有 ~1.5 ms，批起来省的固定开销盖不过批间并行度的
+    /// 损失（16 图约 10 行，逐行扇出正好把线程铺满）。留着这个旋钮是
+    /// 因为这结论是量出来的，不是推出来的；翻转结论在任何档位都一致。
+    pub cls_batch: usize,
 
     // ---- 框合并 / 重试 ----
     /// 同行相邻框合并间隙（行高的倍数），0 = 关。凸包拟合（§5.6）。
@@ -111,6 +118,7 @@ impl Default for PipelineConfig {
             cls_width: 192,
             cls_thresh: 0.9,
             cls_window: false,
+            cls_batch: 1,
             merge_line_gap: 0.5,
             retry_conf: 0.85,
             enhance_contrast: false,

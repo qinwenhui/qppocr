@@ -1,8 +1,8 @@
-//! 内存中的 ONNX 表示（`onnx_model.hpp` 的对应物）。
+//! 内存中的 ONNX 表示。
 //!
-//! 只留推理需要的：节点、属性、常量张量、图输入输出。字段号注释与
-//! onnx.proto 对应，解析器（[`crate::onnx::parse``]）逐字段镜像
-//! `onnx_parser.cpp`。
+//! 只留推理需要的：节点、属性、常量张量、图输入输出。字段号与
+//! `onnx.proto` 一一对应，[`crate::onnx::parse`] 按字段号逐条读取，
+//! 不认识的字段直接跳过。
 
 use std::collections::HashMap;
 

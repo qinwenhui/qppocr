@@ -122,7 +122,7 @@ pub struct Timings {
     pub total_ms: f64,
 }
 
-/// 计时起点（`start.elapsed_ms()` 得毫秒）。字段命名的 `*_ms` 与基准对齐。
+/// 计时起点（`start.elapsed_ms()` 得毫秒）。字段一律以 `*_ms` 结尾。
 trait ElapsedMs {
     fn elapsed_ms(&self) -> f64;
 }
@@ -597,7 +597,7 @@ impl Engine {
             super::image::auto_levels(&mut work);
         }
         // ★ 识别器从原图裁（增强后），不从缩过的 work 裁。这里用
-        // 借用（基准是 `const Image* crop_src = &img`）——默认路径零拷贝，
+        // 借用而不是克隆——默认路径零拷贝，
         // 只有开增强才物化整图副本。
         let mut enhanced_full: Image;
         let crop_src: &Image = if self.cfg.enhance_contrast {
@@ -913,31 +913,43 @@ impl Engine {
             crops.iter().map(std::borrow::Cow::Borrowed).collect();
         if let Some(cls) = &self.cls {
             let (ch, cw) = (self.cfg.cls_height, self.cfg.cls_width);
-            // cls 也用同一套扇出：每行一个批次，行内串行
-            let cls_batches: Vec<(usize, usize)> = (0..crops.len()).map(|i| (i, i + 1)).collect();
-            let (ch, cw) = (ch, cw);
-            let decisions = Self::run_batches(&cls_batches, |b, _e| -> Result<bool> {
-                let i = b;
-                let view = if self.cfg.cls_window {
-                    cls_view(&crops[i], cw, ch)
-                } else {
-                    crops[i].clone()
-                };
-                let mut buf = F32Buf::with_zeroed(3 * (ch as usize) * (cw as usize));
-                pack_crop(&view, ch, cw, &mut buf, false);
+            // cls 也用同一套扇出：按 `cls_batch` 行一组切批，批间扇出、批内
+            // 串行。cls 画布固定 48×192，批起来只是把 N 填进批次维。
+            let per = self.cfg.cls_batch.max(1);
+            let cls_batches: Vec<(usize, usize)> = (0..crops.len())
+                .step_by(per)
+                .map(|b| (b, (b + per).min(crops.len())))
+                .collect();
+            let decisions = Self::run_batches(&cls_batches, |b, e| -> Result<Vec<bool>> {
+                let n = e - b;
+                let stride = 3 * (ch as usize) * (cw as usize);
+                let mut buf = F32Buf::with_zeroed(n * stride);
+                for (k, i) in (b..e).enumerate() {
+                    let view = if self.cfg.cls_window {
+                        cls_view(&crops[i], cw, ch)
+                    } else {
+                        crops[i].clone()
+                    };
+                    pack_crop(&view, ch, cw, &mut buf[k * stride..], false);
+                }
                 let out = cls.run(vec![(
                     self.cls_in.clone(),
                     Tensor {
                         name: String::new(),
-                        shape: vec![1, 3, ch as i64, cw as i64],
+                        shape: vec![n as i64, 3, ch as i64, cw as i64],
                         dtype: DType::F32,
                         f32: buf,
                         i64: Vec::new(),
                     },
                 )])?;
-                let o = &out[0]; // [1, 2]
-                Ok(o.f32[1] > o.f32[0] && o.f32[1] >= self.cfg.cls_thresh)
+                let o = &out[0]; // [n, 2]
+                Ok((0..n)
+                    .map(|k| {
+                        o.f32[k * 2 + 1] > o.f32[k * 2] && o.f32[k * 2 + 1] >= self.cfg.cls_thresh
+                    })
+                    .collect())
             })?;
+            let decisions: Vec<bool> = decisions.into_iter().flatten().collect();
             for (i, &flip) in decisions.iter().enumerate() {
                 if flip {
                     flipped[i] = true;

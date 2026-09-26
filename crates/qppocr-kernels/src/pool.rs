@@ -3,16 +3,15 @@
 //! 为什么不用 rayon：det 图是 177 个**串行节点**，每个节点内部 fork-join
 //! 一次。rayon 的任务队列（injector + work-stealing）每次 `for_each` 有
 //! 固定的入队/唤醒开销，串行节点把它逐节点累加（实测多线程扩展
-//! 1.86x vs  池 2.07x）。基准的池语义不同：
+//! 1.86x vs 本池 2.07x）。本池与 rayon 的语义差异：
 //!
 //! - **一次唤醒全部 worker**（`ReleaseSemaphore(N-1)`），不是一个任务一次
 //!   唤醒——这里用 `Condvar::notify_all`（std 在 Windows 上直接映射
-//!   `WakeAllConditionVariable`，轻量可靠，
-//!   所以  弃用 condvar 的理由在这里不成立）；
+//!   `WakeAllConditionVariable`，轻量可靠）；
 //! - **主线程参与执行**（抢 chunk，干完自己的份额再自旋 join）；
 //! - **join 数的是参与者而不是 chunk**：`done >= nthreads` 才返回。数
-//!   chunk 的版本（不等迟醒的 worker）在  实测 `--bench 2` 挂死 ~20%
-//!   而被回退（util.hpp `parallel_for` 注释），这里照搬参与者计数。
+//!   chunk 的版本（不等迟醒的 worker）实测 `--bench 2` 挂死 ~20%
+//!   而被回退，这里数参与者。
 //!
 //! 参与者计数同时买到一个不变量：**epoch 推进被 join 门控**——所有 worker
 //! 都为 epoch E bump 过 done，主线程才可能发布 E+1。因此 worker 永远不会
@@ -22,8 +21,8 @@
 //!
 //! 嵌套 `parallel_for` 是死锁：内核用 `sgemm_serial` /
 //! 串行 im2col 避免嵌套。设计取舍：**跨线程并发 `fork_join`
-//! 在这里串行化**（`fork_mu`），而不是像  那样挂死——公开 API 允许
-//! 两个引擎在两个线程上各跑推理，基准的单调用方假设在库里不成立。
+//! 在这里串行化**（`fork_mu`）而不是挂死——公开 API 允许两个引擎在
+//! 两个线程上各跑推理，「单调用方」的假设在库里不成立。
 //! worker 永不触碰 `fork_mu`，无递归问题。
 
 use std::cell::Cell;
@@ -65,7 +64,7 @@ pub(crate) fn serial_exec() -> bool {
     SERIAL_EXEC.with(|c| c.get())
 }
 
-/// 一次 fork 的协调成本对齐（16 线程实测 ~97us，`tools/fork_bench.cpp`）。
+/// 一次 fork 的协调成本（16 线程实测 ~97us）。
 /// 只是文档性常量；实际门控在 [`crate::par::Thresholds`]。
 #[allow(dead_code)]
 pub(crate) const FORK_US: f64 = 97.0;
@@ -294,7 +293,7 @@ pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
     // 自旋 join：等全部参与者（含自己）各 bump 一次 done。
     // Release/Acquire 对保证：所有 worker 的 chunk 写入对返回后的主线程可见。
     //
-    // 纯自旋（基准的做法）在核被占满时（多进程并发）是病态的：迟醒的
+    // 纯自旋在核被占满时（多进程并发）是病态的：迟醒的
     // worker 已 READY 却等不到核，而自旋的主线程恰好占着一个核不放。
     // 先自旋一段（无争用时零成本命中），之后每轮让出——SwitchToThread
     // 把当前核立即交给同核待跑的 straggler。

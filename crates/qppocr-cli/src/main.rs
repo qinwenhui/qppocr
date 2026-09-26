@@ -1,9 +1,8 @@
-//! `qppocr` 参考命令行（对应 基准实现的 设计文档）。
+//! `qppocr` 参考命令行。
 //!
-//! 批量多图走**进程内 worker 线程共享一个引擎**：基准的多进程 worker 池
-//! （`proc_pool.hpp`）是被迫的——它的 `ThreadPool` 并发 `parallel_for`
-//! 会挂死；我们的池用 `fork_mu` 把并发 fork 串行化（`pool.rs` 模块注释），
-//! 同进程并发 `run` 是安全的，还省下 W 份权重内存与全部 IPC。
+//! 批量多图走**进程内 worker 线程共享一个引擎**：池用 `fork_mu` 把并发
+//! fork 串行化（见 `qppocr-kernels` 的 `pool.rs` 模块注释），同进程并发
+//! `run` 是安全的，比多进程扇出省下 W 份权重内存与全部 IPC。
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -168,11 +167,10 @@ fn main() {
 /// - 显式 `--workers N`：`min(N, 图数)`；
 /// - 自动：头部探测平均面积（按 max_side_len=960 的帽折算——两档默认
 ///   相同）——大图（≥1.5 MP）一张就吃满线程，cap 2；小图 cap 8；
-///   再受核数减半约束（ 实测：同 16 线程摊到更多 worker 优于集中）。
+///   再受核数减半约束（实测：同 16 线程摊到更多 worker 优于集中）。
 ///
-/// 与 基准的差异：**没有按内存收紧**。多进程每个 worker 是整份引擎
-/// （多进程方案预算 512 MB/worker）；进程内共享引擎的增量只是图像缓冲 +
-/// arena（大图几十 MB 级），8 个并发也在单份引擎的量级内。
+/// 线程数**不按内存收紧**：进程内共享同一个引擎，每个 worker 的增量只是
+/// 图像缓冲 + arena（大图几十 MB 级），8 个并发也在单份引擎的量级内。
 fn auto_workers(o: &Options) -> usize {
     if o.images.len() < 2 {
         return 1;
@@ -223,6 +221,10 @@ fn process_one(engine: &Engine, o: &Options, path: &Path) -> Result<Outcome, Err
 
     let mut best_ms = f64::MAX;
     let mut result = None;
+    // ★ 分阶段数字必须来自**最快的那一次**。以前只留最后一次的 timings，
+    //   于是总时间是最快的、分项是碰运气的那次，九项加起来对不上总数——
+    //   读的人会以为有没统计到的开销。
+    let mut best_t = None;
     for _ in 0..o.bench.max(1) {
         let t0 = std::time::Instant::now();
         let r = if o.det_only {
@@ -233,12 +235,14 @@ fn process_one(engine: &Engine, o: &Options, path: &Path) -> Result<Outcome, Err
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         if ms < best_ms {
             best_ms = ms;
+            best_t = Some(r.timings);
         }
         result = Some(r);
     }
     let res = result.unwrap();
+    let best_t = best_t.expect("bench 至少跑一次");
 
-    let t = &res.timings;
+    let t = &best_t;
     let (det_pre, det_inf, det_post, crop, cls, rec_pre, rec_inf, rec_post) = (
         t.det_pre_ms,
         t.det_infer_ms,
@@ -271,8 +275,21 @@ fn process_one(engine: &Engine, o: &Options, path: &Path) -> Result<Outcome, Err
         ));
     }
     json.push_str(&format!(
-        "], \"timing\": {{\"decode_ms\": {decode_ms:.2}, \"total_ms\": {best_ms:.2}, \"det_pre_ms\": {det_pre:.2}, \"det_infer_ms\": {det_inf:.2}, \"det_post_ms\": {det_post:.2}, \"crop_ms\": {crop:.2}, \"cls_ms\": {cls:.2}, \"rec_pre_ms\": {rec_pre:.2}, \"rec_infer_ms\": {rec_inf:.2}, \"rec_post_ms\": {rec_post:.2}}}}}"
+        "], \"timing\": {{\"decode_ms\": {decode_ms:.2}, \"total_ms\": {best_ms:.2}, \"det_pre_ms\": {det_pre:.2}, \"det_infer_ms\": {det_inf:.2}, \"det_post_ms\": {det_post:.2}, \"crop_ms\": {crop:.2}, \"cls_ms\": {cls:.2}, \"rec_pre_ms\": {rec_pre:.2}, \"rec_infer_ms\": {rec_inf:.2}, \"rec_post_ms\": {rec_post:.2}}}"
     ));
+    // 统计量单列一段：与大括号转义混在一起写容易数错（{} 后的字面 }
+    // 要写 `}}`），拆开就一目了然。
+    json.push_str(&format!(
+        ", \"num_boxes\": {}, \"num_merged\": {}, \"num_decluttered\": {}, \
+         \"num_det_retried\": {}, \"num_flipped\": {}, \"num_unread\": {}",
+        res.num_boxes,
+        res.num_merged,
+        res.num_decluttered,
+        res.num_det_retried,
+        res.num_flipped,
+        res.num_unread,
+    ));
+    json.push('}');
 
     let mut stdout_text = String::new();
     if !o.json && !o.quiet {

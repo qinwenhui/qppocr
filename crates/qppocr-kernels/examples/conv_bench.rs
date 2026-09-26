@@ -1,4 +1,4 @@
-//! conv 双边对拍：Rust 侧（与 /tmp/conv_diff.cpp 同 shape 同数据同 9 轮取最好）。
+//! conv 独立基准：固定 shape、固定数据、「9 轮取最好」。
 //! cargo run --release -p qppocr-kernels --example conv_bench -- <case-idx>
 
 use qppocr_kernels::activation::Activation;

@@ -1,39 +1,38 @@
 //! 并行调度与 fork 阈值。
 //!
-//! 基准实现自带一套 fork-join 线程池（设计文档 的 `ThreadPool`，
-//! Windows 上用信号量唤醒、主线程参与、join 自旋）。Rust 版实现同一套语义
-//! （[`crate::pool`]）——多线程扩展从 rayon 的 1.86x 追到  池的 2.07x
-//! 靠的就是这套语义，不是内核本身。嵌套 `parallel_for` 与 基准一样是
-//! 死锁；`sgemm_serial` / 串行 im2col 这些「调用方已在并行区」的串行
-//! 路径因此是硬性的（它们还有位级一致的作用，见 `gemm.rs`）。
+//! 并行调度与 fork 阈值。
 //!
-//! ## 阈值照搬，不重调
+//! 调度器是 [`crate::pool`]——一套自研 fork-join 池：批量唤醒、主线程参与、
+//! join 自旋、参与者计数屏障。多线程扩展从 rayon 的 1.86x 追到 2.07x 靠的
+//! 就是这套语义，不是内核本身。嵌套 `parallel_for` 是死锁；`sgemm_serial` /
+//! 串行 im2col 这些「调用方已在并行区」的串行路径因此是硬性的（它们还有
+//! 位级一致的作用，见 `gemm.rs`）。
 //!
-//! 这些门控来自 调参基准，每一条都是量出来的（不是拍脑袋）：
+//! 池的构造与所有 worker 线程的诞生都发生在 [`crate::pool`] 里。
 //!
-//! - `fork_min_macs = 4e6`：fork 一次约 97 us（16 线程，`tools/fork_bench.cpp`），
-//!   低于 ~4M MAC 的算子并行收益盖不过 fork 本身。rec 的 depthwise conv 曾经
-//!   在 ~10 us 的单元上 fork，花掉 6 倍于工作量本身的开销。
+//! ## 阈值不重调
+//!
+//! 下面这些门控每一条都是量出来的（不是拍脑袋），实测见 CHANGELOG：
+//!
+//! - `fork_min_macs = 4e6`：16 线程 fork 一次约 97 us，低于 ~4M MAC 的算子
+//!   并行收益盖不过 fork 本身。rec 的 depthwise conv 曾经在 ~10 us 的单元上
+//!   fork，花掉 6 倍于工作量本身的开销。
 //! - `gemm_par_min = 2e5`：GEMM 的 flops 门槛。
 //! - `elem_fork_min_bytes = 1<<20`：纯搬运算子的字节门槛——单线程 memcpy 约
 //!   12 GB/s，1 MB ≈ 一次 fork 的工作量。
-//!
-//! 池就是  那个池（`crate::pool`），fork 成本同量级，这些门两边一致。
 //!
 //! ## FTZ/DAZ
 //!
 //! x86 的 FMA 单元在非正规数上严重降速（实测 19 倍），推理中间量很容易踩中。
 //! [`enable_flush_denormals`] 必须在**任何 worker 线程诞生之前**于主线程调用
-//! ——MXCSR 是每线程的，子线程继承创建者的标志位。 在 `ThreadPool`
-//! 构造函数里做同样的事。
+//! ——MXCSR 是每线程的，子线程继承创建者的标志位；池在构造函数里做同样的事。
 
-/// 每线程任务块数的乘子（= 调参基准 `tp_chunks`，语义随 `crate::pool`
-/// ：原子领票的动态负载均衡，不是 rayon 的静态微任务）。
-///  rotated 实测 4/8/16/32 在噪声内，**1 是离群值**（16 线程 -8%）。
+/// 每线程任务块数的乘子：原子领票的动态负载均衡，不是 rayon 的静态微任务。
+/// rotated 语料实测 4/8/16/32 在噪声内，**1 是离群值**（16 线程 -8%）。
 #[cfg(feature = "parallel")]
 const TP_CHUNKS: usize = 8;
 
-/// 并行门槛，照搬 调参基准。
+/// 并行门槛（默认值见 [`Thresholds::default`]，实测标定）。
 #[derive(Clone, Copy, Debug)]
 pub struct Thresholds {
     /// 低于这么多 MAC 的算子不并行（`fork_min_macs`）。
@@ -116,11 +115,10 @@ pub fn serial_execution() -> bool {
 }
 
 /// 请求池的线程数（含主线程，0 = 自动）。必须在**第一次并行算子**之前
-/// 调用——池在首用时定容，之后请求不再生效（ `ThreadPool::get` 的
-/// 「最早调用者定容」语义）。显式数字不设 16 上限。
+/// 调用——池在首用时定容，之后请求不再生效（「最早调用者定容」）。
+/// 显式数字不设 16 上限。
 ///
-/// 环境变量 `QPPOCR_THREADS` 等价（优先级低于本函数；对标 基准的
-/// `QPPOCR_THREADS`）。
+/// 环境变量 `QPPOCR_THREADS` 等价（优先级低于本函数）。
 #[cfg(feature = "parallel")]
 pub fn set_threads(n: usize) {
     crate::pool::request_threads(n);
@@ -129,7 +127,7 @@ pub fn set_threads(n: usize) {
 /// 在 x86 上打开 FTZ/DAZ（刷新非正规数）。
 ///
 /// 必须在 worker 线程诞生前于主线程调用；`qppocr-core` 在引擎构造时做这件事。
-/// 这是与 基准实现**逐位一致**的前提之一：FTZ 改变非正规数结果的位模式。
+/// 这是**逐位可复现**的前提之一：FTZ 改变非正规数结果的位模式。
 ///
 /// （`_mm_getcsr`/`_mm_setcsr` 内联函数已被 std 标记 deprecated，这里按其
 /// 建议改用内联汇编——语义就是 STMXCSR / LDMXCSR 两条指令。）

@@ -1,4 +1,4 @@
-//! det → cls → rec 流水线（设计文档 ）。
+//! det → cls → rec 流水线。
 //!
 //! 模块划分对应
 //! - [`image`]：Image、缩放、旋转、自动色阶
@@ -6,7 +6,7 @@
 //! - [`crop`]：透视裁剪、pack_crop、cls_view
 //! - [`rec`]：CTC 解码、逐列墨迹、像素空格
 //! - [`engine`]：OcrEngine 主流程（含区域重试）
-//! - [`config`]：调参基准的 36 参数（数值照搬）
+//! - [`config`]：全部行为参数与默认值（实测标定）
 
 pub mod config;
 pub mod crop;

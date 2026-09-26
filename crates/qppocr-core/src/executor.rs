@@ -1,13 +1,13 @@
-//! 执行器（设计文档 ）：带引用计数释放的 arena 逐节点执行。
+//! 执行器：带引用计数释放的 arena 逐节点执行。
 //!
-//! 就绪判定 = 输入都在 arena 里；按序扫描 + 最多 8 趟重试。
+//! 就绪判定 = 一个节点的入边全部就绪（见下方调度注释）。
 //! `take0`：输入是最后消费者时**移动**而不是拷贝——in-place 算子直接吃
 //! 原缓冲，省一次多 MB 的分配和一整趟内存。
 //!
-//! ## 逐节点落盘（阶段 2 判据的对拍机制）
+//! ## 逐节点落盘（位级一致的判据）
 //!
-//! `QPPOCR_DUMP_DIR=<dir>` 时每个节点输出按  `QPPOCR_DUMP_DIR` 相同的
-//! 格式落盘（`%06d.f32`：i32 rank + i64×rank 形状 + f32 数据，manifest.tsv），
+//! `QPPOCR_DUMP_DIR=<dir>` 时每个节点输出按 `%06d.f32` 的
+//! 格式落盘（i32 rank + i64×rank 形状 + f32 数据，另写 manifest.tsv），
 //! 两侧目录逐文件 diff 即「中间张量逐位一致」的判据。
 
 use std::collections::HashMap;
@@ -59,8 +59,8 @@ fn axes_from(
 
 /// 任意 axis 的 softmax（外维并行；exp 占大头，中等张量也值得并行）。
 /// axis 是最后一维时委托给向量化内核（rec 注意力的每个 softmax 都是）；
-/// 通用路径是逐元素标量。★ 通用路径  用 libm exp、我们用同一多项式
-/// （`exp1`），低 位差异 ≤1 ulp——声明过的偏差，对拍若在此翻车有据可查。
+/// 通用路径是逐元素标量。★ 参考路径用 libm exp、我们用同一多项式
+/// （`exp1`），低位差异 ≤1 ulp——声明过的偏差，对拍若在此翻车有据可查。
 fn softmax_axis(t: &mut Tensor, axis: isize) {
     let r = t.rank() as isize;
     let axis = if axis < 0 { axis + r } else { axis };
@@ -219,26 +219,45 @@ impl Session {
             }
         }
 
-        let mut done = vec![false; g.nodes.len()];
+        // ★ 就绪调度改成「未满足入边计数 + 队列」。
+        //
+        // 旧写法是每轮扫全表、逐个节点问「输入齐了吗」：一条 53 节点的
+        // 顺序链要扫 53 轮 × 53 节点 ≈ 2800 次探测。cls 的图正好是这种
+        // 小节点长链，profile 里 executor 开销 1.0-1.9 ms、占该次前向的
+        // 20%——前向本身才 1.3 ms。改成计数后每个节点只在入边满足时被
+        // 入队一次，复杂度从 O(n²) 降到 O(V+E)。
+        //
+        // 执行顺序只在「同时就绪」的节点之间变化；这些节点互不依赖，
+        // 每个算子的输出只由自己的输入决定，因此结果逐位不变。
+        let mut pending: Vec<u32> = vec![0; g.nodes.len()];
+        let mut consumers: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, n) in g.nodes.iter().enumerate() {
+            for inn in &n.inputs {
+                if inn.is_empty() {
+                    continue;
+                }
+                let nm = inn.as_str();
+                if arena.contains_key(nm) || self.initializers.contains_key(nm) {
+                    continue;
+                }
+                pending[i] += 1;
+                consumers.entry(nm).or_default().push(i);
+            }
+        }
+        // 用小顶堆而不是 FIFO：**始终执行下标最小的就绪节点**，这与旧写法
+        // 「按下标扫、碰上就绪就执行」的执行顺序一致（ONNX 图按下标就是
+        // 拓扑序）。顺序重要——按内存序推进时生产者刚写出就被消费者读，
+        // 缓存是热的；换 FIFO 实测 cls 阶段反而慢 6%（4.62 → 4.92 ms/图），
+        // 因为中间张量同时在世的数量变多、缓冲池命中率下降。
+        let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = (0..g.nodes.len())
+            .filter(|&i| pending[i] == 0)
+            .map(std::cmp::Reverse)
+            .collect();
+
         let mut remaining = g.nodes.len();
-        let mut passes = 0;
-        while remaining > 0 && passes < 8 {
-            passes += 1;
-            for i in 0..g.nodes.len() {
-                if done[i] {
-                    continue;
-                }
+        while let Some(std::cmp::Reverse(i)) = ready.pop() {
+            {
                 let n = &g.nodes[i];
-                let mut ready = true;
-                for inn in &n.inputs {
-                    if !inn.is_empty() && get!(&arena, inn).is_none() {
-                        ready = false;
-                        break;
-                    }
-                }
-                if !ready {
-                    continue;
-                }
 
                 // inputs[idx] 是否只被本节点消费（可移动进输出）
                 let takeable = |idx: usize| -> bool {
@@ -676,7 +695,7 @@ impl Session {
                             let sizes = get!(&arena, &n.inputs[3]).ok_or_else(|| {
                                 Error::Graph("Resize: missing sizes input".into())
                             })?;
-                            // 按**扁平数组末两位**取 H/W（基准是 i64.size()-2），
+                            // 按**扁平数组末两位**取 H/W（等价于 i64 的 size()-2），
                             // 不是按 rank——rank-1 的 sizes 长度 4 很常见
                             let sv = as_i64(sizes);
                             oh = sv[sv.len() - 2] as usize;
@@ -1088,7 +1107,26 @@ impl Session {
                 }
 
                 if let Some(t0) = op_t0 {
-                    let e = prof_acc.entry(prof_key).or_insert((0.0, 0));
+                    // 非 Conv 也带上输出形状：逐元素/搬运算子的成本由**形状**
+                    // 决定（同一个 Mul 在 1.97M 元素上是 0.7 ms、在 24K 元素上
+                    // 是 3 us），只有算子名聚不出有意义的账。Conv 的键里已有
+                    // @HxW，不重复。
+                    let key = if op == "Conv" {
+                        prof_key.clone()
+                    } else {
+                        match arena.get(&n.outputs[0]) {
+                            Some(t) => format!(
+                                "{prof_key} [{}]",
+                                t.shape
+                                    .iter()
+                                    .map(|d| d.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            ),
+                            None => prof_key.clone(),
+                        }
+                    };
+                    let e = prof_acc.entry(key).or_insert((0.0, 0));
                     e.0 += t0.elapsed().as_secs_f64() * 1000.0;
                     e.1 += 1;
                 }
@@ -1138,8 +1176,19 @@ impl Session {
                     }
                 }
 
-                done[i] = true;
                 remaining -= 1;
+
+                // 本节点的输出就绪 → 递减下游的未满足入边计数
+                for out in &n.outputs {
+                    if let Some(cs) = consumers.get(out.as_str()) {
+                        for &c in cs {
+                            pending[c] -= 1;
+                            if pending[c] == 0 {
+                                ready.push(std::cmp::Reverse(c));
+                            }
+                        }
+                    }
+                }
             }
         }
         if remaining > 0 {

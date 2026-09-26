@@ -1,4 +1,4 @@
-//! 卷积：设计文档 conv 部分。
+//! 卷积：im2col + GEMM、分组/深度卷积、转置卷积。
 //!
 //! 三条路径（按命中顺序）：
 //!
@@ -226,7 +226,7 @@ pub fn conv2d(
     } else {
         // 通用：分组 im2col + GEMM，输出行 tile
         bias_in_gemm = true;
-        let col_budget = 1usize << 19; // tuning.hpp: col_budget
+        let col_budget = 1usize << 19; // im2col 单块 scratch 预算（f32 个数）
         let kk = cg * kh * kw;
         // tile 高度由 cache 预算定，再缩到 (批×组×tile) 工作项能填满线程池。
         // 预算按并发块数分摊——每个块带自己的 scratch，不除会让总足迹
