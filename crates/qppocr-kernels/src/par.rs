@@ -70,6 +70,20 @@ pub fn worth_forking_bytes(bytes: usize) -> bool {
     threads() > 1 && bytes >= thresholds().elem_fork_min_bytes
 }
 
+/// 本线程所在池的参与者数（含调用线程）。分片线程下小于 [`threads`]。
+///
+/// 只用于**负载均衡**类的决策（切几块）；切分轴/分块数这类进位的东西
+/// 一律用全局的 [`threads`]。
+#[cfg(feature = "parallel")]
+pub fn pool_threads() -> usize {
+    crate::pool::pool_thread_count()
+}
+#[cfg(not(feature = "parallel"))]
+#[inline]
+pub fn pool_threads() -> usize {
+    1
+}
+
 /// 可用线程数（池大小，含主线程）。`parallel` feature 关闭时恒为 1。
 pub fn threads() -> usize {
     #[cfg(feature = "parallel")]
@@ -124,6 +138,23 @@ pub fn set_threads(n: usize) {
     crate::pool::request_threads(n);
 }
 
+/// 请求池布局：`sizes[0]` 是默认池（det 与所有非分片调用走它），
+/// 其余是**分片池**，供两级并行用——外层每个线程占一个，其算子再在本池内
+/// fork，互不排队。必须在第一次 fork 之前调用（池首用定容）。
+///
+/// 全部线程一次性创建；空闲的池只在 condvar 上等，不占 CPU。
+#[cfg(feature = "parallel")]
+pub fn request_pools(sizes: &[usize]) {
+    crate::pool::request_pools(sizes);
+}
+
+/// 本线程用哪个池（0 = 默认池）。仅对**当前线程**生效，且只影响它自己发起的
+/// `fork_join`；分片线程由调用方显式设置。
+#[cfg(feature = "parallel")]
+pub fn set_pool_slot(i: usize) {
+    crate::pool::set_pool_slot(i);
+}
+
 /// 在 x86 上打开 FTZ/DAZ（刷新非正规数）。
 ///
 /// 必须在 worker 线程诞生前于主线程调用；`qppocr-core` 在引擎构造时做这件事。
@@ -162,14 +193,15 @@ where
     if n == 0 {
         return;
     }
-    let t = threads();
-    if t == 1 || n < min_grain.max(2) {
+    let t = threads(); // 全局：只做「有没有并行」的粗判
+    let tp = pool_threads(); // 本地：决定切几块
+    if t == 1 || tp == 1 || n < min_grain.max(2) {
         f(0, n);
         return;
     }
     #[cfg(feature = "parallel")]
     {
-        let nchunk = (t.saturating_mul(TP_CHUNKS)).min(n);
+        let nchunk = (tp.saturating_mul(TP_CHUNKS)).min(n);
         let chunk = n.div_ceil(nchunk);
         let base = chunk; // 每 chunk 的步长
         let total = n;
@@ -216,7 +248,7 @@ pub fn parallel_for_elems<F>(units: usize, elems: usize, f: F)
 where
     F: Fn(usize, usize) + Sync,
 {
-    if threads() == 1 || !worth_forking_bytes(elems.saturating_mul(4)) {
+    if pool_threads() == 1 || !worth_forking_bytes(elems.saturating_mul(4)) {
         f(0, units);
         return;
     }

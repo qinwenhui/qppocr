@@ -217,6 +217,18 @@ impl Engine {
         if cfg.threads > 0 {
             qppocr_kernels::par::set_threads(cfg.threads);
         }
+        // ★ 两级并行：rec 的外层分片各占一个**独立小池**，其算子在该池内
+        //   fork，互不排队。单池做不到这一点——`fork_mu` 会把并发 fork
+        //   串起来，外层线程互相等，等于没分片。
+        //   布局 = [全尺寸默认池, 分片池 × k]，k*分片大小 ≈ 总线程数。
+        let shards = cfg.rec_shards;
+        if shards > 1 {
+            let total = qppocr_kernels::par::threads();
+            let m = (total / shards).max(2);
+            let mut sizes = vec![total];
+            sizes.extend(std::iter::repeat_n(m, shards));
+            qppocr_kernels::par::request_pools(&sizes);
+        }
         // 字典：blank 在 0、字典项、空格在末尾（ppocr 的约定）
         let raw: String = match dict {
             Dictionary::Embedded => {
@@ -468,6 +480,62 @@ impl Engine {
             match slot.into_inner().unwrap() {
                 Some(r) => out.push(r?),
                 None => return Err(Error::Graph("run_batches: 批次槽未回填（内部错误）".into())),
+            }
+        }
+        Ok(out)
+    }
+
+    /// 与 [`Self::run_batches`] 同样按批扇出，但每个外层线程用**自己的
+    /// 分片池**（`pool_slot` 1..=k），于是批内的算子还能在本池内 fork——
+    /// 单池下并发的 fork 会被 `fork_mu` 串起来，外层线程互相排队。
+    ///
+    /// 每行的算子数 ~80 且顺序依赖，外层线程不能太多（分片池会太小、
+    /// 每池的 fork 收益盖不过协调成本）；k 由 `rec_shards` 定。
+    fn run_batches_sharded<T, F>(batches: &[(usize, usize)], f: F, shards: usize) -> Result<Vec<T>>
+    where
+        T: Send,
+        F: Fn(usize, usize) -> Result<T> + Sync,
+    {
+        let n = batches.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let k = shards.min(n).max(1);
+        if k < 2 {
+            return Self::run_batches(batches, f);
+        }
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let next = AtomicUsize::new(0);
+        let slots: Vec<Mutex<Option<Result<T>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            let (fr, nr, sr) = (&f, &next, &slots);
+            for j in 0..k {
+                let jj = j;
+                s.spawn(move || {
+                    // 本线程的 fork 走分片池 jj+1（0 号是默认池）。
+                    qppocr_kernels::par::set_pool_slot(1 + jj);
+                    loop {
+                        let i = nr.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let (b, e) = batches[i];
+                        let r = fr(b, e);
+                        *sr[i].lock().unwrap() = Some(r);
+                    }
+                });
+            }
+        });
+        let mut out = Vec::with_capacity(n);
+        for slot in slots {
+            match slot.into_inner().unwrap() {
+                Some(r) => out.push(r?),
+                None => {
+                    return Err(Error::Graph(
+                        "run_batches_sharded: 批次槽未回填（内部错误）".into(),
+                    ));
+                }
             }
         }
         Ok(out)
@@ -1077,7 +1145,12 @@ impl Engine {
         //   行间并行在两档都赢，行内并行最强的一档也慢 1.06x（small）到
         //   1.43x（tiny）——rec 的算子虽大，但每行 ~80 个算子顺序依赖，
         //   每次 fork ~97 us 的协调开销乘上去不划算。换方案前先看这条。
-        let outs = Self::run_batches(&batches, rec_fn)?;
+        let shards = self.cfg.rec_shards;
+        let outs = if shards > 1 {
+            Self::run_batches_sharded(&batches, rec_fn, shards)?
+        } else {
+            Self::run_batches(&batches, rec_fn)?
+        };
         res.timings.rec_infer_ms += t_ri.elapsed_ms();
 
         // ---- 合并（串行）：并行段只产出结果，这里统一写回 ----

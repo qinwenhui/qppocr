@@ -127,36 +127,103 @@ pub(crate) struct Pool {
     threads: usize,
 }
 
-static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+/// 池的**布局**：每个池的线程数（含调用方那一个）。默认只有一个池，
+/// 大小 = `resolve_threads()`；调 [`request_pools`] 可以改成多个。
+static POOL_SIZES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-/// 取全局池（首个调用创建并固定线程数，对齐  `ThreadPool::get`）。
-fn pool() -> &'static Pool {
-    POOL.get_or_init(|| {
-        // MXCSR 按线程继承：必须在任何 worker 诞生前开 FTZ/DAZ（ 在
-        // ThreadPool 构造函数里做同样的事）。
-        crate::par::enable_flush_denormals();
-        let n = resolve_threads();
-        let p = Pool {
-            shared: Mutex::new(Shared {
-                job: std::ptr::null(),
-                epoch: 0,
-            }),
-            wake: Condvar::new(),
-            fork_mu: Mutex::new(()),
-            threads: n,
-        };
-        for _ in 1..n {
-            std::thread::Builder::new()
-                .name("qppocr-kernel".into())
-                .spawn(worker_loop)
-                .expect("spawn kernel worker");
-        }
-        p
-    })
+static POOLS: std::sync::OnceLock<Vec<&'static Pool>> = std::sync::OnceLock::new();
+
+thread_local! {
+    /// 本线程用哪个池（下标进 [`POOLS`]）。
+    ///
+    /// 多池是为了支持**两级并行**：外层若干线程各自负责一行，每行的算子
+    /// 再在本池内 fork。单池做不到——`fork_mu` 会把并发的 fork 串起来，
+    /// 外层线程互相排队，等于白给。
+    static POOL_SLOT: Cell<usize> = const { Cell::new(0) };
 }
 
-/// 池的线程数（含主线程）。首次调用会创建池。
+/// 请求池布局（必须在**第一次 fork 之前**调用；之后请求不再生效）。
+///
+/// `sizes[0]` 是默认池（det 与所有非分片调用走它），其余是分片池。
+/// 全部线程在首次使用时一次性创建，空闲的池只在 condvar 上等，不占 CPU。
+pub(crate) fn request_pools(sizes: &[usize]) {
+    if sizes.is_empty() {
+        return;
+    }
+    let mut g = POOL_SIZES.lock().unwrap();
+    if POOLS.get().is_none() {
+        *g = sizes.to_vec();
+    }
+}
+
+/// 本线程当前使用的池下标；超出范围会回落 0。
+pub(crate) fn set_pool_slot(i: usize) {
+    POOL_SLOT.with(|c| c.set(i));
+}
+
+fn pool() -> &'static Pool {
+    let pools = POOLS.get_or_init(build_pools);
+    let i = POOL_SLOT.with(|c| c.get());
+    pools.get(i).unwrap_or(&pools[0])
+}
+
+fn build_pools() -> Vec<&'static Pool> {
+    {
+        // MXCSR 按线程继承：必须在任何 worker 诞生前开 FTZ/DAZ。
+        crate::par::enable_flush_denormals();
+        let sizes: Vec<usize> = {
+            let g = POOL_SIZES.lock().unwrap();
+            if g.is_empty() {
+                vec![resolve_threads()]
+            } else {
+                g.clone()
+            }
+        };
+        let mut v: Vec<&'static Pool> = Vec::with_capacity(sizes.len());
+        for (i, &n) in sizes.iter().enumerate() {
+            let n = n.max(1);
+            // leak 而不是存 Box：池活到进程结束（worker 线程持有它的
+            // 引用），`&'static` 让 `worker_loop` 不用带生命周期参数。
+            let p: &'static Pool = Box::leak(Box::new(Pool {
+                shared: Mutex::new(Shared {
+                    job: std::ptr::null(),
+                    epoch: 0,
+                }),
+                wake: Condvar::new(),
+                fork_mu: Mutex::new(()),
+                threads: n,
+            }));
+            for _ in 1..n {
+                std::thread::Builder::new()
+                    .name(format!("qppocr-kernel{i}"))
+                    .spawn(move || worker_loop(p))
+                    .expect("spawn kernel worker");
+            }
+            v.push(p);
+        }
+        v
+    }
+}
+
+/// **全局**线程预算（含调用线程）——永远返回 0 号池（默认池）的大小，
+/// 不是本线程所在分片池的大小。首次调用会创建池。
+///
+/// 这一点是**逐位一致的前提**：`par::threads()` 决定 GEMM 的切分轴、
+/// 各内核的分块数、各种并行门槛。分片只是把「谁来跑这些块」换了个池，
+/// 不能让切分决策跟着变——否则分片前后的输出会在低位上分叉。
+/// join 用的是**本地池**的参与者数，那是 `Pool::threads`，与这里无关。
 pub(crate) fn thread_count() -> usize {
+    let pools = POOLS.get_or_init(build_pools);
+    pools[0].threads
+}
+
+/// **本线程所在池**的参与者数（含调用线程）。分片池小于默认池。
+///
+/// 与 [`thread_count`] 的分工：切分轴/分块数这类**进位**的决策用全局
+/// （`par::threads()`），"切几个块给几个 worker"这类**只影响负载均衡**的
+/// 用这里。用错会让分片池里 2 个参与者去分 128 个块——每块只有原本的
+/// 1/64，调度开销盖过收益。
+pub(crate) fn pool_thread_count() -> usize {
     pool().threads
 }
 
@@ -182,8 +249,7 @@ fn resolve_threads() -> usize {
     n.clamp(1, 16)
 }
 
-fn worker_loop() {
-    let p = pool();
+fn worker_loop(p: &'static Pool) {
     let mut seen = 0u64;
     loop {
         // 快路径：热 worker 在锁内直接命中新 epoch，不进内核等待
