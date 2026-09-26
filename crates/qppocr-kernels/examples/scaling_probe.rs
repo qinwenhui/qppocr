@@ -80,6 +80,17 @@ fn maxpool_probe() {
         std::hint::black_box(&y2);
     }
     println!("    热输出缓冲 {best:7.3} ms   每轮新建输出 {cold:7.3} ms");
+    // 每轮连输入也换一个（模拟整图里「上一个算子刚写出来」的冷数据）
+    let mut coldin = f64::MAX;
+    for k in 0..9 {
+        let x2: Vec<f32> = (0..x.len()).map(|i| (i % 251) as f32 + k as f32).collect();
+        let mut y2 = qppocr_kernels::buf::F32Buf::new();
+        let t0 = std::time::Instant::now();
+        qppocr_kernels::pool2d::pool2d(&x2, n, c, h, w, 2, 2, 1, 1, 0, 0, 1, 1, true, &mut y2);
+        coldin = coldin.min(t0.elapsed().as_secs_f64() * 1000.0);
+        std::hint::black_box(&y2);
+    }
+    println!("    每轮换输入 {coldin:7.3} ms");
     let bytes = (n * c * h * w * 4 * 2) as f64;
     println!(
         "  MaxPool [1,16,400,480] k2x2 s1 SAME_UPPER   {} 线程：{best:7.3} ms   {:.1} GB/s",
