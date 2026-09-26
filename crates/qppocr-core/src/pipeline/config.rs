@@ -44,7 +44,10 @@ pub struct PipelineConfig {
     pub rec_width_grain: i32,
     /// 补白到画布高度的比例下限，0 = 总是放大。
     pub rec_pad_min_h: f64,
-    /// 每批行数（每批固定开销 ~8.6 ms）。
+    /// 每批行数（每批固定开销 ~8.6 ms）。批次**串行**执行，批越大
+    /// 串行步数越少；批内行按 `rec_batch_ratio` 分组，宽度相近才同批。
+    /// 实测 6→16：100 图输出逐字符一致、耗时约 -4%；32 再省 2%。
+    /// ⚠ 上限受内存约束（批宽 = 批内最宽行，显存/内存随宽度线性）。
     pub rec_batch: usize,
     /// 批内最宽/最窄行比例上限（0 = 不限）。⚠ 不是越小越好（§6.2）。
     pub rec_batch_ratio: f64,
@@ -101,7 +104,7 @@ impl Default for PipelineConfig {
             rec_min_width: 16,
             rec_width_grain: 0,
             rec_pad_min_h: 0.0,
-            rec_batch: 6,
+            rec_batch: 16,
             rec_batch_ratio: 1.1,
             rec_space_gap: 0.3,
             cls_height: 48,
