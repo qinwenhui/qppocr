@@ -59,6 +59,19 @@ pub fn resize_bilinear_img(src: &Image, dw: i32, dh: i32) -> Image {
     if dw <= 0 || dh <= 0 {
         return dst;
     }
+    // ★ 快路径：RGB 紧凑排列交给 kernels 的**逐行并行**版本（与下面标量
+    //   分支逐位相同）。det 输入准备的全图缩放实测 6.9 ms 串行，是热点。
+    if src.c == 3 {
+        qppocr_kernels::resize::resize_bilinear_rgb_u8(
+            &src.data,
+            src.w as usize,
+            src.h as usize,
+            &mut dst.data,
+            dw as usize,
+            dh as usize,
+        );
+        return dst;
+    }
     let sx = src.w as f32 / dw as f32;
     let sy = src.h as f32 / dh as f32;
     let c = src.c as usize;

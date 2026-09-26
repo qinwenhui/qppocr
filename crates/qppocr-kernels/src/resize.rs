@@ -127,3 +127,66 @@ pub fn resize_bilinear(
         }
     });
 }
+
+/// 图像级双线性缩放（u8 RGB 紧凑排列）——**逐行并行**。
+///
+/// 与 `qppocr_core::pipeline::image::resize_bilinear_img` 的标量实现
+/// **逐位相同**（同一套半像素中心映射与「首项两乘、其余 fma」的收缩形态），
+/// 只是把行循环交给池子。det 输入准备（848×816 → 832×832）实测 6.9 ms，
+/// 全图缩放是串行热点。
+///
+/// 输出按 clamp(0,255) 取整；`dst` 长度必须为 `dw*dh*3`。
+pub fn resize_bilinear_rgb_u8(
+    src: &[u8],
+    sw: usize,
+    sh: usize,
+    dst: &mut [u8],
+    dw: usize,
+    dh: usize,
+) {
+    assert!(sw > 0 && sh > 0 && dw > 0 && dh > 0, "resize: zero dim");
+    assert_eq!(dst.len(), dw * dh * 3, "resize: dst size");
+    assert_eq!(src.len(), sw * sh * 3, "resize: src size");
+    let sx = sw as f32 / dw as f32;
+    let sy = sh as f32 / dh as f32;
+    // 列映射（所有行共用）
+    let mut x0 = vec![0usize; dw];
+    let mut x1 = vec![0usize; dw];
+    let mut fx = vec![0f32; dw];
+    for x in 0..dw {
+        let v = ((x as f32 + 0.5) * sx - 0.5).max(0.0);
+        let i0 = (v as usize).min(sw - 1);
+        x0[x] = i0;
+        x1[x] = (i0 + 1).min(sw - 1);
+        fx[x] = v - i0 as f32;
+    }
+    let dp = par::SyncPtr::new(dst.as_mut_ptr());
+    par::parallel_for(dh, 64, |yb, ye| {
+        for y in yb..ye {
+            let v = ((y as f32 + 0.5) * sy - 0.5).max(0.0);
+            let j0 = (v as usize).min(sh - 1);
+            let j1 = (j0 + 1).min(sh - 1);
+            let fy = v - j0 as f32;
+            let r0 = &src[j0 * sw * 3..(j0 + 1) * sw * 3];
+            let r1 = &src[j1 * sw * 3..(j1 + 1) * sw * 3];
+            // SAFETY: 输出行 y 与其他并行块不相交。
+            let out = unsafe { dp.offset(y * dw * 3).slice(dw * 3) };
+            for x in 0..dw {
+                let (a, b) = (x0[x] * 3, x1[x] * 3);
+                let lx = fx[x];
+                for ch in 0..3 {
+                    let p00 = r0[a + ch] as f32;
+                    let p01 = r0[b + ch] as f32;
+                    let p10 = r1[a + ch] as f32;
+                    let p11 = r1[b + ch] as f32;
+                    // 位级镜像标量版：首项两乘，其余 fma
+                    let t = p00 * (1.0 - lx) * (1.0 - fy);
+                    let t = (p01 * lx).mul_add(1.0 - fy, t);
+                    let t = (p10 * (1.0 - lx)).mul_add(fy, t);
+                    let val = (p11 * lx).mul_add(fy, t);
+                    out[x * 3 + ch] = (val + 0.5).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    });
+}
