@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # 内核单元测试是自包含的：不需要模型、不需要语料。
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace --lib
+
+  feature-matrix:
+    # 公开门面的 feature 组合矩阵（v0.1.0 前的教训：无门控 re-export 让
+    # default-features=false 编不过，CI 没覆盖到就带了出去）
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "std"
+          - "std,parallel"
+          - "image-decode"
+          - "std,parallel,image-decode"
+          - "serde,std"
+          - "serde,std,parallel,image-decode"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p qppocr --no-default-features ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
+      - run: cargo build -p qppocr-kernels --no-default-features
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
