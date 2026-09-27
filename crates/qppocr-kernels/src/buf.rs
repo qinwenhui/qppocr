@@ -75,12 +75,26 @@ unsafe fn alloc(bytes: usize) -> *mut u8 {
     if k > MAX_CLASS {
         return unsafe { libc_malloc(bytes) };
     }
-    let mut g = PoolInner::get().lock().unwrap();
-    if let Some(FreeBlockWrap(p)) = g.free[k].pop() {
-        g.held_bytes -= 1 << k;
-        return p;
+    // ★ 锁内只做「从桶里摘一块」，**绝不在锁内 malloc**。
+    //   上一版把 `libc_malloc` 写在 guard 还活着的分支里（guard 的析构
+    //   在作用域末尾，NLL 不会提前），于是未命中时是「握着全局池锁去
+    //   要一块新内存」——CRT 堆自己还有一把锁、还可能提交新页。
+    //   rec 每个节点两次进出这把锁、11 个并发会话就是 3600 次/图，
+    //   而 rec 的行级并行实测只有 1.15x，串行点就在这里。
+    let hit = {
+        let mut g = PoolInner::get().lock().unwrap();
+        match g.free[k].pop() {
+            Some(FreeBlockWrap(p)) => {
+                g.held_bytes -= 1 << k;
+                Some(p)
+            }
+            None => None,
+        }
+    };
+    match hit {
+        Some(p) => p,
+        None => unsafe { libc_malloc(1 << k) },
     }
-    unsafe { libc_malloc(1 << k) }
 }
 
 /// 归还一块到池（超限则 free）。
@@ -96,7 +110,6 @@ unsafe fn dealloc(p: *mut u8, bytes: usize) {
         unsafe { libc_free(p) };
         return;
     }
-    let mut g = PoolInner::get().lock().unwrap();
     let blk = 1usize << k;
     let cap_idx = if blk >= 4 << 20 {
         2
@@ -105,12 +118,20 @@ unsafe fn dealloc(p: *mut u8, bytes: usize) {
     } else {
         0
     };
-    if g.free[k].len() >= g.per_class_cap[cap_idx] || g.held_bytes + blk > g.cap_bytes {
+    // ★ 同上：`libc_free` 也在锁外做。归还路径是热路径——每个节点一次。
+    let keep = {
+        let mut g = PoolInner::get().lock().unwrap();
+        if g.free[k].len() >= g.per_class_cap[cap_idx] || g.held_bytes + blk > g.cap_bytes {
+            false
+        } else {
+            g.free[k].push(FreeBlockWrap(p));
+            g.held_bytes += blk;
+            true
+        }
+    };
+    if !keep {
         unsafe { libc_free(p) };
-        return;
     }
-    g.free[k].push(FreeBlockWrap(p));
-    g.held_bytes += blk;
 }
 
 // 不引 libc 依赖：直接声明 CRT 的两个符号（MSVC/GNU 都导出）。
