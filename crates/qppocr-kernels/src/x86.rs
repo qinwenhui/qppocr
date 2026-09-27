@@ -905,40 +905,61 @@ pub unsafe fn softmax_row_vec(row: *mut f32, inner: usize) {
 pub unsafe fn pool2x2_row_vec(
     r0: *const f32,
     r1: *const f32,
-    vm: *mut f32,
+    _vm: *mut f32,
     out: *mut f32,
     w: usize,
 ) {
-    let neg_inf = -f32::MAX;
-    if r1.is_null() {
-        std::ptr::copy_nonoverlapping(r0, vm, w);
-    } else {
-        let mut j = 0usize;
-        while j + 8 <= w {
-            _mm256_storeu_ps(
-                vm.add(j),
-                _mm256_max_ps(_mm256_loadu_ps(r0.add(j)), _mm256_loadu_ps(r1.add(j))),
-            );
-            j += 8;
-        }
-        while j < w {
-            *vm.add(j) = (*r0.add(j)).max(*r1.add(j));
-            j += 1;
-        }
+    if w == 0 {
+        return;
     }
-    *vm.add(w) = neg_inf;
+    // ★ 一趟做完，不再落 scratch 行。
+    //
+    // ⚠ 实测**没有端到端收益**（2.6–2.9 → 2.5–3.1 ms，噪声内），别指望它。
+    // 动它的理由是去掉一个 `vm` scratch 缓冲区与一个参数，代码更短；
+    // **不是因为旧写法慢**——`vm` 只有 w+1 个 float、全程 L1 常驻，
+    // 那两趟往返本来就不贵。这个 op 真正吃的是 DRAM：读 2 个输入行
+    // + 写 1 个输出行 = 38 MB 实际流量，跑在 ~13 GB/s，**它是带宽绑定的**。
+    // det 唯一的 MaxPool 是 1x16x480x416（2.6 ms / 25.6 MB 记账口径）。
+    //
+    // 分组顺序**照抄旧版**：旧版 out[j] = max(vm[j], vm[j+1])，
+    // vm[j] = max(r0[j], r1[j])，即 max(max(r0[j],r1[j]), max(r0[j+1],r1[j+1]))。
+    // 这里逐字保持同一个结合顺序，所以逐位不变。
+    // 右边界：旧版靠 `vm[w] = -inf` 让 out[w-1] = vm[w-1]；这里直接对
+    // 最后一列特判，结果相同（输入是 ReLU 输出，非负、无 NaN，
+    // `max(x, -inf) == x`）。
+    let last = w - 1;
     let mut ox = 0usize;
-    while ox + 8 <= w {
-        _mm256_storeu_ps(
-            out.add(ox),
-            _mm256_max_ps(_mm256_loadu_ps(vm.add(ox)), _mm256_loadu_ps(vm.add(ox + 1))),
+    if r1.is_null() {
+        // 末行：vm 就是 r0 的拷贝 ⇒ out[j] = max(r0[j], r0[j+1])
+        while ox + 8 <= last {
+            let a = _mm256_loadu_ps(r0.add(ox));
+            let b = _mm256_loadu_ps(r0.add(ox + 1));
+            _mm256_storeu_ps(out.add(ox), _mm256_max_ps(a, b));
+            ox += 8;
+        }
+        while ox < last {
+            *out.add(ox) = (*r0.add(ox)).max(*r0.add(ox + 1));
+            ox += 1;
+        }
+        *out.add(last) = *r0.add(last);
+        return;
+    }
+    while ox + 8 <= last {
+        let v0 = _mm256_max_ps(_mm256_loadu_ps(r0.add(ox)), _mm256_loadu_ps(r1.add(ox)));
+        let v1 = _mm256_max_ps(
+            _mm256_loadu_ps(r0.add(ox + 1)),
+            _mm256_loadu_ps(r1.add(ox + 1)),
         );
+        _mm256_storeu_ps(out.add(ox), _mm256_max_ps(v0, v1));
         ox += 8;
     }
-    while ox < w {
-        *out.add(ox) = (*vm.add(ox)).max(*vm.add(ox + 1));
+    while ox < last {
+        let v0 = (*r0.add(ox)).max(*r1.add(ox));
+        let v1 = (*r0.add(ox + 1)).max(*r1.add(ox + 1));
+        *out.add(ox) = v0.max(v1);
         ox += 1;
     }
+    *out.add(last) = (*r0.add(last)).max(*r1.add(last));
 }
 
 // ================================================================ 二元（分配路径）
