@@ -44,8 +44,9 @@ fn mt(m: usize, n: usize, k: usize, t: usize, secs: f64, churn: bool) {
     let b: Vec<f32> = (0..k * n).map(|i| (i % 13) as f32 * 0.01).collect();
     let act = Activation::default();
     let done = std::sync::atomic::AtomicBool::new(false);
-    let counts: Vec<std::sync::atomic::AtomicU64> =
-        (0..t).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let counts: Vec<std::sync::atomic::AtomicU64> = (0..t)
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
     let t0 = Instant::now();
     std::thread::scope(|s| {
         for c in &counts {
@@ -72,7 +73,10 @@ fn mt(m: usize, n: usize, k: usize, t: usize, secs: f64, churn: bool) {
         std::thread::sleep(std::time::Duration::from_secs_f64(secs));
         done.store(true, std::sync::atomic::Ordering::Relaxed);
     });
-    let total: u64 = counts.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).sum();
+    let total: u64 = counts
+        .iter()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .sum();
     let dt = t0.elapsed().as_secs_f64();
     let macs = total as f64 * (m * n * k) as f64;
     println!(
@@ -90,7 +94,10 @@ fn main() {
                 let v: Vec<usize> = rest.split('x').filter_map(|t| t.parse().ok()).collect();
                 (v[0], v[1], v[2])
             };
-            let secs: f64 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(1.5);
+            let secs: f64 = std::env::args()
+                .nth(2)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.5);
             let churn = std::env::args().any(|v| v == "churn");
             println!("并发档：{m}x{n}x{k}，每档 {secs}s，池扰动={churn}");
             for t in [1usize, 2, 4, 6, 8, 11, 16] {
@@ -127,7 +134,10 @@ fn main() {
     } else {
         shapes
     };
-    println!("{:>5} {:>6} {:>6}  {:>9}  {:>10}", "M", "N", "K", "GMAC/s", "ms/次");
+    println!(
+        "{:>5} {:>6} {:>6}  {:>9}  {:>10}",
+        "M", "N", "K", "GMAC/s", "ms/次"
+    );
     let mut acc = 0.0;
     for (m, n, k) in shapes {
         let reps = (2_000_000 / (m * n * k).max(1)).clamp(3, 200);

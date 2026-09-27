@@ -579,16 +579,12 @@ pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
         let bn_in = g.nodes[bi].inputs.clone();
         let bn_out = g.nodes[bi].outputs[0].clone();
         let eps = g.nodes[bi].attr("epsilon").map(|a| a.f).unwrap_or(1e-5);
-        let take = |g: &Graph, name: &str| -> Vec<f32> {
-            g.initializers[name].f32.to_vec()
-        };
+        let take = |g: &Graph, name: &str| -> Vec<f32> { g.initializers[name].f32.to_vec() };
         let scale = take(g, &bn_in[1]);
         let beta = take(g, &bn_in[2]);
         let mean = take(g, &bn_in[3]);
         let var = take(g, &bn_in[4]);
-        let a: Vec<f32> = (0..m)
-            .map(|c| scale[c] / (var[c] + eps).sqrt())
-            .collect();
+        let a: Vec<f32> = (0..m).map(|c| scale[c] / (var[c] + eps).sqrt()).collect();
 
         // W' = W · a（逐输出通道）
         let wname = g.nodes[ci].inputs[1].clone();
@@ -615,9 +611,7 @@ pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
             None => (0..m).map(|c| (-mean[c]) * a[c] + beta[c]).collect(),
             Some(bn_) => {
                 let b = g.initializers[bn_].f32.to_vec();
-                (0..m)
-                    .map(|c| (b[c] - mean[c]) * a[c] + beta[c])
-                    .collect()
+                (0..m).map(|c| (b[c] - mean[c]) * a[c] + beta[c]).collect()
             }
         };
         match &bias_name {
@@ -758,6 +752,7 @@ pub fn fuse_conv_residual(g: &mut Graph) -> i64 {
     n
 }
 
+/// 把只被一个 Add 消费的每通道常量 bias 吸收进前驱 Conv（fold_conv_bias）。
 pub fn fold_conv_bias(g: &mut Graph) -> i64 {
     let consumers = consumer_map(g);
     // tensor -> 唯一读者的下标

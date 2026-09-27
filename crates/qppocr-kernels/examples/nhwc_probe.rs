@@ -21,11 +21,16 @@ const CASES: &[(&str, usize, usize, usize)] = &[
 ];
 
 fn main() {
-    let threads: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let threads: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     qppocr_kernels::par::set_threads(threads);
     let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut next = move || {
-        rng ^= rng >> 12; rng ^= rng << 25; rng ^= rng >> 27;
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
         let v = rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
         (((v >> 40) as i64 - (1 << 23)) as f64 / (1i64 << 23) as f64) as f32
     };
@@ -49,8 +54,15 @@ fn main() {
             while p0 < npix {
                 let w_n = BLK.min(npix - p0);
                 sgemm_serial(
-                    &w, &x_nchw[p0..], y_nchw.as_mut_slice(), co, w_n, ci, npix,
-                    Some(&bias), &Activation::default(),
+                    &w,
+                    &x_nchw[p0..],
+                    y_nchw.as_mut_slice(),
+                    co,
+                    w_n,
+                    ci,
+                    npix,
+                    Some(&bias),
+                    &Activation::default(),
                 );
                 p0 += BLK;
             }
@@ -80,7 +92,12 @@ fn main() {
                     &x_nhwc[p0 * ci..],
                     &wt,
                     &mut y_nhwc.as_mut_slice()[p0 * co..],
-                    m, co, ci, co, None, &Activation::default(),
+                    m,
+                    co,
+                    ci,
+                    co,
+                    None,
+                    &Activation::default(),
                 );
                 let seg = &mut y_nhwc.as_mut_slice()[p0 * co..(p0 + m) * co];
                 for row in seg.chunks_mut(co) {
@@ -92,8 +109,12 @@ fn main() {
             }
             best_nhwc = best_nhwc.min(t0.elapsed().as_secs_f64() * 1000.0);
         }
-        sa += best_nchw; sb += best_nhwc;
-        println!("{name:<24}{best_nchw:10.3}{best_nhwc:10.3}{:8.2}", best_nchw / best_nhwc);
+        sa += best_nchw;
+        sb += best_nhwc;
+        println!(
+            "{name:<24}{best_nchw:10.3}{best_nhwc:10.3}{:8.2}",
+            best_nchw / best_nhwc
+        );
     }
     println!("\n{:<24}{sa:10.2}{sb:10.2}{:8.2}", "—— 合计", sa / sb);
 }
