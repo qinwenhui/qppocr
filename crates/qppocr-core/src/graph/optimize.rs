@@ -635,12 +635,12 @@ pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
             }
         }
 
-        // conv 接管 BN 的输出名，BN 节点删除；四个 BN 参数已无人引用
+        // conv 接管 BN 的输出名，BN 节点删除。
+        // ★ BN 的四个参数**不删**：medium 档的 BN 参数与其他节点共享，
+        //   删掉会让那些引用悬空、整图 pending 卡死（子进程表现为永久
+        //   挂起）。无人引用的 initializer 只是几 KB 死权重，无害。
         g.nodes[ci].outputs[0] = bn_out;
         drop_bn.insert(bi);
-        for k in 1..5 {
-            g.initializers.remove(&bn_in[k]);
-        }
     }
 
     let n = fold.len() as i64;
@@ -663,6 +663,12 @@ pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
 /// **带宽绑定**的行阶段/FPN，折掉一个少一份不随线程扩展的流量。
 pub fn fuse_conv_residual(g: &mut Graph) -> i64 {
     let consumers = consumer_map(g);
+    let mut producer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for o in &n.outputs {
+            producer_of.insert(o.clone(), i);
+        }
+    }
     let mut consumer_of: HashMap<String, usize> = HashMap::new();
     for (i, n) in g.nodes.iter().enumerate() {
         for inn in &n.inputs {
@@ -703,6 +709,19 @@ pub fn fuse_conv_residual(g: &mut Graph) -> i64 {
             continue;
         };
         if rname.is_empty() || g.initializers.contains_key(&rname) {
+            continue;
+        }
+        if g.inputs.iter().any(|gi| gi == &rname) {
+            continue; // 图输入做残差：折叠会把网络入口挂进依赖链
+        }
+        // ★ R 必须由**下标更小**的节点产出（ONNX 按下标即拓扑序）。
+        //   medium 档存在反序的 Add 模式——折叠它会让 conv 依赖一个
+        //   （间接）依赖 conv 旧输出的张量，成环，整图 pending 卡死，
+        //   子进程表现为永久挂起。保守条件只是少折叠几个，不出错。
+        let Some(&rp) = producer_of.get(&rname) else {
+            continue;
+        };
+        if rp >= i {
             continue;
         }
         fuse.push((i, au));
