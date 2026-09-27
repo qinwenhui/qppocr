@@ -109,6 +109,7 @@ pub fn worth_forking_bytes(bytes: usize) -> bool {
 pub fn pool_threads() -> usize {
     crate::pool::pool_thread_count()
 }
+/// 无 `parallel` feature 时恒为 1（见上方 `pool_threads` 的主文档）。
 #[cfg(not(feature = "parallel"))]
 #[inline]
 pub fn pool_threads() -> usize {
@@ -174,6 +175,7 @@ pub fn set_threads(n: usize) {
 pub fn planned_threads() -> usize {
     crate::pool::planned_threads()
 }
+/// 无 `parallel` feature 时恒为 1（见上方 `planned_threads` 的主文档）。
 #[cfg(not(feature = "parallel"))]
 #[inline]
 pub fn planned_threads() -> usize {
