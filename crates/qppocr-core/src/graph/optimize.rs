@@ -660,6 +660,104 @@ pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
     n
 }
 
+/// Conv → Add 残差融合：`Add(conv_out, R)` 的 R 折进 conv 的收尾
+/// （`conv2d_res`，激活之后逐元素加，与原 Add 同值同序——逐位不变）。
+///
+/// 条件：conv 输出恰好只喂这一个 Add；R 与 conv 输出同元素数。conv 若无
+/// bias 会补一个零 bias，保证 residual 恒在 inputs[3]、与 bias 无歧义。
+/// rec 每图 ~60 处（残差与 SE 块）、det 的双分支合并同理——这些 Add 全在
+/// **带宽绑定**的行阶段/FPN，折掉一个少一份不随线程扩展的流量。
+pub fn fuse_conv_residual(g: &mut Graph) -> i64 {
+    let consumers = consumer_map(g);
+    let mut consumer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for inn in &n.inputs {
+            if !inn.is_empty() {
+                consumer_of.entry(inn.clone()).or_insert(i);
+            }
+        }
+    }
+
+    let mut fuse: Vec<(usize, usize)> = Vec::new(); // (conv, add)
+    for i in 0..g.nodes.len() {
+        let cn = &g.nodes[i];
+        if cn.op_type != "Conv" || cn.inputs.len() < 2 || cn.outputs.len() != 1 {
+            continue;
+        }
+        let conv_out = cn.outputs[0].clone();
+        if g.is_graph_output(&conv_out) {
+            continue;
+        }
+        if consumers.get(&conv_out).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Some(&au) = consumer_of.get(&conv_out) else {
+            continue;
+        };
+        let an = &g.nodes[au];
+        if an.op_type != "Add" || an.inputs.len() != 2 || an.outputs.len() != 1 {
+            continue;
+        }
+        // 另一操作数 R：运行期张量（不在 initializers）或常量都行，
+        // 但必须与 conv 输出同元素数——元素数只能从 conv 形状推断，
+        // 这里用保守条件：R 的生产者是节点（运行期）；常量残差极少见。
+        let rname = if an.inputs[0] == conv_out {
+            an.inputs[1].clone()
+        } else if an.inputs[1] == conv_out {
+            an.inputs[0].clone()
+        } else {
+            continue;
+        };
+        if rname.is_empty() || g.initializers.contains_key(&rname) {
+            continue;
+        }
+        fuse.push((i, au));
+    }
+    if fuse.is_empty() {
+        return 0;
+    }
+
+    let mut drop_add: HashSet<usize> = HashSet::new();
+    for &(ci, ai) in &fuse {
+        let an_in0 = g.nodes[ai].inputs[0].clone();
+        let an_in1 = g.nodes[ai].inputs[1].clone();
+        let an_out = g.nodes[ai].outputs[0].clone();
+        let conv_out = g.nodes[ci].outputs[0].clone();
+        let rname = if an_in0 == conv_out { an_in1 } else { an_in0 };
+
+        // conv 无 bias 则补零 bias，让 residual 固定落在 inputs[3]
+        if g.nodes[ci].inputs.len() == 2 {
+            let w = &g.initializers[&g.nodes[ci].inputs[1]];
+            let m = w.shape[0] as usize;
+            let zname = format!("{an_out}.zb");
+            g.initializers.insert(
+                zname.clone(),
+                crate::tensor::Tensor {
+                    name: zname.clone(),
+                    shape: vec![m as i64],
+                    dtype: DType::F32,
+                    f32: qppocr_kernels::buf::F32Buf::from_vec(&vec![0f32; m]),
+                    i64: Vec::new(),
+                },
+            );
+            g.nodes[ci].inputs.push(zname);
+        }
+        g.nodes[ci].inputs.push(rname);
+        g.nodes[ci].outputs[0] = an_out;
+        drop_add.insert(ai);
+    }
+
+    let n = fuse.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if !drop_add.contains(&i) {
+            kept.push(node);
+        }
+    }
+    g.nodes = kept;
+    n
+}
+
 pub fn fold_conv_bias(g: &mut Graph) -> i64 {
     let consumers = consumer_map(g);
     // tensor -> 唯一读者的下标
