@@ -39,7 +39,7 @@ fn run(m: usize, n: usize, k: usize, reps: usize) -> f64 {
 /// 这是判别「并发膨胀是流水线的错还是内存子系统的错」的尺子：同样的
 /// 内核、同样的形状，只改同时跑几个。若聚合吞吐随 T 平掉，那 rec 的
 /// 1.15x 就不是 qppocr 的调度问题。
-fn mt(m: usize, n: usize, k: usize, t: usize, secs: f64) {
+fn mt(m: usize, n: usize, k: usize, t: usize, secs: f64, churn: bool) {
     let a: Vec<f32> = (0..m * k).map(|i| (i % 17) as f32 * 0.01).collect();
     let b: Vec<f32> = (0..k * n).map(|i| (i % 13) as f32 * 0.01).collect();
     let act = Activation::default();
@@ -51,7 +51,18 @@ fn mt(m: usize, n: usize, k: usize, t: usize, secs: f64) {
         for c in &counts {
             s.spawn(|| {
                 let mut cc = vec![0f32; m * n];
+                // churn 档：每次迭代从全局池借/还一个缓冲（模拟执行器每节点
+                // 一次 alloc+dealloc），量互斥锁在 T 线程并发下的代价。
+                let mut buf = if churn {
+                    Some(qppocr_kernels::buf::F32Buf::with_zeroed(m * n))
+                } else {
+                    None
+                };
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if churn {
+                        buf.take();
+                        buf = Some(qppocr_kernels::buf::F32Buf::with_zeroed(m * n));
+                    }
                     sgemm_serial(&a, &b, &mut cc, m, n, k, n, None, &act);
                     c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -80,9 +91,10 @@ fn main() {
                 (v[0], v[1], v[2])
             };
             let secs: f64 = std::env::args().nth(2).and_then(|v| v.parse().ok()).unwrap_or(1.5);
-            println!("并发档：{m}x{n}x{k}，每档 {secs}s");
+            let churn = std::env::args().any(|v| v == "churn");
+            println!("并发档：{m}x{n}x{k}，每档 {secs}s，池扰动={churn}");
             for t in [1usize, 2, 4, 6, 8, 11, 16] {
-                mt(m, n, k, t, secs);
+                mt(m, n, k, t, secs, churn);
             }
             return;
         }

@@ -165,27 +165,26 @@ where
 }
 
 /// 8 连通域标记；每个连通域返回一个点表（带尺寸下限过滤）。
-fn connected_components(mask: &[u8], hh: i32, ww: i32, min_pixels: usize) -> Vec<Vec<Pt>> {
-    let mut label = vec![-1i32; (hh as usize) * (ww as usize)];
+fn connected_components(mask: &mut [u8], hh: i32, ww: i32, min_pixels: usize) -> Vec<Vec<Pt>> {
+    // ★ 就地把 mask 当 visited 用（入栈即清零），不再分配 label 数组。
+    //   旧版每张 det 图分配并清零 960×832×4B = 3.2 MB 的 label，加上
+    //   每个邻居一次 label 随机读——cc 实测 2.6 ms，占 DB 后处理 70%。
+    //   遍历顺序一字不改（同样的扫描序、同样的 8 邻居序、同样的栈），
+    //   所以每个连通域的像素顺序与凸包结果逐位不变。
+    //   ⚠ 调用方此后不再使用 mask（db_postprocess 里 cc 之后只读 pred）。
     let mut out: Vec<Vec<Pt>> = Vec::new();
-    // ★ 栈里存 (y, x) 而不是展平下标：原先每弹一个点都要做一次
-    //   `p / ww` 和 `p % ww`，整数除法在 x86 上是 20-40 个周期，
-    //   连通域有几万个点时这一项就吃掉大半（det 实测 cc = 2.6 ms，
-    //   占 DB 后处理的 70%）。入栈**顺序一字不改**，所以弹出顺序、
-    //   乃至 `cur` 的像素顺序、凸包结果都逐位不变。
     let mut stack: Vec<(i32, i32)> = Vec::new();
     let mut cur: Vec<Pt> = Vec::new();
     for y0 in 0..hh {
         for x0 in 0..ww {
             let idx = (y0 as usize) * (ww as usize) + x0 as usize;
-            if mask[idx] == 0 || label[idx] >= 0 {
+            if mask[idx] == 0 {
                 continue;
             }
-            let id = out.len() as i32;
             cur.clear();
             stack.clear();
             stack.push((y0, x0));
-            label[idx] = id;
+            mask[idx] = 0;
             while let Some((py, px)) = stack.pop() {
                 cur.push(Pt {
                     x: px as f32,
@@ -202,8 +201,8 @@ fn connected_components(mask: &[u8], hh: i32, ww: i32, min_pixels: usize) -> Vec
                             continue;
                         }
                         let ni = (ny as usize) * (ww as usize) + nx as usize;
-                        if mask[ni] != 0 && label[ni] < 0 {
-                            label[ni] = id;
+                        if mask[ni] != 0 {
+                            mask[ni] = 0;
                             stack.push((ny, nx));
                         }
                     }
@@ -303,7 +302,7 @@ pub fn db_postprocess(
     }
 
     let t_dil = t0.elapsed().as_secs_f64() * 1000.0;
-    let mut comps = connected_components(&mask, nh, nw, 1);
+    let mut comps = connected_components(&mut mask, nh, nw, 1);
     let t_cc = t0.elapsed().as_secs_f64() * 1000.0;
     comps.truncate(max_candidates);
     if dbg {

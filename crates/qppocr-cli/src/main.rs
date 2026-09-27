@@ -4,6 +4,9 @@
 //! fork 串行化（见 `qppocr-kernels` 的 `pool.rs` 模块注释），同进程并发
 //! `run` 是安全的，比多进程扇出省下 W 份权重内存与全部 IPC。
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +26,8 @@ struct Options {
     quiet: bool,
     bench: usize,
     no_cls: bool,
+    no_retry: bool,
+    rec_height: u32,
     rec_shards: usize,
 }
 
@@ -63,6 +68,8 @@ fn parse_args() -> Option<Options> {
         quiet: false,
         bench: 1,
         no_cls: false,
+        no_retry: false,
+        rec_height: 0,
         // `usize::MAX` = 自动（按档位），`0` = 关，其余 = 显式分片数。
         rec_shards: usize::MAX,
     };
@@ -119,6 +126,11 @@ fn parse_args() -> Option<Options> {
                 o.bench = args.get(i)?.parse().ok()?;
             }
             "--no-cls" => o.no_cls = true,
+            "--no-retry" => o.no_retry = true,
+            "--rec-height" => {
+                i += 1;
+                o.rec_height = args.get(i)?.parse().ok()?;
+            }
             "--rec-shards" => {
                 i += 1;
                 o.rec_shards = args.get(i)?.parse().ok()?;
@@ -343,7 +355,17 @@ fn run(o: &Options) -> Result<(), Error> {
     // 也被忽略**、默认值落到自动分片——「关分片」的对照实验全程在测同一个配置，
     // 得出来的「无差别」是假的。显式值必须原样透传，`0` 就是「关」。
     let n = o.rec_shards;
-    builder = builder.advanced(move |a| a.rec_shards = n);
+    let no_retry = o.no_retry;
+    let rec_height = o.rec_height;
+    builder = builder.advanced(move |a| {
+        a.rec_shards = n;
+        if no_retry {
+            a.retry_conf = 0.0;
+        }
+        if rec_height > 0 {
+            a.rec_height = rec_height as i32;
+        }
+    });
     let engine = builder.build(&o.models_dir)?;
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if !o.json {

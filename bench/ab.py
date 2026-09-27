@@ -41,7 +41,7 @@ def ours(tier, extra=(), quiet=True):
     imgs = [str(DS / f"img-{i:03d}.jpg") for i in range(1, 101)]
     t0 = time.time()
     r = subprocess.run(
-        [str(OURS), *imgs, "--tier", tier, "--json",
+        [str(OURS), *imgs, "--tier", tier, "--preset", "speed", "--json",
          "--quiet", "--bench", "1", "--workers", "1", *extra],
         capture_output=True, timeout=3600, cwd=OURS_CWD)
     for x in json.loads(r.stdout.decode("utf-8", "replace")):
