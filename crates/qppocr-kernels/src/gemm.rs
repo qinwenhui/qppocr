@@ -46,7 +46,24 @@ pub fn sgemm(
     bias: Option<&[f32]>,
     act: &Activation,
 ) {
-    sgemm_impl(a, b, c, m, n, k, ldc, bias, act, false);
+    sgemm_impl(a, b, c, m, n, k, ldc, bias, act, false, None);
+}
+
+/// sgemm 的残差融合版（Conv + ResidualAdd）：见 `finish_res`。
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_res(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    bias: Option<&[f32]>,
+    act: &Activation,
+    residual: Option<&[f32]>,
+) {
+    sgemm_impl(a, b, c, m, n, k, ldc, bias, act, false, residual);
 }
 
 /// implicit-GEMM 的串行入口：`B` 不是稠密矩阵，而是**每个 k 一行一个指针**
@@ -131,7 +148,7 @@ pub fn sgemm_serial(
     bias: Option<&[f32]>,
     act: &Activation,
 ) {
-    sgemm_impl(a, b, c, m, n, k, ldc, bias, act, true);
+    sgemm_impl(a, b, c, m, n, k, ldc, bias, act, true, None);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,6 +163,7 @@ fn sgemm_impl(
     bias: Option<&[f32]>,
     act: &Activation,
     serial: bool,
+    residual: Option<&[f32]>,
 ) {
     if m == 0 || n == 0 || k == 0 {
         return;
@@ -186,7 +204,7 @@ fn sgemm_impl(
                 panel_body(a, b, c.as_mut_ptr(), m, n, k, ldc, bias, 0, np)
             )
         };
-        finish(c, m, n, ldc, act);
+        finish_res(c, residual, m, n, ldc, act);
         return;
     }
 
@@ -239,22 +257,46 @@ fn sgemm_impl(
             };
         });
     }
-    finish(c, m, n, ldc, act);
+    finish_res(c, residual, m, n, ldc, act);
 }
 
 /// 激活收尾：作用在已写出的输出上，读的是刚写的数据（cache 命中）。
 /// det 的 1x1 conv 一次调用 47 MB 输出，串行扫比把激活留成独立节点还慢，
 /// 所以这里自己 fork。
 fn finish(c: &mut [f32], m: usize, n: usize, ldc: usize, act: &Activation) {
-    if !act.is_on() {
+    finish_res(c, None, m, n, ldc, act);
+}
+
+/// finish 的残差融合版：先施加激活、再加 residual（与被融合掉的独立 Add
+/// 节点同值同序——Add 读的就是激活后的值）。读的是刚写出的热数据，省掉
+/// 独立 Add 的整趟冷读冷写与一个中间张量。residual 与 c 同形同布局。
+fn finish_res(
+    c: &mut [f32],
+    residual: Option<&[f32]>,
+    m: usize,
+    n: usize,
+    ldc: usize,
+    act: &Activation,
+) {
+    if !act.is_on() && residual.is_none() {
         return;
     }
     let cp = par::SyncPtr::new(c.as_mut_ptr());
+    let rp = residual.map(|r| par::SyncPtr::new(r.as_ptr() as *mut f32));
     par::parallel_for_elems(m, m * n, |b, e| {
         for row in b..e {
             // SAFETY: 行区间 [b, e) 两两不相交，每块只动自己的行。
             let row_slice = unsafe { cp.offset(row * ldc).slice(n) };
-            apply_act(row_slice, act);
+            if act.is_on() {
+                apply_act(row_slice, act);
+            }
+            if let Some(r) = &rp {
+                // SAFETY: residual 与 c 同形同布局，行区间本块独占。
+                let rr = unsafe { r.offset(row * ldc).slice(n) };
+                for (d, sv) in row_slice.iter_mut().zip(rr) {
+                    *d += *sv;
+                }
+            }
         }
     });
 }

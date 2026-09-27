@@ -658,6 +658,9 @@ pub fn load_onnx_memory(data: &[u8], display_name: &str) -> Result<Graph> {
     // 最后跑，让它看到最终的 Conv 节点（fuse_gelu 造出它要匹配的
     // FusedGelu，fold_conv_bias 可能刚给它们补了 bias）。
     g.fused_conv_act = crate::graph::optimize::fuse_conv_activation(&mut g);
+    // 残差融合在 act 之后：它要看到最终形态的 Conv；在门控块之前：
+    // 门控块的 Add(Mul(feature,gate),residual) 与这里是两种不同模式。
+    crate::graph::optimize::fuse_conv_residual(&mut g);
     // 门控块放最后：它要看到最终形态的 Mul/Add（前面的 pass 可能已经改过
     // 这两类节点的输入）。
     g.fused_mul_add = crate::graph::optimize::fuse_mul_add(&mut g);

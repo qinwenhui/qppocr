@@ -159,6 +159,24 @@ pub fn conv2d(
     act: &Activation,
     y: &mut F32Buf,
 ) -> [i64; 4] {
+    conv2d_res(x, x_shape, w, w_shape, bias, p, act, y, None)
+}
+
+/// [`conv2d`] 的残差融合版：`residual` 在激活之后逐元素加上（与被融合的
+/// 独立 Add 同值同序）。1×1 GEMM 路径折进 `finish_res`（省一趟冷读写），
+/// 其余路径在尾部一趟完成（至少省掉独立节点与中间张量分配）。
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_res(
+    x: &[f32],
+    x_shape: &[i64; 4],
+    w: &[f32],
+    w_shape: &[i64; 4],
+    bias: Option<&[f32]>,
+    p: &ConvParams,
+    act: &Activation,
+    y: &mut F32Buf,
+    residual: Option<&[f32]>,
+) -> [i64; 4] {
     let out_shape = conv2d_out_shape(x_shape, w_shape, p);
     let (n, c, h, wdim) = (
         x_shape[0] as usize,
@@ -185,6 +203,13 @@ pub fn conv2d(
     let yp = par::SyncPtr::new(y.as_mut_slice().as_mut_ptr());
     let wt = w;
 
+    // 非 1x1 路径的 residual 在出口统一加（与独立 Add 同值同序：
+    // 各路径写完 y（含激活）之后逐元素 += residual）。
+    let tail_residual = if group == 1 && kh == 1 && kw == 1 && p.sh == 1 && p.sw == 1 {
+        None // 1x1 已折进 sgemm_res 的 finish_res
+    } else {
+        residual
+    };
     let mut bias_in_gemm = true;
     if group == 1 && kh == 1 && kw == 1 && p.sh == 1 && p.sw == 1 {
         // C[n] = W * X[n]，整个批次一次 fork
@@ -222,7 +247,10 @@ pub fn conv2d(
             for bn in 0..n {
                 // SAFETY: 各批次写的行段不相交（这里是串行调用，直接取子片）。
                 let ysub = &mut y[bn * m * ohw..(bn + 1) * m * ohw];
-                sgemm(wt, &x[bn * c * ohw..], ysub, m, ohw, c, ohw, bias, act);
+                let rsub = residual.map(|r| &r[bn * m * ohw..(bn + 1) * m * ohw]);
+                crate::gemm::sgemm_res(
+                    wt, &x[bn * c * ohw..], ysub, m, ohw, c, ohw, bias, act, rsub,
+                );
             }
         }
     } else if depthwise {

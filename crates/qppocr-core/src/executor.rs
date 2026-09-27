@@ -369,6 +369,16 @@ impl Session {
                         } else {
                             None
                         };
+                        // 残差融合（fuse_conv_residual）：inputs[3] 是运行期
+                        // 残差张量，在激活之后逐元素加上。图优化保证了
+                        // 有它就必有 inputs[2]（bias），无歧义。
+                        let residual = if n.inputs.len() > 3 {
+                            Some(get!(&arena, &n.inputs[3]).ok_or_else(|| {
+                                Error::Graph(format!("{op}: missing residual {}", n.inputs[3]))
+                            })?)
+                        } else {
+                            None
+                        };
                         let (sh, sw) = strides_of(n);
                         let (dh, dw) = dilations_of(n);
                         let group = get_i(n.attr("group"), 1) as usize;
@@ -394,7 +404,7 @@ impl Session {
                         let mut y = F32Buf::new();
                         let x4 = [x.shape[0], x.shape[1], x.shape[2], x.shape[3]];
                         let w4 = [w.shape[0], w.shape[1], w.shape[2], w.shape[3]];
-                        let os = qppocr_kernels::conv::conv2d(
+                        let os = qppocr_kernels::conv::conv2d_res(
                             &x.f32,
                             &x4,
                             &w.f32,
@@ -413,6 +423,7 @@ impl Session {
                             },
                             &act,
                             &mut y,
+                            residual.map(|t| t.f32.as_slice()),
                         );
                         arena.insert(
                             n.outputs[0].clone(),
