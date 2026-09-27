@@ -501,6 +501,165 @@ pub fn fuse_mul_add(g: &mut Graph) -> i64 {
 /// Conv 后紧跟单消费者 Add(bias)：bias 折进 Conv 第三输入。
 /// 省掉最常见的一次 Add 的读改写——转换版模型把 bias 拆成独立 Add
 ///（上游原件折在 Conv 里，这个 pass 对它们是 no-op）。
+/// Conv → BatchNormalization 折叠：BN 的仿射直接乘进 conv 的权重与 bias。
+///
+/// 数学上恒等：`y = (W∗x + b − μ)·γ/σ + β = (W·γ/σ)∗x + ((b−μ)·γ/σ + β)`。
+/// 浮点上**不逐位一致**（缩放从「累加之后」挪到「权重上」），准入靠
+/// 100 图逐字符对拍。BN 的四个参数折叠后无人引用，一并删除。
+///
+/// 每张 det 图少 0 个这种对（det 无 BN），rec 每图 44 处（2.3 ms、6.7 MB
+/// 串行账）、cls 每图 ~30 处——这些节点全在行阶段，而行阶段的逐元素算子
+/// 是**带宽绑定**的（16 线程聚合带宽反而低于单线程），折掉它们同时改善
+/// 并行扩展的 Amdahl 构成。
+pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
+    let consumers = consumer_map(g);
+    let mut consumer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for inn in &n.inputs {
+            if !inn.is_empty() {
+                consumer_of.entry(inn.clone()).or_insert(i);
+            }
+        }
+    }
+
+    let mut fold: Vec<(usize, usize, usize)> = Vec::new(); // (conv 下标, BN 下标, 输出通道数)
+    for i in 0..g.nodes.len() {
+        let cn = &g.nodes[i];
+        if cn.op_type != "Conv" || cn.inputs.len() < 2 || cn.outputs.len() != 1 {
+            continue;
+        }
+        let conv_out = cn.outputs[0].clone();
+        if g.is_graph_output(&conv_out) {
+            continue;
+        }
+        if consumers.get(&conv_out).copied().unwrap_or(0) != 1 {
+            continue; // conv 的输出必须只喂这一个 BN
+        }
+        let Some(&bu) = consumer_of.get(&conv_out) else {
+            continue;
+        };
+        let bn = &g.nodes[bu];
+        if bn.op_type != "BatchNormalization" || bn.inputs.len() != 5 || bn.outputs.len() != 1 {
+            continue;
+        }
+        if bn.inputs[0] != conv_out {
+            continue;
+        }
+        let Some(w) = g.initializers.get(&cn.inputs[1]) else {
+            continue;
+        };
+        if w.dtype != DType::F32 || w.shape.is_empty() {
+            continue;
+        }
+        let m = w.shape[0] as usize;
+        if m == 0 {
+            continue;
+        }
+        let mut ok = true;
+        for k in 1..5 {
+            match g.initializers.get(&bn.inputs[k]) {
+                Some(t) if t.dtype == DType::F32 && t.numel() == m as i64 => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        fold.push((i, bu, m));
+    }
+    if fold.is_empty() {
+        return 0;
+    }
+
+    let mut drop_bn: HashSet<usize> = HashSet::new();
+    for &(ci, bi, m) in &fold {
+        let bn_in = g.nodes[bi].inputs.clone();
+        let bn_out = g.nodes[bi].outputs[0].clone();
+        let eps = g.nodes[bi].attr("epsilon").map(|a| a.f).unwrap_or(1e-5);
+        let take = |g: &Graph, name: &str| -> Vec<f32> {
+            g.initializers[name].f32.to_vec()
+        };
+        let scale = take(g, &bn_in[1]);
+        let beta = take(g, &bn_in[2]);
+        let mean = take(g, &bn_in[3]);
+        let var = take(g, &bn_in[4]);
+        let a: Vec<f32> = (0..m)
+            .map(|c| scale[c] / (var[c] + eps).sqrt())
+            .collect();
+
+        // W' = W · a（逐输出通道）
+        let wname = g.nodes[ci].inputs[1].clone();
+        let kg = {
+            let w = g.initializers.get(&wname).unwrap();
+            (w.numel() as usize) / m
+        };
+        let w = g.initializers.get_mut(&wname).unwrap();
+        let ws = w.f32.as_mut_slice();
+        for c in 0..m {
+            let ac = a[c];
+            for k in 0..kg {
+                ws[c * kg + k] *= ac;
+            }
+        }
+
+        // b' = (b − μ)·a + β；conv 原本没有 bias 就地造一个
+        let bias_name = if g.nodes[ci].inputs.len() >= 3 {
+            Some(g.nodes[ci].inputs[2].clone())
+        } else {
+            None
+        };
+        let nb: Vec<f32> = match &bias_name {
+            None => (0..m).map(|c| (-mean[c]) * a[c] + beta[c]).collect(),
+            Some(bn_) => {
+                let b = g.initializers[bn_].f32.to_vec();
+                (0..m)
+                    .map(|c| (b[c] - mean[c]) * a[c] + beta[c])
+                    .collect()
+            }
+        };
+        match &bias_name {
+            Some(bn_) => {
+                let b = g.initializers.get_mut(bn_).unwrap();
+                b.f32.as_mut_slice()[..m].copy_from_slice(&nb);
+            }
+            None => {
+                let nbname = format!("{bn_out}.bnb");
+                g.initializers.insert(
+                    nbname.clone(),
+                    crate::tensor::Tensor {
+                        name: nbname.clone(),
+                        shape: vec![m as i64],
+                        dtype: DType::F32,
+                        f32: qppocr_kernels::buf::F32Buf::from_vec(&nb),
+                        i64: Vec::new(),
+                    },
+                );
+                g.nodes[ci].inputs.push(nbname);
+            }
+        }
+
+        // conv 接管 BN 的输出名，BN 节点删除；四个 BN 参数已无人引用
+        g.nodes[ci].outputs[0] = bn_out;
+        drop_bn.insert(bi);
+        for k in 1..5 {
+            g.initializers.remove(&bn_in[k]);
+        }
+    }
+
+    let n = fold.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if !drop_bn.contains(&i) {
+            kept.push(node);
+        }
+    }
+    g.nodes = kept;
+    n
+}
+
 pub fn fold_conv_bias(g: &mut Graph) -> i64 {
     let consumers = consumer_map(g);
     // tensor -> 唯一读者的下标
