@@ -1,0 +1,37 @@
+[package]
+name = "qppocr"
+description = "纯 Rust、手写内核的 PP-OCRv6 推理引擎（面向上游官方 ONNX 原件）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+keywords = ["ocr", "paddleocr", "onnx", "inference", "text-recognition"]
+categories = ["computer-vision", "text-processing"]
+
+[features]
+default = ["std", "parallel", "image-decode"]
+std = []
+# 关掉 = 单线程（WASM/嵌入式用）
+parallel = ["qppocr-core/parallel"]
+# 图像解码（JPEG/PNG）。关掉 = 只吃已解码像素
+image-decode = ["dep:image"]
+# 结果/配置的 serde 序列化（结果类型在 core，feature 透传过去）
+serde = ["dep:serde", "qppocr-core/serde"]
+
+[dependencies]
+qppocr-core = { path = "../qppocr-core", version = "0.1.1" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true
+
+[[example]]
+name = "api_verify"
+required-features = ["serde"]
