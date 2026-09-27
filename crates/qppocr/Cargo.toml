@@ -1,6 +1,7 @@
 [package]
 name = "qppocr"
 description = "纯 Rust、手写内核的 PP-OCRv6 推理引擎（面向上游官方 ONNX 原件）"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,7 +23,7 @@ image-decode = ["dep:image"]
 serde = ["dep:serde", "qppocr-core/serde"]
 
 [dependencies]
-qppocr-core = { path = "../qppocr-core", version = "0.2.0" }
+qppocr-core = { path = "../qppocr-core", version = "0.2.1" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 
