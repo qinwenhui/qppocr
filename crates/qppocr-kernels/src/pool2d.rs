@@ -85,21 +85,7 @@ pub fn pool2d(
                     } else {
                         std::ptr::null()
                     };
-                    crate::arch_dispatch!(
-                        crate::x86::pool2x2_row_vec(r0, r1, vm.as_mut_ptr(), outp, w),
-                        {
-                            for j in 0..w {
-                                vm[j] = match r1 {
-                                    p if !p.is_null() => (*r0.add(j)).max(*p.add(j)),
-                                    _ => *r0.add(j),
-                                };
-                            }
-                            vm[w] = -f32::MAX;
-                            for oxx in 0..w {
-                                *outp.add(oxx) = vm[oxx].max(vm[oxx + 1]);
-                            }
-                        }
-                    );
+                    crate::arch::pool2x2_row(r0, r1, vm.as_mut_ptr(), outp, w);
                 }
             }
         });
@@ -179,4 +165,32 @@ pub fn pool2d(
         }
     });
     (oh, ow)
+}
+
+/// 池化 2x2 s1 行内积的标量判据：垂直 max 落 `vm` scratch 行（长度 w+1，
+/// 行尾 -inf 哨兵），再水平 max。分组顺序与向量内核一致：
+/// `max(max(r0[j], r1[j]), max(r0[j+1], r1[j+1]))`。
+///
+/// # Safety
+///
+/// `r0`/`r1`（非空时）至少 `w` 个可读元素；`vm` 至少 `w+1` 个可写元素；
+/// `out` 至少 `w` 个可写元素。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn pool2x2_row_scalar(
+    r0: *const f32,
+    r1: *const f32,
+    vm: *mut f32,
+    out: *mut f32,
+    w: usize,
+) {
+    for j in 0..w {
+        *vm.add(j) = match r1 {
+            p if !p.is_null() => (*r0.add(j)).max(*p.add(j)),
+            _ => *r0.add(j),
+        };
+    }
+    *vm.add(w) = -f32::MAX;
+    for oxx in 0..w {
+        *out.add(oxx) = (*vm.add(oxx)).max(*vm.add(oxx + 1));
+    }
 }

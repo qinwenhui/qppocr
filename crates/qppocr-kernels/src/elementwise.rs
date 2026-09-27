@@ -199,19 +199,9 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
     if a_shape == b_shape {
         let pa = par::SyncPtr::new(a.as_mut_ptr());
         let opc = op.code();
-        let _ = opc; // 仅 x86_64 的向量臂使用
         par::parallel_for_elems(total, total, |b0, e0| {
-            crate::arch_dispatch!(
-                // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
-                unsafe { crate::x86::binary_flat_inplace_vec(pa.get(), b.as_ptr(), b0, e0, opc) },
-                {
-                    // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
-                    let dst = unsafe { pa.offset(b0).slice(e0 - b0) };
-                    for (d, sb) in dst.iter_mut().zip(&b[b0..e0]) {
-                        *d = op.apply_inplace_rev(*d, *sb);
-                    }
-                }
-            )
+            // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
+            unsafe { crate::arch::binary_flat_inplace(pa.get(), b.as_ptr(), b0, e0, opc) };
         });
         return;
     }
@@ -278,34 +268,23 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
                 ib -= sb[di] * shape[di];
             }
         }
-        let opc = op.code(); // 向量臂/标量臂共用
-        let _ = (opc, b_dense_run);
+        let opc = op.code(); // 向量/标量分支共用
         for o in o0..o1 {
             let cv = b[ib as usize];
-            crate::arch_dispatch!(
-                // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
-                // b 稠密时 bsrc 从 ib 起有 runlen 个元素（步长 1 的保证）。
-                unsafe {
-                    crate::x86::binary_run_inplace_vec(
-                        pa.get(),
-                        b.as_ptr(),
-                        o,
-                        runlen as usize,
-                        ib as usize,
-                        b_dense_run,
-                        cv,
-                        opc,
-                    )
-                },
-                {
-                    // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交。
-                    let dst = unsafe { pa.offset(o * runlen as usize).slice(runlen as usize) };
-                    for (j, d) in dst.iter_mut().enumerate() {
-                        let bv = if b_dense_run { b[ib as usize + j] } else { cv };
-                        *d = op.apply_inplace_rev(*d, bv);
-                    }
-                }
-            );
+            // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
+            // b 稠密时 bsrc 从 ib 起有 runlen 个元素（步长 1 的保证）。
+            unsafe {
+                crate::arch::binary_run_inplace(
+                    pa.get(),
+                    b.as_ptr(),
+                    o,
+                    runlen as usize,
+                    ib as usize,
+                    b_dense_run,
+                    cv,
+                    opc,
+                )
+            };
             for i in 0..no {
                 let di = k + i;
                 idx[i] += 1;
@@ -376,35 +355,11 @@ pub fn binary_op(
         let sv = if a_is_scalar { a[0] } else { b[0] };
         let v = if a_is_scalar { b } else { a };
         let opc = op.code();
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = opc;
         par::parallel_for_elems(total, total, |b0, e0| {
-            #[cfg(target_arch = "x86_64")]
-            if crate::use_avx2() && opc <= 3 {
-                // SAFETY: 区间 [b0, e0) 与其他并行块不相交；v 同长。
-                unsafe {
-                    crate::x86::binary_scalar_vec(
-                        v.as_ptr(),
-                        sv,
-                        a_is_scalar,
-                        yp.get(),
-                        b0,
-                        e0,
-                        opc,
-                    )
-                };
-                return;
-            }
-            // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
-            let seg = unsafe { yp.offset(b0).slice(e0 - b0) };
-            for (i, d) in seg.iter_mut().enumerate() {
-                let (va, vb) = if a_is_scalar {
-                    (sv, v[b0 + i])
-                } else {
-                    (v[b0 + i], sv)
-                };
-                *d = op.apply(va, vb);
-            }
+            // SAFETY: 区间 [b0, e0) 与其他并行块不相交；v 同长。
+            unsafe {
+                crate::arch::binary_scalar_bcast(v.as_ptr(), sv, a_is_scalar, yp.get(), b0, e0, opc)
+            };
         });
         return (y, out_shape);
     }
@@ -456,8 +411,6 @@ pub fn binary_op(
                 }
                 let opc = op.code();
                 let b_dense_run = b_dense_inner;
-                #[cfg(not(target_arch = "x86_64"))]
-                let _ = (opc, b_dense_run);
                 for o in o0..o1 {
                     let cv = if a_const {
                         a[ia as usize]
@@ -471,16 +424,15 @@ pub fn binary_op(
                     };
                     // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
                     // b 稠密时 dense 从 ib 起有 runlen 个元素（步长 1）。
-                    #[cfg(target_arch = "x86_64")]
-                    if crate::use_avx2() && opc <= 3 && a_const {
+                    if a_const {
                         // dense 切片头 = b.as_ptr()+ib，而内核内部还会 add(ib)——
                         // 传全量头 b.as_ptr()，偏移只在内核里做一次
-                        let b_head = if a_const { b.as_ptr() } else { a.as_ptr() };
+                        let b_head = b.as_ptr();
                         let _ = dense;
                         // SAFETY: 输出 run [o*runlen,(o+1)*runlen) 不相交；
                         // b 稠密时 b_head+ib 起有 runlen 个元素（步长 1）。
                         unsafe {
-                            crate::x86::binary_run_alloc_vec(
+                            crate::arch::binary_run_alloc(
                                 yp.get(),
                                 &cv,
                                 b_head,
@@ -578,25 +530,201 @@ pub fn binary_op(
             par::SyncPtr::new(b.as_ptr() as *mut f32),
         );
         let opc = op.code();
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = (opc, pa_src, pb_src);
         par::parallel_for_elems(total, total, |b0, e0| {
-            #[cfg(target_arch = "x86_64")]
-            if crate::use_avx2() && opc <= 3 {
-                // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
-                unsafe {
-                    crate::x86::binary_flat_vec(pa_src.get(), pb_src.get(), yp.get(), b0, e0, opc)
-                };
-                return;
-            }
-            // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交。
-            let seg = unsafe { yp.offset(b0).slice(e0 - b0) };
-            for (i, d) in seg.iter_mut().enumerate() {
-                *d = op.apply(a[b0 + i], b[b0 + i]);
-            }
+            // SAFETY: 区间 [b0, e0) 与其他并行块不相交；a/b 等长。
+            unsafe { crate::arch::binary_flat(pa_src.get(), pb_src.get(), yp.get(), b0, e0, opc) };
         });
     } else {
         par::parallel_for_elems(total, total, scalar_kernel);
     }
     (y, out_shape)
+}
+
+// ================================================================ 区间标量判据
+// arch 分发层的标量分支。op 码语义与 `BinOp::apply` 一致（pow 走 libm），
+// 与向量内核的标量尾巴同一套表达式——三侧（AVX2/NEON/标量）逐位同值。
+
+/// 按 op 码施加二元运算（0..4 = + - * / pow）。
+#[inline]
+pub(crate) fn apply_code(a: f32, b: f32, op: u8) -> f32 {
+    match op {
+        0 => a + b,
+        1 => a - b,
+        2 => a * b,
+        3 => a / b,
+        _ => a.powf(b),
+    }
+}
+
+/// 同形平坦就地：`dst[i] op= src[i]`，区间 `[b, e)`。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交；`dst`/`src` 等长。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn binary_flat_inplace_scalar(
+    dst: *mut f32,
+    src: *const f32,
+    b: usize,
+    e: usize,
+    op: u8,
+) {
+    for i in b..e {
+        let r = apply_code(*dst.add(i), *src.add(i), op);
+        *dst.add(i) = r;
+    }
+}
+
+/// run 路径就地的区间段形式（NEON 内核的尾巴从段起点续跑）。
+///
+/// # Safety
+///
+/// `dst` 起的 `[j0, j1)` 与并发调用者不相交。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn binary_run_inplace_seg(
+    dst: *mut f32,
+    bsrc: *const f32,
+    j0: usize,
+    j1: usize,
+    ib: usize,
+    b_dense_run: bool,
+    cv: f32,
+    op: u8,
+) {
+    for j in j0..j1 {
+        let d = *dst.add(j);
+        let bv = if b_dense_run { *bsrc.add(ib + j) } else { cv };
+        *dst.add(j) = apply_code(d, bv, op);
+    }
+}
+
+/// run 路径就地：`dst[o*runlen + j] op= bsrc[ib + j]`（b 稠密）或 `op= cv`。
+///
+/// # Safety
+///
+/// 输出 run `[o*runlen, (o+1)*runlen)` 必须与并发调用者不相交。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn binary_run_inplace_scalar(
+    dst: *mut f32,
+    bsrc: *const f32,
+    o: usize,
+    runlen: usize,
+    ib: usize,
+    b_dense_run: bool,
+    cv: f32,
+    op: u8,
+) {
+    binary_run_inplace_seg(
+        dst.add(o * runlen),
+        bsrc,
+        0,
+        runlen,
+        ib,
+        b_dense_run,
+        cv,
+        op,
+    );
+}
+
+/// 单元素广播：`py[i] = op(sv, v[i])` 或 `op(v[i], sv)`（`a_scalar` 定方向）。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交；`v` 同长。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn binary_scalar_bcast_scalar(
+    v: *const f32,
+    sv: f32,
+    a_scalar: bool,
+    py: *mut f32,
+    b: usize,
+    e: usize,
+    op: u8,
+) {
+    for i in b..e {
+        let x = *v.add(i);
+        let (va, vb) = if a_scalar { (sv, x) } else { (x, sv) };
+        *py.add(i) = apply_code(va, vb, op);
+    }
+}
+
+/// run 路径分配的区间段形式（NEON 内核的尾巴从段起点续跑）。
+///
+/// # Safety
+///
+/// `dst` 起的 `[j0, j1)` 与并发调用者不相交。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn binary_run_alloc_seg(
+    dst: *mut f32,
+    pa_const: *const f32,
+    bsrc: *const f32,
+    j0: usize,
+    j1: usize,
+    ib: usize,
+    b_dense_run: bool,
+    cv: f32,
+    a_const: bool,
+    op: u8,
+) {
+    for j in j0..j1 {
+        let bv = if b_dense_run { *bsrc.add(ib + j) } else { cv };
+        let av = if a_const { *pa_const } else { *dst.add(j) };
+        *dst.add(j) = apply_code(av, bv, op);
+    }
+}
+
+/// run 路径分配：`py[o*runlen + j] = op(a 值, b[j] 或 cv)`；a 恒常量。
+///
+/// # Safety
+///
+/// 输出 run `[o*runlen, (o+1)*runlen)` 必须与并发调用者不相交。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn binary_run_alloc_scalar(
+    py: *mut f32,
+    pa_const: *const f32,
+    bsrc: *const f32,
+    o: usize,
+    runlen: usize,
+    ib: usize,
+    b_dense_run: bool,
+    cv: f32,
+    a_const: bool,
+    op: u8,
+) {
+    binary_run_alloc_seg(
+        py.add(o * runlen),
+        pa_const,
+        bsrc,
+        0,
+        runlen,
+        ib,
+        b_dense_run,
+        cv,
+        a_const,
+        op,
+    );
+}
+
+/// 同形平坦：`y[i] = a[i] op b[i]`（写新缓冲），区间 `[b, e)`。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交；`pa`/`pb`/`py` 等长。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn binary_flat_scalar(
+    pa: *const f32,
+    pb: *const f32,
+    py: *mut f32,
+    b: usize,
+    e: usize,
+    op: u8,
+) {
+    for i in b..e {
+        let r = apply_code(*pa.add(i), *pb.add(i), op);
+        *py.add(i) = r;
+    }
 }

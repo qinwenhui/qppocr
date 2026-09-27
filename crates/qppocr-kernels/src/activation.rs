@@ -145,23 +145,97 @@ pub fn apply_act(p: &mut [f32], act: &Activation) {
     }
 }
 
+// ================================================================ 区间标量判据
+// arch 分发层的标量分支与 SIMD 对拍的基准：与向量版同样的表达式、同样的
+// 顺序，区间语义（[b, e) 裸指针）与向量内核一致。
+
+/// `y = max(0, x)`，区间 `[b, e)`。NaN→0。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn relu_seg_scalar(t: *mut f32, b: usize, e: usize) {
+    for i in b..e {
+        let v = *t.add(i);
+        *t.add(i) = if v > 0.0 { v } else { 0.0 };
+    }
+}
+
+/// `y = clip(0, 1, fma(x, alpha, beta))`，区间 `[b, e)`。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交；`x`/`y` 等长。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn hardsigmoid_seg_scalar(
+    x: *const f32,
+    y: *mut f32,
+    b: usize,
+    e: usize,
+    alpha: f32,
+    beta: f32,
+) {
+    for i in b..e {
+        // v = fma(x, alpha, beta)；clamp 顺序与向量版一致：max(0, min(1, v))
+        let v = (*x.add(i)).mul_add(alpha, beta);
+        *y.add(i) = if v < 0.0 {
+            0.0
+        } else if v > 1.0 {
+            1.0
+        } else {
+            v
+        };
+    }
+}
+
+/// `y = 1 / (1 + exp1(-x))`，区间 `[b, e)`。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交；`x`/`y` 等长。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn sigmoid_seg_scalar(x: *const f32, y: *mut f32, b: usize, e: usize) {
+    for i in b..e {
+        *y.add(i) = 1.0f32 / (1.0f32 + exp1(-*x.add(i)));
+    }
+}
+
+/// `t = c3·t·(erf1(t/c1) + c2)`，就地，区间 `[b, e)`。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn gelu_seg_scalar(t: *mut f32, b: usize, e: usize, c1: f32, c2: f32, c3: f32) {
+    let inv_c1 = 1.0f32 / c1;
+    for i in b..e {
+        let v = *t.add(i);
+        *t.add(i) = c3 * v * (erf1(v * inv_c1) + c2);
+    }
+}
+
+/// `t = clip(t, lo, hi)`，就地，区间 `[b, e)`。NaN 穿透（比较链语义）。
+///
+/// # Safety
+///
+/// 区间 `[b, e)` 必须与并发调用者不相交。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn clip_seg_scalar(t: *mut f32, b: usize, e: usize, lo: f32, hi: f32) {
+    for i in b..e {
+        let v = *t.add(i);
+        let m = if v < lo { lo } else { v }; // max(v, lo)
+        *t.add(i) = if hi < m { hi } else { m }; // min(m, hi)
+    }
+}
+
 /// `y = max(0, x)`，就地。`v > 0 ? v : 0` 的写法保留 NaN→0 的语义。
 pub fn relu_inplace(t: &mut [f32]) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
-        #[cfg(target_arch = "x86_64")]
-        #[cfg(target_arch = "x86_64")]
-        if crate::use_avx2() {
-            // SAFETY: 区间 [b, e) 与其他并行块不相交。
-            unsafe { crate::x86::relu_vec(tp.get(), b, e) };
-            return;
-        }
-        // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
-        let seg = unsafe { tp.offset(b).slice(e - b) };
-        for v in seg.iter_mut() {
-            *v = if *v > 0.0 { *v } else { 0.0 };
-        }
+        // SAFETY: 区间 [b, e) 与其他并行块不相交。
+        unsafe { crate::arch::relu_seg(tp.get(), b, e) };
     });
 }
 
@@ -172,26 +246,8 @@ pub fn hardsigmoid(x: &[f32], alpha: f32, beta: f32, y: &mut [f32]) {
     let yp = par::SyncPtr::new(y.as_mut_ptr());
     let n = x.len();
     par::parallel_for_elems(n, n, |b, e| {
-        #[cfg(target_arch = "x86_64")]
-        #[cfg(target_arch = "x86_64")]
-        if crate::use_avx2() {
-            // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
-            unsafe { crate::x86::hardsigmoid_vec(x.as_ptr(), yp.get(), b, e, alpha, beta) };
-            return;
-        }
-        // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
-        let seg = unsafe { yp.offset(b).slice(e - b) };
-        for (i, d) in seg.iter_mut().enumerate() {
-            // v = fma(x, alpha, beta)；clamp 顺序与 AVX2 一致：max(0, min(1, v))
-            let v = x[b + i].mul_add(alpha, beta);
-            *d = if v < 0.0 {
-                0.0
-            } else if v > 1.0 {
-                1.0
-            } else {
-                v
-            };
-        }
+        // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
+        unsafe { crate::arch::hardsigmoid_seg(x.as_ptr(), yp.get(), b, e, alpha, beta) };
     });
 }
 
@@ -204,40 +260,19 @@ pub fn sigmoid_tensor(x: &[f32], y: &mut [f32]) {
     let yp = par::SyncPtr::new(y.as_mut_ptr());
     let n = x.len();
     par::parallel_for_elems(n, n, |b, e| {
-        #[cfg(target_arch = "x86_64")]
-        #[cfg(target_arch = "x86_64")]
-        if crate::use_avx2() {
-            // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
-            unsafe { crate::x86::sigmoid_vec(x.as_ptr(), yp.get(), b, e) };
-            return;
-        }
-        // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
-        let seg = unsafe { yp.offset(b).slice(e - b) };
-        for (i, d) in seg.iter_mut().enumerate() {
-            *d = 1.0f32 / (1.0f32 + exp1(-x[b + i]));
-        }
+        // SAFETY: 区间 [b, e) 与其他并行块不相交；x/y 等长已断言。
+        unsafe { crate::arch::sigmoid_seg(x.as_ptr(), yp.get(), b, e) };
     });
 }
 
 /// `t = c3·t·(erf(t/c1) + c2)`，就地。融合 GELU：图导出器会把它拆成
 /// Div/Erf/Add/Mul/Mul 五个节点，这里一趟做完。
 pub fn gelu_inplace(t: &mut [f32], c1: f32, c2: f32, c3: f32) {
-    let inv_c1 = 1.0f32 / c1;
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
-        #[cfg(target_arch = "x86_64")]
-        #[cfg(target_arch = "x86_64")]
-        if crate::use_avx2() {
-            // SAFETY: 区间 [b, e) 与其他并行块不相交。
-            unsafe { crate::x86::gelu_vec(tp.get(), b, e, c1, c2, c3) };
-            return;
-        }
-        // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
-        let seg = unsafe { tp.offset(b).slice(e - b) };
-        for v in seg.iter_mut() {
-            *v = c3 * *v * (erf1(*v * inv_c1) + c2);
-        }
+        // SAFETY: 区间 [b, e) 与其他并行块不相交。
+        unsafe { crate::arch::gelu_seg(tp.get(), b, e, c1, c2, c3) };
     });
 }
 
@@ -259,21 +294,8 @@ pub fn clip_inplace(t: &mut [f32], lo: f32, hi: f32) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());
     let n = t.len();
     par::parallel_for_elems(n, n, |b, e| {
-        #[cfg(target_arch = "x86_64")]
-        #[cfg(target_arch = "x86_64")]
-        if crate::use_avx2() {
-            // SAFETY: 区间 [b, e) 与其他并行块不相交。
-            unsafe { crate::x86::clip_vec(tp.get(), b, e, lo, hi) };
-            return;
-        }
-        // SAFETY: 元素区间 [b, e) 与其他并行块不相交。
-        let seg = unsafe { tp.offset(b).slice(e - b) };
-        for v in seg.iter_mut() {
-            *v = {
-                let m = if *v < lo { lo } else { *v }; // max(v, lo)
-                if hi < m { hi } else { m } // min(m, hi)
-            };
-        }
+        // SAFETY: 区间 [b, e) 与其他并行块不相交。
+        unsafe { crate::arch::clip_seg(tp.get(), b, e, lo, hi) };
     });
 }
 
@@ -301,78 +323,81 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
     assert!(t.len() % inner == 0, "softmax: size not multiple of inner");
     let outer = t.len() / inner;
     let tp = par::SyncPtr::new(t.as_mut_ptr());
-    #[cfg(target_arch = "x86_64")]
-    let use_vec = inner >= 8 && crate::use_avx2();
     par::parallel_for_units(outer, |b, e| {
         for o in b..e {
-            #[cfg(target_arch = "x86_64")]
-            if use_vec {
-                // SAFETY: 行 o 与其他并行块不相交。
-                unsafe { crate::x86::softmax_row_vec(tp.get().add(o * inner), inner) };
-                continue;
-            }
             // SAFETY: 行 o 与其他并行块不相交。
-            let row = unsafe { tp.offset(o * inner).slice(inner) };
-            // 行最大值。max 逐位与顺序无关（NaN 除外，这里不会出现）。
-            // ⚠ 行必须凑满一个向量再首次 load：不满时多余的 lane 会读到
-            // *下一行*，mx 偏大、每个 exp 下溢、结果是 0·inf。角度分类器
-            // softmax 的是 4 个方向分——这个 bug 曾让它静默把每张图都判错方向。
-            let mut i = 0;
-            let mut acc = [0f32; 8];
-            let mut mx = if inner >= 8 {
-                let mut vmax = [row[0]; 8];
-                // 镜像向量循环：逐 lane max
-                while i + 8 <= inner {
-                    for j in 0..8 {
-                        if row[i + j] > vmax[j] {
-                            vmax[j] = row[i + j];
-                        }
-                    }
-                    i += 8;
-                }
-                let mut m = vmax[0];
-                for j in 1..8 {
-                    if vmax[j] > m {
-                        m = vmax[j];
-                    }
-                }
-                m
-            } else {
-                i = 1;
-                row[0]
-            };
-            while i < inner {
-                if row[i] > mx {
-                    mx = row[i];
-                }
-                i += 1;
-            }
-            // exp 阶段：逐 lane 累加（vsum），随后按 hsum8 的结合顺序归约。
-            let mut sum = 0.0f32;
-            let mut i2 = 0;
-            if inner >= 8 {
-                while i2 + 8 <= inner {
-                    for j in 0..8 {
-                        let ev = exp1(row[i2 + j] - mx);
-                        row[i2 + j] = ev;
-                        acc[j] += ev;
-                    }
-                    i2 += 8;
-                }
-                sum = hsum8(&acc);
-            }
-            while i2 < inner {
-                row[i2] = exp1(row[i2] - mx);
-                sum += row[i2];
-                i2 += 1;
-            }
-            // 除法拆成乘 1/sum（inv = 1.f/sum 然后逐元素乘）
-            let inv = 1.0f32 / sum;
-            for v in row.iter_mut() {
-                *v *= inv;
-            }
+            unsafe { crate::arch::softmax_row(tp.get().add(o * inner), inner) };
         }
     });
+}
+
+/// softmax 一行的标量判据：max / exp / 归约按 8-lane 结构逐 lane 镜像向量
+/// 内核，水平归约走 [`hsum8`] 的结合树。行宽不足 8 时逐元素。
+///
+/// ⚠ 行必须凑满一个向量再首次读：不满时多余的 lane 会读到**下一行**，
+/// mx 偏大、每个 exp 下溢、结果是 0·inf。
+///
+/// # Safety
+///
+/// `row` 指向 `inner` 个可读写元素，且该行与其他并行块不相交。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn softmax_row_scalar(row: *mut f32, inner: usize) {
+    let row = std::slice::from_raw_parts_mut(row, inner);
+    // 行最大值。max 逐位与顺序无关（NaN 除外，这里不会出现）。
+    let mut i = 0;
+    let mut acc = [0f32; 8];
+    let mut mx = if inner >= 8 {
+        let mut vmax = [row[0]; 8];
+        // 镜像向量循环：逐 lane max
+        while i + 8 <= inner {
+            for j in 0..8 {
+                if row[i + j] > vmax[j] {
+                    vmax[j] = row[i + j];
+                }
+            }
+            i += 8;
+        }
+        let mut m = vmax[0];
+        for j in 1..8 {
+            if vmax[j] > m {
+                m = vmax[j];
+            }
+        }
+        m
+    } else {
+        i = 1;
+        row[0]
+    };
+    while i < inner {
+        if row[i] > mx {
+            mx = row[i];
+        }
+        i += 1;
+    }
+    // exp 阶段：逐 lane 累加（vsum），随后按 hsum8 的结合顺序归约。
+    let mut sum = 0.0f32;
+    let mut i2 = 0;
+    if inner >= 8 {
+        while i2 + 8 <= inner {
+            for j in 0..8 {
+                let ev = exp1(row[i2 + j] - mx);
+                row[i2 + j] = ev;
+                acc[j] += ev;
+            }
+            i2 += 8;
+        }
+        sum = hsum8(&acc);
+    }
+    while i2 < inner {
+        row[i2] = exp1(row[i2] - mx);
+        sum += row[i2];
+        i2 += 1;
+    }
+    // 除法拆成乘 1/sum（inv = 1.f/sum 然后逐元素乘）
+    let inv = 1.0f32 / sum;
+    for v in row.iter_mut() {
+        *v *= inv;
+    }
 }
 
 use crate::par;

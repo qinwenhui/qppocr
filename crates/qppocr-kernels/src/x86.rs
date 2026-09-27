@@ -242,7 +242,9 @@ pub unsafe fn sgemm_panel_impl<const BP: bool, const SW: usize>(
             }
             // M%4 尾行：nn < 32 恒走标量回退（与通用路径一致）
             for row in m0..m {
-                return_to_scalar_tail::<BP, SW>(a, b, bptrs, c, m, n, k, ldc, bias, p, row);
+                crate::gemm::panel_tail_scalar::<BP, SW>(
+                    a, b, bptrs, c, m, n, k, ldc, bias, p, row,
+                );
             }
             continue;
         }
@@ -387,7 +389,9 @@ pub unsafe fn sgemm_panel_impl<const BP: bool, const SW: usize>(
             } else {
                 // 非整面板尾行： 在 AVX2 构建里这段本来就是标量
                 // （bias 起种 + GCC 收缩的 FMA）。逐位语义两边共用。
-                return_to_scalar_tail::<BP, SW>(a, b, bptrs, c, m, n, k, ldc, bias, p, row);
+                crate::gemm::panel_tail_scalar::<BP, SW>(
+                    a, b, bptrs, c, m, n, k, ldc, bias, p, row,
+                );
             }
         }
     }
@@ -427,48 +431,6 @@ pub unsafe fn sgemm_panel_bptrs_avx2<const SW: usize>(
     pe: usize,
 ) {
     sgemm_panel_impl::<true, SW>(a, std::ptr::null(), bptrs, c, m, n, k, ldc, bias, pb, pe)
-}
-
-/// 非整面板的 M%4 尾行回退：直接执行标量逻辑（bias 起种）。
-///
-///  在 AVX2 构建里这段本来就是标量循环（GCC 收缩成 FMA），Rust 版
-/// 把它放在 `gemm.rs::panel_tail_scalar` 里两边共用。
-#[allow(clippy::too_many_arguments)]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn return_to_scalar_tail<const BP: bool, const SW: usize>(
-    a: *const f32,
-    b: *const f32,
-    bptrs: *const *const f32,
-    c: *mut f32,
-    m: usize,
-    n: usize,
-    k: usize,
-    ldc: usize,
-    bias: *const f32,
-    p: usize,
-    row_start: usize,
-) {
-    let n0 = p * 32;
-    let nn = 32.min(n - n0);
-    let has_bias = !bias.is_null();
-    for row in row_start..m {
-        let ar = a.add(row * k);
-        let bv = if has_bias { *bias.add(row) } else { 0.0 };
-        let cp = c.add(row * ldc + n0);
-        for j in 0..nn {
-            // bias 起种 + fma 链（与标量 panel_body 的非整面板分支逐位相同）
-            let mut s = bv;
-            for kk in 0..k {
-                let bv1 = if BP {
-                    (*bptrs.add(kk)).add((n0 + j) * SW).read()
-                } else {
-                    b.add(kk * n + n0 + j).read()
-                };
-                s = ar.add(kk).read().mul_add(bv1, s);
-            }
-            cp.add(j).write(s);
-        }
-    }
 }
 
 /// 窄 N 路径的 AVX2 版：整行计算，K 上外积。

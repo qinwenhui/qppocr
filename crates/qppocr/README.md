@@ -2,8 +2,10 @@
 
 A pure-Rust OCR engine for the PP-OCRv6 detection / orientation / recognition
 models. It parses and runs the official ONNX files directly — no ONNX Runtime,
-no native inference dependency. Kernels are hand-written AVX2 with a scalar
-fallback, so one binary runs on any x86-64 host and picks up SIMD at runtime.
+no native inference dependency. Kernels are hand-written SIMD — AVX2 on x86-64,
+NEON on aarch64 — with a scalar fallback, so one binary runs on any x86-64 or
+arm64 host; AVX2 is picked up at runtime by CPU detection, NEON is part of the
+aarch64 baseline.
 
 ## What you get
 

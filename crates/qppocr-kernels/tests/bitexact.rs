@@ -1,6 +1,6 @@
-//! AVX2 ↔ 标量逐位对拍。
+//! SIMD ↔ 标量逐位对拍（x86-64 上是 AVX2，aarch64 上是 NEON）。
 //!
-//! 标量版按 AVX2 内核的表达式树编写（同样的 `mul_add` 序列、同样的
+//! 标量版按 SIMD 内核的表达式树编写（同样的 `mul_add` 序列、同样的
 //! round-ties-even、hsum 的结合顺序），所以两版的输出必须**逐位相同**——
 //! 不允许多一个 ulp。任何不一致都是某一侧转写出错。
 
@@ -10,6 +10,15 @@ use qppocr_kernels::activation::Activation;
 use qppocr_kernels::buf::F32Buf;
 use qppocr_kernels::gemm::{sgemm, sgemm_serial};
 use qppocr_kernels::{Backend, force_backend};
+
+/// 本架构的 SIMD 后端（无向量后端的架构上退化为 Scalar，测试退化为
+/// 标量自对拍）。
+#[cfg(target_arch = "x86_64")]
+const SIMD: Backend = Backend::Avx2;
+#[cfg(target_arch = "aarch64")]
+const SIMD: Backend = Backend::Neon;
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const SIMD: Backend = Backend::Scalar;
 
 struct Rng(u64);
 impl Rng {
@@ -36,7 +45,7 @@ fn assert_bits_eq(name: &str, a: &[f32], b: &[f32]) {
         assert_eq!(
             x.to_bits(),
             y.to_bits(),
-            "{name}: bit mismatch at {i}: scalar={x} avx2={y}"
+            "{name}: bit mismatch at {i}: scalar={x} simd={y}"
         );
     }
 }
@@ -95,7 +104,7 @@ fn sgemm_bitexact() {
                         &Activation::default(),
                     );
                 }
-                force_backend(Some(Backend::Avx2));
+                force_backend(Some(SIMD));
                 if serial {
                     sgemm_serial(
                         &a,
@@ -149,7 +158,7 @@ fn sgemm_gelu_bitexact() {
     let mut c2 = vec![0f32; m * n];
     force_backend(Some(Backend::Scalar));
     sgemm(&a, &b, &mut c1, m, n, k, n, Some(&bias), &act);
-    force_backend(Some(Backend::Avx2));
+    force_backend(Some(SIMD));
     sgemm(&a, &b, &mut c2, m, n, k, n, Some(&bias), &act);
     force_backend(None);
     assert_bits_eq("sgemm+gelu", &c1, &c2);
@@ -179,7 +188,7 @@ fn activation_bitexact() {
                 let mut t2 = x.clone();
                 force_backend(Some(Backend::Scalar));
                 $f(&mut t1);
-                force_backend(Some(Backend::Avx2));
+                force_backend(Some(SIMD));
                 $f(&mut t2);
                 force_backend(None);
                 assert_bits_eq($name, &t1, &t2);
@@ -195,14 +204,14 @@ fn activation_bitexact() {
         let mut y2 = vec![0f32; n];
         force_backend(Some(Backend::Scalar));
         sigmoid_tensor(&x, &mut y1);
-        force_backend(Some(Backend::Avx2));
+        force_backend(Some(SIMD));
         sigmoid_tensor(&x, &mut y2);
         force_backend(None);
         assert_bits_eq("sigmoid", &y1, &y2);
 
         force_backend(Some(Backend::Scalar));
         hardsigmoid(&x, 1.0 / 6.0, 0.5, &mut y1);
-        force_backend(Some(Backend::Avx2));
+        force_backend(Some(SIMD));
         hardsigmoid(&x, 1.0 / 6.0, 0.5, &mut y2);
         force_backend(None);
         assert_bits_eq("hardsigmoid", &y1, &y2);
@@ -216,7 +225,7 @@ fn activation_bitexact() {
             let mut t2 = x.clone();
             force_backend(Some(Backend::Scalar));
             softmax_last_dim(&mut t1, inner);
-            force_backend(Some(Backend::Avx2));
+            force_backend(Some(SIMD));
             softmax_last_dim(&mut t2, inner);
             force_backend(None);
             assert_bits_eq(&format!("softmax inner={inner}"), &t1, &t2);
@@ -244,7 +253,7 @@ fn binary_inplace_bitexact() {
         let mut a2 = a.clone();
         force_backend(Some(Backend::Scalar));
         binary_op_inplace(&mut a, a_shape, &b, b_shape, *op);
-        force_backend(Some(Backend::Avx2));
+        force_backend(Some(SIMD));
         binary_op_inplace(&mut a2, a_shape, &b, b_shape, *op);
         force_backend(None);
         assert_bits_eq(
@@ -314,7 +323,7 @@ fn conv_bitexact() {
             &Activation::default(),
             &mut y1,
         );
-        force_backend(Some(Backend::Avx2));
+        force_backend(Some(SIMD));
         conv2d(
             &x,
             &[n as i64, c as i64, h as i64, w as i64],
@@ -361,7 +370,7 @@ fn conv_bitexact() {
             &Activation::default(),
             &mut y1,
         );
-        force_backend(Some(Backend::Avx2));
+        force_backend(Some(SIMD));
         conv2d(
             &x,
             &[n as i64, c as i64, h as i64, w as i64],
@@ -397,7 +406,7 @@ fn conv_bitexact() {
             0,
             &mut y1,
         );
-        force_backend(Some(Backend::Avx2));
+        force_backend(Some(SIMD));
         convtranspose2d(
             &x,
             &[n as i64, c as i64, h as i64, w as i64],
@@ -422,7 +431,7 @@ fn conv_bitexact() {
         let mut y2 = F32Buf::new();
         force_backend(Some(Backend::Scalar));
         pool2d(&x, n, c, h, w, 2, 2, 1, 1, 0, 0, 1, 1, true, &mut y1);
-        force_backend(Some(Backend::Avx2));
+        force_backend(Some(SIMD));
         pool2d(&x, n, c, h, w, 2, 2, 1, 1, 0, 0, 1, 1, true, &mut y2);
         force_backend(None);
         assert_bits_eq("pool 2x2 s1", &y1, &y2);

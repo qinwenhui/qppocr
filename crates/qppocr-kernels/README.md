@@ -7,7 +7,8 @@ contains `unsafe`, and it is the only one that talks to SIMD intrinsics.
 
 ## What is in it
 
-- **GEMM** — an AVX2 panel micro-kernel with a scalar fallback. Supports bias
+- **GEMM** — panel micro-kernels (AVX2 on x86-64, NEON on aarch64) with a
+  scalar fallback. Supports bias
   and an activation epilogue applied in the store pass, so fused operators do
   not re-read the output. An implicit-GEMM entry point (`sgemm_bptrs_serial`)
   lets strided convolutions run without materializing the im2col patch matrix.
@@ -20,8 +21,8 @@ contains `unsafe`, and it is the only one that talks to SIMD intrinsics.
 - **Pooling / resize** — max/avg pooling, global average pool, bilinear and
   nearest resize, 2x2 dilate.
 - **Activations** — vectorized erf/exp polynomials. The scalar versions are
-  exact lane-for-lane mirrors of the AVX2 versions, so scalar and SIMD runs
-  produce bit-identical output.
+  exact lane-for-lane mirrors of the vector versions, so scalar and SIMD runs
+  produce bit-identical output — on both vector backends.
 - **par** — a small fork-join thread pool with batch wakeup, main-thread
   participation, and a serial-execution mode that keeps split decisions
   identical to the parallel path.
@@ -30,7 +31,10 @@ contains `unsafe`, and it is the only one that talks to SIMD intrinsics.
   node output.
 
 CPU features are detected at runtime; binaries built without any special
-`target-cpu` setting still take the AVX2 path when the host supports it.
+`target-cpu` setting still take the AVX2 path when the host supports it. On
+aarch64, NEON is part of the baseline ISA and is always used. Kernel dispatch
+lives in one module (`arch`): adding a backend is one file plus one arm per
+entry point, and kernel code itself contains no architecture conditionals.
 
 ## When to use it directly
 
