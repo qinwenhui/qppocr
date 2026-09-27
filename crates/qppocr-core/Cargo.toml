@@ -1,6 +1,7 @@
 [package]
 name = "qppocr-core"
 description = "qppocr 引擎主体：ONNX 解析、图优化、执行器、det/cls/rec 流水线"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +17,7 @@ parallel = ["qppocr-kernels/parallel"]
 serde = ["dep:serde"]
 
 [dependencies]
-qppocr-kernels = { path = "../qppocr-kernels", version = "0.2.0" }
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.2.1" }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 
 [lints]
