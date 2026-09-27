@@ -4,9 +4,6 @@
 //! fork 串行化（见 `qppocr-kernels` 的 `pool.rs` 模块注释），同进程并发
 //! `run` 是安全的，比多进程扇出省下 W 份权重内存与全部 IPC。
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
