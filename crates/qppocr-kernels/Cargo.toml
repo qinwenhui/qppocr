@@ -1,0 +1,19 @@
+[package]
+name = "qppocr-kernels"
+description = "qppocr 的算子内核：唯一允许 unsafe 的 crate（AVX2/NEON/WASM SIMD）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["parallel"]
+# 关掉 = 单线程（WASM/嵌入式用）；阈值门控自动退化为串行
+parallel = []
+
+[dependencies]
+
+[lints]
+workspace = true

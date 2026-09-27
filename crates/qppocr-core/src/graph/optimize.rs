@@ -1,0 +1,868 @@
+//! 图优化：常量折叠、算子消除、子图坍缩、bias 折叠、conv+act 融合。
+//!
+//! ONNX Runtime 必须通用：任意算子、任意拓扑、任意 dtype，融合要运行时决定。
+//! 我们只跑 PP-OCR（v4/v6，det/rec/cls），可以认出这些导出器吐的**确切
+//! 子图**并换成单个手写内核——「通用框架税」在这里退掉。
+//!
+//! 全部是**结构匹配**：常数从模型里读、不假设，换个数重导出照样融合；
+//! 不匹配的原样保留。
+
+use std::collections::{HashMap, HashSet};
+
+use crate::onnx::model::{Attribute, Graph, Node};
+use crate::tensor::DType;
+
+fn act_f(a: Option<&Attribute>, dflt: f32) -> f32 {
+    a.filter(|x| x.has_f).map(|x| x.f).unwrap_or(dflt)
+}
+
+fn get_i(a: Option<&Attribute>, dflt: i64) -> i64 {
+    a.filter(|x| x.has_i).map(|x| x.i).unwrap_or(dflt)
+}
+
+/// 单元素 initializer——融合可以当标量用的东西。
+fn scalar_const(g: &Graph, name: &str) -> Option<f32> {
+    let t = g.initializers.get(name)?;
+    if t.dtype != DType::F32 || t.numel() != 1 || t.f32.is_empty() {
+        return None;
+    }
+    Some(t.f32[0])
+}
+
+/// tensor 名 -> 产出节点下标（owned：后续要可变借用 g.nodes）。
+fn producer_map(g: &Graph) -> HashMap<String, usize> {
+    let mut p = HashMap::with_capacity(g.nodes.len() * 2);
+    for (i, n) in g.nodes.iter().enumerate() {
+        for o in &n.outputs {
+            p.insert(o.clone(), i);
+        }
+    }
+    p
+}
+
+/// tensor 名 -> 被多少个节点读（owned，同上）。
+fn consumer_map(g: &Graph) -> HashMap<String, i64> {
+    let mut c: HashMap<String, i64> = HashMap::new();
+    for n in &g.nodes {
+        for inn in &n.inputs {
+            if !inn.is_empty() {
+                *c.entry(inn.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+    c
+}
+
+/// GELU 子图坍缩：`c3·(Mul(X·(Add(Erf(Div(X,c1)),c2))))` 五个节点
+///（Div/Erf/Add/Mul/Mul——导出器就这么拆的）换成一个 FusedGelu。
+pub fn fuse_gelu(g: &mut Graph) -> i64 {
+    let producer = producer_map(g);
+    let consumers = consumer_map(g);
+
+    let mut drop: HashSet<usize> = HashSet::new();
+    // 替换按节点下标放：融合节点落在原外层 Mul 的位置。追加会破坏拓扑序，
+    // 执行器（按序走 + 重试未就绪节点）就要跑跟交错融合数一样多的趟数。
+    let mut replace: HashMap<usize, Node> = HashMap::new();
+
+    let nodes = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let _ = nodes; // 占位说明：node_at 只读借用 g.nodes，与 replace 阶段无重叠
+    let node_at = |nm: &str| -> Option<&Node> { producer.get(nm).map(|&i| &g.nodes[i]) };
+
+    for i in 0..g.nodes.len() {
+        let outer = &g.nodes[i];
+        if outer.op_type != "Mul" || outer.inputs.len() != 2 || drop.contains(&i) {
+            continue;
+        }
+
+        // ---- 外层：out = Mul(inner, c3) ----
+        let (c3, inner_name) = match (
+            scalar_const(g, &outer.inputs[0]),
+            scalar_const(g, &outer.inputs[1]),
+        ) {
+            (Some(v), _) => (v, outer.inputs[1].clone()),
+            (None, Some(v)) => (v, outer.inputs[0].clone()),
+            (None, None) => continue,
+        };
+
+        let inner = match node_at(&inner_name) {
+            Some(n) if n.op_type == "Mul" && n.inputs.len() == 2 => n,
+            _ => continue,
+        };
+        if consumers.get(inner_name.as_str()).copied().unwrap_or(0) != 1 {
+            continue; // 必须是这个 gelu 私有的
+        }
+
+        // ---- 内层：inner = Mul(X, add_out) ----
+        let mut addn: Option<&Node> = None;
+        let mut x_name = String::new();
+        for k in 0..2 {
+            let cand = node_at(&inner.inputs[k]);
+            if let Some(c) = cand {
+                if c.op_type == "Add"
+                    && consumers
+                        .get(inner.inputs[k].as_str())
+                        .copied()
+                        .unwrap_or(0)
+                        == 1
+                {
+                    addn = Some(c);
+                    x_name = inner.inputs[1 - k].clone();
+                    break;
+                }
+            }
+        }
+        let addn = match addn {
+            Some(a) if !x_name.is_empty() => a,
+            _ => continue,
+        };
+
+        // ---- add：add_out = Add(erf_out, c2) ----
+        let mut erfn: Option<&Node> = None;
+        let mut c2 = 0f32;
+        for k in 0..2 {
+            let cand = node_at(&addn.inputs[k]);
+            if let Some(c) = cand {
+                if c.op_type == "Erf"
+                    && consumers.get(addn.inputs[k].as_str()).copied().unwrap_or(0) == 1
+                {
+                    match scalar_const(g, &addn.inputs[1 - k]) {
+                        Some(v) => {
+                            c2 = v;
+                            erfn = Some(c);
+                        }
+                        None => {
+                            erfn = None;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        let erfn = match erfn {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // ---- erf：erf_out = Erf(div_out) ----
+        if erfn.inputs.len() != 1 {
+            continue;
+        }
+        let divn = match node_at(&erfn.inputs[0]) {
+            Some(d) if d.op_type == "Div" => d,
+            _ => continue,
+        };
+        if consumers.get(erfn.inputs[0].as_str()).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+
+        // ---- div：div_out = Div(X, c1)——X 必须是同一个张量 ----
+        if divn.inputs.len() != 2 {
+            continue;
+        }
+        let c1;
+        if divn.inputs[0] == x_name {
+            match scalar_const(g, &divn.inputs[1]) {
+                Some(v) => c1 = v,
+                None => continue,
+            }
+        } else if divn.inputs[1] == x_name {
+            match scalar_const(g, &divn.inputs[0]) {
+                Some(v) => c1 = v,
+                None => continue,
+            }
+        } else {
+            continue;
+        }
+
+        // ---- 匹配 ----
+        let mut gn = Node::default();
+        gn.op_type = "FusedGelu".into();
+        gn.name = format!("{}_fused", outer.name);
+        gn.inputs = vec![x_name.clone()];
+        gn.outputs = outer.outputs.clone();
+        for (nm, v) in [("c1", c1), ("c2", c2), ("c3", c3)] {
+            gn.attrs.push(Attribute {
+                name: nm.into(),
+                f: v,
+                has_f: true,
+                ..Default::default()
+            });
+        }
+        replace.insert(i, gn);
+
+        drop.insert(i);
+        drop.insert(producer[inner_name.as_str()]);
+        drop.insert(producer[addn.outputs[0].as_str()]);
+        drop.insert(producer[erfn.outputs[0].as_str()]);
+        drop.insert(producer[divn.outputs[0].as_str()]);
+    }
+
+    if replace.is_empty() {
+        return 0;
+    }
+    let nfused = replace.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, n) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if let Some(r) = replace.remove(&i) {
+            kept.push(r);
+            continue;
+        }
+        if drop.contains(&i) {
+            continue;
+        }
+        kept.push(n);
+    }
+    g.nodes = kept;
+    nfused
+}
+
+/// 相互抵消的 Transpose 对：`Transpose(perm)` 紧跟其逆，产生一张 arena 里
+/// 已有数据的逐字节拷贝。PP-OCRv6 的 rec 头就吐这个：
+///
+/// ```text
+/// Squeeze    (6,160,1,40) -> (6,160,40)
+/// Transpose  (6,160,40)   -> (6,40,160)
+/// Transpose  (6,40,160)   -> (6,160,40)     <- 上面那个的逆
+/// Unsqueeze  (6,160,40)   -> (6,160,1,40)
+/// ```
+///
+/// 不便宜：transpose 逐元素走 r 维下标、循环里带整数除法，两个各是一整趟
+/// GB/s 级的 pass。两个节点（连带分叉）只为被撤销而存在。
+///
+/// 匹配保守：两个节点都带显式同长 `perm`，且复合为恒等。无 `perm` 的
+/// Transpose 是反转轴，这里不知道秩，不动。
+pub fn drop_identity_pairs(g: &mut Graph) -> i64 {
+    let mut removed: i64 = 0;
+    let mut changed = true;
+    // 删一对可能暴露另一对（上面的 Squeeze/Unsqueeze 要等中间的 transpose
+    // 没了才抵消），跑到不动点。循环有界：每趟至少删一个节点。
+    while changed {
+        changed = false;
+        let prod = producer_map(g);
+
+        let perm_of = |n: &Node| -> Option<Vec<i64>> {
+            let a = n.attr("perm")?;
+            if a.ints.is_empty() {
+                return None; // 默认反转：秩未知
+            }
+            Some(a.ints.clone())
+        };
+
+        // 先按值收好要查的名字（闭包不能借 g.nodes：后面要 remove）
+        let consumers_of = |nodes: &[Node], t: &str| -> i64 {
+            nodes
+                .iter()
+                .flat_map(|n| n.inputs.iter())
+                .filter(|inn| inn.as_str() == t)
+                .count() as i64
+        };
+
+        for bi in 0..g.nodes.len() {
+            if changed {
+                break;
+            }
+            if g.nodes[bi].op_type != "Transpose"
+                || g.nodes[bi].inputs.len() != 1
+                || g.nodes[bi].outputs.len() != 1
+            {
+                continue;
+            }
+            if g.is_graph_output(&g.nodes[bi].outputs[0]) {
+                continue;
+            }
+            let y1 = g.nodes[bi].inputs[0].clone();
+            let ai = match prod.get(y1.as_str()) {
+                Some(&i) => i,
+                None => continue,
+            };
+            if ai == bi || g.nodes[ai].op_type != "Transpose" || g.nodes[ai].inputs.len() != 1 {
+                continue;
+            }
+
+            let p = match perm_of(&g.nodes[ai]) {
+                Some(p) => p,
+                None => continue,
+            };
+            let q = match perm_of(&g.nodes[bi]) {
+                Some(q) => q,
+                None => continue,
+            };
+            if p.len() != q.len() {
+                continue;
+            }
+            let r = p.len();
+            let ident = (0..r).all(|i| {
+                let qi = q[i];
+                qi >= 0 && qi < r as i64 && p[qi as usize] == i as i64
+            });
+            if !ident {
+                continue;
+            }
+
+            // B 的输出是 A 的输入。改写 B 输出的所有读者，删 B。
+            let x = g.nodes[ai].inputs[0].clone();
+            let y2 = g.nodes[bi].outputs[0].clone();
+            for n in g.nodes.iter_mut() {
+                for inn in n.inputs.iter_mut() {
+                    if *inn == y2 {
+                        *inn = x.clone();
+                    }
+                }
+            }
+            g.nodes.remove(bi);
+            removed += 1;
+            // A 现在死了——除非还有别人读 y1（或它是输出）
+            let left = consumers_of(&g.nodes, &y1);
+            if left == 0 && !g.is_graph_output(&y1) {
+                for k in 0..g.nodes.len() {
+                    if g.nodes[k].outputs.len() == 1 && g.nodes[k].outputs[0] == y1 {
+                        g.nodes.remove(k);
+                        removed += 1;
+                        break;
+                    }
+                }
+            }
+            changed = true;
+        }
+    }
+    removed
+}
+
+/// Conv 紧跟激活、conv 输出无其他消费者：
+/// `y = Conv(x, w)` + `z = FusedGelu(y)` 变成一个带激活参数的 Conv 节点。
+/// 内核自己施加激活，省掉一整个节点：分叉、arena 槽位、逐节点簿记。
+///
+/// 激活作用在**GEMM 已写出的输出**上、数据还在 cache——不在寄存器 store
+/// 阶段里变换累加器。测过：折进 epilogue 也精确，但 det_small 慢 5.3%
+///（erf256_ps 把一次除法和一堆常数拖进已经占满 16 个 YMM 的循环）。
+/// 写后 pass 不占 GEMM 寄存器。
+pub fn fuse_conv_activation(g: &mut Graph) -> i64 {
+    let mut consumers: HashMap<String, i64> = HashMap::new();
+    let mut consumer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for inn in &n.inputs {
+            if inn.is_empty() {
+                continue;
+            }
+            *consumers.entry(inn.clone()).or_insert(0) += 1;
+            consumer_of.entry(inn.clone()).or_insert(i);
+        }
+    }
+
+    let mut fuse: Vec<(usize, usize)> = Vec::new(); // (conv 下标, 激活下标)
+    for i in 0..g.nodes.len() {
+        let cn = &g.nodes[i];
+        if cn.op_type != "Conv" || cn.outputs.len() != 1 {
+            continue;
+        }
+        let co = cn.outputs[0].clone();
+        if g.is_graph_output(&co) || consumers.get(&co).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let cu = match consumer_of.get(&co) {
+            Some(&x) => x,
+            None => continue,
+        };
+        let an = &g.nodes[cu];
+        if (an.op_type != "FusedGelu" && an.op_type != "Relu")
+            || an.inputs.len() != 1
+            || an.outputs.len() != 1
+        {
+            continue;
+        }
+        if an.inputs[0] != co {
+            continue;
+        }
+        // 只融合 group == 1：depthwise 不走 sgemm，一个静默丢掉融合激活的
+        // conv2d 比一个从不接手的糟糕得多。
+        if get_i(cn.attr("group"), 1) != 1 {
+            continue;
+        }
+        fuse.push((i, cu));
+    }
+    if fuse.is_empty() {
+        return 0;
+    }
+
+    let mut drop: HashSet<usize> = HashSet::new();
+    for &(ci, ai) in &fuse {
+        let an_attrs = g.nodes[ai].attrs.clone();
+        let is_gelu = g.nodes[ai].op_type == "FusedGelu";
+        let an_out = g.nodes[ai].outputs[0].clone();
+        let cn = &mut g.nodes[ci];
+        let mut kind = Attribute::default();
+        kind.name = "act".into();
+        kind.has_i = true;
+        kind.i = if is_gelu { 1 } else { 2 }; // 1 = gelu，2 = relu
+        cn.attrs.push(kind);
+        if is_gelu {
+            // 移动 c1/c2/c3 → act_c1/act_c2/act_c3
+            for (from, to, dflt) in [
+                ("c1", "act_c1", 1.414_213_5f32),
+                ("c2", "act_c2", 1.0),
+                ("c3", "act_c3", 0.5),
+            ] {
+                let v = act_f(an_attrs.iter().find(|a| a.name == from), dflt);
+                cn.attrs.retain(|x| x.name != to);
+                cn.attrs.push(Attribute {
+                    name: to.into(),
+                    f: v,
+                    has_f: true,
+                    ..Default::default()
+                });
+            }
+        }
+        cn.outputs[0] = an_out; // 保留激活的输出名，消费者才能解析
+        drop.insert(ai);
+    }
+
+    let n = fuse.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if drop.contains(&i) {
+            continue;
+        }
+        kept.push(node);
+    }
+    g.nodes = kept;
+    n
+}
+
+/// 门控块坍缩：`Add(Mul(特征, 门), 残差)` → 单个 `MulAddScale`。
+///
+/// PP-OCRv6 的大核主干里每个块都有这么一个（SE 路径算出 `[1,C,1,1]` 的门），
+/// 分开跑要写一趟、再读一趟中间的 12 MB 特征图。融合成一次「读三写一」。
+///
+/// 形状在优化期拿不到（图里只有名字），所以**不在这里判形状**：节点照建，
+/// 执行期看门的元素数是否等于通道数，是就走逐通道标量的快路径、不是就退回
+/// 通用的「先 Mul 再 Add」——两条路数值都等价。
+pub fn fuse_mul_add(g: &mut Graph) -> i64 {
+    let consumers = consumer_map(g);
+    let mut producer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for o in &n.outputs {
+            producer_of.insert(o.clone(), i);
+        }
+    }
+
+    let mut fuse: Vec<(usize, usize, bool)> = Vec::new(); // (Add 下标, Mul 下标, Mul 是否是 Add 的第 0 个输入)
+    for i in 0..g.nodes.len() {
+        let an = &g.nodes[i];
+        if an.op_type != "Add" || an.inputs.len() != 2 || an.outputs.len() != 1 {
+            continue;
+        }
+        for side in 0..2 {
+            let mo = &an.inputs[side];
+            if mo.is_empty() || consumers.get(mo).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(&mi) = producer_of.get(mo) else {
+                continue;
+            };
+            let mn = &g.nodes[mi];
+            if mn.op_type != "Mul" || mn.inputs.len() != 2 || mn.outputs.len() != 1 {
+                continue;
+            }
+            fuse.push((i, mi, side == 0));
+            break;
+        }
+    }
+    if fuse.is_empty() {
+        return 0;
+    }
+
+    let mut drop: HashSet<usize> = HashSet::new();
+    for &(ai, mi, mul_first) in &fuse {
+        let mn = g.nodes[mi].clone();
+        let an = g.nodes[ai].clone();
+        let residual = an.inputs[if mul_first { 1 } else { 0 }].clone();
+        let out_name = an.outputs[0].clone();
+        let cn = &mut g.nodes[ai];
+        cn.op_type = "MulAddScale".into();
+        cn.inputs = vec![mn.inputs[0].clone(), mn.inputs[1].clone(), residual];
+        cn.outputs = vec![out_name];
+        cn.attrs.clear();
+        cn.name = format!("fused:{}", an.name);
+        drop.insert(mi);
+    }
+
+    let n = fuse.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if drop.contains(&i) {
+            continue;
+        }
+        kept.push(node);
+    }
+    g.nodes = kept;
+    n
+}
+
+/// Conv 后紧跟单消费者 Add(bias)：bias 折进 Conv 第三输入。
+/// 省掉最常见的一次 Add 的读改写——转换版模型把 bias 拆成独立 Add
+///（上游原件折在 Conv 里，这个 pass 对它们是 no-op）。
+/// Conv → BatchNormalization 折叠：BN 的仿射直接乘进 conv 的权重与 bias。
+///
+/// 数学上恒等：`y = (W∗x + b − μ)·γ/σ + β = (W·γ/σ)∗x + ((b−μ)·γ/σ + β)`。
+/// 浮点上**不逐位一致**（缩放从「累加之后」挪到「权重上」），准入靠
+/// 100 图逐字符对拍。BN 的四个参数折叠后无人引用，一并删除。
+///
+/// 每张 det 图少 0 个这种对（det 无 BN），rec 每图 44 处（2.3 ms、6.7 MB
+/// 串行账）、cls 每图 ~30 处——这些节点全在行阶段，而行阶段的逐元素算子
+/// 是**带宽绑定**的（16 线程聚合带宽反而低于单线程），折掉它们同时改善
+/// 并行扩展的 Amdahl 构成。
+pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
+    let consumers = consumer_map(g);
+    let mut consumer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for inn in &n.inputs {
+            if !inn.is_empty() {
+                consumer_of.entry(inn.clone()).or_insert(i);
+            }
+        }
+    }
+
+    let mut fold: Vec<(usize, usize, usize)> = Vec::new(); // (conv 下标, BN 下标, 输出通道数)
+    for i in 0..g.nodes.len() {
+        let cn = &g.nodes[i];
+        if cn.op_type != "Conv" || cn.inputs.len() < 2 || cn.outputs.len() != 1 {
+            continue;
+        }
+        let conv_out = cn.outputs[0].clone();
+        if g.is_graph_output(&conv_out) {
+            continue;
+        }
+        if consumers.get(&conv_out).copied().unwrap_or(0) != 1 {
+            continue; // conv 的输出必须只喂这一个 BN
+        }
+        let Some(&bu) = consumer_of.get(&conv_out) else {
+            continue;
+        };
+        let bn = &g.nodes[bu];
+        if bn.op_type != "BatchNormalization" || bn.inputs.len() != 5 || bn.outputs.len() != 1 {
+            continue;
+        }
+        if bn.inputs[0] != conv_out {
+            continue;
+        }
+        let Some(w) = g.initializers.get(&cn.inputs[1]) else {
+            continue;
+        };
+        if w.dtype != DType::F32 || w.shape.is_empty() {
+            continue;
+        }
+        let m = w.shape[0] as usize;
+        if m == 0 {
+            continue;
+        }
+        let mut ok = true;
+        for k in 1..5 {
+            match g.initializers.get(&bn.inputs[k]) {
+                Some(t) if t.dtype == DType::F32 && t.numel() == m as i64 => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        fold.push((i, bu, m));
+    }
+    if fold.is_empty() {
+        return 0;
+    }
+
+    let mut drop_bn: HashSet<usize> = HashSet::new();
+    for &(ci, bi, m) in &fold {
+        let bn_in = g.nodes[bi].inputs.clone();
+        let bn_out = g.nodes[bi].outputs[0].clone();
+        let eps = g.nodes[bi].attr("epsilon").map(|a| a.f).unwrap_or(1e-5);
+        let take = |g: &Graph, name: &str| -> Vec<f32> { g.initializers[name].f32.to_vec() };
+        let scale = take(g, &bn_in[1]);
+        let beta = take(g, &bn_in[2]);
+        let mean = take(g, &bn_in[3]);
+        let var = take(g, &bn_in[4]);
+        let a: Vec<f32> = (0..m).map(|c| scale[c] / (var[c] + eps).sqrt()).collect();
+
+        // W' = W · a（逐输出通道）
+        let wname = g.nodes[ci].inputs[1].clone();
+        let kg = {
+            let w = g.initializers.get(&wname).unwrap();
+            (w.numel() as usize) / m
+        };
+        let w = g.initializers.get_mut(&wname).unwrap();
+        let ws = w.f32.as_mut_slice();
+        for c in 0..m {
+            let ac = a[c];
+            for k in 0..kg {
+                ws[c * kg + k] *= ac;
+            }
+        }
+
+        // b' = (b − μ)·a + β；conv 原本没有 bias 就地造一个
+        let bias_name = if g.nodes[ci].inputs.len() >= 3 {
+            Some(g.nodes[ci].inputs[2].clone())
+        } else {
+            None
+        };
+        let nb: Vec<f32> = match &bias_name {
+            None => (0..m).map(|c| (-mean[c]) * a[c] + beta[c]).collect(),
+            Some(bn_) => {
+                let b = g.initializers[bn_].f32.to_vec();
+                (0..m).map(|c| (b[c] - mean[c]) * a[c] + beta[c]).collect()
+            }
+        };
+        match &bias_name {
+            Some(bn_) => {
+                let b = g.initializers.get_mut(bn_).unwrap();
+                b.f32.as_mut_slice()[..m].copy_from_slice(&nb);
+            }
+            None => {
+                let nbname = format!("{bn_out}.bnb");
+                g.initializers.insert(
+                    nbname.clone(),
+                    crate::tensor::Tensor {
+                        name: nbname.clone(),
+                        shape: vec![m as i64],
+                        dtype: DType::F32,
+                        f32: qppocr_kernels::buf::F32Buf::from_vec(&nb),
+                        i64: Vec::new(),
+                    },
+                );
+                g.nodes[ci].inputs.push(nbname);
+            }
+        }
+
+        // conv 接管 BN 的输出名，BN 节点删除。
+        // ★ BN 的四个参数**不删**：medium 档的 BN 参数与其他节点共享，
+        //   删掉会让那些引用悬空、整图 pending 卡死（子进程表现为永久
+        //   挂起）。无人引用的 initializer 只是几 KB 死权重，无害。
+        g.nodes[ci].outputs[0] = bn_out;
+        drop_bn.insert(bi);
+    }
+
+    let n = fold.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if !drop_bn.contains(&i) {
+            kept.push(node);
+        }
+    }
+    g.nodes = kept;
+    n
+}
+
+/// Conv → Add 残差融合：`Add(conv_out, R)` 的 R 折进 conv 的收尾
+/// （`conv2d_res`，激活之后逐元素加，与原 Add 同值同序——逐位不变）。
+///
+/// 条件：conv 输出恰好只喂这一个 Add；R 与 conv 输出同元素数。conv 若无
+/// bias 会补一个零 bias，保证 residual 恒在 inputs[3]、与 bias 无歧义。
+/// rec 每图 ~60 处（残差与 SE 块）、det 的双分支合并同理——这些 Add 全在
+/// **带宽绑定**的行阶段/FPN，折掉一个少一份不随线程扩展的流量。
+pub fn fuse_conv_residual(g: &mut Graph) -> i64 {
+    let consumers = consumer_map(g);
+    let mut producer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for o in &n.outputs {
+            producer_of.insert(o.clone(), i);
+        }
+    }
+    let mut consumer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for inn in &n.inputs {
+            if !inn.is_empty() {
+                consumer_of.entry(inn.clone()).or_insert(i);
+            }
+        }
+    }
+
+    let mut fuse: Vec<(usize, usize)> = Vec::new(); // (conv, add)
+    for i in 0..g.nodes.len() {
+        let cn = &g.nodes[i];
+        if cn.op_type != "Conv" || cn.inputs.len() < 2 || cn.outputs.len() != 1 {
+            continue;
+        }
+        let conv_out = cn.outputs[0].clone();
+        if g.is_graph_output(&conv_out) {
+            continue;
+        }
+        if consumers.get(&conv_out).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let Some(&au) = consumer_of.get(&conv_out) else {
+            continue;
+        };
+        let an = &g.nodes[au];
+        if an.op_type != "Add" || an.inputs.len() != 2 || an.outputs.len() != 1 {
+            continue;
+        }
+        // 另一操作数 R：运行期张量（不在 initializers）或常量都行，
+        // 但必须与 conv 输出同元素数——元素数只能从 conv 形状推断，
+        // 这里用保守条件：R 的生产者是节点（运行期）；常量残差极少见。
+        let rname = if an.inputs[0] == conv_out {
+            an.inputs[1].clone()
+        } else if an.inputs[1] == conv_out {
+            an.inputs[0].clone()
+        } else {
+            continue;
+        };
+        if rname.is_empty() || g.initializers.contains_key(&rname) {
+            continue;
+        }
+        if g.inputs.iter().any(|gi| gi == &rname) {
+            continue; // 图输入做残差：折叠会把网络入口挂进依赖链
+        }
+        // ★ R 必须由**下标更小**的节点产出（ONNX 按下标即拓扑序）。
+        //   medium 档存在反序的 Add 模式——折叠它会让 conv 依赖一个
+        //   （间接）依赖 conv 旧输出的张量，成环，整图 pending 卡死，
+        //   子进程表现为永久挂起。保守条件只是少折叠几个，不出错。
+        let Some(&rp) = producer_of.get(&rname) else {
+            continue;
+        };
+        if rp >= i {
+            continue;
+        }
+        fuse.push((i, au));
+    }
+    if fuse.is_empty() {
+        return 0;
+    }
+
+    let mut drop_add: HashSet<usize> = HashSet::new();
+    for &(ci, ai) in &fuse {
+        let an_in0 = g.nodes[ai].inputs[0].clone();
+        let an_in1 = g.nodes[ai].inputs[1].clone();
+        let an_out = g.nodes[ai].outputs[0].clone();
+        let conv_out = g.nodes[ci].outputs[0].clone();
+        let rname = if an_in0 == conv_out { an_in1 } else { an_in0 };
+
+        // conv 无 bias 则补零 bias，让 residual 固定落在 inputs[3]
+        if g.nodes[ci].inputs.len() == 2 {
+            let w = &g.initializers[&g.nodes[ci].inputs[1]];
+            let m = w.shape[0] as usize;
+            let zname = format!("{an_out}.zb");
+            g.initializers.insert(
+                zname.clone(),
+                crate::tensor::Tensor {
+                    name: zname.clone(),
+                    shape: vec![m as i64],
+                    dtype: DType::F32,
+                    f32: qppocr_kernels::buf::F32Buf::from_vec(&vec![0f32; m]),
+                    i64: Vec::new(),
+                },
+            );
+            g.nodes[ci].inputs.push(zname);
+        }
+        g.nodes[ci].inputs.push(rname);
+        g.nodes[ci].outputs[0] = an_out;
+        drop_add.insert(ai);
+    }
+
+    let n = fuse.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if !drop_add.contains(&i) {
+            kept.push(node);
+        }
+    }
+    g.nodes = kept;
+    n
+}
+
+/// 把只被一个 Add 消费的每通道常量 bias 吸收进前驱 Conv（fold_conv_bias）。
+pub fn fold_conv_bias(g: &mut Graph) -> i64 {
+    let consumers = consumer_map(g);
+    // tensor -> 唯一读者的下标
+    let mut consumer_of: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for inn in &n.inputs {
+            if !inn.is_empty() {
+                consumer_of.entry(inn.clone()).or_insert(i);
+            }
+        }
+    }
+
+    let mut absorb: Vec<(usize, usize)> = Vec::new(); // (conv 下标, add 下标)
+    for i in 0..g.nodes.len() {
+        let cn = &g.nodes[i];
+        if cn.op_type != "Conv" || cn.inputs.len() != 2 {
+            continue; // 已经有 bias
+        }
+        if cn.outputs.len() != 1 {
+            continue;
+        }
+        let conv_out = cn.outputs[0].clone();
+        if g.is_graph_output(&conv_out) {
+            continue;
+        }
+        if consumers.get(&conv_out).copied().unwrap_or(0) != 1 {
+            continue; // 必须恰好喂一个消费者
+        }
+        // producer 映到的是**产出** conv_out 的节点（Conv 自己）；要的 Add
+        // 是**读** conv_out 的节点，用 consumer_of 查。
+        let cu = match consumer_of.get(&conv_out) {
+            Some(&x) => x,
+            None => continue,
+        };
+        let an = &g.nodes[cu];
+        if an.op_type != "Add" || an.inputs.len() != 2 || an.outputs.len() != 1 {
+            continue;
+        }
+
+        // 另一操作数必须是每输出通道一值的常量
+        let ww = match g.initializers.get(&cn.inputs[1]) {
+            Some(w) => w,
+            None => continue,
+        };
+        if ww.shape.is_empty() {
+            continue;
+        }
+        let m = ww.shape[0];
+
+        let bname = if an.inputs[0] == conv_out {
+            an.inputs[1].clone()
+        } else if an.inputs[1] == conv_out {
+            an.inputs[0].clone()
+        } else {
+            continue;
+        };
+        let bb = match g.initializers.get(&bname) {
+            Some(b) => b,
+            None => continue,
+        };
+        if bb.dtype != DType::F32 || bb.numel() != m {
+            continue;
+        }
+
+        absorb.push((i, cu));
+    }
+    if absorb.is_empty() {
+        return 0;
+    }
+
+    let mut drop_add: HashSet<usize> = HashSet::new();
+    for &(ci, ai) in &absorb {
+        let an_in0 = g.nodes[ai].inputs[0].clone();
+        let an_in1 = g.nodes[ai].inputs[1].clone();
+        let an_out = g.nodes[ai].outputs[0].clone();
+        let conv_out = g.nodes[ci].outputs[0].clone();
+        let bname = if an_in0 == conv_out { an_in1 } else { an_in0 };
+        let cn = &mut g.nodes[ci];
+        cn.inputs.push(bname); // conv2d 本来就会施加逐通道 bias
+        cn.outputs[0] = an_out; // 保留 Add 的名字，消费者才能解析
+        drop_add.insert(ai);
+    }
+
+    let n = absorb.len() as i64;
+    let mut kept: Vec<Node> = Vec::with_capacity(g.nodes.len());
+    for (i, node) in std::mem::take(&mut g.nodes).into_iter().enumerate() {
+        if drop_add.contains(&i) {
+            continue;
+        }
+        kept.push(node);
+    }
+    g.nodes = kept;
+    n
+}
