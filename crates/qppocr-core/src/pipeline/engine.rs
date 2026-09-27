@@ -1079,9 +1079,13 @@ impl Engine {
                 max_wh_ratio = max_wh_ratio.max(wh_ratio[i]);
             }
             let mut img_w = (img_h as f32 * max_wh_ratio) as i32;
-            if self.cfg.rec_width_grain > 1 {
-                img_w = (img_w + self.cfg.rec_width_grain - 1) / self.cfg.rec_width_grain
-                    * self.cfg.rec_width_grain;
+            let grain = std::env::var("QPPOCR_REC_GRAIN")
+                .ok()
+                .and_then(|v| v.trim().parse::<i32>().ok())
+                .filter(|&v| v > 1)
+                .unwrap_or(self.cfg.rec_width_grain);
+            if grain > 1 {
+                img_w = (img_w + grain - 1) / grain * grain;
             }
 
             let bsz = end - beg;
