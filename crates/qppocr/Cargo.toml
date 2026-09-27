@@ -22,7 +22,7 @@ image-decode = ["dep:image"]
 serde = ["dep:serde", "qppocr-core/serde"]
 
 [dependencies]
-qppocr-core = { path = "../qppocr-core", version = "0.1.2" }
+qppocr-core = { path = "../qppocr-core", version = "0.2.0" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 

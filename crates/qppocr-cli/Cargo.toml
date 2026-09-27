@@ -14,7 +14,7 @@ name = "qppocr"
 path = "src/main.rs"
 
 [dependencies]
-qppocr = { path = "../qppocr", version = "0.1.2" }
+qppocr = { path = "../qppocr", version = "0.2.0" }
 # 参考 CLI 的全局分配器：CRT 堆在多线程分配下有锁竞争，mimalloc 消掉它
 # （100 图 4 轮交错实测整体 0.983，收益集中在 det）。库本体不绑定分配器。
 mimalloc = { version = "0.1", default-features = false }
