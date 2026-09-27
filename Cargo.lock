@@ -197,7 +197,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qppocr"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "image",
  "qppocr-core",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "qppocr-cli"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "mimalloc",
  "qppocr",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "qppocr-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "image",
  "qppocr-kernels",
@@ -224,7 +224,7 @@ dependencies = [
 
 [[package]]
 name = "qppocr-kernels"
-version = "0.1.2"
+version = "0.2.0"
 
 [[package]]
 name = "quote"
