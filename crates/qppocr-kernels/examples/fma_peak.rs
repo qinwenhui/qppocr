@@ -29,10 +29,14 @@ unsafe fn loop_fma(iters: usize) -> f32 {
 }
 
 fn main() {
-    let n: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(20_000_000);
+    let n: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000_000);
     let mut best = f64::MAX;
     for _ in 0..5 {
         let t0 = std::time::Instant::now();
+        // SAFETY: loop_fma 只做纯算术，无内存副作用。
         let v = unsafe { loop_fma(n) };
         let s = t0.elapsed().as_secs_f64();
         best = best.min(s);
@@ -40,7 +44,11 @@ fn main() {
     }
     // 每次迭代 8 条 FMA × 8 lane × 2 flop = 128 flop
     let flops = (n as f64) * 128.0;
-    println!("单核 AVX2+FMA 峰值 ≈ {:.1} GFLOPS = {:.1} GMAC/s（{:.2} GHz 等效）",
-             flops / best / 1e9, flops / best / 2e9, flops / best / 32e9);
+    println!(
+        "单核 AVX2+FMA 峰值 ≈ {:.1} GFLOPS = {:.1} GMAC/s（{:.2} GHz 等效）",
+        flops / best / 1e9,
+        flops / best / 2e9,
+        flops / best / 32e9
+    );
     println!("对照：sgemm 单线程实测 42 GMAC/s（bench_gemm 82-97 GFLOPS）");
 }

@@ -151,6 +151,23 @@ pub fn sgemm_serial(
     sgemm_impl(a, b, c, m, n, k, ldc, bias, act, true, None);
 }
 
+/// [`sgemm_serial`] 的残差融合版（并行区里逐行调用，保持串行面板路径）。
+#[allow(clippy::too_many_arguments)]
+pub fn sgemm_serial_res(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    bias: Option<&[f32]>,
+    act: &Activation,
+    residual: Option<&[f32]>,
+) {
+    sgemm_impl(a, b, c, m, n, k, ldc, bias, act, true, residual);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sgemm_impl(
     a: &[f32],
@@ -518,7 +535,11 @@ pub fn im2col(
                                 std::ptr::write_bytes(dst.add(hi), 0, ow - hi);
                                 let mut ox = lo;
                                 while ox < hi {
-                                    *dst.add(ox) = *xr.as_ptr().add(ox * sw - pw + kx);
+                                    // ★ 加法在前：`ox*sw - pw + kx` 的左结合会先算
+                                    //   `ox*sw - pw`（lo=0、kx>0 时 usize 下溢）。
+                                    //   release 的回绕恰好绕回正确值，debug 直接
+                                    //   panic——这正是 CI 三次挂掉的那个错。
+                                    *dst.add(ox) = *xr.as_ptr().add(ox * sw + kx - pw);
                                     ox += 1;
                                 }
                             }

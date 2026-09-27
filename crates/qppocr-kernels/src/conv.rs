@@ -15,7 +15,7 @@
 
 use crate::activation::Activation;
 use crate::buf::F32Buf;
-use crate::gemm::{im2col, sgemm, sgemm_bptrs_serial, sgemm_serial};
+use crate::gemm::{im2col, sgemm_bptrs_serial, sgemm_serial_res};
 use crate::par;
 
 /// 深度卷积一个 (n, channel) 平面的**标量参考实现**（非 x86 的兜底，
@@ -228,7 +228,8 @@ pub fn conv2d_res(
                     // SAFETY: 本块写的行 [(bn*m+m0), (bn*m+m1)) 与其他块不相交。
                     let ysub = unsafe { yp.offset((bn * m + m0) * ohw).slice((m1 - m0) * ohw) };
                     {
-                        sgemm_serial(
+                        let rsub = residual.map(|r| &r[(bn * m + m0) * ohw..(bn * m + m1) * ohw]);
+                        sgemm_serial_res(
                             &wt[m0 * c..],
                             &x[bn * c * ohw..],
                             ysub,
@@ -238,6 +239,7 @@ pub fn conv2d_res(
                             ohw,
                             bias.map(|b| &b[m0..]),
                             act,
+                            rsub,
                         );
                     }
                     r = bn * m + m1;
@@ -249,7 +251,16 @@ pub fn conv2d_res(
                 let ysub = &mut y[bn * m * ohw..(bn + 1) * m * ohw];
                 let rsub = residual.map(|r| &r[bn * m * ohw..(bn + 1) * m * ohw]);
                 crate::gemm::sgemm_res(
-                    wt, &x[bn * c * ohw..], ysub, m, ohw, c, ohw, bias, act, rsub,
+                    wt,
+                    &x[bn * c * ohw..],
+                    ysub,
+                    m,
+                    ohw,
+                    c,
+                    ohw,
+                    bias,
+                    act,
+                    rsub,
                 );
             }
         }
@@ -409,7 +420,7 @@ pub fn conv2d_res(
                 im2col(
                     xg, cg, h, wdim, kh, kw, p.sh, p.sw, p.ph, p.pw, ow, oy0, rows, &mut cols,
                 );
-                sgemm_serial(
+                sgemm_serial_res(
                     wg,
                     &cols,
                     yg,
@@ -419,6 +430,7 @@ pub fn conv2d_res(
                     ohw,
                     bias.map(|b| &b[g * mg..]),
                     act,
+                    None, // 残差由函数尾部的统一趟处理（非 1x1 路径）
                 );
             }
         };
@@ -458,6 +470,19 @@ pub fn conv2d_res(
                 bias_body(0, n * m);
             }
         }
+    }
+    // 非 1x1 路径的残差：bias 之后逐元素加（与独立 Add 同值同序）。
+    if let Some(r) = tail_residual {
+        let total = out_elems;
+        let yp2 = par::SyncPtr::new(y.as_mut_slice().as_mut_ptr());
+        par::parallel_for_elems(total, total * 4, |b0, e0| {
+            // SAFETY: 元素区间 [b0, e0) 与其他并行块不相交；r 同长。
+            let seg = unsafe { yp2.offset(b0).slice(e0 - b0) };
+            let rs = &r[b0..e0];
+            for (d, sv) in seg.iter_mut().zip(rs) {
+                *d += *sv;
+            }
+        });
     }
     out_shape
 }
