@@ -224,10 +224,14 @@ det 已经不多了、行阶段是大头。
 5. **更多节点融合**（对方有 9 类，我们 4 类）：`Conv + Bias + ResidualAdd`、
    `ConvTranspose + Bias + Activation`、`Conv + HardSwish`。det 的 `Add`
    有 15 处、93 MB，融进生产者卷积能省掉「写中间张量 + 再读回来」两趟。
-6. **det 里 <15 GB/s 的算子**：MaxPool 8.8、Resize 13.2、Sigmoid 4.6、
-   `Conv 3->16 k3x3 s2` 39 GMAC/s（机器峰值 137）。合计约 5 ms。
-   `connected_components` 2.6 ms 已试过拿掉整除，**没用**（LLVM 已强度归约），
-   占 DB 后处理的 70%，得换算法。
+6. **det 里 <15 GB/s 的算子**：MaxPool 8.8、Resize 13.2、Sigmoid 4.6 GB/s。
+   合计约 5 ms，**但这些是带宽绑定的，不是内核写得差**：
+   - MaxPool 已试过**单趟化**（去掉 scratch 行）——**无收益**（2.6-2.9 →
+     2.5-3.1 ms）。它读 2 行 + 写 1 行 = 38 MB 实际流量 @ ~13 GB/s，
+     瓶颈就是 DRAM，记账口径的 25.6 MB 低估了它。
+   - `connected_components` 2.6 ms 试过拿掉整除——**没用**（LLVM 已强度
+     归约），占 DB 后处理的 70%，真要动得换算法。
+   → 这一类的正确做法是**减少流量**（融合掉上游的写），不是再抠内核。
 7. **区域重试触发率**：我们 9/100、对方 7/100，触发一次该图 det 翻倍。
    ⚠ 但**测试时用的是关掉重试的配置**（`Preset::Speed`），这是应用层功能，别当性能问题。
 
