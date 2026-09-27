@@ -254,7 +254,10 @@ impl Default for Advanced {
             unclip_ratio: 1.6,
             unclip_perp: 1.0,
             unclip_margin_thresh: 0.0,
-            retry_conf: 0.85,
+            // 区域重试默认关：它是应用层的质量增强（低置信区域重跑一遍
+            // det），代价是触发图 det 翻倍（语料上 9/100 张）。要开用
+            // Accuracy 预设或 Advanced::retry_conf。
+            retry_conf: 0.0,
             merge_line_gap: 0.5,
             rec_batch_ratio: 1.1,
             rec_space_gap: 0.3,
@@ -486,6 +489,8 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
         }
         Preset::Balanced => {
             pc.rec_height = 48;
+            // retry 继承默认（关）。曾经这里留 0.85，等于「默认模式背着
+            // 一半用户开慢路径」——基准测试里更是白送 9/100 张的双倍 det。
         }
         Preset::Accuracy => {
             pc.rec_height = 48;
