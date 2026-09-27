@@ -1307,7 +1307,11 @@ impl Session {
                 let need: Vec<&str> = n
                     .inputs
                     .iter()
-                    .filter(|inn| !inn.is_empty() && !arena.contains_key(*inn))
+                    .filter(|inn| {
+                        !inn.is_empty()
+                            && !arena.contains_key(*inn)
+                            && !self.initializers.contains_key(inn.as_str())
+                    })
                     .map(|s| s.as_str())
                     .collect();
                 if !need.is_empty() {

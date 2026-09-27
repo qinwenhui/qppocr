@@ -660,7 +660,9 @@ pub fn load_onnx_memory(data: &[u8], display_name: &str) -> Result<Graph> {
     g.fused_conv_act = crate::graph::optimize::fuse_conv_activation(&mut g);
     // 残差融合在 act 之后：它要看到最终形态的 Conv；在门控块之前：
     // 门控块的 Add(Mul(feature,gate),residual) 与这里是两种不同模式。
-    crate::graph::optimize::fuse_conv_residual(&mut g);
+    if std::env::var_os("QPPOCR_NO_RESIDUAL").is_none() {
+        crate::graph::optimize::fuse_conv_residual(&mut g);
+    }
     // 门控块放最后：它要看到最终形态的 Mul/Add（前面的 pass 可能已经改过
     // 这两类节点的输入）。
     g.fused_mul_add = crate::graph::optimize::fuse_mul_add(&mut g);
