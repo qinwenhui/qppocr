@@ -199,13 +199,13 @@ pub fn set_pool_slot(i: usize) {
     crate::pool::set_pool_slot(i);
 }
 
-/// 在 x86 上打开 FTZ/DAZ（刷新非正规数）。
+/// 打开 FTZ/DAZ（刷新非正规数）。
 ///
 /// 必须在 worker 线程诞生前于主线程调用；`qppocr-core` 在引擎构造时做这件事。
 /// 这是**逐位可复现**的前提之一：FTZ 改变非正规数结果的位模式。
 ///
-/// （`_mm_getcsr`/`_mm_setcsr` 内联函数已被 std 标记 deprecated，这里按其
-/// 建议改用内联汇编——语义就是 STMXCSR / LDMXCSR 两条指令。）
+/// x86-64 经 MXCSR（FTZ|DAZ 位），aarch64 经 FPCR（FZ 位——同时覆盖输入
+/// 与输出的非正规数冲刷）。其余架构无操作。
 pub fn enable_flush_denormals() {
     #[cfg(target_arch = "x86_64")]
     {
@@ -219,6 +219,18 @@ pub fn enable_flush_denormals() {
             std::arch::asm!("stmxcsr [{0}]", in(reg) &mut word, options(nostack));
             word |= 0x8040; // FTZ | DAZ
             std::arch::asm!("ldmxcsr [{0}]", in(reg) &word, options(nostack));
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: MRS 读 FPCR 到通用寄存器、MSR 写回，只改 FZ 位
+        //（bit 24），其余位原样保留。仅影响当前线程的浮点控制寄存器。
+        unsafe {
+            // SAFETY: 见上方注释。
+            let mut fpcr: u64;
+            std::arch::asm!("mrs {0}, fpcr", out(reg) fpcr);
+            fpcr |= 1 << 24; // FZ
+            std::arch::asm!("msr fpcr, {0}", in(reg) fpcr);
         }
     }
 }

@@ -8,7 +8,25 @@
 
 ## [Unreleased]
 
-（尚无）
+### 新增（Added）
+
+- **aarch64 NEON 后端**：sgemm 面板（含 implicit-GEMM 指针面板）、窄 N
+  路径、深度卷积、ConvTranspose、激活（GELU/erf/exp/ReLU/clip/
+  HardSigmoid/sigmoid）、softmax、二元算子、2x2 池化、双线性缩放、
+  2x2 膨胀——全部与标量判据逐位一致（`bitexact` 对拍在 aarch64 上自动
+  选 NEON 侧）。Apple Silicon（M 系列）与各家 ARM 服务器/手机 SoC 从
+  纯标量回退升级为向量执行。f32 NEON 是 aarch64 基线指令集，无需运行时
+  探测；`enable_flush_denormals` 在 aarch64 上经 FPCR 置 FZ 位。
+- `Backend` 枚举新增 `Neon` 档；`detect_backend()` 在 aarch64 上返回它。
+
+### 变更（Changed）
+
+- **内核分发层重构为单一入口**（`qppocr-kernels::arch`）：全部
+  `target_arch` 接线集中到一个模块，内核文件不再含架构条件；原先
+  「分发宏 + cfg-if」两套写法合一。标量参考实现从调用点内联代码抽成
+  命名函数（仍是逐位判据）。x86-64 输出逐位不变。
+- implicit-GEMM（卷积免 im2col 物化路径）不再限定特定架构：无向量后端
+  的目标同样走指针面板，省掉 patch 矩阵的内存搬运。
 
 ## [0.2.0] - 2026-09-27
 

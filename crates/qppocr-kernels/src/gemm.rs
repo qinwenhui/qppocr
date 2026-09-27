@@ -72,7 +72,6 @@ pub fn sgemm_res(
 ///
 /// 与 [`sgemm_serial`] 走**同一条面板路径、同一个 k 序**（ch → ky → kx），
 /// 输出逐位一致。
-#[cfg(target_arch = "x86_64")]
 #[allow(clippy::too_many_arguments)]
 pub fn sgemm_bptrs_serial(
     a: &[f32],
@@ -99,7 +98,7 @@ pub fn sgemm_bptrs_serial(
     // 调用方保证指向可读的 slab（含右侧 slack）。
     unsafe {
         if sw == 2 {
-            crate::x86::sgemm_panel_bptrs_avx2::<2>(
+            crate::arch::sgemm_panel_bptrs::<2>(
                 a.as_ptr(),
                 bptrs.as_ptr(),
                 c.as_mut_ptr(),
@@ -112,7 +111,7 @@ pub fn sgemm_bptrs_serial(
                 np,
             );
         } else {
-            crate::x86::sgemm_panel_bptrs_avx2::<1>(
+            crate::arch::sgemm_panel_bptrs::<1>(
                 a.as_ptr(),
                 bptrs.as_ptr(),
                 c.as_mut_ptr(),
@@ -195,30 +194,24 @@ fn sgemm_impl(
     if let Some(b) = bias {
         assert!(b.len() >= m, "sgemm: bias too small");
     }
-    #[cfg(target_arch = "x86_64")]
     let bptr = |bias: Option<&[f32]>| bias.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-
-    // AVX2 与标量共用同一套分发；内核选择见 panel_body/m_rows_body 的注释。
 
     // 小 GEMM 留在单线程——但仍然走同一内核。 这里曾退化为标量三重循环，
     // 让角度分类器和 FPN neck 里的每个小 conv 比算术该有的慢几个数量级。
     if serial || flops < par::thresholds().gemm_par_min || par::threads() == 1 {
         // SAFETY: 串行调用，无并发访问；形状已在上面的 assert 校验。
         unsafe {
-            crate::arch_dispatch!(
-                crate::x86::sgemm_panel_avx2(
-                    a.as_ptr(),
-                    b.as_ptr(),
-                    c.as_mut_ptr(),
-                    m,
-                    n,
-                    k,
-                    ldc,
-                    bptr(bias),
-                    0,
-                    np,
-                ),
-                panel_body(a, b, c.as_mut_ptr(), m, n, k, ldc, bias, 0, np)
+            crate::arch::sgemm_panel(
+                a.as_ptr(),
+                b.as_ptr(),
+                c.as_mut_ptr(),
+                m,
+                n,
+                k,
+                ldc,
+                bptr(bias),
+                0,
+                np,
             )
         };
         finish_res(c, residual, m, n, ldc, act);
@@ -234,20 +227,17 @@ fn sgemm_impl(
         par::parallel_for(np, 1, |pb, pe| {
             // SAFETY: 各面板写不相交的列区间 [p*32, p*32+nn)，元素两两不重叠。
             unsafe {
-                crate::arch_dispatch!(
-                    crate::x86::sgemm_panel_avx2(
-                        a.as_ptr(),
-                        b.as_ptr(),
-                        cp.get(),
-                        m,
-                        n,
-                        k,
-                        ldc,
-                        bptr(bias),
-                        pb,
-                        pe,
-                    ),
-                    panel_body(a, b, cp.get(), m, n, k, ldc, bias, pb, pe)
+                crate::arch::sgemm_panel(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    cp.get(),
+                    m,
+                    n,
+                    k,
+                    ldc,
+                    bptr(bias),
+                    pb,
+                    pe,
                 )
             };
         });
@@ -257,19 +247,17 @@ fn sgemm_impl(
         par::parallel_for(m, 1, |mb, me| {
             // SAFETY: 各块写不相交的行区间 [mb, me)。
             unsafe {
-                crate::arch_dispatch!(
-                    crate::x86::sgemm_mrows_avx2(
-                        a.as_ptr(),
-                        b.as_ptr(),
-                        cp.get(),
-                        n,
-                        k,
-                        ldc,
-                        bptr(bias),
-                        mb,
-                        me,
-                    ),
-                    m_rows_body(a, b, cp.get(), m, n, k, ldc, bias, mb, me)
+                crate::arch::sgemm_mrows(
+                    a.as_ptr(),
+                    b.as_ptr(),
+                    cp.get(),
+                    m,
+                    n,
+                    k,
+                    ldc,
+                    bptr(bias),
+                    mb,
+                    me,
                 )
             };
         });
@@ -280,8 +268,6 @@ fn sgemm_impl(
 /// 激活收尾：作用在已写出的输出上，读的是刚写的数据（cache 命中）。
 /// det 的 1x1 conv 一次调用 47 MB 输出，串行扫比把激活留成独立节点还慢，
 /// 所以这里自己 fork。
-// 仅 x86_64：唯一调用方是同样门控的 sgemm_bptrs_serial（隐式 GEMM 面板）。
-#[cfg(target_arch = "x86_64")]
 fn finish(c: &mut [f32], m: usize, n: usize, ldc: usize, act: &Activation) {
     finish_res(c, None, m, n, ldc, act);
 }
@@ -320,7 +306,9 @@ fn finish_res(
     });
 }
 
-/// 面板体：`[pb, pe)` 号 N 面板，每面板 32 列。
+/// 面板体（标量判据）：`[pb, pe)` 号 N 面板，每面板 32 列。
+///
+/// SIMD 后端（AVX2/NEON）与它逐位对拍；`arch` 分发层的标量分支也走它。
 ///
 /// # Safety
 ///
@@ -332,7 +320,7 @@ fn finish_res(
 /// SAFETY: `c` 的列区间 `[p*32, p*32+nn)`（对所有行）必须与并发调用者
 /// 的区间不相交。
 #[allow(clippy::too_many_arguments)]
-unsafe fn panel_body(
+pub(crate) unsafe fn panel_body(
     a: &[f32],
     b: &[f32],
     c: *mut f32,
@@ -399,13 +387,14 @@ unsafe fn panel_body(
     }
 }
 
-/// 窄 N 路径：整行计算，K 上外积。32 列主体 bias 后置，N%32 尾列 bias 起种。
+/// 窄 N 路径（标量判据）：整行计算，K 上外积。32 列主体 bias 后置，
+/// N%32 尾列 bias 起种。
 ///
 /// # Safety
 ///
 /// 行区间 `[mb, me)` 必须与并发调用者不相交。
 #[allow(clippy::too_many_arguments)]
-unsafe fn m_rows_body(
+pub(crate) unsafe fn m_rows_body(
     a: &[f32],
     b: &[f32],
     c: *mut f32,
@@ -439,6 +428,124 @@ unsafe fn m_rows_body(
             }
             // SAFETY: 同上。
             unsafe { *c.add(row * ldc + j) = s };
+        }
+    }
+}
+
+/// 非整面板的 M%4 尾行回退（标量，bias 起种）：SIMD 后端共用的尾巴。
+/// 纯标量 `mul_add` 链，无架构内联函数，各后端逐位同值。
+///
+/// # Safety
+///
+/// 面板 `p` 的列区间 `[p*32, p*32+nn)`（行 `[row_start, m)`）与并发调用者
+/// 不相交；`bptrs`（BP 时）指向 k 个可读行。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn panel_tail_scalar<const BP: bool, const SW: usize>(
+    a: *const f32,
+    b: *const f32,
+    bptrs: *const *const f32,
+    c: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    bias: *const f32,
+    p: usize,
+    row_start: usize,
+) {
+    let n0 = p * 32;
+    let nn = 32.min(n - n0);
+    let has_bias = !bias.is_null();
+    for row in row_start..m {
+        let ar = a.add(row * k);
+        let bv = if has_bias { *bias.add(row) } else { 0.0 };
+        let cp = c.add(row * ldc + n0);
+        for j in 0..nn {
+            // bias 起种 + fma 链（与 panel_body 的非整面板分支逐位相同）
+            let mut s = bv;
+            for kk in 0..k {
+                let bv1 = if BP {
+                    (*bptrs.add(kk)).add((n0 + j) * SW).read()
+                } else {
+                    b.add(kk * n + n0 + j).read()
+                };
+                s = ar.add(kk).read().mul_add(bv1, s);
+            }
+            cp.add(j).write(s);
+        }
+    }
+}
+
+/// implicit-GEMM 面板体的标量判据：B 每 k 一行一个指针、行内步长 `SW`。
+/// 每元素的运算串与 [`panel_body`] 相同（k 升序 FMA 链、bias 位置按分支），
+/// 只是 B 的取数经指针间接。
+///
+/// # Safety
+///
+/// 同 [`panel_body`]；`bptrs` 指向 k 个可读行（含右侧按 SW 计的触达范围）。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn sgemm_panel_bptrs_scalar<const SW: usize>(
+    a: *const f32,
+    bptrs: *const *const f32,
+    c: *mut f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    ldc: usize,
+    bias: *const f32,
+    pb: usize,
+    pe: usize,
+) {
+    let has_bias = !bias.is_null();
+    for p in pb..pe {
+        let n0 = p * 32;
+        let nn = 32.min(n - n0);
+        let full = nn == 32;
+        let mut m0 = 0;
+        while m0 + 4 <= m {
+            for i in 0..4 {
+                let row = m0 + i;
+                let ar = a.add(row * k);
+                for j in 0..nn {
+                    let mut acc = 0.0f32;
+                    for kk in 0..k {
+                        let bv = (*bptrs.add(kk)).add((n0 + j) * SW).read();
+                        acc = ar.add(kk).read().mul_add(bv, acc);
+                    }
+                    if has_bias {
+                        acc += *bias.add(row);
+                    }
+                    c.add(row * ldc + n0 + j).write(acc);
+                }
+            }
+            m0 += 4;
+        }
+        for row in m0..m {
+            let ar = a.add(row * k);
+            let bv = if has_bias { *bias.add(row) } else { 0.0 };
+            for j in 0..nn {
+                let v = if full {
+                    let mut acc = 0.0f32;
+                    for kk in 0..k {
+                        let bvv = (*bptrs.add(kk)).add((n0 + j) * SW).read();
+                        acc = ar.add(kk).read().mul_add(bvv, acc);
+                    }
+                    if has_bias {
+                        acc += *bias.add(row);
+                    }
+                    acc
+                } else {
+                    let mut s = bv;
+                    for kk in 0..k {
+                        let bvv = (*bptrs.add(kk)).add((n0 + j) * SW).read();
+                        s = ar.add(kk).read().mul_add(bvv, s);
+                    }
+                    s
+                };
+                c.add(row * ldc + n0 + j).write(v);
+            }
         }
     }
 }

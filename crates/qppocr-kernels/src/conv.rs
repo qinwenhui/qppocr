@@ -15,7 +15,6 @@
 
 use crate::activation::Activation;
 use crate::buf::F32Buf;
-#[cfg(target_arch = "x86_64")] // 仅 x86_64 有隐式 GEMM 面板（macOS/arm 编不过）
 use crate::gemm::sgemm_bptrs_serial;
 use crate::gemm::{im2col, sgemm_serial_res};
 use crate::par;
@@ -287,25 +286,22 @@ pub fn conv2d_res(
                 pad_channel(&mut pad, xch, h, wdim, p.ph, p.pw, pheight, pwidth, p.pew);
                 // SAFETY: (n, c) 通道平面与其他块不相交；pad 长度 = pheight*pwidth。
                 let yc = unsafe { yp.offset((bn * m + ch) * ohw).slice(ohw) };
-                crate::arch_dispatch!(
-                    // SAFETY: yc 是本块独占的通道平面；pad/wc 只读且不与之重叠。
-                    unsafe {
-                        crate::x86::depthwise_plane_padded_avx2(
-                            yc.as_mut_ptr(),
-                            pad.as_ptr(),
-                            wc.as_ptr(),
-                            oh,
-                            ow,
-                            pwidth,
-                            kh,
-                            kw,
-                            p.sh,
-                            p.sw,
-                            bv,
-                        )
-                    },
-                    depthwise_plane_scalar(yc, &pad, wc, oh, ow, pwidth, kh, kw, p.sh, p.sw, bv,)
-                );
+                // SAFETY: yc 是本块独占的通道平面；pad/wc 只读且不与之重叠。
+                unsafe {
+                    crate::arch::depthwise_plane_padded(
+                        yc.as_mut_ptr(),
+                        pad.as_ptr(),
+                        wc.as_ptr(),
+                        oh,
+                        ow,
+                        pwidth,
+                        kh,
+                        kw,
+                        p.sh,
+                        p.sw,
+                        bv,
+                    )
+                };
             }
         };
         let units = n * c;
@@ -360,8 +356,7 @@ pub fn conv2d_res(
                 //   DRAM 带宽上限上。改成「把这一块要用到的输入行补零成一张
                 //   slab，B 的每个 k 行给一个指向 slab 的指针」——一个字节的
                 //   patch 都不用写。
-                #[cfg(target_arch = "x86_64")]
-                if (p.sw == 1 || p.sw == 2) && crate::use_avx2() {
+                if p.sw == 1 || p.sw == 2 {
                     // slab：cg × slab_rows × pwidth，行距 pwidth，原始像素落在
                     // [pw, pw+wdim)，其余（上下补边、左右补边、右端 slack）是 0。
                     let slab_rows = (rows - 1) * p.sh + kh;
@@ -555,41 +550,20 @@ pub fn convtranspose2d(
                     for iy in 0..h {
                         let orow = &mut yo[(iy * 2 + ky) * ow..(iy * 2 + ky + 1) * ow];
                         let rowbase = iy * wdim; // 通道内行起点（xn 是 [c][h][w]）
-                        let mut j = 0usize;
-                        #[cfg(target_arch = "x86_64")]
-                        if crate::use_avx2() {
-                            while j + 8 <= wdim {
-                                // SAFETY: 输出段 [j*2, j*2+16) 属于本输出通道，
-                                // 与其他并行块不相交；x 读 [rowbase+j, +8)。
-                                unsafe {
-                                    crate::x86::convt_row_vec(
-                                        xn.as_ptr().add(rowbase),
-                                        h * wdim,
-                                        w0.as_ptr(),
-                                        w1.as_ptr(),
-                                        c,
-                                        j,
-                                        orow.as_mut_ptr(),
-                                    )
-                                };
-                                j += 8;
-                            }
-                        }
-                        while j < wdim {
-                            let o2 = &mut orow[j * 2..j * 2 + 2];
-                            // a -> 偶数输出列，b -> 奇数；c 升序累加（位级与
-                            // AVX2 的 interleave 写法一致）
-                            let mut a = 0.0f32;
-                            let mut b = 0.0f32;
-                            for ch in 0..c {
-                                let xv = xn[ch * h * wdim + rowbase + j];
-                                a = xv.mul_add(w0[ch], a);
-                                b = xv.mul_add(w1[ch], b);
-                            }
-                            o2[0] = a;
-                            o2[1] = b;
-                            j += 1;
-                        }
+                        // SAFETY: 输出行 (iy*2+ky) 的这一段属于本输出通道，与
+                        // 其他并行块不相交；x 读各通道同一行 [0, wdim)。
+                        unsafe {
+                            crate::arch::convt_rows(
+                                xn.as_ptr().add(rowbase),
+                                h * wdim,
+                                w0.as_ptr(),
+                                w1.as_ptr(),
+                                c,
+                                0,
+                                wdim,
+                                orow.as_mut_ptr(),
+                            )
+                        };
                     }
                 }
             }
@@ -597,4 +571,38 @@ pub fn convtranspose2d(
         par::parallel_for(m, 1, body);
     }
     [n as i64, m as i64, oh as i64, ow as i64]
+}
+
+/// ConvTranspose 行内积的标量判据：输入列 `[j0, j1)` 每列散射出相邻两个
+/// 输出（kx 奇偶），c 通道升序 FMA 链。向量后端按本架构宽度分批后，
+/// 不足一批的尾巴也走这里——每元素的运算串与向量路径一致。
+///
+/// # Safety
+///
+/// `xr` 起有 `c*ch_plane` 个可读元素；`w0`/`w1` 各 `c` 个；`orow` 起有
+/// `2*(j1-j0)` 个可写元素。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn convt_row_scalar(
+    xr: *const f32,
+    ch_plane: usize,
+    w0: *const f32,
+    w1: *const f32,
+    c: usize,
+    j0: usize,
+    j1: usize,
+    orow: *mut f32,
+) {
+    for j in j0..j1 {
+        // a -> 偶数输出列，b -> 奇数；c 升序累加
+        let mut a = 0.0f32;
+        let mut b = 0.0f32;
+        for ch in 0..c {
+            let xv = *xr.add(ch * ch_plane + j);
+            a = xv.mul_add(*w0.add(ch), a);
+            b = xv.mul_add(*w1.add(ch), b);
+        }
+        orow.add(j * 2).write(a);
+        orow.add(j * 2 + 1).write(b);
+    }
 }

@@ -93,36 +93,21 @@ pub fn resize_bilinear(
                 let r0 = &xnc[iy0[oy] * w..(iy0[oy] + 1) * w];
                 let r1 = &xnc[iy1[oy] * w..(iy1[oy] + 1) * w];
                 let ly = fy[oy];
-                #[cfg(target_arch = "x86_64")]
-                if crate::use_avx2() {
-                    // SAFETY: 输出行 nc 的这段与其他并行块不相交；映射表
-                    // 长度为 ow，源列界内（预计算时已钳制）。
-                    unsafe {
-                        crate::x86::bilinear_row_vec(
-                            r0.as_ptr(),
-                            r1.as_ptr(),
-                            ix0.as_ptr(),
-                            ix1.as_ptr(),
-                            fx.as_ptr(),
-                            ly,
-                            yr.as_mut_ptr(),
-                            0,
-                            ow,
-                        )
-                    };
-                    continue;
-                }
-                for (oxx, yv) in yr.iter_mut().enumerate() {
-                    let (x0, x1) = (ix0[oxx] as usize, ix1[oxx] as usize);
-                    let lx = fx[oxx];
-                    // 四角加权——项与顺序固定（位级可复现）。★ 收缩形态：
-                    // GCC 把后续三项的「积 + 累加」收缩成 FMA（首项两个乘、
-                    // 每项的第一乘保留、第二乘折进 fma），Rust 显式 mul_add
-                    let t = r0[x0] * (1.0 - lx) * (1.0 - ly);
-                    let t = (r0[x1] * lx).mul_add(1.0 - ly, t);
-                    let t = (r1[x0] * (1.0 - lx)).mul_add(ly, t);
-                    *yv = (r1[x1] * lx).mul_add(ly, t);
-                }
+                // SAFETY: 输出行 nc 的这段与其他并行块不相交；映射表
+                // 长度为 ow，源列界内（预计算时已钳制）。
+                unsafe {
+                    crate::arch::bilinear_row(
+                        r0.as_ptr(),
+                        r1.as_ptr(),
+                        ix0.as_ptr(),
+                        ix1.as_ptr(),
+                        fx.as_ptr(),
+                        ly,
+                        yr.as_mut_ptr(),
+                        0,
+                        ow,
+                    )
+                };
             }
         }
     });
@@ -216,19 +201,56 @@ pub fn dilate2x2_max(mask: &[u8], dst: &mut [u8], h: usize, w: usize) {
                 Some(u) => cur[0].max(u[0]),
                 None => cur[0],
             };
-            #[cfg(target_arch = "x86_64")]
-            if crate::use_avx2() {
-                // SAFETY: x ∈ [1, w) 段内所有访问都在界内（w 由调用方保证）。
-                unsafe { crate::x86::dilate2x2_row_avx2(cur, up, out.as_mut_ptr(), w) };
-                continue;
-            }
-            for x in 1..w {
-                let mut v = cur[x - 1].max(cur[x]);
-                if let Some(u) = up {
-                    v = v.max(u[x - 1]).max(u[x]);
-                }
-                out[x] = v;
-            }
+            // SAFETY: x ∈ [1, w) 段内所有访问都在界内（w 由调用方保证）。
+            unsafe { crate::arch::dilate2x2_row(cur, up, out.as_mut_ptr(), w) };
         }
     });
+}
+
+/// resize_bilinear 行内积的标量判据：四角加权，项与顺序固定——首项两乘，
+/// 其余 fma（收缩形态与向量内核一致）。
+///
+/// # Safety
+///
+/// 输出行区间与其他并行块不相交；映射表长度覆盖 `[ox0, ox1)`。
+#[allow(clippy::too_many_arguments)]
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn bilinear_row_scalar(
+    r0: *const f32,
+    r1: *const f32,
+    ix0: *const i32,
+    ix1: *const i32,
+    fx: *const f32,
+    ly: f32,
+    dst: *mut f32,
+    ox0: usize,
+    ox1: usize,
+) {
+    for ox in ox0..ox1 {
+        let j = ox - ox0;
+        let lx = *fx.add(j);
+        let i0 = *ix0.add(j) as usize;
+        let i1 = *ix1.add(j) as usize;
+        let t = *r0.add(i0) * (1.0 - lx) * (1.0 - ly);
+        let t = (*r0.add(i1) * lx).mul_add(1.0 - ly, t);
+        let t = (*r1.add(i0) * (1.0 - lx)).mul_add(ly, t);
+        *dst.add(ox) = (*r1.add(i1) * lx).mul_add(ly, t);
+    }
+}
+
+/// 2×2 膨胀行内核的标量判据（`x ∈ [1, w)`）。max 可交换，与向量内核逐位
+/// 相同。
+///
+/// # Safety
+///
+/// `cur` 至少 `w` 字节；`up` 非空时至少 `w` 字节；`out` 至少 `w` 字节。
+#[allow(unsafe_op_in_unsafe_fn)] // 裸指针循环：前置条件见 # Safety 段
+pub(crate) unsafe fn dilate2x2_row_scalar(cur: &[u8], up: Option<&[u8]>, out: *mut u8, w: usize) {
+    for x in 1..w {
+        let mut v = cur[x - 1].max(cur[x]);
+        if let Some(u) = up {
+            v = v.max(u[x - 1]).max(u[x]);
+        }
+        *out.add(x) = v;
+    }
 }
