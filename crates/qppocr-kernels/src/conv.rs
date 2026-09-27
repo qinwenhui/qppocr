@@ -15,7 +15,9 @@
 
 use crate::activation::Activation;
 use crate::buf::F32Buf;
-use crate::gemm::{im2col, sgemm_bptrs_serial, sgemm_serial_res};
+#[cfg(target_arch = "x86_64")] // 仅 x86_64 有隐式 GEMM 面板（macOS/arm 编不过）
+use crate::gemm::sgemm_bptrs_serial;
+use crate::gemm::{im2col, sgemm_serial_res};
 use crate::par;
 
 /// 深度卷积一个 (n, channel) 平面的**标量参考实现**（非 x86 的兜底，

@@ -1,7 +1,9 @@
 //! 纯寄存器 FMA 峰值：不碰内存，量本机单核 AVX2+FMA 的理论上限。
 //! 用来判断 sgemm 离峰值还有多远（若 sgemm 只有峰值的一半，那是内核问题）。
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn loop_fma(iters: usize) -> f32 {
     let mut a = _mm256_set1_ps(1.000001);
@@ -28,6 +30,7 @@ unsafe fn loop_fma(iters: usize) -> f32 {
     _mm256_cvtss_f32(_mm256_add_ps(s, t))
 }
 
+#[cfg(target_arch = "x86_64")]
 fn main() {
     let n: usize = std::env::args()
         .nth(1)
@@ -52,3 +55,6 @@ fn main() {
     );
     println!("对照：sgemm 单线程实测 42 GMAC/s（bench_gemm 82-97 GFLOPS）");
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {}

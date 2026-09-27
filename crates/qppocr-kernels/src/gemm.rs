@@ -280,6 +280,8 @@ fn sgemm_impl(
 /// 激活收尾：作用在已写出的输出上，读的是刚写的数据（cache 命中）。
 /// det 的 1x1 conv 一次调用 47 MB 输出，串行扫比把激活留成独立节点还慢，
 /// 所以这里自己 fork。
+// 仅 x86_64：唯一调用方是同样门控的 sgemm_bptrs_serial（隐式 GEMM 面板）。
+#[cfg(target_arch = "x86_64")]
 fn finish(c: &mut [f32], m: usize, n: usize, ldc: usize, act: &Activation) {
     finish_res(c, None, m, n, ldc, act);
 }
