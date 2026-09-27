@@ -650,6 +650,9 @@ pub fn load_onnx_memory(data: &[u8], display_name: &str) -> Result<Graph> {
 
     // 模型特化：只做结构匹配，不匹配的原样保留。
     g.dropped_identity = crate::graph::optimize::drop_identity_pairs(&mut g);
+    // BN 折叠在最前：折掉 Conv→BN 之后，后面的 conv+act 融合才能直接
+    // 看到 Conv→Gelu 这样的对。
+    crate::graph::optimize::fold_conv_batchnorm(&mut g);
     g.fused_gelu = crate::graph::optimize::fuse_gelu(&mut g);
     g.folded_bias = crate::graph::optimize::fold_conv_bias(&mut g);
     // 最后跑，让它看到最终的 Conv 节点（fuse_gelu 造出它要匹配的
