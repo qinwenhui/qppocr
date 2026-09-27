@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/qppocr",
+    "crates/qppocr-core",
+    "crates/qppocr-kernels",
+    "crates/qppocr-cli",
+]
+
+[workspace.package]
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/qinwenhui/qppocr"
+homepage = "https://github.com/qinwenhui/qppocr"
+authors = ["qinwh"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+# 内核对分支误预测敏感；保持构建简单可复现，不开 LTO/PGO。
+lto = false
