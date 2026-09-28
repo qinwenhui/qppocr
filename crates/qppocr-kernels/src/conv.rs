@@ -6,12 +6,12 @@
 //!    批次，而不是每批一次 fork——rec 的 6x3x48x320 条带上每批 GEMM 只有
 //!    ~18 us 工作量，而 16 线程的 fork 要 97 us，fork 是它并行工作量的 5 倍）。
 //! 2. **depthwise（g>1 且 Cg==1）→ 直接累加**，任意核大小（v6 det 用 7x7；
-//!    早版本把这个排除在外送去 im2col，花了 ~6 倍代价）。同样整批一次 fork。
+//!    送 im2col 要多付 kh·kw 倍的搬运）。同样整批一次 fork。
 //! 3. **通用：分组 im2col + GEMM，按输出行 tile**。补丁矩阵整图一次性建
 //!    要几百 MB（v6 的 2x2 conv 在 992x752 图上 ~190 MB），tile 限制工作集。
 //!
-//! 三条路径都在寄存器里算满输出再 store，没有一条需要预清零 y
-//! （det 1x1 conv 47 MB、~4 ms/节点，白扫一趟）。
+//! 三条路径都在寄存器里算满输出再 store，没有一条需要预清零 y（大输出
+//! 的逐节点预清零是纯浪费）。
 
 use crate::activation::Activation;
 use crate::buf::F32Buf;
@@ -19,13 +19,13 @@ use crate::gemm::sgemm_bptrs_serial;
 use crate::gemm::{im2col, sgemm_serial_res};
 use crate::par;
 
-/// 深度卷积一个 (n, channel) 平面的**标量参考实现**（非 x86 的兜底，
-/// 也是 AVX2 路径位级对拍的基准）。输入是**已补零的平面**。
+/// 深度卷积一个 (n, channel) 平面的**标量参考实现**（无向量后端时的
+/// 执行路径，也是位级对拍的基准）。输入是**已补零的平面**。
 ///
 /// 补零平面：`(ph + h + peh) × pwidth`，行距 `pwidth`，原始像素放在
 /// `[ph + y][pw + x]`，其余全是 0。这样卷积本身可以完全不带边界判断——
-/// 越界的 tap 读到的就是 0，贡献 `w * 0.0`。旧写法是逐 tap 判断越界再跳过，
-/// 那几列（占列数 4%）实测吃掉 30-60% 的时间。
+/// 越界的 tap 读到的就是 0，贡献 `w * 0.0`。逐 tap 判断越界再跳过的
+/// 写法，边界几列的分支成本很高。
 ///
 /// 累加顺序：ky 外层、kx 内层、从 0 起，最后加 bias。
 #[allow(clippy::too_many_arguments)]

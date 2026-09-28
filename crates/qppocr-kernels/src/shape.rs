@@ -3,7 +3,7 @@
 //!
 //! slice 与 transpose 共用 [`copy_strided`]：目标元素
 //! `dst[o*inner + k] = src[base + Σ_{i<r-1} idx_i·stride_i + k·stride_{r-1}]`。
-//! 曾经每输出元素重算一遍偏移（每维一次 `%`/`/`）；odometer 每外层步一次
+//! 朴素实现每输出元素重算一遍偏移（每维一次 `%`/`/`）；odometer 每外层步一次
 //! 加法一次比较。最内维 `stride == 1` 时内循环是 memcpy 而不是 inner 次
 //! 标量 load——`Transpose [3,6,8,40,15]` 正是这种。
 

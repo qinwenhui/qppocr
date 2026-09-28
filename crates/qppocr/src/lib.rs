@@ -39,11 +39,12 @@
 //! 获取后按 [`ModelSource::Dir`] 的布局摆放；SHA-256 默认与官方原件
 //! 核对。
 //!
-//! # 为什么「默认值就是最优值」
+//! # 默认值与调参
 //!
-//! 上游默认 `det_thresh=0.5`，我们测出 `0.2` 更好（exact 91.31→91.99%）；
-//! `rec_height=48` 是 sweep 的尖峰。这类结论沉淀在默认值里——
-//! `cargo add qppocr` 后不配任何东西，拿到的就是最好的一档。
+//! 默认值在我们的参考环境（x86 桌面机、商品图语料）上标定，开箱即用；
+//! 但 CPU 代际、核数、图源（票据 / 扫描件 / 街景）都会移动最优点。
+//! 常规项走 [`Config`]，更细的旋钮走 [`Advanced`]，字段注释写明各自
+//! 影响什么——建议拿自己的机器和语料量一量再定。
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
@@ -113,14 +114,15 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// 预设：三个经过整段语料验证的档位。
+/// 预设：三组常用取值，作为起点；在预设之上还可以用 [`Config`] /
+/// [`Advanced`] 继续按环境调整。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Preset {
     /// 速度优先：`rec_height` 40，关区域重试。
     Speed,
-    /// 默认：全部默认值（36 项参数的测量结果）。
+    /// 默认：全部字段取默认值。
     #[default]
     Balanced,
     /// 精度优先：`rec_height` 48，开区域重试与边距判定。
@@ -130,14 +132,14 @@ pub enum Preset {
 /// 公开配置。字段全部是 `Option`：`None` = 跟预设走，
 /// 设了就**只覆盖这一项**，其余仍跟预设。
 ///
-/// 判据：用户不需要跑基准就能讲清楚该往哪边调吗？
-/// 能 → 进这里；不能（要量具）→ [`Advanced`]。
+/// 这里放的是不看基准也能说明白取舍的项；更底层、需要结合自己负载
+/// 测量的旋钮在 [`Advanced`]。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Config {
-    /// 识别画布高度（像素）。40 更快、48 更准（sweep）。
+    /// 识别画布高度（像素，32 的倍数）。低更快、高更准。
     pub rec_height: Option<u32>,
     /// 检测输入长边上限。
     pub det_max_side: Option<u32>,
@@ -154,23 +156,27 @@ pub struct Config {
     pub vertical_padding: Option<bool>,
 }
 
-/// 实测标出来的常数。**不要改**——每一项都有实测依据。
+/// 引擎的底层调参项。默认值是我们的参考环境上取的折中，不是普适
+/// 最优——不同 CPU、不同图源很可能有一组更好的值。字段注释写明各自
+/// 影响什么、往哪边调会发生什么，按自己的环境调即可。
 ///
-/// 保留它是为了让我们自己能继续调参，以及极少数有自己量具的用户一条路。
-/// 这里的字段**不提供稳定性承诺**，任何一个小版本都可能变。
-/// 只能经 [`EngineBuilder::advanced`] 进入。
+/// 经 [`EngineBuilder::advanced`] 进入：闭包收到的初始值是预设生效后
+/// 的值，只改点名的项，其余保留。
+///
+/// 字段集随版本演进（`#[non_exhaustive]`），不做跨小版本的稳定性承诺。
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Advanced {
-    /// DB 二值化阈值。上游 0.5；0.2 是帕累托改进。
+    /// DB 二值化阈值。上游默认 0.5；本引擎默认 0.2——低阈值多保小字与
+    /// 断笔、多进杂块，按图源取舍。
     pub det_thresh: f32,
     /// 框内概率均值下限。
     pub box_thresh: f32,
     /// unclip 扩张比例。
     pub unclip_ratio: f32,
-    /// unclip 垂直分量。⚠ 最敏感的一个。
+    /// unclip 垂直分量。对行高影响最直接——框整体偏高或偏低先调它。
     pub unclip_perp: f32,
     /// 边距杂波判定阈值。0 = 关。
     pub unclip_margin_thresh: f32,
@@ -186,7 +192,8 @@ pub struct Advanced {
     pub cls_thresh: f32,
 
     // ---- 以下与 `PipelineConfig` 同名同义 ----
-    /// 检测输入长边上限。⚠ 双向帽：低于工作图长边会把检测输入**缩小**。
+    /// 检测输入长边上限。双向的：低于工作图长边时会把检测输入缩小
+    /// （精度换速度）。
     pub det_max_side: i32,
     /// 检测输入像素上限（原图的倍数，只在补边时生效）。
     pub det_pixel_budget: f64,
@@ -218,14 +225,15 @@ pub struct Advanced {
     pub cls_height: i32,
     /// 分类器画布宽。
     pub cls_width: i32,
-    /// 超宽行取居中窗口分类。⚠ 对上游 PP-LCNet 有害（默认关）。
+    /// 超宽行取居中窗口做方向分类（默认关：常规行被窗口截掉特征后，
+    /// 方向判定会变差）。
     pub cls_window: bool,
     /// 一次方向分类前向塞几行（纯性能旋钮，输出不变）。
     pub cls_batch: usize,
     /// rec 外层分片数（两级并行）。`usize::MAX` = 按档位自动，
     /// `0` = 强制不分片（纯性能旋钮，输出不变）。
     pub rec_shards: usize,
-    /// 自动色阶预处理。⚠ 改变检测器所见（默认关）。
+    /// 自动色阶预处理，会改变检测器看到的输入（默认关）。
     pub enhance_contrast: bool,
     /// 检测放大倍数（成本 ~N²；裁剪仍取原图，默认 1）。
     pub upscale: i32,

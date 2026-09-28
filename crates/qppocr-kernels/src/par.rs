@@ -1,7 +1,5 @@
 //! 并行调度与 fork 阈值。
 //!
-//! 并行调度与 fork 阈值。
-//!
 //! 调度器是 [`crate::pool`]——一套自研 fork-join 池：批量唤醒、主线程参与、
 //! join 自旋、参与者计数屏障。多线程扩展从 rayon 的 1.86x 追到 2.07x 靠的
 //! 就是这套语义，不是内核本身。嵌套 `parallel_for` 是死锁；`sgemm_serial` /
@@ -10,29 +8,25 @@
 //!
 //! 池的构造与所有 worker 线程的诞生都发生在 [`crate::pool`] 里。
 //!
-//! ## 阈值不重调
+//! ## 阈值
 //!
-//! 下面这些门控每一条都是量出来的（不是拍脑袋），实测见 CHANGELOG：
-//!
-//! - `fork_min_macs = 4e6`：16 线程 fork 一次约 97 us，低于 ~4M MAC 的算子
-//!   并行收益盖不过 fork 本身。rec 的 depthwise conv 曾经在 ~10 us 的单元上
-//!   fork，花掉 6 倍于工作量本身的开销。
-//! - `gemm_par_min = 2e5`：GEMM 的 flops 门槛。
-//! - `elem_fork_min_bytes = 1<<20`：纯搬运算子的字节门槛——单线程 memcpy 约
-//!   12 GB/s，1 MB ≈ 一次 fork 的工作量。
+//! 门槛的含义：低于它的算子留在单线程（fork 的协调成本盖过并行收益）。
+//! 默认值在本项目的参考机器上标定；[`Thresholds`] 的字段可整体替换，
+//! 环境变量（`QPPOCR_FORK_MACS` / `QPPOCR_GEMM_MIN` / `QPPOCR_ELEM_MIN`）
+//! 可在进程级覆盖，用来在自己的负载上扫门槛。
 //!
 //! ## FTZ/DAZ
 //!
-//! x86 的 FMA 单元在非正规数上严重降速（实测 19 倍），推理中间量很容易踩中。
+//! x86 的 FMA 单元在非正规数上严重降速，推理中间量很容易踩中。
 //! [`enable_flush_denormals`] 必须在**任何 worker 线程诞生之前**于主线程调用
 //! ——MXCSR 是每线程的，子线程继承创建者的标志位；池在构造函数里做同样的事。
 
-/// 每线程任务块数的乘子：原子领票的动态负载均衡，不是 rayon 的静态微任务。
-/// rotated 语料实测 4/8/16/32 在噪声内，**1 是离群值**（16 线程 -8%）。
+/// 每线程任务块数的乘子：原子领票的动态负载均衡。块数过少（=1）时长
+/// 任务会拖住整池的 join。
 #[cfg(feature = "parallel")]
 const TP_CHUNKS: usize = 8;
 
-/// 并行门槛（默认值见 [`Thresholds::default`]，实测标定）。
+/// 并行门槛。默认值在参考机器上标定，可按目标环境整体替换。
 #[derive(Clone, Copy, Debug)]
 pub struct Thresholds {
     /// 低于这么多 MAC 的算子不并行（`fork_min_macs`）。
