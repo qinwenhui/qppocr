@@ -698,10 +698,7 @@ mod tests {
         ];
         for (preset, retry, rec_h) in cases {
             let pc = resolve_config(preset, &Config::default(), None);
-            assert_eq!(
-                pc.retry_conf, retry,
-                "{preset:?} 的区域重试默认与文档不符"
-            );
+            assert_eq!(pc.retry_conf, retry, "{preset:?} 的区域重试默认与文档不符");
             assert_eq!(pc.rec_height, rec_h, "{preset:?} 的 rec_height 与文档不符");
         }
         // Advanced::default() 的自注契约：「必须与 PipelineConfig::default()
