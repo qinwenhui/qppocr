@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/qppocr",
     "crates/qppocr-core",
+    "crates/qppocr-gpu",
     "crates/qppocr-kernels",
     "crates/qppocr-cli",
 ]

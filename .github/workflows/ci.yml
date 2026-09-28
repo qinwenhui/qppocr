@@ -81,6 +81,10 @@ jobs:
           - "std,parallel,image-decode"
           - "serde,std"
           - "serde,std,parallel,image-decode"
+          # GPU 后端：ash 用 loaded 加载器，无 Vulkan SDK 的 runner 可编译；
+          # 运行时枚举为空 → 测试自动 skip（真机验证在开发机的 Arc 上）。
+          - "gpu"
+          - "std,parallel,image-decode,gpu-cuda"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
