@@ -17,6 +17,8 @@
 pub(crate) mod device;
 #[allow(dead_code)]
 pub(crate) mod memory;
+#[allow(dead_code)]
+pub(crate) mod pipeline;
 
 use ash::vk;
 use ash::{Entry, Instance};

@@ -1,0 +1,12 @@
+[package]
+name = "shader-build"
+description = "GLSL → SPIR-V 编译工具（naga，纯 Rust）——签入产物，仓库零 C++ 依赖"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+# 独立工具：不进 workspace（cargo build --workspace 不该拖着 naga）。
+[workspace]
+
+[dependencies]
+naga = { version = "24", features = ["glsl-in", "spv-out"] }
