@@ -161,7 +161,10 @@ mod tests {
     #[test]
     fn documented_defaults_are_asserted() {
         let d = PipelineConfig::default();
-        assert_eq!(d.retry_conf, 0.0, "区域重试默认必须关闭（README/CHANGELOG 如此声明）");
+        assert_eq!(
+            d.retry_conf, 0.0,
+            "区域重试默认必须关闭（README/CHANGELOG 如此声明）"
+        );
         // 门面 Advanced::default() 自注「必须与 PipelineConfig::default()
         // 一致」的两个字段，在此一并锁住。
         assert_eq!(d.rec_batch, 1);
