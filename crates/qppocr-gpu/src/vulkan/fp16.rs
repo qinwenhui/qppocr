@@ -79,7 +79,7 @@ pub fn f16_words_to_f32(src: &[u32]) -> Vec<f32> {
 
 /// f32 → f16 的位级转换（round-to-nearest-even，IEEE 754）。
 /// 精度：尾数 23→10 位截断 + 舍入；值域 [±65504]；denormal → 0。
-fn f32_to_f16_bits(x: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;

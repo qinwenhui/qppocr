@@ -1,0 +1,39 @@
+// NHWC-f16 通道广播族：op 由参数块给出（0=mul_c 1=add_c 2=muladd_scale
+// 3=fused_hardsigmoid_mul 4=fused_sigmoid_mul）。
+// NHWC 里通道恒 = f16 下标 % C——每 vec4 恰是同一位置的 4 个通道，
+// gate 直接按 vec4 取（gate[Cpad4]）。
+// 语义镜像：mul_c/add_c（广播）、muladd_scale.comp（out=f*gate+r）、
+// fused_*_mul（out=f*act(gate)，gate 为前激活值）。
+// 布局：op, a_off, gate_off, r_off, out_off, n(元素数), cpad, p1(f32bits), p2
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(std430, binding = 0) buffer D32 { vec4 d[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint OFF_NONE = 0xFFFFFFFFu;
+
+void main() {
+    uint P = pc.p_off;
+    uint op = params[P + 0];
+    uint a_off = params[P + 1], gate_off = params[P + 2], r_off = params[P + 3];
+    uint out_off = params[P + 4], n = params[P + 5], cpad = params[P + 6];
+    float p1 = uintBitsToFloat(params[P + 7]);
+    float p2 = uintBitsToFloat(params[P + 8]);
+
+    uint nv = n >> 2;
+    uint c4 = cpad >> 2;
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= nv) return;
+    uint rowC4 = gid % c4; // 该位置的通道 vec4 下标
+
+    vec4 a = vec4(d[(a_off >> 2) + gid]);
+    vec4 g = vec4(d[(gate_off >> 2) + rowC4]);
+    vec4 o;
+    if (op == 0u) o = a * g;
+    else if (op == 1u) o = a + g;
+    else if (op == 2u) o = a * g + vec4(d[(r_off >> 2) + gid]);
+    else if (op == 3u) o = a * clamp(g * p1 + p2, vec4(0.0), vec4(1.0));
+    else o = a * (1.0 / (1.0 + exp(-g)));
+    d[(out_off >> 2) + gid] = vec4(o);
+}

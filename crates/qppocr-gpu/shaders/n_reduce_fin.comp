@@ -1,0 +1,32 @@
+// 空间均值阶段 2：scratch[mBlocks][Cpad] f32 → f16 gate[Cpad]。
+// 一线程一通道（f32 连续读）；经共享内存拼 vec4 一次写出
+//（直接读改写 f16 vec4 有跨线程 lane 竞争）。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer F32 { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(std430, binding = 2) buffer D32 { vec4 d[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+shared float accs[256];
+
+void main() {
+    uint P = pc.p_off;
+    uint scratch_off = params[P + 0], out_off = params[P + 1];
+    uint mBlocks = params[P + 2], cDim = params[P + 3], mDim = params[P + 4];
+
+    uint lid = gl_LocalInvocationID.x;
+    float acc = 0.0;
+    if (lid < cDim) {
+        for (uint b = 0u; b < mBlocks; b++) {
+            acc += data[scratch_off + b * cDim + lid];
+        }
+    }
+    accs[lid] = acc;
+    barrier();
+    // 每 4 通道一线程拼 vec4 写出（cDim 为 %4 对齐——分配保证）
+    if (lid % 4u == 0u && lid < cDim) {
+        vec4 v = vec4(accs[lid], accs[lid + 1u], accs[lid + 2u], accs[lid + 3u]);
+        d[(out_off >> 2) + (lid >> 2)] = vec4(v / float(mDim));
+    }
+}

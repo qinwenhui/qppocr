@@ -88,6 +88,37 @@ const SHADERS: &[(&str, &[u8])] = &[
         include_bytes!("../../shaders/spirv/nhwc_to_nchw.spv"),
     ),
     ("sigmoid", include_bytes!("../../shaders/spirv/sigmoid.spv")),
+    // ---- NHWC-f16 内核族（n_ 前缀；详见各 .comp 头注释）----
+    (
+        "n_channel",
+        include_bytes!("../../shaders/spirv/n_channel.spv"),
+    ),
+    (
+        "n_concat_c",
+        include_bytes!("../../shaders/spirv/n_concat_c.spv"),
+    ),
+    ("n_conv", include_bytes!("../../shaders/spirv/n_conv.spv")),
+    (
+        "n_conv_dw",
+        include_bytes!("../../shaders/spirv/n_conv_dw.spv"),
+    ),
+    ("n_convt", include_bytes!("../../shaders/spirv/n_convt.spv")),
+    ("n_elem", include_bytes!("../../shaders/spirv/n_elem.spv")),
+    ("n_entry", include_bytes!("../../shaders/spirv/n_entry.spv")),
+    ("n_exit", include_bytes!("../../shaders/spirv/n_exit.spv")),
+    ("n_pool", include_bytes!("../../shaders/spirv/n_pool.spv")),
+    (
+        "n_reduce_hw",
+        include_bytes!("../../shaders/spirv/n_reduce_hw.spv"),
+    ),
+    (
+        "n_reduce_fin",
+        include_bytes!("../../shaders/spirv/n_reduce_fin.spv"),
+    ),
+    (
+        "n_resize",
+        include_bytes!("../../shaders/spirv/n_resize.spv"),
+    ),
 ];
 
 /// push constant 块（与各 .comp 的 PC 布局一一对应；float 元素偏移）。
@@ -259,8 +290,9 @@ impl KernelSet {
     /// 建：单 SSBO 绑定（绑定 arena 的块缓冲）+ push constant 区
     /// （compute，0..128）+ 全部管线。
     pub(crate) fn new(device: &Device, buffer: vk::Buffer, size: vk::DeviceSize) -> Result<Self> {
-        // 双视图绑定：binding 0 = f32[]（计算数据）、binding 1 = u32[]
-        //（参数块）——同一 VkBuffer，只读别名，GLSL 侧按需声明。
+        // 三视图绑定：binding 0 = f32[]（计算数据）、binding 1 = u32[]
+        //（参数块）、binding 2 = f16vec4[]（NHWC-f16 内核族 + coopmat 装载）
+        //——同一 VkBuffer 的别名视图，GLSL 侧按需声明。
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -269,6 +301,11 @@ impl KernelSet {
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::COMPUTE),
@@ -292,7 +329,7 @@ impl KernelSet {
 
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(2 * SHADERS.len() as u32)];
+            .descriptor_count(3 * SHADERS.len() as u32)];
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(SHADERS.len() as u32);
@@ -310,8 +347,8 @@ impl KernelSet {
             .buffer(buffer)
             .offset(0)
             .range(size);
-        // 两个绑定指向同一缓冲（f32 视图 / u32 视图）
-        let buf_infos = [buf_info, buf_info];
+        // 三个绑定指向同一缓冲（f32 / u32 / f16vec4 视图）
+        let buf_infos = [buf_info, buf_info, buf_info];
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(set)
@@ -322,7 +359,12 @@ impl KernelSet {
                 .dst_set(set)
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(&buf_infos[1..]),
+                .buffer_info(&buf_infos[1..2]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&buf_infos[2..]),
         ];
         // SAFETY: set/buffer 存活；写入结构在调用期间有效。
         unsafe { device.update_descriptor_sets(&writes, &[]) };

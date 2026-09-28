@@ -1,20 +1,44 @@
 // 空间均值（GlobalAveragePool / ReduceMean(axes={2,3})）：
 // out[n,c] = Σ_hw x / (h*w)。det 的 8+5 个 SE 归约全走这里。
+//
+// 并行形态：一个 workgroup 归约一个 (n,c) 通道平面——线程跨步累加
+// （相邻 lane 读相邻元素，合并访存），subgroupAdd 收拢 lane，
+// 跨 subgroup 经共享数组再一次 subgroupAdd。总 barrier 一枚。
 #version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer Buf { float data[]; };
 layout(std430, binding = 1) buffer Params { uint params[]; };
 layout(push_constant) uniform PC { uint p_off; } pc;
 
+shared float sg_partials[32]; // 每 subgroup 的部分和（256 线程 ≤ 32 subgroup）
+
 void main() {
     uint P = pc.p_off;
     uint in_off = params[P + 0], out_off = params[P + 1];
     uint n = params[P + 2], c = params[P + 3], h = params[P + 4], w = params[P + 5];
+    uint hw = h * w;
 
-    uint i = gl_GlobalInvocationID.x;   // n*c 线性
-    if (i >= n * c) return;
-    uint base = in_off + i * h * w;
+    // 一个 WG = 一个 (n,c)：通道号取 **工作组号**。取全局调用号会让
+    // 同一 subgroup 内部分线程提前 return——subgroupAdd 要求整组参与，
+    // 部分参与是 UB（实测直接设备丢失）。
+    uint ch = gl_WorkGroupID.x;
+    if (ch >= n * c) return; // 网格精确时恒假——防越界网格
+    uint lid = gl_LocalInvocationID.x;
+    uint base = in_off + ch * hw;
+
     float acc = 0.0;
-    for (uint j = 0; j < h * w; j++) acc += data[base + j];
-    data[out_off + i] = acc / float(h * w);
+    for (uint j = lid; j < hw; j += 256) acc += data[base + j];
+
+    float sg = subgroupAdd(acc); // 每 subgroup 的和（lane 0 持有效值）
+    if (subgroupElect()) sg_partials[gl_SubgroupID] = sg;
+    barrier();
+    if (gl_SubgroupID == 0) {
+        float v = (gl_SubgroupInvocationID < gl_NumSubgroups)
+            ? sg_partials[gl_SubgroupInvocationID]
+            : 0.0;
+        float total = subgroupAdd(v);
+        if (gl_SubgroupInvocationID == 0) data[out_off + ch] = total / float(hw);
+    }
 }

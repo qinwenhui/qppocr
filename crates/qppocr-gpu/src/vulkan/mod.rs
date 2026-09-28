@@ -18,12 +18,15 @@ pub(crate) mod device;
 pub(crate) mod fp16;
 #[allow(dead_code)]
 pub(crate) mod memory;
+pub(crate) mod nhwc;
 #[allow(dead_code)]
 pub(crate) mod pipeline;
 pub(crate) mod session;
 
 #[cfg(test)]
 mod kernel_tests;
+#[cfg(test)]
+mod n_kernel_tests;
 
 use ash::vk;
 use ash::{Entry, Instance};
@@ -133,6 +136,10 @@ pub(crate) struct Inner {
     pub(crate) device: std::sync::Arc<device::VulkanDevice>,
     /// 选定的 memory types 与 UMA 判定。
     pub(crate) mem_types: memory::MemoryTypes,
+    /// 协作矩阵（XMX/DNA）形状：fp16 输入、f32 累加、Subgroup 域。
+    pub(crate) coopmat: Option<CoopMat>,
+    /// 计算队列族的 subgroup 大小（coopmat 内核的排布前提）。
+    pub(crate) subgroup_size: u32,
     /// 实例句柄：`Drop::drop` 里显式 destroy（ash 0.38 无 Drop）。
     /// 字段从不读取——存在即销毁序职责（见 [`InstanceGuard`]）。
     #[allow(dead_code)]
@@ -140,6 +147,14 @@ pub(crate) struct Inner {
     /// loader 库句柄，声明在最后；经 [`NeverUnload`] 故意不卸载（见其文档）。
     #[allow(dead_code)]
     entry: NeverUnload,
+}
+
+/// 探测到的协作矩阵形状（Intel XMX 8×16×16 / AMD 16×16×16 …）。
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CoopMat {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
 }
 
 /// 一个 Vulkan 设备的上下文：实例 + 选定的物理设备 + 执行基建。
@@ -211,6 +226,15 @@ impl VulkanContext {
         };
         let (physical, props) = all[pick];
         let name = device_name(&props);
+        // 协作矩阵探测：VK_KHR_cooperative_matrix + fp16/f32/Subgroup 形状。
+        // 没有就 None——内核族走标量 f16 路径（仍远快于 f32 标量）。
+        let coopmat = probe_coopmat(&entry, &instance, physical);
+        // 计算队列族的 subgroup 大小（Intel=16；coopmat 内核按 16 排布）。
+        let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
+        // SAFETY: physical 来自同实例枚举；p2 的 pNext 链在调用期间存活。
+        unsafe { instance.get_physical_device_properties2(physical, &mut p2) };
+        let subgroup_size = sg.subgroup_size;
         // 计算队列族：优先**专用**计算队列（无图形位），核显上通常是 0 号
         // 图形队列之外的独立族，提交不被图形负载排队。
         // SAFETY: physical 来自同实例的枚举结果。
@@ -232,6 +256,7 @@ impl VulkanContext {
             &instance,
             physical,
             queue_family,
+            coopmat.is_some(),
         )?);
         let mem_types = memory::MemoryTypes::pick(&instance, physical)?;
         Ok(Self {
@@ -240,11 +265,55 @@ impl VulkanContext {
                 api: api_str(props.api_version),
                 device,
                 mem_types,
+                coopmat,
+                subgroup_size,
                 instance: InstanceGuard(instance),
                 entry: NeverUnload(std::mem::ManuallyDrop::new(entry)),
             }),
         })
     }
+}
+
+/// 探测 fp16×f32(Subgroup) 的协作矩阵形状。
+fn probe_coopmat(
+    entry: &Entry,
+    instance: &Instance,
+    physical: vk::PhysicalDevice,
+) -> Option<CoopMat> {
+    if std::env::var_os("QPPOCR_GPU_NO_CM").is_some() {
+        return None; // 手动关：对标量路径做 A/B
+    }
+    // SAFETY: physical 来自同实例枚举；失败按「无扩展」处理。
+    let exts = unsafe { instance.enumerate_device_extension_properties(physical) }
+        .ok()
+        .unwrap_or_default();
+    let cm_name = ash::khr::cooperative_matrix::NAME;
+    let has = exts.iter().any(|e| {
+        // SAFETY: extension_name 是以 NUL 结尾的 C 字符数组。
+        let n = unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) };
+        n == cm_name
+    });
+    if !has {
+        return None;
+    }
+    let cm = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+    // SAFETY: 扩展存在（函数指针刚由 loader 加载）。
+    let props = unsafe { cm.get_physical_device_cooperative_matrix_properties(physical) }.ok()?;
+    // A/B=fp16、C/Result=f32、Subgroup 域——XMX/DNA 的标准形态。
+    props
+        .iter()
+        .find(|p| {
+            p.a_type == vk::ComponentTypeKHR::FLOAT16
+                && p.b_type == vk::ComponentTypeKHR::FLOAT16
+                && p.c_type == vk::ComponentTypeKHR::FLOAT32
+                && p.result_type == vk::ComponentTypeKHR::FLOAT32
+                && p.scope == vk::ScopeKHR::SUBGROUP
+        })
+        .map(|p| CoopMat {
+            m: p.m_size,
+            n: p.n_size,
+            k: p.k_size,
+        })
 }
 
 impl DeviceContext for VulkanContext {
@@ -306,8 +375,12 @@ mod tests {
             Ok(ctx) => {
                 assert_eq!(ctx.kind(), DeviceKind::Vulkan);
                 eprintln!(
-                    "[vulkan] opened: {} ({}) | UMA={}",
-                    ctx.inner.name, ctx.inner.api, ctx.inner.mem_types.uma
+                    "[vulkan] opened: {} ({}) | UMA={} | coopmat={:?} | subgroup={}",
+                    ctx.inner.name,
+                    ctx.inner.api,
+                    ctx.inner.mem_types.uma,
+                    ctx.inner.coopmat,
+                    ctx.inner.subgroup_size
                 );
             }
             Err(e) => eprintln!("[vulkan] open 跳过（无满足基线的设备）: {e}"),
