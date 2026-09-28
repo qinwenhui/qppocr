@@ -719,3 +719,122 @@ fn hardsigmoid_then_conv_min_repro() {
     ctx.inner.device.submit_wait_cb(cb).unwrap();
     eprintln!("[gpu] hardsigmoid→conv 序列通过（该形态未复现设备丢失）");
 }
+
+#[test]
+fn conv_gemm_vs_cpu() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+
+    // 1x1 conv：[1,ci,h,w] × [m,ci,1,1] → [1,m,h,w]
+    let (ci, m, h, w) = (32u32, 24u32, 16u32, 12u32);
+    let x_n = (ci * h * w) as usize;
+    let w_n = (m * ci) as usize;
+    let out_n = (m * h * w) as usize;
+    arena
+        .alloc(((x_n + w_n + m as usize + out_n) * 4 + 128) as vk::DeviceSize)
+        .unwrap();
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+
+    let mut seed = 0x4528_21e6_38d0_1377_u64;
+    let x = arena.alloc(x_n as vk::DeviceSize * 4).unwrap();
+    let wgt = arena.alloc(w_n as vk::DeviceSize * 4).unwrap();
+    let bias = arena.alloc(m as vk::DeviceSize * 4).unwrap();
+    let out = arena.alloc(out_n as vk::DeviceSize * 4).unwrap();
+    let pp = arena.alloc(128).unwrap();
+    fill(&x, x_n, &mut seed);
+    fill(&wgt, w_n, &mut seed);
+    fill(&bias, m as usize, &mut seed);
+
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
+    // conv_gemm 参数序（与 conv.comp 相同布局，1x1 专用的字段含义）：
+    // in,w,b,r,out, n,ci,h,w, m,kh,kw,sh,sw,ph,pw, group,act, c1,c2,c3, hw,ow
+    let mut pb = ParamBlock::new();
+    pb.u(el(&x))
+        .u(el(&wgt))
+        .u(el(&bias))
+        .u(OFF_NONE)
+        .u(el(&out))
+        .u(1) // n（占位）
+        .u(ci) // ci = K
+        .u(h)
+        .u(w) // h, w（占位）
+        .u(m) // m = M
+        .u(1)
+        .u(1) // kh, kw
+        .u(1)
+        .u(1) // sh, sw
+        .u(0)
+        .u(0) // ph, pw
+        .u(1) // group
+        .u(0) // act = none
+        .f(std::f32::consts::SQRT_2)
+        .f(1.0)
+        .f(0.5)
+        .u(h * w) // hw = N 维
+        .u(0); // ow（不用）
+    let pc = pb.finish(&pp);
+    // SAFETY: cb 录制态；PC 与 conv_gemm.comp 参数块对应。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb,
+            &ks,
+            "conv_gemm",
+            pc.bytes(),
+            [h * w / 16 + 1, m / 16 + 1, 1],
+        );
+    }
+    ctx.inner.device.end_reusable_cb(cb).unwrap();
+    ctx.inner.device.submit_wait_cb(cb).unwrap();
+
+    // CPU 判据
+    let xv = read(&x, x_n);
+    let wv = read(&wgt, w_n);
+    let bv = read(&bias, m as usize);
+    let mut want = vec![0f32; out_n];
+    for mi in 0..m as usize {
+        for hw in 0..(h * w) as usize {
+            let mut acc = 0f32;
+            for c in 0..ci as usize {
+                acc += xv[c * (h * w) as usize + hw] * wv[mi * ci as usize + c];
+            }
+            want[mi * (h * w) as usize + hw] = acc + bv[mi];
+        }
+    }
+    let got = read(&out, out_n);
+    let e = rel_err(&got, &want);
+    eprintln!("[gpu] conv_gemm(ci{ci} m{m} {h}x{w}) rel|diff| = {e:.3e}");
+    eprintln!("[gpu]   got[0..4]  = {:?}", &got[..4.min(got.len())]);
+    eprintln!("[gpu]   want[0..4] = {:?}", &want[..4.min(want.len())]);
+    // 找最差元素的位置
+    let (mut wi, mut wd) = (0usize, 0f32);
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        let d = (g - w).abs() / (1.0 + w.abs());
+        if d > wd {
+            wd = d;
+            wi = i;
+        }
+    }
+    let m_idx = wi / (h * w) as usize;
+    let hw_idx = wi % (h * w) as usize;
+    eprintln!(
+        "[gpu]   最差 [{wi}] (m={m_idx} hw={hw_idx}): gpu={:.6} want={:.6} diff={:.6}",
+        got[wi],
+        want[wi],
+        (got[wi] - want[wi]).abs()
+    );
+    // 打印该 M 行的首尾
+    let row = m_idx * (h * w) as usize;
+    eprintln!(
+        "[gpu]   m={m_idx} 行首: got={:.4} want={:.4}",
+        got[row], want[row]
+    );
+    eprintln!(
+        "[gpu]   m={m_idx} 行尾: got={:.4} want={:.4}",
+        got[row + (h * w) as usize - 1],
+        want[row + (h * w) as usize - 1]
+    );
+    assert!(e < 1e-3, "conv_gemm 超容差: {e}");
+}

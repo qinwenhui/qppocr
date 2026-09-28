@@ -348,6 +348,7 @@ impl VulkanSession {
         // Mul(feature, gate_out) 时，合为 fused_*_mul（省一整趟 NCHW 读写
         // + 独立门 dispatch）。融合掉的节点记入 skip 集。
         let mut fused = std::collections::HashSet::new(); // 被融合掉的节点名
+        let se_fusion_on = std::env::var_os("QPPOCR_GPU_SE_FUSION").is_some();
         for i in 0..self.graph.nodes.len() {
             let n = &self.graph.nodes[i];
             if n.op_type != "HardSigmoid" && n.op_type != "Sigmoid" {
@@ -381,8 +382,10 @@ impl VulkanSession {
                 continue;
             }
             // 融合：HardSigmoid/Sigmoid 节点标记为跳过
-            fused.insert(n.name.clone());
-            eprintln!("[gpu] SE 融合: {} → {} (fused)", n.name, mul.name);
+            if se_fusion_on {
+                fused.insert(n.name.clone());
+                eprintln!("[gpu] SE 融合: {} → {} (fused)", n.name, mul.name);
+            }
         }
 
         for (node_idx, n) in self.graph.nodes.iter().enumerate() {
@@ -656,6 +659,60 @@ impl VulkanSession {
                 let ws = shape_of(&n.inputs[1]);
                 let (sh, sw) = strides(n);
                 let pads = pads4(n);
+                // 1x1 s1 p0 g1 N=1：tiled GEMM 路径（NCHW 输入天然
+                // [Ci,HW]，零重排）。det 图 61/83 conv 走这里。
+                if ws[2] == 1
+                    && ws[3] == 1
+                    && sh == 1
+                    && sw == 1
+                    && pads == (0, 0, 0, 0)
+                    && std::env::var_os("QPPOCR_GPU_NO_GEMM").is_none()
+                    && planner::get_i(n.attr("group"), 1) == 1
+                    && xs[0] == 1
+                {
+                    let m = ws[0] as u32;
+                    // GEMM 的 N 维 = 空间 H×W（不含 M）——out_n 是 M×H×W，
+                    // 拿它当 HW 会超界（实测设备挂死的根因）
+                    let hw = (out_shape[2] * out_shape[3]) as u32;
+                    let mut pb = ParamBlock::new();
+                    pb.u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(if n.inputs.len() > 2 && !n.inputs[2].is_empty() {
+                            off_of(&n.inputs[2])?
+                        } else {
+                            OFF_NONE
+                        })
+                        .u(if n.inputs.len() > 3 && !n.inputs[3].is_empty() {
+                            off_of(&n.inputs[3])?
+                        } else {
+                            OFF_NONE
+                        })
+                        .u(off_of(out)?)
+                        .u(1) // n（占位）
+                        .u(ws[1] as u32) // ci
+                        .u(1)
+                        .u(1) // h, w（占位）
+                        .u(m) // m
+                        .u(1)
+                        .u(1) // kh, kw
+                        .u(1)
+                        .u(1) // sh, sw
+                        .u(0)
+                        .u(0) // ph, pw
+                        .u(1) // group
+                        .u(planner::get_i(n.attr("act"), 0) as u32)
+                        .f(planner::get_f(n.attr("act_c1"), std::f32::consts::SQRT_2))
+                        .f(planner::get_f(n.attr("act_c2"), 1.0))
+                        .f(planner::get_f(n.attr("act_c3"), 0.5))
+                        .u(hw) // ohw（= N 维）
+                        .u(0); // ow（GEMM 不用）
+                    return Ok((
+                        "conv_gemm",
+                        Some(pb),
+                        Vec::new(),
+                        [hw / 16 + 1, m / 16 + 1, 1],
+                    ));
+                }
                 let b_off = if n.inputs.len() > 2 && !n.inputs[2].is_empty() {
                     off_of(&n.inputs[2])?
                 } else {
@@ -1268,6 +1325,17 @@ mod tests {
             .sum::<f32>()
             / a.len() as f32;
         eprintln!("[gpu] det 概率图：max|diff| = {max_abs:.3e}，mean|diff| = {mean_abs:.3e}");
+        // 值域检查：概率图应在 [0,1]，有效文本区域的值应接近 1
+        let gpu_min = a.iter().cloned().fold(1f32, f32::min);
+        let gpu_max = a.iter().cloned().fold(0f32, f32::max);
+        let gpu_mean = a.iter().sum::<f32>() / a.len() as f32;
+        let cpu_min = b.iter().cloned().fold(1f32, f32::min);
+        let cpu_max = b.iter().cloned().fold(0f32, f32::max);
+        let cpu_mean = b.iter().sum::<f32>() / b.len() as f32;
+        let gpu_hi = a.iter().filter(|v| **v > 0.2).count();
+        let cpu_hi = b.iter().filter(|v| **v > 0.2).count();
+        eprintln!("[gpu] GPU 值域 [{gpu_min:.4},{gpu_max:.4}] mean={gpu_mean:.4} >0.2: {gpu_hi}");
+        eprintln!("[gpu] CPU 值域 [{cpu_min:.4},{cpu_max:.4}] mean={cpu_mean:.4} >0.2: {cpu_hi}");
         // 验收口径：mean 反映整体数值健康（逐层 fma/累加序差异的传播），
         // max 允许 sigmoid 斜坡处的极值放大（det_thresh=0.2 附近的框边界
         // 翻转由 verify.py 的字符级对拍判定，不在这里卡死）。
