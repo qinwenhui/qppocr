@@ -24,3 +24,7 @@ libloading = { version = "0.8", optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# tests/plan.rs 构造 Tensor 输入用（F32Buf）
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.2.1" }
