@@ -10,6 +10,12 @@
 
 ### 新增（Added）
 
+- **CLI `bench` 子命令**：测量纪律内建——同进程跑完整语料、1 轮 warmup
+  丢弃、多配置逐轮交错、中位数汇总，报告探测到的内核后端与生效配置；
+  `--sweep` 对自己的图集扫 preset / rec-height / threads / rec-shards。
+  `qppocr` 门面新增 `detect_backend` / `Backend` 再导出。
+- CI 新增 aarch64-linux 测试 job（交叉编译 + QEMU 用户态执行）：
+  NEON↔标量逐位对拍在 linux-arm64 上持续验证，不依赖 Apple 硬件。
 - **aarch64 NEON 后端**：sgemm 面板（含 implicit-GEMM 指针面板）、窄 N
   路径、深度卷积、ConvTranspose、激活（GELU/erf/exp/ReLU/clip/
   HardSigmoid/sigmoid）、softmax、二元算子、2x2 池化、双线性缩放、
@@ -18,6 +24,15 @@
   纯标量回退升级为向量执行。f32 NEON 是 aarch64 基线指令集，无需运行时
   探测；`enable_flush_denormals` 在 aarch64 上经 FPCR 置 FZ 位。
 - `Backend` 枚举新增 `Neon` 档；`detect_backend()` 在 aarch64 上返回它。
+
+### 修复（Fixed）
+
+- **池的嵌套 fork 结构性降级**：worker 线程内的 `fork_join` 改为就地
+  串行执行（切分决策不变，与并行路径逐位一致），消灭「并行区内再次
+  并行」争 `fork_mu` 的整类死锁。此前内核依赖「收尾激活的字节数低于
+  fork 阈值」这一形状巧合避开嵌套——大通道形状越过阈值即挂死，疑似即
+  medium 多进程批量（`--workers 4/8`）偶发停滞的根因；50ms 唤醒兜底
+  对它无效（卡的是互斥锁不是条件变量）。触发时每线程提示一次。
 
 ### 变更（Changed）
 
