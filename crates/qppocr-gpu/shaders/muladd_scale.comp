@@ -1,6 +1,7 @@
-// 融合 SE 门控：out = f * gate[C] + r（镜像 kernels/elementwise::
-// mul_add_scale_alloc 的快路径——CPU 侧刻意不做 fma（两次舍入），
-// GPU 编译器若融合则 ≤1 ulp，容差内）。
+// 融合 SE 门控：out = f * gate[C] + r。
+// CPU 侧刻意两次舍入（不 FMA）——GPU 编译器可能融合（≤1 ulp，
+// naga 不支持 precise 限定符阻融合；主要误差源在 sigmoid/gelu 的
+// exp 多项式，已逐字镜像）。
 #version 450
 layout(local_size_x = 256) in;
 layout(std430, binding = 0) buffer Buf { float data[]; };
