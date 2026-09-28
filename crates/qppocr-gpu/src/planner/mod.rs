@@ -399,6 +399,27 @@ mod extra_tests {
                 }
             }
         }
+        for (i, n) in graph.nodes.iter().enumerate().take(16) {
+            if n.op_type == "Conv" {
+                let attrs: Vec<String> = [
+                    "group",
+                    "strides",
+                    "pads",
+                    "kernel_shape",
+                    "dilations",
+                    "auto_pad",
+                ]
+                .iter()
+                .filter_map(|a| {
+                    n.attr(a)
+                        .map(|v| format!("{a}={:?}", v.ints).replace(']', "") + "]")
+                })
+                .collect();
+                eprintln!("[plan] #{i} {} {} {:?}", n.name, n.op_type, attrs);
+            } else {
+                eprintln!("[plan] #{i} {} {}", n.name, n.op_type);
+            }
+        }
         eprintln!("[plan] det 算子直方图: {ops:?}");
         eprintln!(
             "[plan] Conv act: {conv_act:?} | group: {conv_group:?} | kernel_shape: {conv_k:?}"

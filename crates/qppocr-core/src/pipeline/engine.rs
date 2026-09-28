@@ -204,7 +204,8 @@ impl Engine {
         dict: Dictionary,
         cfg: PipelineConfig,
     ) -> Result<Self> {
-        let opts = SessionOptions::default();
+        let mut opts = SessionOptions::default();
+        opts.model = crate::device::ModelRole::Det;
         let (det_graph, det_init) = Session::parts_from_path(det_path)?;
         let det_in = first_input(&det_graph);
         let det = ctx.create_session(det_graph, det_init, &opts)?;
@@ -236,7 +237,9 @@ impl Engine {
             Some(p) => {
                 let (g, init) = Session::parts_from_path(p)?;
                 let name = first_input(&g);
-                (Some(ctx.create_session(g, init, &opts)?), name)
+                let mut opts_cls = SessionOptions::default();
+                opts_cls.model = crate::device::ModelRole::Cls;
+                (Some(ctx.create_session(g, init, &opts_cls)?), name)
             }
             None => (None, String::new()),
         };
@@ -268,12 +271,15 @@ impl Engine {
         dict: Dictionary,
         cfg: PipelineConfig,
     ) -> Result<Self> {
-        let opts = SessionOptions::default();
+        let mut opts = SessionOptions::default();
+        opts.model = crate::device::ModelRole::Det;
         let (det_graph, det_init) =
             Session::parts_from_memory(det, &format!("{display_name}.det.onnx"))?;
         let det_in = first_input(&det_graph);
         let det = ctx.create_session(det_graph, det_init, &opts)?;
 
+        let mut opts = SessionOptions::default();
+        opts.model = crate::device::ModelRole::Rec;
         let (rec_graph, rec_init) =
             Session::parts_from_memory(rec, &format!("{display_name}.rec.onnx"))?;
         // ★ 字典与输入名在 create_session 消费图之前取（同 open_with）。

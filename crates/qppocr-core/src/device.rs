@@ -45,13 +45,31 @@ pub struct DeviceInfo {
     pub api: String,
 }
 
+/// 模型在流水线里的角色（GPU 路径按角色决定部署策略——bring-up 期的
+/// 混合部署：`QPPOCR_GPU_STAGES=det` 时 rec/cls 走 CPU）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelRole {
+    /// 检测模型（det）。
+    Det,
+    /// 识别模型（rec）。
+    Rec,
+    /// 方向分类模型（cls）。
+    Cls,
+    /// 其他 / 直接使用 core 的调用方。
+    #[default]
+    Other,
+}
+
 /// 会话构造选项。
 ///
 /// 空壳起步（`#[non_exhaustive]`）：precision（fp16）等旋钮后续版本加，
-/// 调用方一律经 [`Default`] 构造。
+/// 调用方一律经 [`Default`] 构造后按需覆写字段。
 #[non_exhaustive]
 #[derive(Debug, Default)]
-pub struct SessionOptions {}
+pub struct SessionOptions {
+    /// 本会话装的模型角色（pipeline 按位置填；直接调用者留默认）。
+    pub model: ModelRole,
+}
 
 /// 设备上下文：装载期工厂，一个设备一份。
 pub trait DeviceContext: Send + Sync {

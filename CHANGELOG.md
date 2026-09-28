@@ -10,6 +10,24 @@
 
 ### 新增（Added）
 
+- **GPU det 端到端跑通（Phase 1-G2）**：图计划生成器（planner 形状表
+  → op→内核映射 → 活性复用的区域布局 → 权重/参数块上传 → 整图 140
+  dispatch 录进一条可复用命令缓冲）+ VulkanSession（形状键计划缓存，
+  run = memcpy 输入 → 一次提交 → 读回输出）+ `QPPOCR_GPU_STAGES=det`
+  混合部署（det 走 GPU、rec/cls 明确告知走 CPU，非静默降级）。
+  Intel Arc 实测：128×128 二跑 6.1 ms；640×640 二跑 91.6 ms；CLI 端到端
+  （真实图片、det GPU + rec/cls CPU）文本输出与 CPU 路径**逐行一致**
+  （img-001~004 四图对比）。概率图 mean|diff| = 2.7e-5（逐层 fma/累加
+  序差异的正常传播；max 出现在 sigmoid 斜坡处，框归属翻转由字符级对拍
+  判定）。SessionOptions 新增 `model: ModelRole`（pipeline 按位置填
+  det/rec/cls）。开发中抓出并修复四个真 bug（全在提交信息留案底）：
+  ①`Layout` first-fit 分割后剩余区段未后移 → 同址重叠分配（深度卷积
+  in-place 别名的根因）；②静态区（权重/参数块）与激活共用空闲表 →
+  CB 重放时被激活写冲掉（conv 读到垃圾参数 → GPU 挂死设备丢失）；
+  ③单 CB 内连续 dispatch 缺内存屏障 → 长序列结果错乱（规范要求的
+  SSBO 写→读可见性）；④会话字段序 ctx 在前 → 先销毁设备再销毁管线
+  （CLI 路径 100% 退出段错误）。
+
 - **GPU 计算内核 G1（Phase 1-G 第一批，det 全算子覆盖）**：按 det 图
   真实分布（83 Conv：61×1x1 + 16×3x3 + 4×5x5 + 17 分组/深度；Conv
   ×2、池化/归约 14、Resize×6、通道 Concat×2）实现 conv（通用 group、
