@@ -17,6 +17,7 @@
 //! 用两个 q 寄存器凑满一组。
 
 #![allow(unsafe_op_in_unsafe_fn)] // 见模块注释：安全性由分发层契约承担
+#![allow(clippy::missing_safety_doc)] // 同  模块：前置条件由各入口的 Safety 段与分发层契约承担
 #![allow(clippy::approx_constant)] // 系数照抄多项式原文：位级一致的要求
 
 use std::arch::aarch64::*;
