@@ -926,7 +926,7 @@ pub unsafe fn bilinear_row_neon(
         vst1q_f32(dst.add(ox), r);
         ox += 4;
     }
-    crate::resize::bilinear_row_scalar(r0, r1, ix0, ix1, fx, ly, dst, ox, ox1);
+    crate::resize::bilinear_row_scalar(r0, r1, ix0, ix1, fx, ly, dst, ox0, ox1);
 }
 
 /// 2×2 最大值膨胀的行内核（`x ∈ [1, w)`）：16 字节一批取 max。
