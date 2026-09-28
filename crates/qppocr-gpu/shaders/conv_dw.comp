@@ -1,0 +1,154 @@
+// depthwise 3x3 stride 1 的向量化内核：每线程 4 水平相邻输出像素。
+//
+// 朴素版每线程 1 像素 × 9 读 = 9 读/输出。向量化后：
+// - 权重 9 个一次装载（朴素 9 读/线程 × 4 线程 = 36 → 9）
+// - 输入 3 行 × 6 列 = 18 unique（朴素 4×9=36 → 18，-50%）
+// - FMA 数不变（每输出仍 9 次）
+//
+// 适用：group=M（depthwise）、kh=kw=3、sh=sw=1、N=1。
+// local (4,8)=32 线程，workgroup 16 列 × 8 行。
+#version 450
+layout(local_size_x = 4, local_size_y = 8) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1];
+    uint b_off = params[P + 2], r_off = params[P + 3], out_off = params[P + 4];
+    uint Ci = params[P + 6];    // 输入通道
+    uint H  = params[P + 7];
+    uint W  = params[P + 8];
+    uint M  = params[P + 9];    // 输出通道（depthwise 下 M == Ci）
+    uint PH = params[P + 14], PW = params[P + 15];
+    uint act = params[P + 17];
+    float c1 = uintBitsToFloat(params[P + 18]);
+    float c2 = uintBitsToFloat(params[P + 19]);
+    float c3 = uintBitsToFloat(params[P + 20]);
+    uint OHW = params[P + 21];
+    uint OW  = params[P + 22];
+    uint OH = OHW / OW;
+
+    uint lx = gl_LocalInvocationID.x;  // 0-3
+    uint ly = gl_LocalInvocationID.y;  // 0-7
+    uint oh = gl_WorkGroupID.y * 8 + ly;
+    uint ch = gl_WorkGroupID.z;        // 通道 = N*M 里的 m（depthwise 1:1）
+    if (oh >= OH || ch >= M) return;
+
+    // 4 个输出列的起点
+    uint ow0 = gl_WorkGroupID.x * 16 + lx * 4;
+
+    // 权重一次装载：w[ch][0][ky][kx]（depthwise 的 cig=1）
+    // ONNX 权重 [M, 1, 3, 3] → flat [ch * 9 + ky * 3 + kx]
+    float w00 = data[w_off + ch * 9 + 0];
+    float w01 = data[w_off + ch * 9 + 1];
+    float w02 = data[w_off + ch * 9 + 2];
+    float w10 = data[w_off + ch * 9 + 3];
+    float w11 = data[w_off + ch * 9 + 4];
+    float w12 = data[w_off + ch * 9 + 5];
+    float w20 = data[w_off + ch * 9 + 6];
+    float w21 = data[w_off + ch * 9 + 7];
+    float w22 = data[w_off + ch * 9 + 8];
+
+    float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+
+    // 3 行（ky=0,1,2 → iy = oh-1+ky，stride 1 无 dilation）
+    for (uint ky = 0; ky < 3; ky++) {
+        int iy = int(oh) - int(PH) + int(ky);
+        if (iy < 0 || iy >= int(H)) continue;
+        uint row_base = in_off + ch * H * W + uint(iy) * W;
+        // 6 个输入列（ow0-1 到 ow0+4），按需读
+        // p=0: 需要列 ow0-1, ow0, ow0+1
+        // p=1: 需要列 ow0, ow0+1, ow0+2
+        // p=2: 需要列 ow0+1, ow0+2, ow0+3
+        // p=3: 需要列 ow0+2, ow0+3, ow0+4
+        // 只读 unique 的 6 列：ow0-1 到 ow0+4
+
+        // 列 ow0-1（kx=0 for p=0）
+        if (ow0 > 0 || PW > 0) {
+            int ix = int(ow0) - int(PW) - 1 + 0;  // kx=0, ow=ow0
+            // 实际上让我直接逐 (kx, p) 展开更清晰
+        }
+
+        // 直接展开 3×3 内积（比嵌套循环 + 通用索引快）
+        // kx=0: 输入列 = ow + p - PW + 0
+        {
+            int ix = int(ow0) - int(PW);
+            float wv = (ky == 0) ? w00 : (ky == 1) ? w10 : w20;
+            if (ix >= 0 && ix < int(W)) {
+                float x = data[row_base + uint(ix)];
+                acc0 = fma(x, wv, acc0);       // p=0
+            }
+            if (ix + 1 >= 0 && ix + 1 < int(W)) {
+                float x = data[row_base + uint(ix + 1)];
+                acc1 = fma(x, wv, acc1);       // p=1（ow0+1 的 kx=0 → ix+1）
+            }
+            if (ix + 2 >= 0 && ix + 2 < int(W)) {
+                float x = data[row_base + uint(ix + 2)];
+                acc2 = fma(x, wv, acc2);
+            }
+            if (ix + 3 >= 0 && ix + 3 < int(W)) {
+                float x = data[row_base + uint(ix + 3)];
+                acc3 = fma(x, wv, acc3);
+            }
+        }
+        // kx=1: 输入列 = ow + p - PW + 1
+        {
+            int ix = int(ow0) - int(PW) + 1;
+            float wv = (ky == 0) ? w01 : (ky == 1) ? w11 : w21;
+            if (ix >= 0 && ix < int(W)) {
+                float x = data[row_base + uint(ix)];
+                acc0 = fma(x, wv, acc0);
+            }
+            if (ix + 1 >= 0 && ix + 1 < int(W)) {
+                float x = data[row_base + uint(ix + 1)];
+                acc1 = fma(x, wv, acc1);
+            }
+            if (ix + 2 >= 0 && ix + 2 < int(W)) {
+                float x = data[row_base + uint(ix + 2)];
+                acc2 = fma(x, wv, acc2);
+            }
+            if (ix + 3 >= 0 && ix + 3 < int(W)) {
+                float x = data[row_base + uint(ix + 3)];
+                acc3 = fma(x, wv, acc3);
+            }
+        }
+        // kx=2: 输入列 = ow + p - PW + 2
+        {
+            int ix = int(ow0) - int(PW) + 2;
+            float wv = (ky == 0) ? w02 : (ky == 1) ? w12 : w22;
+            if (ix >= 0 && ix < int(W)) {
+                float x = data[row_base + uint(ix)];
+                acc0 = fma(x, wv, acc0);
+            }
+            if (ix + 1 >= 0 && ix + 1 < int(W)) {
+                float x = data[row_base + uint(ix + 1)];
+                acc1 = fma(x, wv, acc1);
+            }
+            if (ix + 2 >= 0 && ix + 2 < int(W)) {
+                float x = data[row_base + uint(ix + 2)];
+                acc2 = fma(x, wv, acc2);
+            }
+            if (ix + 3 >= 0 && ix + 3 < int(W)) {
+                float x = data[row_base + uint(ix + 3)];
+                acc3 = fma(x, wv, acc3);
+            }
+        }
+    }
+
+    // epilogue + 写 4 输出
+    float bias_v = (b_off != NONE) ? data[b_off + ch] : 0.0;
+    uint out_base = out_off + ch * OHW + oh * OW;
+    for (uint p = 0; p < 4; p++) {
+        uint ow = ow0 + p;
+        if (ow >= OW) break;
+        float v = (p == 0) ? acc0 : (p == 1) ? acc1 : (p == 2) ? acc2 : acc3;
+        v += bias_v;
+        if (act == 2) v = max(v, 0.0);
+        // act==1 (gelu) 在 depthwise 不出现（图优化只融合 group==1 的激活）
+        data[out_base + ow] = v;
+    }
+}
