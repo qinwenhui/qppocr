@@ -1,0 +1,95 @@
+// 通用 k×k conv 的隐式 GEMM（k=1 走 conv_gemm，这里管 3x3/5x5 等大核）。
+//
+// 与 conv.comp（direct，2D 空间 dispatch）的区别：
+// - 1D dispatch [OHW/16, M/16]（同 conv_gemm）——M 相邻线程读相邻权重行，
+//   HW 相邻线程读相邻输入列 + 写相邻输出（coalesced）
+// - 权重按 [M, Ci, kh, kw] 展平为 [M, Ci*k²] 的 A 矩阵——行主序连续读
+// - 输入经内联 im2col 索引（免物化）按 [Ci*k², OHW] 的 B 矩阵读
+//
+// 适用：group=1, N=1, 任意 k/s/p（depthwise 走 conv.comp）。
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+float erf1(float x) {
+    float ax = abs(x);
+    float t = 1.0 / fma(0.3275911, ax, 1.0);
+    float p = 1.0614054;
+    p = fma(p, t, -1.453152027);
+    p = fma(p, t, 1.421413741);
+    p = fma(p, t, -0.284496736);
+    p = fma(p, t, 0.2548296);
+    p *= t;
+    float xx = clamp(-ax * ax, -88.0, 88.0);
+    float kf = roundEven(xx * 1.442695);
+    float r = fma(-kf, 0.6931472, xx);
+    r = fma(-kf, -2.9802322e-8, r);
+    float q = 1.0 / 720.0;
+    q = fma(q, r, 1.0 / 120.0);
+    q = fma(q, r, 1.0 / 24.0);
+    q = fma(q, r, 1.0 / 6.0);
+    q = fma(q, r, 0.5);
+    q = fma(q, r, 1.0);
+    q = fma(q, r, 1.0);
+    float e = uintBitsToFloat(uint(int(kf) + 127) << 23) * q;
+    float res = fma(-p, e, 1.0);
+    return uintBitsToFloat(floatBitsToUint(res) | (floatBitsToUint(x) & 0x80000000u));
+}
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1];
+    uint b_off = params[P + 2], r_off = params[P + 3], out_off = params[P + 4];
+    uint Ci = params[P + 6];    // 输入通道
+    uint H  = params[P + 7];    // 输入高
+    uint W  = params[P + 8];    // 输入宽
+    uint M  = params[P + 9];    // 输出通道
+    uint KH = params[P + 10], KW = params[P + 11];
+    uint SH = params[P + 12], SW = params[P + 13];
+    uint PH = params[P + 14], PW = params[P + 15];
+    uint act = params[P + 17];
+    float c1 = uintBitsToFloat(params[P + 18]);
+    float c2 = uintBitsToFloat(params[P + 19]);
+    float c3 = uintBitsToFloat(params[P + 20]);
+    uint OHW = params[P + 21];
+    uint OW  = params[P + 22];
+
+    uint gm = gl_GlobalInvocationID.y;  // M
+    uint gn = gl_GlobalInvocationID.x;  // OHW（oh*OW + ow）
+    if (gm >= M || gn >= OHW) return;
+
+    uint ow = gn % OW;
+    uint oh = gn / OW;
+
+    float acc = 0.0;
+    // 隐式 GEMM：K = Ci × KH × KW，A 行连续（权重 [M, Ci, kh, kw] 展平）
+    for (uint c = 0; c < Ci; c++) {
+        for (uint ky = 0; ky < KH; ky++) {
+            int iy = int(oh * SH) - int(PH) + int(ky);
+            if (iy < 0 || iy >= int(H)) continue;
+            for (uint kx = 0; kx < KW; kx++) {
+                int ix = int(ow * SW) - int(PW) + int(kx);
+                if (ix < 0 || ix >= int(W)) continue;
+                // A[gm][c*KH*KW + ky*KW + kx] = w[gm][c][ky][kx]
+                float a = data[w_off + (gm * Ci + c) * KH * KW + ky * KW + kx];
+                // B[c*KH*KW + ky*KW + kx][gn] = x[c][iy][ix]
+                float b = data[in_off + (c * H + uint(iy)) * W + uint(ix)];
+                acc = fma(a, b, acc);
+            }
+        }
+    }
+
+    if (b_off != NONE) acc += data[b_off + gm];
+    if (act == 2) {
+        acc = acc > 0.0 ? acc : 0.0;
+    } else if (act == 1) {
+        float inv = 1.0 / c1;
+        acc = c3 * acc * (erf1(acc * inv) + c2);
+    }
+    if (r_off != NONE) acc += data[r_off + gm * OHW + gn];
+    data[out_off + gm * OHW + gn] = acc;
+}

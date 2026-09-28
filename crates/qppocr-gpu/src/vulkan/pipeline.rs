@@ -30,6 +30,10 @@ const SHADERS: &[(&str, &[u8])] = &[
         include_bytes!("../../shaders/spirv/conv_gemm.spv"),
     ),
     (
+        "conv_k_gemm",
+        include_bytes!("../../shaders/spirv/conv_k_gemm.spv"),
+    ),
+    (
         "convtranspose",
         include_bytes!("../../shaders/spirv/convtranspose.spv"),
     ),
