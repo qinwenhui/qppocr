@@ -8,6 +8,19 @@
 
 ## [Unreleased]
 
+### 修复（Fixed）
+
+- **区域重试自 0.2.0 起实际默认开启**（与 0.2.0 发布说明及 README 宣称
+  相反）：当时的「默认关闭」只改了门面（`Advanced::default` 与 Balanced
+  预设），漏改 core 的 `PipelineConfig::default()`——门面 `resolve_config`
+  以 core 默认值为起点、Balanced 预设不清零，于是默认配置仍在约 9/100
+  张图上隐式跑双倍 det（0.2.0/0.2.1 发布版均如此）。core 默认值现归零，
+  默认真正关闭；Accuracy 预设与显式 `Advanced::retry_conf` 的开启路径
+  不受影响。已补回归断言（门面预设契约 + core 默认值各一条测试），
+  「文档声明的默认值必须被测试锁住」，防同类脱节再犯。
+  逐行精度开关一致（0.2.0 发布说明的实测依据不变）；对拍基线已随
+  本行为修正重建（tiny 1099→1096 行、small 1042→1041 行）。
+
 ### 新增（Added）
 
 - **设备接缝（GPU 地基）**：`qppocr-core` 新增 `device` 模块——

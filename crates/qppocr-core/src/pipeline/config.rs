@@ -136,11 +136,35 @@ impl Default for PipelineConfig {
             cls_window: false,
             cls_batch: 1,
             merge_line_gap: 0.5,
-            retry_conf: 0.85,
+            // 区域重试默认关（应用层的质量增强，代价是触发图 det 翻倍）。
+            // ⚠ 门面 resolve_config 以本默认值为起点、Balanced 预设不清零
+            //   ——这里留 0.85 等于默认模式隐式开重试（0.2.0/0.2.1 实际
+            //   如此发布，与 CHANGELOG/README 宣称相反）。要开用 Accuracy
+            //   预设或显式 retry_conf。
+            retry_conf: 0.0,
             enhance_contrast: false,
             upscale: 1,
             rec_shards: usize::MAX,
             threads: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 文档声明的默认值必须被断言锁住：0.2.0/0.2.1 曾宣称「区域重试
+    /// 默认关闭」而这里的默认值仍是 0.85（门面以它为起点、Balanced
+    /// 预设不清零），发布版实际默认开启——声明与行为脱节两个版本
+    /// 才被发现。改这里或门面预设前先改/确认这条断言与文档一致。
+    #[test]
+    fn documented_defaults_are_asserted() {
+        let d = PipelineConfig::default();
+        assert_eq!(d.retry_conf, 0.0, "区域重试默认必须关闭（README/CHANGELOG 如此声明）");
+        // 门面 Advanced::default() 自注「必须与 PipelineConfig::default()
+        // 一致」的两个字段，在此一并锁住。
+        assert_eq!(d.rec_batch, 1);
+        assert_eq!(d.cls_batch, 1);
     }
 }

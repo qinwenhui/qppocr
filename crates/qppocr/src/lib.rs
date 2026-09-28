@@ -680,3 +680,32 @@ fn resolve_config(preset: Preset, cfg: &Config, advanced_fn: Option<AdvancedFn>)
     pc.upscale = adv.upscale;
     pc
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 预设的实际解析结果必须与文档声明一致。区域重试曾在这里脱节：
+    /// 0.2.0 宣称「默认关闭」，但 core 默认值是 0.85、Balanced 预设又
+    /// 不清零——发布版实际默认开启，两个版本后才被发现。声明过的
+    /// 默认行为一律进这条测试（「声明 = 断言」）。
+    #[test]
+    fn preset_contract_matches_docs() {
+        let cases = [
+            (Preset::Speed, 0.0f64, 40i32),
+            (Preset::Balanced, 0.0, 48),
+            (Preset::Accuracy, 0.85, 48),
+        ];
+        for (preset, retry, rec_h) in cases {
+            let pc = resolve_config(preset, &Config::default(), None);
+            assert_eq!(
+                pc.retry_conf, retry,
+                "{preset:?} 的区域重试默认与文档不符"
+            );
+            assert_eq!(pc.rec_height, rec_h, "{preset:?} 的 rec_height 与文档不符");
+        }
+        // Advanced::default() 的自注契约：「必须与 PipelineConfig::default()
+        // 一致」——整份覆盖时不得悄悄换行为。
+        assert_eq!(Advanced::default().retry_conf, 0.0);
+    }
+}
