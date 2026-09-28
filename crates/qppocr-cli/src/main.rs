@@ -7,7 +7,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use qppocr::{Engine, Error, Preset, Tier};
+use qppocr::{DeviceChoice, Engine, Error, GpuApi, Preset, Tier};
 
 #[derive(Clone)]
 struct Options {
@@ -27,12 +27,59 @@ struct Options {
     no_retry: bool,
     rec_height: u32,
     rec_shards: usize,
+    /// 计算设备（`--device`）。
+    device: DeviceChoice,
     /// `bench` 子命令模式。
     bench_mode: bool,
     /// bench 的测量轮数（另有 1 轮 warmup 丢弃）。
     rounds: usize,
     /// bench 的扫描轴：`key=v1,v2,...`，逐值与基准配置交错对比。
     sweep: Option<(String, Vec<String>)>,
+}
+
+/// `--device` 值解析：`cpu | gpu | vulkan[:N] | cuda[:N]`。
+fn parse_device(s: &str) -> Option<DeviceChoice> {
+    let (api, idx) = match s.split_once(':') {
+        Some((a, i)) => (a, Some(i.parse().ok()?)),
+        None => (s, None),
+    };
+    match api {
+        "cpu" if idx.is_none() => Some(DeviceChoice::Cpu),
+        "gpu" => Some(DeviceChoice::Gpu {
+            api: GpuApi::Auto,
+            index: idx,
+        }),
+        "vulkan" => Some(DeviceChoice::Gpu {
+            api: GpuApi::Vulkan,
+            index: idx,
+        }),
+        "cuda" => Some(DeviceChoice::Gpu {
+            api: GpuApi::Cuda,
+            index: idx,
+        }),
+        _ => None,
+    }
+}
+
+/// DeviceChoice 回 CLI 字符串（worker 参数回传 / bench 报告用）。
+fn device_name(d: &DeviceChoice) -> String {
+    match d {
+        DeviceChoice::Cpu => "cpu".into(),
+        // DeviceChoice 是 non_exhaustive：未来变体（如指定设备名）落到
+        // 这里，字符串形式的往返保真交给那一版再扩。
+        DeviceChoice::Gpu { api, index } => {
+            let a = match api {
+                GpuApi::Auto => "gpu",
+                GpuApi::Vulkan => "vulkan",
+                GpuApi::Cuda => "cuda",
+            };
+            match index {
+                Some(i) => format!("{a}:{i}"),
+                None => a.into(),
+            }
+        }
+        _ => "cpu".into(),
+    }
 }
 
 fn print_usage() {
@@ -54,6 +101,7 @@ options:
   --bench <n>       run n times per image and report the best
   --no-cls          turn off the 0/180 direction classifier
   --rec-shards <n>  rec 两级并行的外层分片数（0 = 关，不传 = 按档位自动）
+  --device <d>      cpu | gpu | vulkan[:N] | cuda[:N]   (default: cpu)
   --quiet           suppress the per-line listing
   -h, --help        this help
 
@@ -62,8 +110,8 @@ bench 子命令（测量纪律内建）：
   交错、各自取中位，报告探测到的内核后端与生效配置。
   --rounds <n>      测量轮数（默认 3）
   --sweep <k=vs>    扫一个轴：preset=balanced,speed | rec-height=40,48,56 |
-                    threads=4,8,16 | rec-shards=0,4,12。第一个值之外还能
-                    用 'base' 引用命令行给的基准配置。"
+                    threads=4,8,16 | rec-shards=0,4,12 | device=cpu,gpu。
+                    第一个值之外还能用 'base' 引用命令行给的基准配置。"
     );
 }
 
@@ -85,6 +133,7 @@ fn parse_args() -> Option<Options> {
         rec_height: 0,
         // `usize::MAX` = 自动（按档位），`0` = 关，其余 = 显式分片数。
         rec_shards: usize::MAX,
+        device: DeviceChoice::Cpu,
         bench_mode: false,
         rounds: 3,
         sweep: None,
@@ -152,6 +201,14 @@ fn parse_args() -> Option<Options> {
                 i += 1;
                 o.rec_shards = args.get(i)?.parse().ok()?;
             }
+            "--device" => {
+                i += 1;
+                let s = args.get(i)?;
+                o.device = parse_device(s).or_else(|| {
+                    eprintln!("--device: cpu | gpu | vulkan[:N] | cuda[:N]");
+                    None
+                })?;
+            }
             "--rounds" => {
                 i += 1;
                 o.rounds = args.get(i)?.parse().ok()?;
@@ -163,9 +220,9 @@ fn parse_args() -> Option<Options> {
                 let k = k.trim().to_ascii_lowercase();
                 if !matches!(
                     k.as_str(),
-                    "preset" | "rec-height" | "threads" | "rec-shards"
+                    "preset" | "rec-height" | "threads" | "rec-shards" | "device"
                 ) {
-                    eprintln!("--sweep: preset | rec-height | threads | rec-shards");
+                    eprintln!("--sweep: preset | rec-height | threads | rec-shards | device");
                     return None;
                 }
                 let vs: Vec<String> = vs.split(',').map(|v| v.trim().to_string()).collect();
@@ -388,6 +445,7 @@ fn build_engine(o: &Options) -> Result<Engine, Error> {
     let mut builder = Engine::builder()
         .tier(o.tier)
         .preset(o.preset)
+        .device(o.device.clone())
         .detect_orientation(!o.no_cls);
     if o.threads > 0 {
         builder = builder.threads(o.threads);
@@ -488,6 +546,9 @@ fn run(o: &Options) -> Result<(), Error> {
                 .arg(o.tier.dir_name())
                 .arg("--preset")
                 .arg(preset_name(o.preset));
+            // ★ device 必须回传：这里漏掉的话子进程静默跑 CPU，bench 数字
+            //   全部失真且无任何报错（--tier/--preset 曾是同一类遗漏高发区）。
+            cmd.arg("--device").arg(device_name(&o.device));
             let child = cmd
                 .stdout(std::process::Stdio::piped())
                 .spawn()
@@ -576,6 +637,7 @@ fn apply_sweep(o: &mut Options, key: &str, val: &str) -> Result<String, String> 
                 "preset" => preset_name(o.preset).to_string(),
                 "rec-height" => o.rec_height.to_string(),
                 "threads" => o.threads.to_string(),
+                "device" => device_name(&o.device),
                 _ => o.rec_shards.to_string(),
             })
         } else {
@@ -601,6 +663,9 @@ fn apply_sweep(o: &mut Options, key: &str, val: &str) -> Result<String, String> 
         "rec-shards" => {
             o.rec_shards = v.parse().map_err(|_| format!("rec-shards: {v} 不是整数"))?;
         }
+        "device" => {
+            o.device = parse_device(&v).ok_or_else(|| format!("device: {v}"))?;
+        }
         _ => unreachable!("parse_args 已限定了 sweep 键"),
     }
     Ok(match key {
@@ -624,7 +689,7 @@ fn run_bench(o: &Options) -> Result<(), Error> {
     // 配置列表：基准 + sweep 值（第一个 sweep 值通常就是 base）。
     let mut configs: Vec<(String, Options)> = Vec::new();
     let eff = format!(
-        "preset={} rec_h={} threads={} shards={}",
+        "preset={} rec_h={} threads={} shards={} device={}",
         preset_name(o.preset),
         if o.rec_height > 0 {
             o.rec_height.to_string()
@@ -641,6 +706,7 @@ fn run_bench(o: &Options) -> Result<(), Error> {
             0 => "off".into(),
             n => n.to_string(),
         },
+        device_name(&o.device),
     );
     configs.push(("base".to_string(), o.clone()));
     if let Some((key, vals)) = &o.sweep {
@@ -653,6 +719,7 @@ fn run_bench(o: &Options) -> Result<(), Error> {
                     && e.rec_height == c.rec_height
                     && e.threads == c.threads
                     && e.rec_shards == c.rec_shards
+                    && e.device == c.device
             });
             if !dup {
                 configs.push((label, c));

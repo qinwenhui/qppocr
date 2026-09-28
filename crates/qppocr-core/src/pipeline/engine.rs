@@ -5,8 +5,12 @@
 //! 「从模型 metadata 取」或「显式给一份」两种来源，取不到时报错并
 //! 指出该档位字典的行数——不静默降级。
 
+use std::sync::Arc;
+
+use crate::device::{DeviceContext, DeviceSession, SessionOptions, cpu_context};
 use crate::error::{Error, Result};
 use crate::executor::Session;
+use crate::onnx::model::Graph;
 use crate::tensor::{DType, Tensor};
 
 use super::config::PipelineConfig;
@@ -144,14 +148,25 @@ pub enum Dictionary {
     Text(String),
 }
 
+/// 图的第一个非空输入名（三个会话的输入张量都按它命名传入）。
+///
+/// 在 `create_session` 消费图之前调用——设备会话不保证保留 [`Graph`]。
+fn first_input(g: &Graph) -> String {
+    g.inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// OCR 引擎：一次构造、多次 run；`run(&self)`（权重只读）。
 pub struct Engine {
     /// 检测会话。
-    det: Session,
+    det: Arc<dyn DeviceSession>,
     /// 识别会话。
-    rec: Session,
+    rec: Arc<dyn DeviceSession>,
     /// 方向分类会话（可选）。
-    cls: Option<Session>,
+    cls: Option<Arc<dyn DeviceSession>>,
     /// 流水线配置。
     cfg: PipelineConfig,
     /// 字符表（0 = blank，末尾 = 空格）。
@@ -165,9 +180,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// 打开引擎。`dict` 给 [`Dictionary::Text`] 时用外部字典（上游模型）；
-    /// [`Dictionary::Embedded`] 从 rec 模型 metadata 取，取不到报错并
-    /// 给出修复建议（§4.4 的硬要求）。
+    /// 打开引擎（默认 CPU 设备）。`dict` 给 [`Dictionary::Text`] 时用外部
+    /// 字典（上游模型）；[`Dictionary::Embedded`] 从 rec 模型 metadata 取，
+    /// 取不到报错并给出修复建议（§4.4 的硬要求）。
     pub fn open(
         det_path: &std::path::Path,
         rec_path: &std::path::Path,
@@ -175,16 +190,62 @@ impl Engine {
         dict: Dictionary,
         cfg: PipelineConfig,
     ) -> Result<Self> {
-        let det = Session::open(det_path)?;
-        let rec = Session::open(rec_path)?;
-        let cls = match cls_path {
-            Some(p) => Some(Session::open(p)?),
-            None => None,
-        };
-        Self::from_sessions(det, rec, cls, dict, cfg)
+        let ctx = cpu_context();
+        Self::open_with(ctx.as_ref(), det_path, rec_path, cls_path, dict, cfg)
     }
 
-    /// 从内存字节构造（WASM / 移动端；display_name 只用于报告）。
+    /// 打开引擎（指定设备）：det/rec/cls 三个模型都经 `ctx` 构造会话
+    /// （装载期一次性上传权重）。
+    pub fn open_with(
+        ctx: &dyn DeviceContext,
+        det_path: &std::path::Path,
+        rec_path: &std::path::Path,
+        cls_path: Option<&std::path::Path>,
+        dict: Dictionary,
+        cfg: PipelineConfig,
+    ) -> Result<Self> {
+        let opts = SessionOptions::default();
+        let (det_graph, det_init) = Session::parts_from_path(det_path)?;
+        let det_in = first_input(&det_graph);
+        let det = ctx.create_session(det_graph, det_init, &opts)?;
+
+        // ★ 字典与输入名在 create_session 消费图之前取：设备会话不保证
+        //   保留 Graph（权重上传后拓扑只活在它的执行计划里）。
+        let (rec_graph, rec_init) = Session::parts_from_path(rec_path)?;
+        let raw: String = match dict {
+            Dictionary::Embedded => {
+                rec_graph
+                    .metadata
+                    .get("character")
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Graph(
+                            "rec 模型不带 'character' 字典元数据（上游原件如此）——\
+                         请用 Dictionary::Text 显式提供：tiny 档 6904 行、\
+                         small/medium 档 18708 行"
+                                .into(),
+                        )
+                    })?
+            }
+            Dictionary::Text(s) => s,
+        };
+        let rec_in = first_input(&rec_graph);
+        let rec = ctx.create_session(rec_graph, rec_init, &opts)?;
+
+        let (cls, cls_in) = match cls_path {
+            Some(p) => {
+                let (g, init) = Session::parts_from_path(p)?;
+                let name = first_input(&g);
+                (Some(ctx.create_session(g, init, &opts)?), name)
+            }
+            None => (None, String::new()),
+        };
+
+        Self::from_device_sessions(det, rec, cls, raw, det_in, rec_in, cls_in, cfg)
+    }
+
+    /// 从内存字节构造（默认 CPU 设备；WASM / 移动端，display_name 只用于
+    /// 报告）。
     pub fn open_bytes(
         det: &[u8],
         rec: &[u8],
@@ -193,23 +254,71 @@ impl Engine {
         dict: Dictionary,
         cfg: PipelineConfig,
     ) -> Result<Self> {
-        let det = Session::from_memory(det, &format!("{display_name}.det.onnx"))?;
-        let rec = Session::from_memory(rec, &format!("{display_name}.rec.onnx"))?;
-        let cls = match cls {
-            Some(b) => Some(Session::from_memory(
-                b,
-                &format!("{display_name}.cls.onnx"),
-            )?),
-            None => None,
-        };
-        Self::from_sessions(det, rec, cls, dict, cfg)
+        let ctx = cpu_context();
+        Self::open_bytes_with(ctx.as_ref(), det, rec, cls, display_name, dict, cfg)
     }
 
-    fn from_sessions(
-        det: Session,
-        rec: Session,
-        cls: Option<Session>,
+    /// 从内存字节构造（指定设备）。
+    pub fn open_bytes_with(
+        ctx: &dyn DeviceContext,
+        det: &[u8],
+        rec: &[u8],
+        cls: Option<&[u8]>,
+        display_name: &str,
         dict: Dictionary,
+        cfg: PipelineConfig,
+    ) -> Result<Self> {
+        let opts = SessionOptions::default();
+        let (det_graph, det_init) =
+            Session::parts_from_memory(det, &format!("{display_name}.det.onnx"))?;
+        let det_in = first_input(&det_graph);
+        let det = ctx.create_session(det_graph, det_init, &opts)?;
+
+        let (rec_graph, rec_init) =
+            Session::parts_from_memory(rec, &format!("{display_name}.rec.onnx"))?;
+        // ★ 字典与输入名在 create_session 消费图之前取（同 open_with）。
+        let raw: String = match dict {
+            Dictionary::Embedded => {
+                rec_graph
+                    .metadata
+                    .get("character")
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Graph(
+                            "rec 模型不带 'character' 字典元数据（上游原件如此）——\
+                         请用 Dictionary::Text 显式提供：tiny 档 6904 行、\
+                         small/medium 档 18708 行"
+                                .into(),
+                        )
+                    })?
+            }
+            Dictionary::Text(s) => s,
+        };
+        let rec_in = first_input(&rec_graph);
+        let rec = ctx.create_session(rec_graph, rec_init, &opts)?;
+
+        let (cls, cls_in) = match cls {
+            Some(b) => {
+                let (g, init) = Session::parts_from_memory(b, &format!("{display_name}.cls.onnx"))?;
+                let name = first_input(&g);
+                (Some(ctx.create_session(g, init, &opts)?), name)
+            }
+            None => (None, String::new()),
+        };
+
+        Self::from_device_sessions(det, rec, cls, raw, det_in, rec_in, cls_in, cfg)
+    }
+
+    /// 由已构造的设备会话组装引擎（字典原文与三个输入名已在上游提取）。
+    #[allow(clippy::too_many_arguments)]
+    fn from_device_sessions(
+        det: Arc<dyn DeviceSession>,
+        rec: Arc<dyn DeviceSession>,
+        cls: Option<Arc<dyn DeviceSession>>,
+        raw: String,
+        det_in: String,
+        rec_in: String,
+        cls_in: String,
         cfg: PipelineConfig,
     ) -> Result<Self> {
         // 线程数要在首次并行算子前请求（池首用时定容；先建的引擎赢，
@@ -217,12 +326,16 @@ impl Engine {
         if cfg.threads > 0 {
             qppocr_kernels::par::set_threads(cfg.threads);
         }
-        // ★ 两级并行：rec 的外层分片各占一个**独立小池**，其算子在该池内
-        //   fork，互不排队。单池做不到这一点——`fork_mu` 会把并发 fork
-        //   串起来，外层线程互相等，等于没分片。
+        // ★ 两级并行（仅受益于宿主侧扇出的会话，即 CPU）：rec 的外层分片
+        //   各占一个**独立小池**，其算子在该池内 fork，互不排队。单池做不
+        //   到这一点——`fork_mu` 会把并发 fork 串起来，外层线程互相等，
+        //   等于没分片。
         //   布局 = [全尺寸默认池, 分片池 × k]，k*分片大小 ≈ 总线程数。
+        //   GPU 会话（prefers_host_parallelism() = false）不扇出，分片池
+        //   永远空转——跳过布局请求；池 0 仍按全尺寸创建，裁剪 / db 后
+        //   处理这些设备边界外的 CPU 并行不受影响。
         let shards = cfg.rec_shards;
-        if shards > 1 {
+        if shards > 1 && rec.prefers_host_parallelism() {
             // ★ 必须用 planned_threads()：threads() 会顺手把池按**默认布局**
             //   建起来，之后 request_pools 就成了 no-op——分片线程会全部挤在
             //   0 号池上被 fork_mu 串行化（实测逐算子耗时翻倍）。
@@ -233,23 +346,6 @@ impl Engine {
             qppocr_kernels::par::request_pools(&sizes);
         }
         // 字典：blank 在 0、字典项、空格在末尾（ppocr 的约定）
-        let raw: String = match dict {
-            Dictionary::Embedded => {
-                rec.graph
-                    .metadata
-                    .get("character")
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::Graph(
-                            "rec 模型不带 'character' 字典元数据（上游原件如此）——\
-                             请用 Dictionary::Text 显式提供：tiny 档 6904 行、\
-                             small/medium 档 18708 行"
-                                .into(),
-                        )
-                    })?
-            }
-            Dictionary::Text(s) => s,
-        };
         let mut charset = vec!["blank".to_string()];
         let mut cur = String::new();
         for ch in raw.chars() {
@@ -275,25 +371,6 @@ impl Engine {
             // 允许自定义字典，但不是常见档位时提示一下（不阻止——用户可能
             // 真的换了字典）。真正的硬校验在 run 时的 C == charset.len()。
         }
-
-        let det_in = det
-            .graph
-            .inputs
-            .iter()
-            .find(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_default();
-        let rec_in = rec
-            .graph
-            .inputs
-            .iter()
-            .find(|s| !s.is_empty())
-            .cloned()
-            .unwrap_or_default();
-        let cls_in = cls
-            .as_ref()
-            .and_then(|c| c.graph.inputs.iter().find(|s| !s.is_empty()).cloned())
-            .unwrap_or_default();
 
         Ok(Self {
             det,
@@ -1032,7 +1109,7 @@ impl Engine {
                 .step_by(per)
                 .map(|b| (b, (b + per).min(crops.len())))
                 .collect();
-            let decisions = Self::run_batches(&cls_batches, |b, e| -> Result<Vec<bool>> {
+            let cls_fn = |b: usize, e: usize| -> Result<Vec<bool>> {
                 let n = e - b;
                 let stride = 3 * (ch as usize) * (cw as usize);
                 let mut buf = F32Buf::with_zeroed(n * stride);
@@ -1060,7 +1137,19 @@ impl Engine {
                         o.f32[k * 2 + 1] > o.f32[k * 2] && o.f32[k * 2 + 1] >= self.cfg.cls_thresh
                     })
                     .collect())
-            })?;
+            };
+            // 设备会话不受益于宿主侧扇出（GPU 内部已并行，N 个小批的
+            // 线程 spawn + 并发提交是纯开销）——退化为串行循环，与
+            // `run_batches` 的单线程分支同构。
+            let decisions = if cls.prefers_host_parallelism() {
+                Self::run_batches(&cls_batches, cls_fn)?
+            } else {
+                let mut out = Vec::with_capacity(cls_batches.len());
+                for &(b, e) in &cls_batches {
+                    out.push(cls_fn(b, e)?);
+                }
+                out
+            };
             let decisions: Vec<bool> = decisions.into_iter().flatten().collect();
             for (i, &flip) in decisions.iter().enumerate() {
                 if flip {
@@ -1194,7 +1283,15 @@ impl Engine {
         //   1.43x（tiny）——rec 的算子虽大，但每行 ~80 个算子顺序依赖，
         //   每次 fork ~97 us 的协调开销乘上去不划算。换方案前先看这条。
         let shards = self.cfg.rec_shards;
-        let outs = if shards > 1 {
+        let outs = if !self.rec.prefers_host_parallelism() {
+            // 设备会话：行间扇出只会把提交串在会话内部的队列锁上——
+            // 串行批即可（与 cls 阶段同一门控）。
+            let mut outs = Vec::with_capacity(batches.len());
+            for &(b, e) in &batches {
+                outs.push(rec_fn(b, e)?);
+            }
+            outs
+        } else if shards > 1 {
             Self::run_batches_sharded(&batches, rec_fn, shards)?
         } else {
             Self::run_batches(&batches, rec_fn)?

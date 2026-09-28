@@ -13,6 +13,9 @@ pub enum Error {
     /// 图里有执行不了的东西（不支持的算子、缺输入……）。
     /// **不静默降级**：报错点名，不给"尽力而为"。
     Graph(String),
+    /// 设备级失败（GPU 不可用 / 算子缺支持 / 运行时丢失……）。
+    /// 与 [`Error::Graph`] 同一纪律：点名到设备与原因，不静默回退。
+    Device(String),
 }
 
 impl fmt::Display for Error {
@@ -21,6 +24,7 @@ impl fmt::Display for Error {
             Error::Parse(m) => write!(f, "onnx parse: {m}"),
             Error::Io(m) => write!(f, "io: {m}"),
             Error::Graph(m) => write!(f, "graph: {m}"),
+            Error::Device(m) => write!(f, "device: {m}"),
         }
     }
 }

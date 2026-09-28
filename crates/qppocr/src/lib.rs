@@ -87,6 +87,9 @@ pub enum Error {
     Image(String),
     /// 推理失败（不支持的算子、图不可解……）。
     Inference(CoreError),
+    /// 设备不可用 / 不支持（显式要求 GPU 而编译期未启用或运行时无设备）。
+    /// **不静默回退**到 CPU。
+    Device(String),
     /// IO。
     Io(String),
 }
@@ -97,12 +100,44 @@ impl std::fmt::Display for Error {
             Error::Model(m) => write!(f, "model: {m}"),
             Error::Image(m) => write!(f, "image: {m}"),
             Error::Inference(e) => write!(f, "inference: {e}"),
+            Error::Device(m) => write!(f, "device: {m}"),
             Error::Io(m) => write!(f, "io: {m}"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// 计算设备选择（[`EngineBuilder::device`]）。默认 CPU。
+///
+/// 默认值是起点不是结论：弱核显上 GPU 可能输给 AVX2 CPU，量产部署前
+/// 拿目标机器量一量再定。
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DeviceChoice {
+    /// 本机 CPU。
+    #[default]
+    Cpu,
+    /// GPU。`index` 选设备（`None` = 第一个可用）。
+    Gpu {
+        /// GPU API。
+        api: GpuApi,
+        /// 设备序号。
+        index: Option<u32>,
+    },
+}
+
+/// GPU API 选择。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum GpuApi {
+    /// 有什么用什么（当前即 Vulkan）。
+    #[default]
+    Auto,
+    /// Vulkan 计算后端。
+    Vulkan,
+    /// CUDA 计算后端。
+    Cuda,
+}
 
 impl From<CoreError> for Error {
     fn from(e: CoreError) -> Self {
@@ -335,6 +370,7 @@ fn auto_rec_shards(tier: Tier, want: usize) -> usize {
 pub struct Engine {
     core: CoreEngine,
     cfg: PipelineConfig,
+    device: DeviceChoice,
 }
 
 impl std::fmt::Debug for Engine {
@@ -342,6 +378,7 @@ impl std::fmt::Debug for Engine {
         // 摘要式：权重不属于 Debug 输出；config 是全部行为参数。
         f.debug_struct("Engine")
             .field("config", &self.cfg)
+            .field("device", &self.device)
             .finish_non_exhaustive()
     }
 }
@@ -385,6 +422,11 @@ impl Engine {
     pub fn config(&self) -> &PipelineConfig {
         &self.cfg
     }
+
+    /// 实际运行设备（bench / 诊断报告用；`Auto` API 的解析结果在此回报）。
+    pub fn device(&self) -> &DeviceChoice {
+        &self.device
+    }
 }
 
 /// Advanced 覆盖闭包的装箱类型（builder 内部）。
@@ -398,6 +440,7 @@ pub struct EngineBuilder {
     cfg: Config,
     advanced_fn: Option<AdvancedFn>,
     verify: Option<bool>,
+    device: Option<DeviceChoice>,
 }
 
 impl EngineBuilder {
@@ -444,6 +487,13 @@ impl EngineBuilder {
         self
     }
 
+    /// 计算设备（默认 CPU）。GPU 需要编译期启用 `gpu` feature；显式要
+    /// GPU 而不可用时构造报错，**不静默回退** CPU。
+    pub fn device(mut self, d: DeviceChoice) -> Self {
+        self.device = Some(d);
+        self
+    }
+
     /// 构造引擎。
     pub fn build(self, models_dir: impl AsRef<std::path::Path>) -> Result<Engine, Error> {
         let source = ModelSource::Dir(models_dir.as_ref().to_path_buf());
@@ -454,9 +504,21 @@ impl EngineBuilder {
     pub fn build_with(self, source: ModelSource) -> Result<Engine, Error> {
         let tier = self.tier.unwrap_or_default();
         let preset = self.preset.unwrap_or_default();
+        // 设备先解析：GPU 不可用要在读模型字节之前报错（快速失败），
+        // 不让「以为在跑 GPU」的人先等完权重加载才发现。
+        let device = self.device.unwrap_or_default();
+        let ctx = resolve_device(&device)?;
         let loaded = source.load(tier, self.verify.unwrap_or(true))?;
         let mut cfg = resolve_config(preset, &self.cfg, self.advanced_fn);
-        cfg.rec_shards = auto_rec_shards(tier, cfg.rec_shards);
+        if matches!(device, DeviceChoice::Gpu { .. }) {
+            // GPU 会话不受益于宿主侧行扇出（提交在设备队列上串行化），
+            // 分片只会增加线程 spawn 与争抢。pipeline 侧还有
+            // `prefers_host_parallelism()` 运行时门控——这里是构造期
+            // 第一道，cfg 快照也如实反映。
+            cfg.rec_shards = 0;
+        } else {
+            cfg.rec_shards = auto_rec_shards(tier, cfg.rec_shards);
+        }
         // 关方向分类 = 真不装配 cls（不加载、不推理）。曾经只把 cls_thresh
         // 设成 INFINITY：cls 照跑、时间照花、模型照占内存。
         let cls_bytes = if self.cfg.detect_orientation {
@@ -464,7 +526,8 @@ impl EngineBuilder {
         } else {
             None
         };
-        let core = CoreEngine::open_bytes(
+        let core = CoreEngine::open_bytes_with(
+            ctx.as_ref(),
             &loaded.det,
             &loaded.rec,
             cls_bytes,
@@ -473,7 +536,23 @@ impl EngineBuilder {
             cfg.clone(),
         )
         .map_err(Error::from)?;
-        Ok(Engine { core, cfg })
+        Ok(Engine { core, cfg, device })
+    }
+}
+
+/// [`DeviceChoice`] → 设备上下文。
+///
+/// GPU 路径由 `gpu` feature（`qppocr-gpu` crate）提供，落地后在此接入；
+/// 未编译进来时明确报错——静默回退 CPU 会让「我以为在跑 GPU」的基准
+/// 数字全部作废。
+fn resolve_device(
+    choice: &DeviceChoice,
+) -> Result<std::sync::Arc<dyn qppocr_core::device::DeviceContext>, Error> {
+    match choice {
+        DeviceChoice::Cpu => Ok(qppocr_core::device::cpu_context()),
+        DeviceChoice::Gpu { .. } => Err(Error::Device(
+            "GPU support not compiled in (enable feature \"gpu\")".into(),
+        )),
     }
 }
 
