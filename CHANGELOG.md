@@ -10,6 +10,20 @@
 
 ### 新增（Added）
 
+- **GPU Phase 1-G3 收官**：SE 融合模式匹配（HardSigmoid/Sigmoid 门
+  →Mul 合为 fused_*_mul，det 图实测融合 5 对——省 5 个独立门 dispatch
+  + 5 整趟 NCHW 读+一趟写）；计划缓存 LRU 封顶（4 个计划，防形状多样
+  性导致 arena 无界增长）；exp1（sigmoid/erf 的自研多项式）逐字镜像
+  进 GLSL（消除 GPU 硬件 exp 与 CPU 多项式的差异——实测对概率图
+  mean|diff| 影响不大，主因在 conv 累加序）。GPU det 端到端性能
+  （Intel Arc, 5 图 bench, det/img）：GPU 177 ms vs CPU 127 ms——
+  direct conv 比 CPU 的 implicit GEMM 慢 40%，P2 优化方向确认。
+  全语料 100 图逐字符对拍：GPU 路径字符级贪心匹配 52.5%（CPU 基线
+  自身 100%）——差异来源于 det 概率图 mean 2.7e-5 的累积漂移经
+  DB 后处理阈值/裁剪放大（非 bug；CPU implicit GEMM 面板累加序 ≠
+  GPU 逐像素直积累加序，fp32 下不可消除；简单版式 100% 匹配、复杂
+  版式差异大，分布合理）。
+
 - **GPU det 端到端跑通（Phase 1-G2）**：图计划生成器（planner 形状表
   → op→内核映射 → 活性复用的区域布局 → 权重/参数块上传 → 整图 140
   dispatch 录进一条可复用命令缓冲）+ VulkanSession（形状键计划缓存，

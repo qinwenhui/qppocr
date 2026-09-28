@@ -344,8 +344,55 @@ impl VulkanSession {
         let mut params: Vec<(u32, Vec<u32>)> = Vec::new();
         let is_output = |nm: &str| self.graph.is_graph_output(nm);
 
+        // SE 融合预扫：HardSigmoid/Sigmoid(gate[1,C,1,1]) 的唯一消费者是
+        // Mul(feature, gate_out) 时，合为 fused_*_mul（省一整趟 NCHW 读写
+        // + 独立门 dispatch）。融合掉的节点记入 skip 集。
+        let mut fused = std::collections::HashSet::new(); // 被融合掉的节点名
+        for i in 0..self.graph.nodes.len() {
+            let n = &self.graph.nodes[i];
+            if n.op_type != "HardSigmoid" && n.op_type != "Sigmoid" {
+                continue;
+            }
+            let in_v = table.values.get(&n.inputs[0]);
+            if in_v.map(|v| v.shape.len() != 4 || v.shape[2] != 1 || v.shape[3] != 1) != Some(false)
+            {
+                continue; // 非 [1,C,1,1] 门
+            }
+            // 找唯一消费者是 Mul 的
+            let out_name = &n.outputs[0];
+            let consumers: Vec<&Node> = self
+                .graph
+                .nodes
+                .iter()
+                .filter(|m| m.inputs.iter().any(|i| i == out_name))
+                .collect();
+            if consumers.len() != 1 || consumers[0].op_type != "Mul" {
+                continue;
+            }
+            let mul = consumers[0];
+            // Mul 的另一个输入是 4D 特征图（非门）
+            let other = if &mul.inputs[0] == out_name {
+                &mul.inputs[1]
+            } else {
+                &mul.inputs[0]
+            };
+            let other_v = table.values.get(other);
+            if other_v.map(|v| v.shape.len() != 4 || v.shape[2] == 1) != Some(false) {
+                continue;
+            }
+            // 融合：HardSigmoid/Sigmoid 节点标记为跳过
+            fused.insert(n.name.clone());
+            eprintln!("[gpu] SE 融合: {} → {} (fused)", n.name, mul.name);
+        }
+
         for (node_idx, n) in self.graph.nodes.iter().enumerate() {
             let out = n.outputs[0].clone();
+            // 被融合的节点：跳过（其消费者 Mul 用 fused_* 内核替代）。
+            // 不清输入——Mul 的 fused 内核直接读 HardSigmoid 的**输入**
+            //（前激活门值），该张量仍需存活。
+            if fused.contains(&n.name) {
+                continue;
+            }
             let out_v = table.values.get(&out).ok_or_else(|| {
                 Error::Graph(format!("planner 缺少 {} 的输出 {}", n.op_type, out))
             })?;
@@ -375,7 +422,7 @@ impl VulkanSession {
             ledger.push((format!("n:{}", n.name), out_off, out_n));
             offs.insert(out.clone(), out_off);
 
-            let (kernel, pb, pc_inline, groups) = self.map_node(n, &table, &offs)?;
+            let (kernel, pb, pc_inline, groups) = self.map_node(n, &table, &offs, &fused)?;
             if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() && n.name == "Conv.5" {
                 eprintln!(
                     "[gpu][dbg] {} 输入形状: {:?}",
@@ -576,11 +623,13 @@ impl VulkanSession {
 
     /// 节点 → (内核名, 参数块 | 内联 PC, dispatch 网格)。
     #[allow(clippy::type_complexity)]
+    #[allow(clippy::too_many_arguments)]
     fn map_node(
         &self,
         n: &Node,
         table: &planner::ShapeTable,
         offs: &HashMap<String, u32>,
+        fused: &std::collections::HashSet<String>,
     ) -> Result<(&'static str, Option<ParamBlock>, Vec<u8>, [u32; 3])> {
         let shape_of = |name: &str| -> Vec<i64> {
             table
@@ -885,6 +934,39 @@ impl VulkanSession {
                     ))
                 } else if b.len() == 4 && b_n == b[1] as u32 {
                     // [1,C,1,1] 通道广播
+                    // SE 融合：门的激活算子被跳过时，用 fused_*_mul
+                    //（一趋 NCHW 读写替代独立门 dispatch + mul_c 两趋）
+                    let gate_producer = self
+                        .graph
+                        .nodes
+                        .iter()
+                        .find(|m| m.outputs.first() == Some(&n.inputs[1]));
+                    let is_fused_gate = gate_producer.is_some_and(|m| {
+                        fused.contains(&m.name)
+                            && (m.op_type == "HardSigmoid" || m.op_type == "Sigmoid")
+                    });
+                    if is_fused_gate && n.op_type == "Mul" {
+                        let gp = gate_producer.unwrap();
+                        let kernel = if gp.op_type == "HardSigmoid" {
+                            "fused_hardsigmoid_mul"
+                        } else {
+                            "fused_sigmoid_mul"
+                        };
+                        // gate 偏移指到 HardSigmoid/Sigmoid 的**输入**（前激活）
+                        let pc = PcChannel {
+                            a_off: off_of(&n.inputs[0])?,
+                            b_off: off_of(&gp.inputs[0])?,
+                            out_off: off_of(out)?,
+                            hw: (a[2] * a[3]) as u32,
+                            c: a[1] as u32,
+                        };
+                        return Ok((
+                            kernel,
+                            None,
+                            pc.bytes().to_vec(),
+                            [(a[2] * a[3]) as u32 / 256 + 1, a[1] as u32, a[0] as u32],
+                        ));
+                    }
                     let pc = PcChannel {
                         a_off: off_of(&n.inputs[0])?,
                         b_off: off_of(&n.inputs[1])?,
@@ -968,6 +1050,14 @@ impl DeviceSession for VulkanSession {
         if !plans.iter().any(|(s, _)| *s == in_shape) {
             let plan = self.build_plan(&in_shape)?;
             plans.push((in_shape.clone(), plan));
+            // LRU 封顶：每个计划 ≈ 整块 arena（62-125 MB @ 960 输入），
+            // 100 图语料的形状多样性会无界增长。4 个计划封顶——淘汰
+            // 最旧的（Vec 头部）。命中的形状下次重建（~10ms）。
+            const MAX_PLANS: usize = 4;
+            if plans.len() > MAX_PLANS {
+                let removed = plans.len() - MAX_PLANS;
+                plans.drain(0..removed);
+            }
         }
         let plan = plans
             .iter()

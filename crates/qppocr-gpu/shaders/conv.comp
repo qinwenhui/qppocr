@@ -12,6 +12,25 @@ layout(push_constant) uniform PC { uint p_off; } pc;
 
 const uint NONE = 0xFFFFFFFFu;
 
+float exp1(float x) {
+    const float LN2_HI = 0.6931472;
+    const float LN2_LO = -2.9802322e-8;
+    const float INV_LN2 = 1.442695;
+    x = clamp(x, -88.0, 88.0);
+    float kf = roundEven(x * INV_LN2);
+    float r = fma(-kf, LN2_HI, x);
+    r = fma(-kf, LN2_LO, r);
+    float p = 1.0 / 720.0;
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    int ki = int(kf) + 127;
+    return uintBitsToFloat(uint(ki) << 23) * p;
+}
+
 float erf1(float x) {
     float ax = abs(x);
     float t = 1.0 / fma(0.3275911, ax, 1.0);
@@ -21,7 +40,7 @@ float erf1(float x) {
     p = fma(p, t, -0.284496736);
     p = fma(p, t, 0.2548296);
     p *= t;
-    float e = exp(-ax * ax);
+    float e = exp1(-ax * ax);  // 与 CPU 位级一致的自研多项式（非硬件 exp）
     float r = fma(-p, e, 1.0);
     return uintBitsToFloat(floatBitsToUint(r) | (floatBitsToUint(x) & 0x80000000u));
 }
