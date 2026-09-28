@@ -17,14 +17,14 @@ default = ["std", "parallel", "image-decode"]
 std = []
 # 关掉 = 单线程（WASM/嵌入式用）
 parallel = ["qppocr-core/parallel"]
-# 图像解码（JPEG/PNG）。关掉 = 只吃已解码像素
+# 图像解码（JPEG/PNG/BMP；BMP 无损、无 rayon 依赖）。关掉 = 只吃已解码像素
 image-decode = ["dep:image"]
 # 结果/配置的 serde 序列化（结果类型在 core，feature 透传过去）
 serde = ["dep:serde", "qppocr-core/serde"]
 
 [dependencies]
 qppocr-core = { path = "../qppocr-core", version = "0.2.1" }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"], optional = true }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 
 [dev-dependencies]

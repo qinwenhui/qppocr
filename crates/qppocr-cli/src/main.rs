@@ -27,6 +27,10 @@ struct Options {
     no_retry: bool,
     rec_height: u32,
     rec_shards: usize,
+    /// DB 二值化阈值（0 = 跟配置默认走）。
+    det_thresh: f32,
+    /// 检测输入长边上限（0 = 跟配置默认走）。
+    det_max_side: i32,
     /// 计算设备（`--device`）。
     device: DeviceChoice,
     /// `bench` 子命令模式。
@@ -101,6 +105,8 @@ options:
   --bench <n>       run n times per image and report the best
   --no-cls          turn off the 0/180 direction classifier
   --rec-shards <n>  rec 两级并行的外层分片数（0 = 关，不传 = 按档位自动）
+  --det-thresh <f>  DB 二值化阈值（默认 0.2；低阈值多保细笔/小字，多进杂块）
+  --det-max-side <n> 检测输入长边上限（默认 960；大图上适当调高保弱缘笔画）
   --device <d>      cpu | gpu | vulkan[:N] | cuda[:N]   (default: cpu)
   --quiet           suppress the per-line listing
   -h, --help        this help
@@ -133,6 +139,8 @@ fn parse_args() -> Option<Options> {
         rec_height: 0,
         // `usize::MAX` = 自动（按档位），`0` = 关，其余 = 显式分片数。
         rec_shards: usize::MAX,
+        det_thresh: 0.0,
+        det_max_side: 0,
         device: DeviceChoice::Cpu,
         bench_mode: false,
         rounds: 3,
@@ -200,6 +208,19 @@ fn parse_args() -> Option<Options> {
             "--rec-shards" => {
                 i += 1;
                 o.rec_shards = args.get(i)?.parse().ok()?;
+            }
+            "--det-thresh" => {
+                i += 1;
+                let v: f32 = args.get(i)?.parse().ok()?;
+                if !(0.0..=1.0).contains(&v) {
+                    eprintln!("--det-thresh: 0.0-1.0 之间的概率阈值");
+                    return None;
+                }
+                o.det_thresh = v;
+            }
+            "--det-max-side" => {
+                i += 1;
+                o.det_max_side = args.get(i)?.parse().ok()?;
             }
             "--device" => {
                 i += 1;
@@ -456,6 +477,8 @@ fn build_engine(o: &Options) -> Result<Engine, Error> {
     let n = o.rec_shards;
     let no_retry = o.no_retry;
     let rec_height = o.rec_height;
+    let det_thresh = o.det_thresh;
+    let det_max_side = o.det_max_side;
     builder = builder.advanced(move |a| {
         a.rec_shards = n;
         if no_retry {
@@ -463,6 +486,12 @@ fn build_engine(o: &Options) -> Result<Engine, Error> {
         }
         if rec_height > 0 {
             a.rec_height = rec_height as i32;
+        }
+        if det_thresh > 0.0 {
+            a.det_thresh = det_thresh;
+        }
+        if det_max_side > 0 {
+            a.det_max_side = det_max_side;
         }
     });
     builder.build(&o.models_dir)
