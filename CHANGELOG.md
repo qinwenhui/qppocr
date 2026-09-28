@@ -41,6 +41,10 @@
   丢弃、多配置逐轮交错、中位数汇总，报告探测到的内核后端与生效配置；
   `--sweep` 对自己的图集扫 preset / rec-height / threads / rec-shards。
   `qppocr` 门面新增 `detect_backend` / `Backend` 再导出。
+- 新增 `RELEASING.md`：引用模型（internal-main 私有主线 / 公开孤儿
+  快照 / v tag）与发布 checklist、改动准入纪律（「声明 = 断言」、
+  verify.py 对拍、abx 性能口径）全部文档化；废止长命 release-prep
+  分支（0.3.0 的过期分支已删）。
 - CI 新增 aarch64-linux 测试 job（交叉编译 + QEMU 用户态执行）：
   NEON↔标量逐位对拍在 linux-arm64 上持续验证，不依赖 Apple 硬件。
 - **aarch64 NEON 后端**：sgemm 面板（含 implicit-GEMM 指针面板）、窄 N
