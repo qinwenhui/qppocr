@@ -3,10 +3,12 @@
 // 朴素版（每线程 1 输出）：实测在此 GPU 上最优。
 //
 // 实验记录（Intel Arc）：
-// - 共享内存 16×16 tile：naga barrier 语义 bug（共享常量 patch 不可行，
-//   追加常量方案基础测试过但多线程 tile 仍偶发竞态）
+// - 共享内存 16×16 tile：单 WG 5/5 稳定、多 WG 随机失败（Intel 驱动
+//   OpControlBarrier 并发 workgroup bug；barrier patch 经单 WG 验证正确）
 // - 2×2 寄存器分块：与朴素等速（瓶颈不在带宽）
 // - 4×4 寄存器分块：更慢（16 累加器寄存器压力 → occupancy 降）
+// - NHWC：与 NCHW 完全等速（L2 预取已处理步长）
+// - fp16：1.65x（另见 conv_gemm_f16.comp）
 //
 // 适用：kh=kw=1, sh=sw=1, ph=pw=0, group=1, N=1。
 #version 450
@@ -27,7 +29,7 @@ float erf1(float x) {
     p = fma(p, t, 0.2548296);
     p *= t;
     float xx = clamp(-ax * ax, -88.0, 88.0);
-    float kf = roundEven(xx * 1.442695);
+    float kf = roundEven(xx * 1.44695);
     float r = fma(-kf, 0.6931472, xx);
     r = fma(-kf, -2.9802322e-8, r);
     float q = 1.0 / 720.0;
