@@ -1,12 +1,16 @@
-// 1x1 conv 的 GEMM（寄存器分块版）：C[M,HW] = A[M,Ci] × B[Ci,HW]。
+// 1x1 conv 的 GEMM：C[M,HW] = A[M,Ci] × B[Ci,HW]。
+// NCHW 输入在 N=1 时天然 [Ci,HW]——零重排直做 GEMM。
+// 朴素版（每线程 1 输出）：实测在此 GPU 上最优。
 //
-// 每线程 2×2 输出（寄存器累加）：4 load + 4 FMA / k 步（朴素版 2 load
-// + 1 FMA）——FLOP:load 从 1:2 → 1:1，内存流量减半。
-// local (8,8)=64 线程，workgroup tile 16×16。
+// 实验记录（Intel Arc）：
+// - 共享内存 16×16 tile：naga barrier 语义 bug（共享常量 patch 不可行，
+//   追加常量方案基础测试过但多线程 tile 仍偶发竞态）
+// - 2×2 寄存器分块：与朴素等速（瓶颈不在带宽）
+// - 4×4 寄存器分块：更慢（16 累加器寄存器压力 → occupancy 降）
 //
 // 适用：kh=kw=1, sh=sw=1, ph=pw=0, group=1, N=1。
 #version 450
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 16, local_size_y = 16) in;
 layout(std430, binding = 0) buffer Buf { float data[]; };
 layout(std430, binding = 1) buffer Params { uint params[]; };
 layout(push_constant) uniform PC { uint p_off; } pc;
@@ -50,58 +54,18 @@ void main() {
     float c2 = uintBitsToFloat(params[P + 19]);
     float c3 = uintBitsToFloat(params[P + 20]);
 
-    uint ty = gl_LocalInvocationID.y;
-    uint tx = gl_LocalInvocationID.x;
-    // 2×2 寄存器分块：线程 (ty,tx) 管输出 (gm0/gm1, gn0/gn1)
-    uint gm0 = gl_WorkGroupID.y * 16 + ty * 2;
-    uint gm1 = gm0 + 1;
-    uint gn0 = gl_WorkGroupID.x * 16 + tx * 2;
-    uint gn1 = gn0 + 1;
+    uint gm = gl_GlobalInvocationID.y;
+    uint gn = gl_GlobalInvocationID.x;
+    if (gm >= M || gn >= HW) return;
 
-    float acc00 = 0.0, acc01 = 0.0, acc10 = 0.0, acc11 = 0.0;
-
+    float acc = 0.0;
     for (uint k = 0; k < Ci; k++) {
-        float a0 = (gm0 < M) ? data[w_off + gm0 * Ci + k] : 0.0;
-        float a1 = (gm1 < M) ? data[w_off + gm1 * Ci + k] : 0.0;
-        float b0 = (gn0 < HW) ? data[in_off + k * HW + gn0] : 0.0;
-        float b1 = (gn1 < HW) ? data[in_off + k * HW + gn1] : 0.0;
-        acc00 = fma(a0, b0, acc00);
-        acc01 = fma(a0, b1, acc01);
-        acc10 = fma(a1, b0, acc10);
-        acc11 = fma(a1, b1, acc11);
+        acc = fma(data[w_off + gm * Ci + k], data[in_off + k * HW + gn], acc);
     }
 
-    // epilogue + 写 4 输出（bias/act/residual 与 conv.comp 同序）
-    if (gm0 < M && gn0 < HW) {
-        float v = acc00;
-        if (b_off != NONE) v += data[b_off + gm0];
-        if (act == 2) v = max(v, 0.0);
-        else if (act == 1) { float inv = 1.0/c1; v = c3 * v * (erf1(v * inv) + c2); }
-        if (r_off != NONE) v += data[r_off + gm0 * HW + gn0];
-        data[out_off + gm0 * HW + gn0] = v;
-    }
-    if (gm0 < M && gn1 < HW) {
-        float v = acc01;
-        if (b_off != NONE) v += data[b_off + gm0];
-        if (act == 2) v = max(v, 0.0);
-        else if (act == 1) { float inv = 1.0/c1; v = c3 * v * (erf1(v * inv) + c2); }
-        if (r_off != NONE) v += data[r_off + gm0 * HW + gn1];
-        data[out_off + gm0 * HW + gn1] = v;
-    }
-    if (gm1 < M && gn0 < HW) {
-        float v = acc10;
-        if (b_off != NONE) v += data[b_off + gm1];
-        if (act == 2) v = max(v, 0.0);
-        else if (act == 1) { float inv = 1.0/c1; v = c3 * v * (erf1(v * inv) + c2); }
-        if (r_off != NONE) v += data[r_off + gm1 * HW + gn0];
-        data[out_off + gm1 * HW + gn0] = v;
-    }
-    if (gm1 < M && gn1 < HW) {
-        float v = acc11;
-        if (b_off != NONE) v += data[b_off + gm1];
-        if (act == 2) v = max(v, 0.0);
-        else if (act == 1) { float inv = 1.0/c1; v = c3 * v * (erf1(v * inv) + c2); }
-        if (r_off != NONE) v += data[r_off + gm1 * HW + gn1];
-        data[out_off + gm1 * HW + gn1] = v;
-    }
+    if (b_off != NONE) acc += data[b_off + gm];
+    if (act == 2) acc = max(acc, 0.0);
+    else if (act == 1) { float inv = 1.0/c1; acc = c3 * acc * (erf1(acc * inv) + c2); }
+    if (r_off != NONE) acc += data[r_off + gm * HW + gn];
+    data[out_off + gm * HW + gn] = acc;
 }
