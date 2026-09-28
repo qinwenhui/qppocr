@@ -275,3 +275,21 @@ det 已经不多了、行阶段是大头。
   `python bench/verify.py save <名字>` 存基线、`diff <名字>` 比。
   两档基线：`base`（tiny，1099 行）、`pre-small`（small，1042 行）。
   性能改动一律用 `python bench/abx.py` 交错 A/B，不比单跑。
+
+## 2026-09-28 对方 GPU 路线数据（外部报告，未同机复测）
+
+机器：AMD Ryzen AI H365 笔记本，Radeon 880M 核显（RDNA 3.5, 12CU，
+LPDDR5X 共享带宽 ~120GB/s 级）。对方 Vulkan 后端，4 workers，据称同
+100 图语料：tiny 30ms / small 46ms / medium 117ms（口径疑似吞吐归一）。
+
+拟合 t = a + b·FLOPs：固定开销 a ≈ 19–25ms/图，与档位无关——dispatch/
+barrier/传输/同步/后处理是对方的大头，tiny 尤其被压住。medium 在其
+GPU 路线上首次「可用」（<120ms）。
+
+我方含义：
+- 笔记本/核显场景 CPU-only 无胜算（我方桌面 16 线程 small ~250ms，
+  对方核显 46ms）——GPU 后端是必争之地，优先级上调；
+- 攻击面 = 固定开销：mega-kernel 融合 + 异步 staging + 全异步提交，
+  目标把 a 压到 ~5ms 级；带宽墙 → 隐式 GEMM（免 im2col）+ 后置 fp16；
+- 验收：同 H365 同 100 图，bench --device gpu 对拍三档全胜；
+  开发用任意 Vulkan 卡，880M 数据可由社区/实机回传。
