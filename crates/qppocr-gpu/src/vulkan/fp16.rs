@@ -21,6 +21,8 @@ use ash::vk;
 /// f32 → f16 转换内核（元素数需偶数；装载期 padding 保证）。
 /// 输入：f32 data[in_off .. in_off+n]
 /// 输出：f16 packed data[out_off/2 .. ]（n/2 个 uint）
+///（n_ 家族已转 f32 存储；保留给将来 fp16 路线复用。）
+#[allow(dead_code)]
 pub(crate) fn record_to_f16(
     dev: &ash::Device,
     cb: vk::CommandBuffer,
@@ -37,6 +39,7 @@ pub(crate) fn record_to_f16(
 }
 
 /// f16 → f32 转换内核。
+#[allow(dead_code)]
 pub(crate) fn record_from_f16(
     dev: &ash::Device,
     cb: vk::CommandBuffer,
@@ -57,8 +60,8 @@ pub fn f32_to_f16_words(src: &[f32]) -> Vec<u32> {
     let n = src.len().div_ceil(2) * 2;
     let mut out = Vec::with_capacity(n / 2);
     for i in (0..n).step_by(2) {
-        let a = src.get(i).copied().unwrap_or(0.0) as f32;
-        let b = src.get(i + 1).copied().unwrap_or(0.0) as f32;
+        let a = src.get(i).copied().unwrap_or(0.0);
+        let b = src.get(i + 1).copied().unwrap_or(0.0);
         out.push(pack_half2x16(a, b));
     }
     out

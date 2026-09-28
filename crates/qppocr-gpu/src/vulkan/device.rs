@@ -80,8 +80,8 @@ impl VulkanDevice {
         if coopmat {
             ci = ci.enabled_extension_names(&exts);
         }
-        // v11 挂在 v12 之前的 pNext 链上。
-        ci.push_next(&mut v11);
+        // v11 挂在 v12 之前的 pNext 链上（push_next 返回挂好链的 ci）。
+        ci = ci.push_next(&mut v11);
         // SAFETY: ci 与其 pNext 链在调用期间存活；无自定义分配器。
         let device = unsafe { instance.create_device(physical, &ci, None) }
             .map_err(|e| Error::Device(format!("vkCreateDevice 失败: {e}")))?;

@@ -280,7 +280,6 @@ impl VulkanSession {
         }
         let (last_off, last_n) = (plan.recs[to].3, plan.recs[to].4);
         let base = plan.base;
-        let dev = self.ctx.device.raw().clone();
         let ks = &plan._ks;
         let mut idx = from;
         self.ctx.device.submit_one_shot(|d, cb| {
@@ -305,7 +304,6 @@ impl VulkanSession {
     /// CPU dump 目录）。首个分歧节点带两侧首元素值报错。
     fn stepped_run_and_cmp(&self, plan: &Plan) -> Result<()> {
         let dump_dir = std::env::var_os("QPPOCR_GPU_DUMP_CMP");
-        let dev = self.ctx.device.raw().clone();
         for (i, (kernel, node, idx, out_off, out_n, pc, groups, ins, _shapes, _osh)) in
             plan.recs.iter().enumerate()
         {
@@ -456,11 +454,10 @@ impl VulkanSession {
         }
         let mut live: HashMap<String, u32> = refs.clone();
 
-        // 路径选择：默认 = 旧 NCHW f32（真实数据已验证）；QPPOCR_GPU_NHWC=1
-        // 切 n_ 内核族（NHWC f32 + k-major 权重——真实图 det 图仍有数值
-        // 分歧待修，见 n_kernel_tests::det_real_input_cmp）。QPPOCR_GPU_F32
-        // 是历史环境名，保留等价旧路径。
-        let f32_mode = std::env::var_os("QPPOCR_GPU_NHWC").is_none();
+        // 路径选择：默认 = n_ 内核族（NHWC f32 + k-major 权重；真实图与
+        // 旧路径逐位一致 2e-8、GPU 总时间 24.7ms vs 旧路径 77ms）。
+        // QPPOCR_GPU_F32=1 回退旧 NCHW f32 路径（A/B 与兜底）。
+        let f32_mode = std::env::var_os("QPPOCR_GPU_F32").is_some();
 
         let mut layout = Layout::new();
         let mut ledger: Vec<(String, u32, u32)> = Vec::new(); // (名, off, len)
@@ -482,7 +479,12 @@ impl VulkanSession {
                 }
             }
         }
-        for (name, t) in &self.initializers {
+        // **确定序**（按名排序）：HashMap 迭代序逐进程随机——区域布局会跟着
+        // 漂移，任何依赖布局的越界/重叠 bug 都会以「两次运行分歧层不同」
+        // 的形态出现（实测发生过）。排序后布局恒定，分歧可稳定复现定位。
+        let mut init_sorted: Vec<(&String, &Tensor)> = self.initializers.iter().collect();
+        init_sorted.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, t) in init_sorted {
             let Some(v) = table.values.get(name) else {
                 continue;
             };
@@ -699,6 +701,7 @@ impl VulkanSession {
 
             // 节点 → 内核路由：n_ 路径可能展开多条 rec（reduce 两阶段），
             // f32 路径恒单条。
+            #[allow(clippy::type_complexity)]
             let routes: Vec<(&'static str, Option<ParamBlock>, Vec<u8>, [u32; 3])> = if f32_mode {
                 let (k, pb, pc_inline, groups) = self.map_node(n, &table, &offs, &fused)?;
                 vec![(k, pb, pc_inline, groups)]
@@ -1084,7 +1087,7 @@ impl VulkanSession {
         let full = std::env::var("QPPOCR_GPU_PROF").unwrap_or_default() == "full";
         let top = if full { n } else { idx.len().min(20) };
         for &i in &idx[..top] {
-            let (kernel, node, _, out_off, out_n, _, groups, _, shapes, _osh) = &plan.recs[i];
+            let (kernel, node, _, _out_off, _out_n, _, groups, _, shapes, _osh) = &plan.recs[i];
             let sh: Vec<String> = shapes
                 .iter()
                 .take(2)
@@ -1097,7 +1100,7 @@ impl VulkanSession {
                 })
                 .collect();
             eprintln!(
-                "[gpu][prof]   #{i:<4} {kernel:<20} {node:<28} {:.3} ms  grid {groups:?} in {} n={out_n}",
+                "[gpu][prof]   #{i:<4} {kernel:<20} {node:<28} {:.3} ms  grid {groups:?} in {} n={_out_n}",
                 deltas[i],
                 sh.join(" × "),
             );
@@ -1120,7 +1123,7 @@ impl VulkanSession {
         w_offs: &mut HashMap<String, u32>,
         reduce_scratch: u32,
     ) -> Result<Vec<(&'static str, ParamBlock, [u32; 3])>> {
-        use super::nhwc::{conv_bias, cpad4, repack_conv_w, repack_convt_w, repack_dw_w};
+        use super::nhwc::{cpad4, repack_conv_w, repack_convt_w, repack_dw_w};
         let shape_of = |name: &str| -> Vec<i64> {
             table
                 .values
@@ -1167,6 +1170,13 @@ impl VulkanSession {
                         |t| repack_conv_w(&t.f32, co, ci, kh, kw),
                     )?;
                     let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
+                    // 残差（fuse_conv_residual 折进 conv 的 inputs[3]；
+                    // NHWC 同布局直加，act 之后——镜像 CPU conv2d_res）
+                    let r_off = if n.inputs.len() > 3 && !n.inputs[3].is_empty() {
+                        off_of(&n.inputs[3])?
+                    } else {
+                        OFF_NONE
+                    };
                     let mut pb = ParamBlock::new();
                     pb.u(off_of(&n.inputs[0])?)
                         .u(w_off)
@@ -1187,7 +1197,8 @@ impl VulkanSession {
                         .u(act)
                         .f(c1)
                         .f(c2)
-                        .f(c3);
+                        .f(c3)
+                        .u(r_off);
                     let nv = cpad4(ws[0]) / 4;
                     Ok(vec![(
                         "n_conv",
@@ -1206,6 +1217,11 @@ impl VulkanSession {
                         |t| repack_dw_w(&t.f32, cch, kh, kw),
                     )?;
                     let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
+                    let r_off = if n.inputs.len() > 3 && !n.inputs[3].is_empty() {
+                        off_of(&n.inputs[3])?
+                    } else {
+                        OFF_NONE
+                    };
                     let cp = cpad4(ws[0]);
                     let mut pb = ParamBlock::new();
                     pb.u(off_of(&n.inputs[0])?)
@@ -1226,7 +1242,8 @@ impl VulkanSession {
                         .u(act)
                         .f(c1)
                         .f(c2)
-                        .f(c3);
+                        .f(c3)
+                        .u(r_off);
                     Ok(vec![("n_conv_dw", pb, [div256(m_dim * cp / 4), nb, 1])])
                 } else {
                     Err(Error::Graph(format!(
@@ -2102,8 +2119,6 @@ impl DeviceSession for VulkanSession {
                 self.prof_print(plan, p, wall_ms);
             }
         }
-        let t_out = std::time::Instant::now();
-
         let mut outs = Vec::with_capacity(plan.out_offs.len());
         for (i, (name, off, n)) in plan.out_offs.iter().enumerate() {
             let shape = plan.out_shapes.get(i).cloned().unwrap_or_default();
