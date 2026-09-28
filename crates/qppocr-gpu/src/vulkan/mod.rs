@@ -15,6 +15,7 @@
 // roundtrip 测试使用——豁免 dead_code 到接线完成。
 #[allow(dead_code)]
 pub(crate) mod device;
+pub(crate) mod fp16;
 #[allow(dead_code)]
 pub(crate) mod memory;
 #[allow(dead_code)]
