@@ -26,6 +26,10 @@ const SHADERS: &[(&str, &[u8])] = &[
     ),
     ("conv", include_bytes!("../../shaders/spirv/conv.spv")),
     (
+        "conv_gemm_nhwc",
+        include_bytes!("../../shaders/spirv/conv_gemm_nhwc.spv"),
+    ),
+    (
         "conv_gemm_f16",
         include_bytes!("../../shaders/spirv/conv_gemm_f16.spv"),
     ),
@@ -75,6 +79,14 @@ const SHADERS: &[(&str, &[u8])] = &[
         include_bytes!("../../shaders/spirv/resize_nearest.spv"),
     ),
     ("to_f16", include_bytes!("../../shaders/spirv/to_f16.spv")),
+    (
+        "nchw_to_nhwc",
+        include_bytes!("../../shaders/spirv/nchw_to_nhwc.spv"),
+    ),
+    (
+        "nhwc_to_nchw",
+        include_bytes!("../../shaders/spirv/nhwc_to_nchw.spv"),
+    ),
     ("sigmoid", include_bytes!("../../shaders/spirv/sigmoid.spv")),
 ];
 
@@ -126,6 +138,16 @@ pub(crate) struct PcMulAddScale {
     pub c: u32,
 }
 
+/// 布局转换内核的 PC：直接装参数（不经参数块间接层）。
+#[repr(C)]
+pub(crate) struct PcLayout {
+    pub in_off: u32,
+    pub out_off: u32,
+    pub c: u32,
+    pub h: u32,
+    pub w: u32,
+}
+
 /// 参数块内核（conv/pool/resize/convT/reduce/concat）：全部形状参数
 /// 放 arena（128 B 的 push constant 装不下），PC 只带参数块偏移。
 #[repr(C)]
@@ -161,6 +183,7 @@ macro_rules! pc_bytes {
 }
 
 pc_bytes!(
+    PcLayout,
     PcUnary,
     PcUnaryF,
     PcBinary,
