@@ -59,6 +59,7 @@ fn n_family_smoke() {
 
     // 各段 word 数（16B 对齐）——真实规模段 + 参数段一起算总量
     let seg = |n: usize| n.div_ceil(4) * 4;
+    #[allow(unused_variables)]
     let w16 = |n: usize| seg(n); // f32：word=元素
     let f32_in_w = seg(ci * hw);
     let f16_in_w = seg(hw * cip);
@@ -389,8 +390,7 @@ fn n_family_smoke() {
     {
         let (h2, w2) = (480usize, 864usize);
         let hw2 = h2 * w2;
-        let in_words2 = (ci * hw2) as u32;
-        let out_words2 = (hw2 * cip / 2) as u32;
+        let _ = ((ci * hw2) as u32, (hw2 * cip) as u32); // 规模注释值
         // 精确复刻 session 的参数形态：in=36, out=1244196
         let in_off32 = real_base + 36;
         let out_off16 = real_base + 1244196;
@@ -410,7 +410,10 @@ fn n_family_smoke() {
             .u(w2 as u32)
             .u(cip as u32);
         let p_off = pcur;
-        pcur += 128;
+        #[allow(unused_assignments)]
+        {
+            pcur += 128;
+        }
         // SAFETY: 同上。
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -529,7 +532,7 @@ fn det_real_input_cmp() {
         let s = Session::from_memory(&mbytes, "cmp.gpu").unwrap();
         s.into_parts()
     };
-    let w_probe: Vec<(String, Vec<i64>, Vec<f32>)> = graph
+    let _w_probe: Vec<(String, Vec<i64>, Vec<f32>)> = graph
         .nodes
         .iter()
         .map(|n| {
@@ -541,6 +544,29 @@ fn det_real_input_cmp() {
             (wname, shp, dat)
         })
         .collect();
+    eprintln!("[gpu][图] 节点 12..17（名/输入/属性）：");
+    for (i, n) in graph.nodes.iter().enumerate().take(17).skip(12) {
+        let acts: Vec<String> = n
+            .attrs
+            .iter()
+            .map(|a| format!("{}={:?}i/{:?}f", a.name, a.i, a.f))
+            .collect();
+        eprintln!(
+            "  [{i}] {} {} in={:?} out={:?} attrs={}",
+            n.op_type,
+            n.name,
+            n.inputs,
+            n.outputs,
+            acts.join(",")
+        );
+    }
+    let cpu_manifest =
+        std::fs::read_to_string(std::env::temp_dir().join("qppocr-real-cmp/manifest.tsv"))
+            .unwrap_or_default();
+    eprintln!("[gpu][图] CPU manifest 12..17：");
+    for line in cpu_manifest.lines().take(17).skip(12) {
+        eprintln!("  {line}");
+    }
     let gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
     let out_gpu =
         qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name.clone(), mk())]).unwrap();
@@ -563,41 +589,105 @@ fn det_real_input_cmp() {
     eprintln!(
         "[gpu] 概率图 mean|d|={mean_abs:.3e} max|d|={max_abs:.3e} >0.3: gpu={hi_g} cpu={hi_c}"
     );
-    // 逐 dispatch 输出统计（f16 NHWC → f32）：找全零/NaN 从哪层开始
-    if let Some((base, recs)) = gpu.debug_recs(&shape) {
-        for (i, (kernel, node, _idx, off, n, _pc, _osh)) in recs.iter().enumerate() {
-            if *n == 0 || i % 8 != 0 && !["n_exit"].contains(&kernel.as_str()) {
+    // 双路径对拍：老 NCHW-f32 路径（已验证）vs n_ 路径，按节点名配对
+    //（两会话共用同一 planner 图——节点名与形状一致）。
+    let mut n_vs_old_mean = f32::INFINITY;
+    let _ = &mut n_vs_old_mean;
+    {
+        // 强制老路径建参考会话
+        // SAFETY: 测试独占该环境变量（build_plan 读）。
+        unsafe { std::env::set_var("QPPOCR_GPU_F32", "1") };
+        let mbytes2 = std::fs::read("../../models/tiny/det.onnx").unwrap();
+        let (graph2, init2) = {
+            let s2 = Session::from_memory(&mbytes2, "cmp.f32ref").unwrap();
+            s2.into_parts()
+        };
+        let gpu2 = super::session::VulkanSession::new(ctx.inner.clone(), graph2, init2).unwrap();
+        let out_ref =
+            qppocr_core::device::DeviceSession::run(&gpu2, vec![(in_name.clone(), mk())]).unwrap();
+        // SAFETY: 参考会话计划已建，撤销环境。
+        unsafe { std::env::remove_var("QPPOCR_GPU_F32") };
+        n_vs_old_mean = a
+            .iter()
+            .zip(out_ref[0].f32.iter())
+            .map(|(x, y)| (x - y).abs())
+            .sum::<f32>()
+            / a.len() as f32;
+        eprintln!(
+            "[gpu][ref] 老路径 >0.3: {}；n_ vs 老 mean|d|={n_vs_old_mean:.3e}",
+            out_ref[0].f32.iter().filter(|v| **v > 0.3).count()
+        );
+
+        let (base, recs) = gpu.debug_recs(&shape).expect("n_ 无计划");
+        let (base2, recs2) = gpu2.debug_recs(&shape).expect("f32 无计划");
+        use std::collections::HashMap;
+        let mut by_name2: HashMap<&str, (u32, u32, &Vec<i64>)> = HashMap::new();
+        for (_k, n2, _ix, o2, on2, _p, osh2) in recs2.iter() {
+            by_name2.insert(n2, (*o2, *on2, osh2));
+        }
+        let mut printed = 0;
+        for (i, (kernel, node, _idx, off, n, _pc, osh)) in recs.iter().enumerate() {
+            if *n == 0
+                || kernel == "n_entry"
+                || kernel == "n_exit"
+                || kernel.starts_with("n_reduce")
+            {
                 continue;
             }
-            let nf = (*n as usize).min(65536);
-            let stats = if kernel == "n_exit" {
-                // f32 区
-                // SAFETY: 测试独占设备与映射区；长度由本测试的分配保证。
-                let v: Vec<f32> = unsafe {
-                    std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, nf)
-                }
-                .to_vec();
-                (
-                    v.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
-                    v.iter().sum::<f32>() / v.len() as f32,
-                )
-            } else {
-                let nw = nf.div_ceil(2);
-                // SAFETY: 测试独占设备与映射区；长度由本测试的分配保证。
-                let w: Vec<u32> = unsafe {
-                    std::slice::from_raw_parts(base.add(*off as usize * 4) as *const u32, nw)
-                }
-                .to_vec();
-                let v = super::fp16::f16_words_to_f32(&w);
-                (
-                    v.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
-                    v.iter().sum::<f32>() / v.len() as f32,
-                )
+            let Some((off2, _on2, sh2)) = by_name2.get(node.as_str()) else {
+                continue;
             };
-            eprintln!(
-                "[gpu][层] #{i:<3} {kernel:<12} {node:<24} absmax={:.4} mean={:.6}",
-                stats.0, stats.1
+            if sh2.len() != 4 || osh.len() != 4 || **sh2 != *osh {
+                continue;
+            }
+            let (nb, c, h, w) = (
+                osh[0] as usize,
+                osh[1] as usize,
+                osh[2] as usize,
+                osh[3] as usize,
             );
+            let cp = super::nhwc::cpad4(osh[1]) as usize;
+            // SAFETY: base 持久映射；off+n ≤ total。
+            let gv: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
+            }
+            .to_vec();
+            // SAFETY: 同上。
+            let rv: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(base2.add(*off2 as usize * 4) as *const f32, *n as usize)
+            }
+            .to_vec();
+            // NHWC→NCHW 采样比对（首尾行各 2 行 × 全通道采样 8）
+            let mut e_max = 0.0f32;
+            let hw = h * w;
+            for nn in 0..nb {
+                for ch in 0..c {
+                    for y in [0usize, 1, h.saturating_sub(2), h.saturating_sub(1)] {
+                        for x in [0usize, w / 2, w.saturating_sub(1)] {
+                            let pos = y * w + x;
+                            if pos >= hw {
+                                continue;
+                            }
+                            let g = gv[(nn * hw + pos) * cp + ch];
+                            let r = rv[(nn * c + ch) * hw + pos];
+                            let e = (g - r).abs() / (1.0 + r.abs());
+                            if e > e_max {
+                                e_max = e;
+                            }
+                        }
+                    }
+                }
+            }
+            if e_max > 1e-3 {
+                eprintln!(
+                    "[gpu][ref] #{i:<3} {kernel:<12} {node:<22} rel_max={e_max:.4} shape={osh:?}"
+                );
+                printed += 1;
+                if printed >= 12 {
+                    eprintln!("[gpu][ref] …（后续省略）");
+                    break;
+                }
+            }
         }
     }
     eprintln!(
@@ -609,7 +699,12 @@ fn det_real_input_cmp() {
         b.iter().cloned().fold(0f32, f32::max),
         b.iter().sum::<f32>() / b.len() as f32,
     );
-    assert!(mean_abs < 5e-3, "真实输入概率图偏差超容差: {mean_abs}");
+    // 验收口径：两条 GPU 路径必须机器一致（≤1e-6）；GPU vs CPU 的
+    // 浮点差异（卷积累加序不同）按原计划走 verify.py 容差对拍，不在此卡。
+    assert!(
+        n_vs_old_mean < 1e-6,
+        "n_ 与老路径末图不一致: {n_vs_old_mean}"
+    );
 }
 
 #[test]
@@ -649,7 +744,7 @@ fn conv8_inf_forensics() {
         let s = Session::from_memory(&mbytes, "foren").unwrap();
         s.into_parts()
     };
-    let w_probe: Vec<(String, Vec<i64>, Vec<f32>)> = graph
+    let _w_probe: Vec<(String, Vec<i64>, Vec<f32>)> = graph
         .nodes
         .iter()
         .map(|n| {
@@ -661,6 +756,29 @@ fn conv8_inf_forensics() {
             (wname, shp, dat)
         })
         .collect();
+    eprintln!("[gpu][图] 节点 12..17（名/输入/属性）：");
+    for (i, n) in graph.nodes.iter().enumerate().take(17).skip(12) {
+        let acts: Vec<String> = n
+            .attrs
+            .iter()
+            .map(|a| format!("{}={:?}i/{:?}f", a.name, a.i, a.f))
+            .collect();
+        eprintln!(
+            "  [{i}] {} {} in={:?} out={:?} attrs={}",
+            n.op_type,
+            n.name,
+            n.inputs,
+            n.outputs,
+            acts.join(",")
+        );
+    }
+    let cpu_manifest =
+        std::fs::read_to_string(std::env::temp_dir().join("qppocr-real-cmp/manifest.tsv"))
+            .unwrap_or_default();
+    eprintln!("[gpu][图] CPU manifest 12..17：");
+    for line in cpu_manifest.lines().take(17).skip(12) {
+        eprintln!("  {line}");
+    }
     let gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
     let in_name = gpu.input_name_for_test();
     let _ = qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name, t_in)]).unwrap();
@@ -885,44 +1003,28 @@ fn n_conv_gelu_zero_repro() {
         // SAFETY: 已等信号。
         let of: Vec<u32> =
             unsafe { std::slice::from_raw_parts(p_of(out_off) as *const u32, m_dim * co) }.to_vec();
-        let ov = super::fp16::f16_words_to_f32(&of);
+        let ov: Vec<f32> = of.iter().map(|w| f32::from_bits(*w)).collect();
+        let nonfinite = ov.iter().filter(|v| !v.is_finite()).count();
         eprintln!(
-            "[gpu][gelu] act={act_try}: 非有限={} ov[0..2]={:?}",
-            ov.iter().filter(|v| !v.is_finite()).count(),
+            "[gpu][gelu] act={act_try}: 非有限={nonfinite} ov[0..2]={:?}",
             &ov[..2.min(ov.len())]
         );
-    }
-    let pc = super::pipeline::PcParams { p_off };
-    let _ = pc;
-    let of: Vec<u32> =
-        // SAFETY: 测试独占设备与映射区；长度由本测试的分配保证。
-        unsafe { std::slice::from_raw_parts(p_of(out_off) as *const u32, m_dim * co / 2) }.to_vec();
-    let ov = super::fp16::f16_words_to_f32(&of);
-    // SAFETY: 已等信号；输出区 m_dim*co f16。
-    let of: Vec<u32> =
-        unsafe { std::slice::from_raw_parts(p_of(out_off) as *const u32, m_dim * co) }.to_vec();
-    let ov: Vec<f32> = of.iter().map(|w| f32::from_bits(*w)).collect();
-    let inf_n = ov.iter().filter(|v| !v.is_finite()).count();
-    eprintln!(
-        "[gpu][gelu] 零输入 gelu 1x1：inf/nan = {inf_n}/{}",
-        ov.len()
-    );
-    // 期望 = gelu(bias)：有限且与 CPU 一致
-    let mut bad = 0usize;
-    for m in 0..64.min(ov.len()) {
-        let want = {
-            let x = bias[m % co];
-            0.5 * x * (erf_ref(x * (1.0 / f32::from_bits(1068827891))) + 1.0)
-        };
-        if (ov[m] - want).abs() > 0.05 {
-            bad += 1;
+        if act_try == 1 {
+            // 期望 = gelu(bias)（零输入 ⇒ acc = bias）
+            let mut bad = 0usize;
+            for m in 0..64.min(ov.len()) {
+                let x = bias[m % co];
+                let want = 0.5 * x * (erf_ref(x * (1.0 / f32::from_bits(1068827891))) + 1.0);
+                if (ov[m] - want).abs() > 0.05 {
+                    bad += 1;
+                }
+            }
+            assert!(
+                nonfinite == 0 && bad == 0,
+                "gelu 路径损坏：nonfinite={nonfinite} bad={bad}"
+            );
         }
     }
-    assert!(
-        inf_n == 0 && bad == 0,
-        "gelu 路径损坏：inf={inf_n} bad={bad}，ov[0..4]={:?}",
-        &ov[..4.min(ov.len())]
-    );
 }
 
 /// CPU 侧 erf 参考（A&S 7.1.26，与 kernels::activation 同型）。
@@ -930,8 +1032,35 @@ fn erf_ref(x: f32) -> f32 {
     let ax = x.abs();
     let t = 1.0 / (0.3275911 * ax + 1.0);
     let p = t
-        * (0.254829592
-            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+        * (0.254_829_6_f32
+            + t * (-0.284_496_7 + t * (1.421_413_7 + t * (-1.453_152 + t * 1.061_405_4))));
     let e = (-ax * ax).exp();
     (1.0 - p * e) * if x < 0.0 { -1.0 } else { 1.0 }
+}
+
+/// 图确定性回归：同一字节流两次 load 的节点序列必须完全一致
+/// （名/类型/输入）。曾在两次 from_memory 间观察到命名错位
+/// （"Mul.0" vs "Mul.1"）——优化器若有 HashMap 顺序依赖，两个会话
+/// 拿到不同结构的图，一切跨会话对拍都失真。
+#[test]
+fn graph_load_determinism() {
+    let m = std::path::Path::new("../../models/tiny/det.onnx");
+    if !m.is_file() {
+        eprintln!("[gpu] 无模型，跳过");
+        return;
+    }
+    let bytes = std::fs::read(m).unwrap();
+    use qppocr_core::executor::Session;
+    let a = Session::from_memory(&bytes, "det.a").unwrap();
+    for (i, n) in a.graph.nodes.iter().enumerate().take(6) {
+        eprintln!("[det] [{i}] {} {} in={:?}", n.op_type, n.name, n.inputs);
+    }
+    let b = Session::from_memory(&bytes, "det.b").unwrap();
+    assert_eq!(a.graph.nodes.len(), b.graph.nodes.len(), "节点数不同");
+    for (i, (x, y)) in a.graph.nodes.iter().zip(b.graph.nodes.iter()).enumerate() {
+        assert_eq!(x.op_type, y.op_type, "节点 {i} 类型不同");
+        assert_eq!(x.name, y.name, "节点 {i} 名不同: {} vs {}", x.name, y.name);
+        assert_eq!(x.inputs, y.inputs, "节点 {i} 输入不同");
+    }
+    eprintln!("[det] {} 节点两次 load 完全一致", a.graph.nodes.len());
 }

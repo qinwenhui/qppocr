@@ -9,7 +9,7 @@
 
 use super::VulkanContext;
 use super::memory::{Arena, Region};
-use super::pipeline::{KernelSet, OFF_NONE, ParamBlock, PcUnary, PcUnaryF, record_dispatch};
+use super::pipeline::{KernelSet, OFF_NONE, ParamBlock, PcUnaryF, record_dispatch};
 use ash::vk;
 use qppocr_kernels::activation::Activation;
 use qppocr_kernels::buf::F32Buf;
@@ -1126,7 +1126,7 @@ fn conv_gemm_nhwc_vs_cpu() {
     // NHWC 转换（GPU 内核）
     let x_nhwc = arena.alloc(x_nhwc_n as vk::DeviceSize * 4).unwrap();
     let out = arena.alloc(out_n as vk::DeviceSize * 4).unwrap();
-    let pp_conv = arena.alloc(64).unwrap(); // 转换内核的 PC
+    let _pp_conv = arena.alloc(64).unwrap(); // 转换内核的 PC
     let pp_gemm = arena.alloc(128).unwrap(); // GEMM 的参数块
 
     let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
@@ -1139,7 +1139,7 @@ fn conv_gemm_nhwc_vs_cpu() {
         h,
         w,
     };
-    let total = (h * w * ci) as u32;
+    let total = h * w * ci;
     // SAFETY: cb 录制态。
     unsafe {
         record_dispatch(
@@ -1203,7 +1203,7 @@ fn conv_gemm_nhwc_vs_cpu() {
             let mut acc = 0f32;
             for c in 0..ci as usize {
                 // NHWC 输入：像素 hw_i 的通道 c
-                let nhwc_idx = hw_i * ci as usize + c;
+                let _nhwc_idx = hw_i * ci as usize + c;
                 // 从 NCHW 数据推 NHWC 值（避免依赖转换内核正确性）
                 let nchw_idx = c * hw as usize + hw_i;
                 let b = xv[nchw_idx]; // 直接用 NCHW 索引（数学等价）

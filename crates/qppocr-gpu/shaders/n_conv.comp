@@ -70,6 +70,7 @@ void main() {
     float c1 = uintBitsToFloat(params[P + 17]);
     float c2 = uintBitsToFloat(params[P + 18]);
     float c3 = uintBitsToFloat(params[P + 19]);
+    uint r_off = params[P + 20]; // 残差（NHWC 同布局；OFF_NONE=无）
 
     uint b = gl_WorkGroupID.y;
     uint nv = nDim >> 2;
@@ -123,6 +124,14 @@ void main() {
         acc1 = apply_act(acc1, act, c1, c2, c3);
         acc2 = apply_act(acc2, act, c1, c2, c3);
         acc3 = apply_act(acc3, act, c1, c2, c3);
+    }
+    // 残差在 act 之后（镜像 CPU conv2d_res：acc+bias → act → +residual）
+    if (r_off != OFF_NONE) {
+        uint rb = (r_off >> 2) + b * mDim * nv;
+        if (ok[0]) acc0 += d[rb + m0 * nv + n4];
+        if (ok[1]) acc1 += d[rb + (m0 + 1u) * nv + n4];
+        if (ok[2]) acc2 += d[rb + (m0 + 2u) * nv + n4];
+        if (ok[3]) acc3 += d[rb + (m0 + 3u) * nv + n4];
     }
     if (ok[0]) d[ob + m0 * nv + n4] = vec4(acc0);
     if (ok[1]) d[ob + (m0 + 1u) * nv + n4] = vec4(acc1);

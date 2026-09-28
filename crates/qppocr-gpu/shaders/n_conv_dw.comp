@@ -56,6 +56,7 @@ void main() {
     float c1 = uintBitsToFloat(params[P + 16]);
     float c2 = uintBitsToFloat(params[P + 17]);
     float c3 = uintBitsToFloat(params[P + 18]);
+    uint r_off = params[P + 19]; // 残差（NHWC 同布局；OFF_NONE=无）
 
     uint b = gl_WorkGroupID.y;
     uint cv4 = cDim >> 2;
@@ -87,5 +88,6 @@ void main() {
         acc = c3 * acc * (vec4(erf1(acc.x * inv), erf1(acc.y * inv),
                                erf1(acc.z * inv), erf1(acc.w * inv)) + c2);
     }
+    if (r_off != OFF_NONE) acc += d[(r_off >> 2) + b * mDim * cv4 + m * cv4 + c4];
     d[ob + m * cv4 + c4] = vec4(acc);
 }

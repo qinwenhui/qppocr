@@ -150,7 +150,9 @@ pub(crate) struct Inner {
 }
 
 /// 探测到的协作矩阵形状（Intel XMX 8×16×16 / AMD 16×16×16 …）。
+/// 字段仅作诊断回报（Debug 打印）；本机无 coopmat，路径未启用。
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 pub(crate) struct CoopMat {
     pub m: u32,
     pub n: u32,
