@@ -8,21 +8,18 @@
 
 ## [Unreleased]
 
-### 修复（Fixed）
-
-- **区域重试自 0.2.0 起实际默认开启**（与 0.2.0 发布说明及 README 宣称
-  相反）：当时的「默认关闭」只改了门面（`Advanced::default` 与 Balanced
-  预设），漏改 core 的 `PipelineConfig::default()`——门面 `resolve_config`
-  以 core 默认值为起点、Balanced 预设不清零，于是默认配置仍在约 9/100
-  张图上隐式跑双倍 det（0.2.0/0.2.1 发布版均如此）。core 默认值现归零，
-  默认真正关闭；Accuracy 预设与显式 `Advanced::retry_conf` 的开启路径
-  不受影响。已补回归断言（门面预设契约 + core 默认值各一条测试），
-  「文档声明的默认值必须被测试锁住」，防同类脱节再犯。
-  逐行精度开关一致（0.2.0 发布说明的实测依据不变）；对拍基线已随
-  本行为修正重建（tiny 1099→1096 行、small 1042→1041 行）。
-
 ### 新增（Added）
 
+- **GPU 后端 crate 落地（`qppocr-gpu`，Phase 1 第一步）**：Vulkan 设备
+  枚举与打开（ash；实例按 1.1 请求最大化枚举面，可用性按物理设备
+  `apiVersion` 判定 1.4 基线，低于基线的设备枚举可见并标注）+ CUDA
+  枚举级预留（dlopen 驱动，零编译期 SDK 依赖）。门面 feature `gpu` /
+  `gpu-cuda` 接线：`--device gpu`（Auto：Vulkan 优先、CUDA 兜底）、
+  `--device vulkan[:N]`、`--device cuda[:N]` 全部到达真实设备事实；
+  `--device cpu` 与默认构建零变化（不引 GPU 依赖）。计算内核尚未实现
+  ——显式要求 GPU 的会话构造给出明确说明，不静默回退。已在本机
+  Intel Arc（Vulkan 1.4.335）实测枚举/打开。CI feature 矩阵补
+  `gpu` 与 `gpu-cuda` 组合。
 - **设备接缝（GPU 地基）**：`qppocr-core` 新增 `device` 模块——
   `DeviceContext`（装载期工厂，权重按值一次性移交设备）与
   `DeviceSession`（与 CPU `Session::run` 同签名的执行入口）两个 trait
@@ -58,6 +55,16 @@
 
 ### 修复（Fixed）
 
+- **区域重试自 0.2.0 起实际默认开启**（与 0.2.0 发布说明及 README 宣称
+  相反）：当时的「默认关闭」只改了门面（`Advanced::default` 与 Balanced
+  预设），漏改 core 的 `PipelineConfig::default()`——门面 `resolve_config`
+  以 core 默认值为起点、Balanced 预设不清零，于是默认配置仍在约 9/100
+  张图上隐式跑双倍 det（0.2.0/0.2.1 发布版均如此）。core 默认值现归零，
+  默认真正关闭；Accuracy 预设与显式 `Advanced::retry_conf` 的开启路径
+  不受影响。已补回归断言（门面预设契约 + core 默认值各一条测试），
+  「文档声明的默认值必须被测试锁住」，防同类脱节再犯。
+  逐行精度开关一致（0.2.0 发布说明的实测依据不变）；对拍基线已随
+  本行为修正重建（tiny 1099→1096 行、small 1042→1041 行）。
 - **池的嵌套 fork 结构性降级**：worker 线程内的 `fork_join` 改为就地
   串行执行（切分决策不变，与并行路径逐位一致），消灭「并行区内再次
   并行」争 `fork_mu` 的整类死锁。此前内核依赖「收尾激活的字节数低于

@@ -141,7 +141,12 @@ pub enum GpuApi {
 
 impl From<CoreError> for Error {
     fn from(e: CoreError) -> Self {
-        Error::Inference(e)
+        // 设备错误在门面有自己的变体——包成 Inference 会让 "device:" 语义
+        // 戴着 "inference:" 的帽子出来。
+        match e {
+            CoreError::Device(m) => Error::Device(m),
+            other => Error::Inference(other),
+        }
     }
 }
 
@@ -542,17 +547,72 @@ impl EngineBuilder {
 
 /// [`DeviceChoice`] → 设备上下文。
 ///
-/// GPU 路径由 `gpu` feature（`qppocr-gpu` crate）提供，落地后在此接入；
-/// 未编译进来时明确报错——静默回退 CPU 会让「我以为在跑 GPU」的基准
-/// 数字全部作废。
+/// GPU 路径由 `gpu` feature（`qppocr-gpu` crate）提供；未编译进来时
+/// 明确报错——静默回退 CPU 会让「我以为在跑 GPU」的基准数字全部作废。
+/// 报错信息带手头的设备事实（枚举结果），不报空泛的「不可用」。
 fn resolve_device(
     choice: &DeviceChoice,
 ) -> Result<std::sync::Arc<dyn qppocr_core::device::DeviceContext>, Error> {
     match choice {
         DeviceChoice::Cpu => Ok(qppocr_core::device::cpu_context()),
-        DeviceChoice::Gpu { .. } => Err(Error::Device(
-            "GPU support not compiled in (enable feature \"gpu\")".into(),
-        )),
+        DeviceChoice::Gpu { api, index } => {
+            #[cfg(not(feature = "gpu"))]
+            {
+                let _ = (api, index);
+                Err(Error::Device(
+                    "GPU support not compiled in (enable feature \"gpu\")".into(),
+                ))
+            }
+            #[cfg(feature = "gpu")]
+            {
+                use qppocr_gpu::VulkanContext;
+                let gpu_err = |e: qppocr_core::Error| match e {
+                    qppocr_core::Error::Device(m) => Error::Device(m),
+                    other => Error::Device(format!("{other}")),
+                };
+                match api {
+                    GpuApi::Vulkan => Ok(std::sync::Arc::new(
+                        VulkanContext::open(*index).map_err(gpu_err)?,
+                    )),
+                    // Auto = 有什么用什么：Vulkan 优先（验收线在 Vulkan），
+                    // CUDA 兜底（仅 gpu-cuda 编译时）；两者皆败报主因
+                    // （Vulkan 的报错带设备清单，信息量最大）。
+                    GpuApi::Auto => match VulkanContext::open(*index) {
+                        Ok(ctx) => Ok(std::sync::Arc::new(ctx)),
+                        Err(ve) => {
+                            #[cfg(feature = "gpu-cuda")]
+                            {
+                                match qppocr_gpu::CudaContext::open(*index) {
+                                    Ok(c) => Ok(std::sync::Arc::new(c)),
+                                    Err(_) => Err(gpu_err(ve)),
+                                }
+                            }
+                            #[cfg(not(feature = "gpu-cuda"))]
+                            {
+                                Err(gpu_err(ve))
+                            }
+                        }
+                    },
+                    GpuApi::Cuda => {
+                        #[cfg(feature = "gpu-cuda")]
+                        {
+                            Ok(std::sync::Arc::new(
+                                qppocr_gpu::CudaContext::open(*index).map_err(gpu_err)?,
+                            ))
+                        }
+                        #[cfg(not(feature = "gpu-cuda"))]
+                        {
+                            let _ = index;
+                            Err(Error::Device(
+                                "CUDA 支持未编译（feature \"gpu-cuda\"）；当前用 \
+                                 --device vulkan 或 --device cpu"
+                                    .into(),
+                            ))
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

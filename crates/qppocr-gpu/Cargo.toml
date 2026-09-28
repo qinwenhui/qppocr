@@ -1,0 +1,26 @@
+[package]
+name = "qppocr-gpu"
+description = "qppocr 的 GPU 设备后端（Vulkan 计算先行；CUDA 枚举级预留）"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["vulkan"]
+# Vulkan 计算后端（ash；loaded 加载器——构建无需 Vulkan SDK，运行时无 loader/ICD 则枚举为空）
+vulkan = ["dep:ash"]
+# CUDA 枚举级预留（dlopen，无编译期 CUDA SDK 依赖；内核后续版本）
+cuda = ["dep:libloading"]
+
+[dependencies]
+qppocr-core = { path = "../qppocr-core", version = "0.2.1" }
+# 锁 minor：ash 升级走独立 PR（raw 指针面全封在本 crate 的 vulkan 模块内）
+ash = { version = "~0.38", optional = true, features = ["loaded", "debug"] }
+libloading = { version = "0.8", optional = true }
+
+[lints]
+workspace = true
