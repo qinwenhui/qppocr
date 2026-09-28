@@ -15,12 +15,8 @@
 //! 权重精度：装载期一次性转换为 f16——det 模型对权重量化到 f16 的
 //! 精度损失在逐字符对拍里不构成差异（竞品全部用 fp16 推理）。
 
-use ash::vk;
-use qppocr_core::error::Result;
-
-use super::device::VulkanDevice;
-use super::memory::Arena;
 use super::pipeline::{KernelSet, PcUnary, record_dispatch};
+use ash::vk;
 
 /// f32 → f16 转换内核（元素数需偶数；装载期 padding 保证）。
 /// 输入：f32 data[in_off .. in_off+n]
@@ -61,8 +57,8 @@ pub fn f32_to_f16_words(src: &[f32]) -> Vec<u32> {
     let n = src.len().div_ceil(2) * 2;
     let mut out = Vec::with_capacity(n / 2);
     for i in (0..n).step_by(2) {
-        let a = src.get(i).copied().unwrap_or(0.0) as f16_helper;
-        let b = src.get(i + 1).copied().unwrap_or(0.0) as f16_helper;
+        let a = src.get(i).copied().unwrap_or(0.0) as f32;
+        let b = src.get(i + 1).copied().unwrap_or(0.0) as f32;
         out.push(pack_half2x16(a, b));
     }
     out
@@ -126,7 +122,6 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     if rem > 0x1000 || (rem == 0x1000 && (mant16 & 1) != 0) {
         m += 1;
         if m == 0x400 {
-            m = 0;
             return sign | (((new_exp + 1) as u16) << 10);
         }
     }
@@ -167,9 +162,6 @@ fn pack_half2x16(a: f32, b: f32) -> u32 {
 fn unpack_half2x16(w: u32) -> (f32, f32) {
     (f16_to_f32_bits(w as u16), f16_to_f32_bits((w >> 16) as u16))
 }
-
-// 类型别名让 f32_to_f16_words 的 as 转换语义清晰
-type f16_helper = f32;
 
 #[cfg(test)]
 mod tests {
