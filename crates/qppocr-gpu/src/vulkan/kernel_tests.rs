@@ -877,3 +877,266 @@ fn shared_memory_basic() {
     }
     eprintln!("[gpu] 共享内存基础测试通过");
 }
+
+/// fp16 GEMM 对拍：f16 精度 ~3 位十进制（rel ~1e-3），断言 5e-3。
+#[test]
+fn conv_gemm_f16_vs_cpu() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+
+    let (ci, m, h, w) = (32u32, 24u32, 16u32, 12u32);
+    let hw = h * w;
+    let x_n = (ci * hw) as usize;
+    let w_n = (m * ci) as usize;
+    let out_n = (m * hw) as usize;
+    // f16 packed：每 2 个 f16 = 1 个 uint
+    let x16_words = x_n / 2;
+    let w16_words = w_n / 2;
+    let out16_words = out_n / 2;
+    arena
+        .alloc(((x16_words + w16_words + m as usize / 2 + out16_words) * 4 + 128) as vk::DeviceSize)
+        .unwrap();
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+
+    let mut seed = 0xa5a5_5a5a_1234_5678_u64;
+    // 生成 f32 测试数据
+    let mut xv = vec![0f32; x_n];
+    let mut wv = vec![0f32; w_n];
+    let mut bv = vec![0f32; m as usize];
+    for v in xv.iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    for v in wv.iter_mut() {
+        *v = lcg(&mut seed) * 0.5;
+    }
+    for v in bv.iter_mut() {
+        *v = lcg(&mut seed) * 0.1;
+    }
+
+    // 转换为 f16 packed
+    let x16 = crate::vulkan::fp16::f32_to_f16_words(&xv);
+    let w16 = crate::vulkan::fp16::f32_to_f16_words(&wv);
+    let b16 = crate::vulkan::fp16::f32_to_f16_words(&bv);
+
+    // 上传（偏移按 f16 元素索引）
+    let x_reg = arena.alloc(x16_words as vk::DeviceSize * 4).unwrap();
+    let w_reg = arena.alloc(w16_words as vk::DeviceSize * 4).unwrap();
+    let b_reg = arena.alloc((m as usize / 2) as vk::DeviceSize * 4).unwrap();
+    let out_reg = arena.alloc(out16_words as vk::DeviceSize * 4).unwrap();
+    let pp = arena.alloc(128).unwrap();
+
+    // SAFETY: 持久映射；长度与分配一致。
+    unsafe {
+        std::ptr::copy_nonoverlapping(x16.as_ptr(), x_reg.ptr as *mut u32, x16.len());
+        std::ptr::copy_nonoverlapping(w16.as_ptr(), w_reg.ptr as *mut u32, w16.len());
+        std::ptr::copy_nonoverlapping(b16.as_ptr(), b_reg.ptr as *mut u32, b16.len());
+    }
+
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
+    // conv_gemm_f16 参数序与 conv.comp 相同（偏移按 f16 元素索引）
+    let mut pb = ParamBlock::new();
+    pb.u(x_reg.offset as u32 / 4 * 2) // f16 元素索引 = word 索引 * 2
+        .u(w_reg.offset as u32 / 4 * 2)
+        .u(b_reg.offset as u32 / 4 * 2)
+        .u(OFF_NONE) // 无残差
+        .u(out_reg.offset as u32 / 4 * 2)
+        .u(1)
+        .u(ci)
+        .u(h)
+        .u(w)
+        .u(m)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(0)
+        .u(0)
+        .u(1)
+        .u(0) // group=1, act=0
+        .f(0.0)
+        .f(0.0)
+        .f(0.0)
+        .u(hw)
+        .u(w);
+    let pc = pb.finish(&pp);
+    // SAFETY: cb 录制态；PC 与 conv_gemm_f16.comp 参数对应。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb,
+            &ks,
+            "conv_gemm_f16",
+            pc.bytes(),
+            [hw / 2 / 16 + 1, m / 16 + 1, 1],
+        );
+    }
+    ctx.inner.device.end_reusable_cb(cb).unwrap();
+    ctx.inner.device.submit_wait_cb(cb).unwrap();
+
+    // 读回 f16 packed 并转 f32
+    // SAFETY: 已等信号。
+    let out16 =
+        unsafe { std::slice::from_raw_parts(out_reg.ptr as *const u32, out16_words).to_vec() };
+    let got = crate::vulkan::fp16::f16_words_to_f32(&out16);
+
+    // CPU 参考（f32 精度）
+    let mut want = vec![0f32; out_n];
+    for mi in 0..m as usize {
+        for j in 0..hw as usize {
+            let mut acc = 0f32;
+            for c in 0..ci as usize {
+                acc += xv[c * hw as usize + j] * wv[mi * ci as usize + c];
+            }
+            want[mi * hw as usize + j] = acc + bv[mi];
+        }
+    }
+    let e = rel_err(&got, &want);
+    eprintln!("[gpu] conv_gemm_f16(ci{ci} m{m} {h}x{w}) rel|diff| = {e:.3e}");
+    assert!(e < 5e-3, "fp16 GEMM 超容差: {e}");
+}
+
+/// fp16 vs fp32 GEMM 性能对比（单内核多次重放计时）。
+#[test]
+fn gemm_f16_vs_f32_perf() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+
+    // 用 det 典型形状：ci=32, m=64, hw=207360（大）
+    let (ci, m, hw) = (32u32, 64u32, 207_360u32);
+    let x_n = (ci * hw) as usize;
+    let w_n = (m * ci) as usize;
+    let out_n = (m * hw) as usize;
+    // f32 需要：x + w + bias + out = (32+2048+64+13271040)*4 ≈ 53 MB
+    // f16 需要：一半 ≈ 27 MB
+    // 总 arena ≈ 80 MB
+    arena.alloc(90_000_000).unwrap();
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+
+    let mut seed = 0xfeed_beef_dead_1234_u64;
+    // f32 路径
+    let x32 = arena.alloc(x_n as vk::DeviceSize * 4).unwrap();
+    let w32 = arena.alloc(w_n as vk::DeviceSize * 4).unwrap();
+    let b32 = arena.alloc(m as vk::DeviceSize * 4).unwrap();
+    let out32 = arena.alloc(out_n as vk::DeviceSize * 4).unwrap();
+    fill(&x32, x_n.min(1_000_000), &mut seed); // 填一部分就够了（不用全填，只测性能）
+    fill(&w32, w_n, &mut seed);
+
+    // f16 路径
+    let xv = read(&x32, x_n.min(1_000_000));
+    let wv = read(&w32, w_n);
+    let x16 = crate::vulkan::fp16::f32_to_f16_words(&xv);
+    // 只上传前面的部分（完整太大，用部分填充测性能）
+    let x16_partial = &x16[..x16.len().min(500_000)];
+    let w16 = crate::vulkan::fp16::f32_to_f16_words(&wv);
+
+    let x16_reg = arena.alloc(x16.len() as vk::DeviceSize * 2).unwrap();
+    let w16_reg = arena.alloc(w16.len() as vk::DeviceSize * 4).unwrap();
+    let b16_reg = arena.alloc(m as vk::DeviceSize * 2).unwrap();
+    let out16_reg = arena.alloc(out_n as vk::DeviceSize * 2).unwrap();
+    // SAFETY: 持久映射。
+    unsafe {
+        std::ptr::copy_nonoverlapping(x16.as_ptr(), x16_reg.ptr as *mut u32, x16.len());
+        std::ptr::copy_nonoverlapping(w16.as_ptr(), w16_reg.ptr as *mut u32, w16.len());
+    }
+
+    let pp = arena.alloc(256).unwrap();
+
+    // f32 GEMM 计时
+    let cb32 = ctx.inner.device.alloc_reusable_cb().unwrap();
+    let mut pb = ParamBlock::new();
+    pb.u(el(&x32))
+        .u(el(&w32))
+        .u(el(&b32))
+        .u(OFF_NONE)
+        .u(el(&out32))
+        .u(1)
+        .u(ci)
+        .u(1)
+        .u(1)
+        .u(m)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(0)
+        .u(0)
+        .u(1)
+        .u(0)
+        .f(0.0)
+        .f(0.0)
+        .f(0.0)
+        .u(hw)
+        .u(1);
+    let pc32 = pb.finish(&pp);
+    // SAFETY: cb 录制态。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb32,
+            &ks,
+            "conv_gemm",
+            pc32.bytes(),
+            [hw / 16 + 1, m / 16 + 1, 1],
+        );
+    }
+    ctx.inner.device.end_reusable_cb(cb32).unwrap();
+
+    // f16 GEMM 计时
+    let cb16 = ctx.inner.device.alloc_reusable_cb().unwrap();
+    let mut pb = ParamBlock::new();
+    pb.u(x16_reg.offset as u32 / 4 * 2)
+        .u(w16_reg.offset as u32 / 4 * 2)
+        .u(b16_reg.offset as u32 / 4 * 2)
+        .u(OFF_NONE)
+        .u(out16_reg.offset as u32 / 4 * 2)
+        .u(1)
+        .u(ci)
+        .u(1)
+        .u(1)
+        .u(m)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(0)
+        .u(0)
+        .u(1)
+        .u(0)
+        .f(0.0)
+        .f(0.0)
+        .f(0.0)
+        .u(hw)
+        .u(1);
+    let pc16 = pb.finish(&pp);
+    // SAFETY: 同上。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb16,
+            &ks,
+            "conv_gemm_f16",
+            pc16.bytes(),
+            [hw / 2 / 16 + 1, m / 16 + 1, 1],
+        );
+    }
+    ctx.inner.device.end_reusable_cb(cb16).unwrap();
+
+    // 各跑 10 次取中位
+    for (name, cb) in [("f32", cb32), ("f16", cb16)] {
+        let mut times = Vec::new();
+        for _ in 0..10 {
+            let t0 = std::time::Instant::now();
+            ctx.inner.device.submit_wait_cb(cb).unwrap();
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[gpu] GEMM {name} (ci{ci} m{m} hw{hw}): 中位 {:.2} ms",
+            times[5]
+        );
+    }
+}

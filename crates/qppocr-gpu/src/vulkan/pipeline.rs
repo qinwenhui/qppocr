@@ -25,11 +25,15 @@ const SHADERS: &[(&str, &[u8])] = &[
         include_bytes!("../../shaders/spirv/concat_c.spv"),
     ),
     ("conv", include_bytes!("../../shaders/spirv/conv.spv")),
-    ("conv_dw", include_bytes!("../../shaders/spirv/conv_dw.spv")),
     (
-        "_shared_test",
-        include_bytes!("../../shaders/spirv/_shared_test.spv"),
+        "conv_gemm_f16",
+        include_bytes!("../../shaders/spirv/conv_gemm_f16.spv"),
     ),
+    (
+        "from_f16",
+        include_bytes!("../../shaders/spirv/from_f16.spv"),
+    ),
+    ("conv_dw", include_bytes!("../../shaders/spirv/conv_dw.spv")),
     (
         "conv_gemm",
         include_bytes!("../../shaders/spirv/conv_gemm.spv"),
@@ -70,6 +74,7 @@ const SHADERS: &[(&str, &[u8])] = &[
         "resize_nearest",
         include_bytes!("../../shaders/spirv/resize_nearest.spv"),
     ),
+    ("to_f16", include_bytes!("../../shaders/spirv/to_f16.spv")),
     ("sigmoid", include_bytes!("../../shaders/spirv/sigmoid.spv")),
 ];
 
