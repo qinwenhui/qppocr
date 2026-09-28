@@ -23,6 +23,9 @@ pub(crate) struct VulkanDevice {
     next_signal: AtomicU64,
     command_pool: vk::CommandPool,
     timeline: vk::Semaphore,
+    /// 时间戳剖析：所选队列族的有效位数（0 = 不支持）与每 tick 纳秒。
+    timestamp_valid_bits: u32,
+    timestamp_period_ns: f32,
 }
 
 impl VulkanDevice {
@@ -34,10 +37,14 @@ impl VulkanDevice {
         instance: &Instance,
         physical: vk::PhysicalDevice,
         queue_family: u32,
+        coopmat: bool,
     ) -> Result<Self> {
         // 特性先行查询：开不了就带着明确原因失败，不靠驱动兜底。
+        let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut info2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
+        let mut info2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut v11)
+            .push_next(&mut v12);
         // SAFETY: physical 来自同一实例的枚举；info2 的 pNext 链在调用期间存活。
         unsafe { instance.get_physical_device_features2(physical, &mut info2) };
         if v12.timeline_semaphore == 0 {
@@ -47,20 +54,48 @@ impl VulkanDevice {
                     .into(),
             ));
         }
+        // NHWC-f16 内核族的两个硬前提：f16 SSBO 存储 + fp16 算术。
+        if coopmat && (v11.storage_buffer16_bit_access == 0 || v12.shader_float16 == 0) {
+            return Err(Error::Device(
+                "有 VK_KHR_cooperative_matrix 但缺 16bit 存储/fp16 算术特性\
+                 ——驱动不完整"
+                    .into(),
+            ));
+        }
         let priorities = [1.0f32];
         let queue_ci = vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
             .queue_priorities(&priorities);
         let queue_cis = [queue_ci];
-        let mut v12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true);
-        let ci = vk::DeviceCreateInfo::default()
+        let mut v11 =
+            vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(coopmat);
+        let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
+            .timeline_semaphore(true)
+            .shader_float16(coopmat);
+        // 协作矩阵按设备扩展启用（非核心）。
+        let exts = [ash::khr::cooperative_matrix::NAME.as_ptr()];
+        let mut ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_cis)
             .push_next(&mut v12);
+        if coopmat {
+            ci = ci.enabled_extension_names(&exts);
+        }
+        // v11 挂在 v12 之前的 pNext 链上。
+        ci.push_next(&mut v11);
         // SAFETY: ci 与其 pNext 链在调用期间存活；无自定义分配器。
         let device = unsafe { instance.create_device(physical, &ci, None) }
             .map_err(|e| Error::Device(format!("vkCreateDevice 失败: {e}")))?;
         // SAFETY: family/索引来自设备创建时的队列描述。
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        // 时间戳剖析参数（查询族属性与设备限值）。
+        // SAFETY: physical 来自同一实例枚举；属性结构在调用期间存活。
+        let props = unsafe { instance.get_physical_device_properties(physical) };
+        // SAFETY: 同上。
+        let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let (timestamp_valid_bits, timestamp_period_ns) = families
+            .get(queue_family as usize)
+            .map(|f| (f.timestamp_valid_bits, props.limits.timestamp_period))
+            .unwrap_or((0, 1.0));
         let pool_ci = vk::CommandPoolCreateInfo::default()
             .queue_family_index(queue_family)
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -80,7 +115,15 @@ impl VulkanDevice {
             next_signal: AtomicU64::new(1),
             command_pool,
             timeline,
+            timestamp_valid_bits,
+            timestamp_period_ns,
         })
+    }
+
+    /// 时间戳剖析支持：`(该队列族有效位数, 每 tick 纳秒)`。位数 0 =
+    /// 该队列不支持时间戳查询，剖析模式自动退化为不测量。
+    pub(crate) fn timestamps(&self) -> (u32, f32) {
+        (self.timestamp_valid_bits, self.timestamp_period_ns)
     }
 
     /// 取下一个信号值（提交前调用；提交与等待共用这个值）。

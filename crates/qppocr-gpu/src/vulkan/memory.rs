@@ -30,13 +30,20 @@ impl MemoryTypes {
         let required = |flags: vk::MemoryPropertyFlags, i: u32| {
             props.memory_types[i as usize].property_flags & flags == flags
         };
+        // staging 优先 HOST_CACHED：写合并（非缓存）型写入快但**主机读回
+        // 慢 ~100×**（输出回读实测 3.3MB 吃 ~26ms）。缓存型读写都走 L3。
+        let hv_hc = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let staging = (0..props.memory_type_count)
-            .find(|&i| {
-                required(
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    i,
-                )
+            .find(|&i| required(hv_hc | vk::MemoryPropertyFlags::HOST_CACHED, i))
+            .or_else(|| {
+                (0..props.memory_type_count).find(|&i| {
+                    required(hv_hc, i)
+                        && !props.memory_types[i as usize]
+                            .property_flags
+                            .contains(vk::MemoryPropertyFlags::HOST_CACHED)
+                })
             })
+            .or_else(|| (0..props.memory_type_count).find(|&i| required(hv_hc, i)))
             .ok_or_else(|| {
                 Error::Device("没有 HOST_VISIBLE|HOST_COHERENT 的 memory type".into())
             })?;

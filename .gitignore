@@ -17,3 +17,4 @@ Thumbs.db
 # 对拍/基准临时产物
 tools/*.f32
 *.f32
+bench/__pycache__/

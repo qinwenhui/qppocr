@@ -32,7 +32,8 @@ use super::pipeline::{
 use crate::planner;
 
 /// 计划缓存的条目明细（调试/步进对拍用）：(内核, 节点名, 节点序号,
-/// 输出偏移, 输出元素数, PC 字节, dispatch 网格, 输入明细)。
+/// 输出偏移, 输出元素数, PC 字节, dispatch 网格, 输入明细, 输入形状,
+/// 输出形状)。
 type PlanRec = (
     String,
     String,
@@ -42,6 +43,8 @@ type PlanRec = (
     Vec<u8>,
     [u32; 3],
     Vec<(String, u32, u32)>,
+    Vec<Vec<i64>>,
+    Vec<i64>,
 );
 
 /// 一个输入形状对应的整图执行计划。
@@ -58,8 +61,23 @@ struct Plan {
     /// 逐 dispatch 明细（步进对拍调试用；正常路径不读）。
     #[allow(dead_code)]
     recs: Vec<PlanRec>,
+    /// 剖析查询池（QPPOCR_GPU_PROF 时存在；索引 0 = 首个 dispatch 前，
+    /// i = 第 i-1 个 dispatch 后）。录制在 CB 里，每次重放自复位。
+    qpool: Option<vk::QueryPool>,
     _arena: Arena,
     _ks: KernelSet,
+    /// 查询池销毁用的设备句柄（drop 序：先于 ctx 释放）。
+    _dev: ash::Device,
+}
+
+impl Drop for Plan {
+    fn drop(&mut self) {
+        if let Some(p) = self.qpool.take() {
+            // SAFETY: 池由本计划独占；drop 时设备上无未完成工作（run
+            // 等完信号才返回）；_dev/ctx 仍存活（本体在字段 drop 前执行）。
+            unsafe { self._dev.destroy_query_pool(p, None) };
+        }
+    }
 }
 
 // SAFETY: base 是 _arena 持久映射的裸指针，存活期与 Plan 相同且无并发
@@ -151,6 +169,15 @@ fn numel(table: &planner::ShapeTable, name: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// planner 形状表里取形状（缺项给空——调用方容错）。
+fn shape_of(table: &planner::ShapeTable, name: &str) -> Vec<i64> {
+    table
+        .values
+        .get(name)
+        .map(|v| v.shape.clone())
+        .unwrap_or_default()
+}
+
 /// GPU 会话：设备共享句柄 + 形状键计划缓存。
 pub(crate) struct VulkanSession {
     graph: Graph,
@@ -192,12 +219,94 @@ impl VulkanSession {
         })
     }
 
+    /// 调试：给定形状返回 (整块基址, [(内核, 节点, 输出偏移, 输出元素数)])。
+    /// 测试读中间量统计用（n_ 模式的区域是 f16 NHWC）。
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn debug_recs(
+        &self,
+        in_shape: &[i64],
+    ) -> Option<(
+        *mut u8,
+        Vec<(String, String, usize, u32, u32, Vec<u8>, Vec<i64>)>,
+    )> {
+        let plans = self.plans.lock().ok()?;
+        let p = plans.iter().find(|(s, _)| s == in_shape).map(|(_, p)| p)?;
+        Some((
+            p.base,
+            p.recs
+                .iter()
+                .map(|(k, n, idx, o, on, pc, _, _, _, osh)| {
+                    (k.clone(), n.clone(), *idx, *o, *on, pc.clone(), osh.clone())
+                })
+                .collect(),
+        ))
+    }
+
+    /// 调试：重放 recs[from..=to]（之前可先 mutate 整块基址），
+    /// 返回 (基址, 末 rec 的输出偏移/元素数)。现场取证用。
+    /// （旧单 rec 形态等价 from==to。）
+    pub(crate) fn debug_replay(
+        &self,
+        in_shape: &[i64],
+        rec_idx: usize,
+        mutate: Option<&dyn Fn(*mut u8)>,
+    ) -> Result<(*mut u8, u32, u32)> {
+        self.debug_replay_range(in_shape, rec_idx, rec_idx, mutate)
+    }
+
+    pub(crate) fn debug_replay_range(
+        &self,
+        in_shape: &[i64],
+        from: usize,
+        to: usize,
+        mutate: Option<&dyn Fn(*mut u8)>,
+    ) -> Result<(*mut u8, u32, u32)> {
+        let mut plans = self
+            .plans
+            .lock()
+            .map_err(|_| Error::Device("计划缓存锁中毒".into()))?;
+        let plan = plans
+            .iter_mut()
+            .find(|(s, _)| s == in_shape)
+            .map(|(_, p)| p)
+            .ok_or_else(|| Error::Device("debug_replay：无该形状计划".into()))?;
+        if let Some(f) = mutate {
+            f(plan.base);
+        }
+        // 录制区间 → 一条 CB → 提交等完（锁内：与 run 同一串行化域）
+        let mut recs_out: Vec<(String, Vec<u8>, [u32; 3])> = Vec::new();
+        for r in &plan.recs[from..=to] {
+            recs_out.push((r.0.clone(), r.5.clone(), r.6));
+        }
+        let (last_off, last_n) = (plan.recs[to].3, plan.recs[to].4);
+        let base = plan.base;
+        let dev = self.ctx.device.raw().clone();
+        let ks = &plan._ks;
+        let mut idx = from;
+        self.ctx.device.submit_one_shot(|d, cb| {
+            for (kernel, pc, groups) in &recs_out {
+                // SAFETY: cb 录制态；PC 与该 rec 构建期参数一致。
+                unsafe {
+                    super::pipeline::record_dispatch(d, cb, ks, kernel, pc, *groups);
+                }
+                idx += 1;
+                let _ = idx;
+            }
+        })?;
+        Ok((base, last_off, last_n))
+    }
+
+    /// 调试：图输入名。
+    pub(crate) fn input_name_for_test(&self) -> String {
+        self.input_name.clone()
+    }
+
     /// 步进执行 + 逐节点对拍（输入已写入；QPPOCR_GPU_DUMP_CMP 给出
     /// CPU dump 目录）。首个分歧节点带两侧首元素值报错。
     fn stepped_run_and_cmp(&self, plan: &Plan) -> Result<()> {
         let dump_dir = std::env::var_os("QPPOCR_GPU_DUMP_CMP");
         let dev = self.ctx.device.raw().clone();
-        for (i, (kernel, node, idx, out_off, out_n, pc, groups, ins)) in
+        for (i, (kernel, node, idx, out_off, out_n, pc, groups, ins, _shapes, _osh)) in
             plan.recs.iter().enumerate()
         {
             // 输入复查：每个输入区域当前值 vs 它生产时的 dump——
@@ -238,13 +347,54 @@ impl VulkanSession {
                     }
                 }
             }
-            let one = self.ctx.device.alloc_reusable_cb()?;
-            // SAFETY: cb 录制态；PC 与内核参数块对应（build 期生成）。
-            unsafe {
-                record_dispatch(&dev, one, &plan._ks, kernel, pc, *groups);
+            let ks = &plan._ks;
+            let pc = pc.clone();
+            let kernel = kernel.clone();
+            let groups = *groups;
+            self.ctx.device.submit_one_shot(|d, cb| {
+                // SAFETY: cb 录制态；PC 与内核参数块对应（build 期生成）。
+                unsafe {
+                    record_dispatch(d, cb, ks, &kernel, &pc, groups);
+                }
+            })?;
+            // 逐层 f16 统计：找数值死亡层（QPPOCR_GPU_STEP_STATS 时）
+            if std::env::var_os("QPPOCR_GPU_STEP_STATS").is_some() && *out_n > 0 {
+                let nf = *out_n as usize; // 全量扫描（死亡层定位）
+                let stats = if kernel == "n_exit" {
+                    // SAFETY: base 持久映射；out_off+n ≤ total。
+                    let v: Vec<f32> = unsafe {
+                        std::slice::from_raw_parts(
+                            plan.base.add(*out_off as usize * 4) as *const f32,
+                            nf,
+                        )
+                    }
+                    .to_vec();
+                    (
+                        v.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
+                        v.iter().sum::<f32>() / v.len() as f32,
+                        v.iter().filter(|x| x.is_nan()).count(),
+                    )
+                } else {
+                    // SAFETY: 同上。
+                    let w: Vec<u32> = unsafe {
+                        std::slice::from_raw_parts(
+                            plan.base.add(*out_off as usize * 4) as *const u32,
+                            nf.div_ceil(2),
+                        )
+                    }
+                    .to_vec();
+                    let v = super::fp16::f16_words_to_f32(&w);
+                    (
+                        v.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
+                        v.iter().sum::<f32>() / v.len() as f32,
+                        v.iter().filter(|x| x.is_nan()).count(),
+                    )
+                };
+                eprintln!(
+                    "[gpu][层] #{i:<3} {kernel:<12} {node:<26} absmax={:.4} mean={:.6} nan={}",
+                    stats.0, stats.1, stats.2
+                );
             }
-            self.ctx.device.end_reusable_cb(one)?;
-            self.ctx.device.submit_wait_cb(one)?;
             eprintln!("[gpu][step] {i}/{} {} {} ok", plan.recs.len(), kernel, node);
             if let Some(dir) = &dump_dir {
                 let path = std::path::Path::new(dir).join(format!("s0_{idx:06}.f32"));
@@ -306,12 +456,32 @@ impl VulkanSession {
         }
         let mut live: HashMap<String, u32> = refs.clone();
 
+        // 路径选择：默认 = 旧 NCHW f32（真实数据已验证）；QPPOCR_GPU_NHWC=1
+        // 切 n_ 内核族（NHWC f32 + k-major 权重——真实图 det 图仍有数值
+        // 分歧待修，见 n_kernel_tests::det_real_input_cmp）。QPPOCR_GPU_F32
+        // 是历史环境名，保留等价旧路径。
+        let f32_mode = std::env::var_os("QPPOCR_GPU_NHWC").is_none();
+
         let mut layout = Layout::new();
         let mut ledger: Vec<(String, u32, u32)> = Vec::new(); // (名, off, len)
         let mut offs: HashMap<String, u32> = HashMap::new();
         // 权重占区（F32 且被引用；i64 常量链由 planner 折叠，不上传）。
         // 权重**永不释放**：命令缓冲每次重放都读它，区域复用=数据被覆盖。
-        let mut upload: Vec<(u32, Vec<f32>)> = Vec::new();
+        // 统一 word 上传：f32 数据按位转 u32。
+        let mut upload: Vec<(u32, Vec<u32>)> = Vec::new();
+        // conv 族权重（重排目标）名单：预环跳过，节点处理时惰性重排。
+        let mut conv_w_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if !f32_mode {
+            for n in &self.graph.nodes {
+                if n.op_type == "Conv" || n.op_type == "ConvTranspose" {
+                    for w in n.inputs.iter().skip(1).take(2) {
+                        if !w.is_empty() {
+                            conv_w_names.insert(w.clone());
+                        }
+                    }
+                }
+            }
+        }
         for (name, t) in &self.initializers {
             let Some(v) = table.values.get(name) else {
                 continue;
@@ -319,16 +489,19 @@ impl VulkanSession {
             if v.dtype != DType::F32 || refs.get(name).copied().unwrap_or(0) == 0 {
                 continue;
             }
-            let off = layout.alloc_static(t.f32.len() as u32);
-            ledger.push((format!("w:{name}"), off, t.f32.len() as u32));
+            if conv_w_names.contains(name) {
+                continue; // conv 权重/bias 惰性重排（map_node_n）
+            }
+            let words: Vec<u32> = if f32_mode {
+                t.f32.iter().map(|f| f.to_bits()).collect()
+            } else {
+                super::nhwc::init_to_nhwc(t)
+            };
+            let off = layout.alloc_static(words.len() as u32);
+            ledger.push((format!("w:{name}"), off, words.len() as u32));
             offs.insert(name.clone(), off);
-            upload.push((off, t.f32.to_vec()));
+            upload.push((off, words));
         }
-        // 图输入占区：每次 run 重写，同样永不释放。
-        offs.insert(
-            self.input_name.clone(),
-            layout.alloc(in_shape.iter().product::<i64>() as u32),
-        );
 
         struct Rec {
             kernel: &'static str,
@@ -339,16 +512,98 @@ impl VulkanSession {
             pc: Vec<u8>,
             groups: [u32; 3],
             ins: Vec<(String, u32, u32)>, // (输入名, off, numel)
+            in_shapes: Vec<Vec<i64>>,
+            out_shape: Vec<i64>,
         }
         let mut recs: Vec<Rec> = Vec::new();
         let mut params: Vec<(u32, Vec<u32>)> = Vec::new();
         let is_output = |nm: &str| self.graph.is_graph_output(nm);
 
+        // 图输入占区：f32 区每 run 重写（host memcpy）；n_ 模式另有
+        // entry 转换出的 NHWC-f16 区，节点一律引用后者。两区都不释放。
+        let in_words = in_shape.iter().product::<i64>() as u32;
+        let in_f32_off = layout.alloc(in_words);
+        if f32_mode {
+            offs.insert(self.input_name.clone(), in_f32_off);
+        } else {
+            let in_f16_off = layout.alloc(super::nhwc::nhwc_words(in_shape));
+            offs.insert(self.input_name.clone(), in_f16_off);
+            // entry 转换 dispatch（整图第一条）
+            let (nb, c, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
+            let mut pb = ParamBlock::new();
+            pb.u(in_f32_off)
+                .u(in_f16_off)
+                .u(nb as u32)
+                .u(c as u32)
+                .u(h as u32)
+                .u(w as u32)
+                .u(super::nhwc::cpad4(c));
+            let p_off = layout.alloc_static(pb.len_words());
+            ledger.push(("p:<entry>".into(), p_off, pb.len_words()));
+            params.push((p_off, pb.words().to_vec()));
+            recs.push(Rec {
+                kernel: "n_entry",
+                node: "<entry>".into(),
+                node_idx: usize::MAX,
+                out_off: in_f16_off,
+                out_n: in_words,
+                pc: super::pipeline::PcParams { p_off }.bytes().to_vec(),
+                groups: [((nb * h * w) as u32).div_ceil(256), 1, 1],
+                ins: vec![(self.input_name.clone(), in_f32_off, in_words)],
+                in_shapes: vec![in_shape.to_vec()],
+                out_shape: in_shape.to_vec(),
+            });
+        }
+
         // SE 融合预扫：HardSigmoid/Sigmoid(gate[1,C,1,1]) 的唯一消费者是
         // Mul(feature, gate_out) 时，合为 fused_*_mul（省一整趟 NCHW 读写
         // + 独立门 dispatch）。融合掉的节点记入 skip 集。
+        // n_ 模式默认开（n_channel 内核原生支持）；QPPOCR_GPU_NO_SE 关。
         let mut fused = std::collections::HashSet::new(); // 被融合掉的节点名
-        let se_fusion_on = std::env::var_os("QPPOCR_GPU_SE_FUSION").is_some();
+        let se_fusion_on = if f32_mode {
+            std::env::var_os("QPPOCR_GPU_SE_FUSION").is_some()
+        } else {
+            std::env::var_os("QPPOCR_GPU_NO_SE").is_none()
+        };
+        // n_ 模式：conv 族权重的惰性重排区（名 → 偏移，防共享权重重排两份）
+        let mut w_offs: HashMap<String, u32> = HashMap::new();
+        // n_ 模式：SE 归约的两阶段共享 scratch（f32 words，按最大块需求开一份）
+        let reduce_scratch: u32 = if f32_mode {
+            0
+        } else {
+            let mut need = 0u32;
+            for n in &self.graph.nodes {
+                if n.op_type == "GlobalAveragePool"
+                    || (n.op_type == "ReduceMean"
+                        && planner::axes_from(n, &table.values)
+                            .map(|a| {
+                                let r = shape_of(&table, &n.inputs[0]).len() as i64;
+                                a.iter()
+                                    .map(|&x| if x < 0 { x + r } else { x })
+                                    .collect::<Vec<_>>()
+                            })
+                            .is_ok_and(|norm| {
+                                norm.len() == 2 && norm.contains(&2) && norm.contains(&3)
+                            }))
+                {
+                    let xs = shape_of(&table, &n.inputs[0]);
+                    if xs.len() == 4 && xs[0] == 1 {
+                        let m_blocks = (xs[2] * xs[3]) as u32;
+                        let m_blocks = m_blocks.div_ceil(1024);
+                        need = need.max(m_blocks * super::nhwc::cpad4(xs[1]));
+                    }
+                }
+            }
+            if need > 0 {
+                let off = layout.alloc_static(need);
+                ledger.push(("w:<reduce-scratch>".into(), off, need));
+                off
+            } else {
+                0
+            }
+        };
+        // n_ 模式：exit 转换列表 (f16 源名, 图输出名, act)——节点环后统一发
+        let mut pending_exits: Vec<(String, String, u32)> = Vec::new();
         for i in 0..self.graph.nodes.len() {
             let n = &self.graph.nodes[i];
             if n.op_type != "HardSigmoid" && n.op_type != "Sigmoid" {
@@ -410,79 +665,125 @@ impl VulkanSession {
                     &is_output,
                     &self.initializers,
                     &self.input_name,
+                    f32_mode,
                 );
                 continue;
             }
-            // 输出区域先占（map_node 的参数要引用它）
+            // n_ 模式：图输出 Sigmoid 在 exit 融合（省一整趟 f16 读写）。
+            // 其输入区域不释放（无消费者递减）——正确，常驻到计划结束。
+            if !f32_mode
+                && n.op_type == "Sigmoid"
+                && is_output(&out)
+                && offs.contains_key(&n.inputs[0])
+            {
+                pending_exits.push((n.inputs[0].clone(), out.clone(), 4));
+                continue;
+            }
+            // 输出区域先占（map_node 的参数要引用它）。
+            // n_ 模式按 NHWC-f16 word 数（含 Cpad4 padding）。
             let out_n = numel(&table, &out);
-            let out_off = layout.alloc(out_n);
+            let out_words = if f32_mode {
+                out_n
+            } else {
+                super::nhwc::nhwc_words(&out_v.shape)
+            };
+            let out_off = layout.alloc(out_words);
             if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() {
                 eprintln!(
-                    "[gpu][live] {out} @{} 分配于 {}（len {out_n}）",
+                    "[gpu][live] {out} @{} 分配于 {}（len {out_words}）",
                     out_off, n.name
                 );
             }
-            ledger.push((format!("n:{}", n.name), out_off, out_n));
+            ledger.push((format!("n:{}", n.name), out_off, out_words));
             offs.insert(out.clone(), out_off);
 
-            let (kernel, pb, pc_inline, groups) = self.map_node(n, &table, &offs, &fused)?;
-            if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() && n.name == "Conv.5" {
-                eprintln!(
-                    "[gpu][dbg] {} 输入形状: {:?}",
-                    n.name,
-                    n.inputs
-                        .iter()
-                        .map(|i| table.values.get(i).map(|v| v.shape.clone()))
-                        .collect::<Vec<_>>()
-                );
-                eprintln!(
-                    "[gpu][dbg] 输出形状: {:?} 偏移={:?}",
-                    out_v.shape,
-                    offs.get(&out)
-                );
-                if let Some(pb) = &pb {
-                    eprintln!("[gpu][dbg] 参数块 words = {:?}", pb.words());
-                }
-                eprintln!(
-                    "[gpu][dbg] 各输入偏移: {:?}",
-                    n.inputs
-                        .iter()
-                        .map(|i| offs.get(i).copied())
-                        .collect::<Vec<_>>()
-                );
-                eprintln!("[gpu][dbg] layout.total = {}", layout.total);
-            }
-            let pc: Vec<u8> = if let Some(pb) = pb {
-                // 参数块与数据同块（u32 视图）；静态内容，装载期写一次
-                let p_off = layout.alloc_static(pb.len_words());
-                ledger.push((format!("p:{}", n.name), p_off, pb.len_words()));
-                params.push((p_off, pb.words().to_vec()));
-                super::pipeline::PcParams { p_off }.bytes().to_vec()
+            // 节点 → 内核路由：n_ 路径可能展开多条 rec（reduce 两阶段），
+            // f32 路径恒单条。
+            let routes: Vec<(&'static str, Option<ParamBlock>, Vec<u8>, [u32; 3])> = if f32_mode {
+                let (k, pb, pc_inline, groups) = self.map_node(n, &table, &offs, &fused)?;
+                vec![(k, pb, pc_inline, groups)]
             } else {
-                pc_inline
+                self.map_node_n(
+                    n,
+                    &table,
+                    &offs,
+                    &fused,
+                    &mut layout,
+                    &mut upload,
+                    &mut w_offs,
+                    reduce_scratch,
+                )?
+                .into_iter()
+                .map(|(k, pb, g)| (k, Some(pb), Vec::new(), g))
+                .collect()
             };
-            let ins: Vec<(String, u32, u32)> = n
-                .inputs
-                .iter()
-                .filter(|i| !i.is_empty())
-                .map(|i| {
-                    (
-                        i.clone(),
-                        offs.get(i).copied().unwrap_or(0),
-                        numel(&table, i),
-                    )
-                })
-                .collect();
-            recs.push(Rec {
-                kernel,
-                node: n.name.clone(),
-                node_idx,
-                out_off,
-                out_n,
-                pc,
-                groups,
-                ins,
-            });
+            for (kernel, pb, pc_inline, groups) in routes {
+                if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() && n.name == "Conv.5" {
+                    eprintln!(
+                        "[gpu][dbg] {} 输入形状: {:?}",
+                        n.name,
+                        n.inputs
+                            .iter()
+                            .map(|i| table.values.get(i).map(|v| v.shape.clone()))
+                            .collect::<Vec<_>>()
+                    );
+                    eprintln!(
+                        "[gpu][dbg] 输出形状: {:?} 偏移={:?}",
+                        out_v.shape,
+                        offs.get(&out)
+                    );
+                    if let Some(pb) = &pb {
+                        eprintln!("[gpu][dbg] 参数块 words = {:?}", pb.words());
+                    }
+                    eprintln!(
+                        "[gpu][dbg] 各输入偏移: {:?}",
+                        n.inputs
+                            .iter()
+                            .map(|i| offs.get(i).copied())
+                            .collect::<Vec<_>>()
+                    );
+                    eprintln!("[gpu][dbg] layout.total = {}", layout.total);
+                }
+                let pc: Vec<u8> = if let Some(pb) = pb {
+                    // 参数块与数据同块（u32 视图）；静态内容，装载期写一次
+                    let p_off = layout.alloc_static(pb.len_words());
+                    ledger.push((format!("p:{}", n.name), p_off, pb.len_words()));
+                    params.push((p_off, pb.words().to_vec()));
+                    super::pipeline::PcParams { p_off }.bytes().to_vec()
+                } else {
+                    pc_inline
+                };
+                let ins: Vec<(String, u32, u32)> = n
+                    .inputs
+                    .iter()
+                    .filter(|i| !i.is_empty())
+                    .map(|i| {
+                        (
+                            i.clone(),
+                            offs.get(i).copied().unwrap_or(0),
+                            numel(&table, i),
+                        )
+                    })
+                    .collect();
+                let in_shapes: Vec<Vec<i64>> = n
+                    .inputs
+                    .iter()
+                    .filter(|i| !i.is_empty())
+                    .map(|i| shape_of(&table, i))
+                    .collect();
+                recs.push(Rec {
+                    kernel,
+                    node: n.name.clone(),
+                    node_idx,
+                    out_off,
+                    out_n,
+                    pc,
+                    groups,
+                    ins,
+                    in_shapes,
+                    out_shape: out_v.shape.clone(),
+                });
+            } // routes 循环尾（release 按节点一次，不按 rec）
 
             release_inputs(
                 n,
@@ -493,7 +794,64 @@ impl VulkanSession {
                 &is_output,
                 &self.initializers,
                 &self.input_name,
+                f32_mode,
             );
+        }
+
+        // n_ 模式：exit 转换（每个图输出一条；sigmoid 融合的在节点环里挂单）。
+        // 输出区按图输出顺序分配 f32 NCHW word 数——out_offs 指它（host 读回）。
+        if !f32_mode {
+            let mut exit_order: Vec<String> = Vec::new();
+            for o in self.graph.outputs.iter() {
+                if !pending_exits.iter().any(|(_, name, _)| name == o) {
+                    exit_order.push(o.clone());
+                }
+            }
+            for (_, name, _) in &pending_exits {
+                exit_order.push(name.clone());
+            }
+            for name in exit_order {
+                let (src_name, act) = pending_exits
+                    .iter()
+                    .find(|(_, n, _)| *n == name)
+                    .map(|(s, _, a)| (s.clone(), *a))
+                    .unwrap_or((name.clone(), 0));
+                let Some(src_off) = offs.get(&src_name).copied() else {
+                    return Err(Error::Graph(format!("exit：{src_name} 无区域")));
+                };
+                let Some(v) = table.values.get(&name) else {
+                    return Err(Error::Graph(format!("exit：图输出 {name} 无形状")));
+                };
+                let (nb, c, h, w) = (v.shape[0], v.shape[1], v.shape[2], v.shape[3]);
+                let out_words = numel(&table, &name);
+                let out_off = layout.alloc(out_words);
+                let mut pb = ParamBlock::new();
+                pb.u(src_off)
+                    .u(out_off)
+                    .u(nb as u32)
+                    .u(c as u32)
+                    .u(h as u32)
+                    .u(w as u32)
+                    .u(super::nhwc::cpad4(c))
+                    .u(act);
+                let p_off = layout.alloc_static(pb.len_words());
+                ledger.push((format!("p:<exit:{name}>"), p_off, pb.len_words()));
+                params.push((p_off, pb.words().to_vec()));
+                recs.push(Rec {
+                    kernel: "n_exit",
+                    node: format!("<exit:{name}>"),
+                    node_idx: usize::MAX,
+                    out_off,
+                    out_n: out_words,
+                    pc: super::pipeline::PcParams { p_off }.bytes().to_vec(),
+                    groups: [((nb * h * w) as u32).div_ceil(256), 1, 1],
+                    ins: vec![(src_name.clone(), src_off, out_words)],
+                    in_shapes: vec![v.shape.clone()],
+                    out_shape: v.shape.clone(),
+                });
+                // out_offs 指向 f32 区（复用下方统一构造：先记到 offs 供其读取）
+                offs.insert(name.clone(), out_off);
+            }
         }
 
         // 对账（调试模式）：静态区（w:/p:）两两不重叠、不与图输出重叠。
@@ -538,13 +896,22 @@ impl VulkanSession {
             .ok_or_else(|| Error::Device("arena 空".into()))?;
         let ks = KernelSet::new(self.ctx.device.raw(), buf, buf_size)?;
 
-        // 权重 + 参数块上传（coherent 映射直写）
+        // 权重 + 参数块上传（coherent 映射直写；统一 u32 word 视图）
+        // 越界自查：主机侧写越界映射内存 = 打死设备（本机实测形态）。
+        for (off, data) in upload.iter().chain(params.iter()) {
+            assert!(
+                off + data.len() as u32 <= layout.total,
+                "静态上传越界: {off}+{} > {}",
+                data.len(),
+                layout.total
+            );
+        }
         // SAFETY: whole 是整块持久映射；off+len ≤ total。
         unsafe {
             for (off, data) in &upload {
                 std::ptr::copy_nonoverlapping(
                     data.as_ptr(),
-                    whole.ptr.add(*off as usize * 4) as *mut f32,
+                    whole.ptr.add(*off as usize * 4) as *mut u32,
                     data.len(),
                 );
             }
@@ -560,10 +927,43 @@ impl VulkanSession {
         // 录制整图 dispatch 序列
         let dev = self.ctx.device.raw().clone();
         let cb = self.ctx.device.alloc_reusable_cb()?;
-        for r in &recs {
+        // 剖析模式（QPPOCR_GPU_PROF=1|full）：每 dispatch 后一枚时间戳。
+        let (ts_bits, _) = self.ctx.device.timestamps();
+        let qpool = if std::env::var_os("QPPOCR_GPU_PROF").is_some() && ts_bits > 0 {
+            let ci = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(recs.len() as u32 + 1);
+            // SAFETY: ci 合法；池归本计划（Drop 销毁）。
+            Some(
+                unsafe { dev.create_query_pool(&ci, None) }
+                    .map_err(|e| Error::Device(format!("建时间戳查询池失败: {e}")))?,
+            )
+        } else {
+            None
+        };
+        // SAFETY: cb 处于录制态；查询池刚创建且未被并发使用（每次重放
+        // 先复位——查询在重放里被重写）。
+        unsafe {
+            if let Some(p) = qpool {
+                dev.cmd_reset_query_pool(cb, p, 0, recs.len() as u32 + 1);
+                dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, p, 0);
+            }
+        }
+        for (i, r) in recs.iter().enumerate() {
             // SAFETY: cb 处于录制态；PC 与内核参数块逐字段对应（map_node 保证）。
             unsafe {
                 record_dispatch(&dev, cb, &ks, r.kernel, &r.pc, r.groups);
+            }
+            if let Some(p) = qpool {
+                // SAFETY: 同上；BOTTOM_OF_PIPE = 前序工作全部完成之时。
+                unsafe {
+                    dev.cmd_write_timestamp(
+                        cb,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        p,
+                        i as u32 + 1,
+                    );
+                }
             }
         }
         self.ctx.device.end_reusable_cb(cb)?;
@@ -607,21 +1007,551 @@ impl VulkanSession {
                     r.pc.clone(),
                     r.groups,
                     r.ins.clone(),
+                    r.in_shapes.clone(),
+                    r.out_shape.clone(),
                 )
             })
             .collect();
         Ok(Plan {
             base: whole.ptr,
             recs: dbg_recs,
-            in_offs: [(self.input_name.clone(), offs[&self.input_name])]
+            // in_offs 指向 **f32 区**（host 每次 memcpy 的目标）。n_ 模式下
+            // offs[input] 是 entry 转换出的 f16 区——拿它当 memcpy 目标会把
+            // 原始 f32 字节灌进 f16 激活/参数区（曾碾碎参数块打死设备）。
+            in_offs: [(self.input_name.clone(), in_f32_off)]
                 .into_iter()
                 .collect(),
             out_offs,
             out_shapes,
             cb,
+            qpool,
             _arena: arena,
             _ks: ks,
+            _dev: dev.clone(),
         })
+    }
+
+    /// 逐 dispatch GPU 时间剖析（QPPOCR_GPU_PROF=1 | full）。
+    ///
+    /// 时间戳读回后按 dispatch 取相邻差：第 i 段 = 第 i 个 dispatch 的
+    /// 执行 + 其前的屏障/排队开销。`=1` 打印按内核聚合 + top-20；
+    /// `=full` 额外逐 dispatch 列表。附 GPU 总时间 vs 提交往返的墙钟
+    /// （差值 = 主机等待/提交开销）。
+    fn prof_print(&self, plan: &Plan, pool: vk::QueryPool, wall_ms: f64) {
+        let dev = self.ctx.device.raw();
+        let n = plan.recs.len();
+        let mut stamps = vec![0u64; n + 1];
+        // SAFETY: pool 归本计划且提交已等完信号；data 切片长度即查询数。
+        let ok = unsafe {
+            dev.get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
+        }
+        .is_ok();
+        if !ok {
+            eprintln!("[gpu][prof] 时间戳查询不可用（查询未完成？）");
+            return;
+        }
+        let (_, period) = self.ctx.device.timestamps();
+        let ms = |d: u64| d as f64 * period as f64 / 1e6;
+        let deltas: Vec<f64> = (0..n)
+            .map(|i| ms(stamps[i + 1].saturating_sub(stamps[i])))
+            .collect();
+        let total: f64 = deltas.iter().sum();
+
+        // 按内核聚合
+        let mut by_kernel: HashMap<&str, (usize, f64)> = HashMap::new();
+        for (r, d) in plan.recs.iter().zip(&deltas) {
+            let e = by_kernel.entry(r.0.as_str()).or_default();
+            e.0 += 1;
+            e.1 += *d;
+        }
+        let mut kers: Vec<(&str, usize, f64)> =
+            by_kernel.into_iter().map(|(k, (c, t))| (k, c, t)).collect();
+        kers.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        eprintln!(
+            "[gpu][prof] GPU 总 {total:.2} ms / 提交往返墙钟 {wall_ms:.2} ms / \
+             {n} dispatch（均 {:.3} ms）",
+            total / n as f64
+        );
+        for (k, c, t) in &kers {
+            eprintln!(
+                "[gpu][prof]   {k:<22} ×{c:<4} {t:8.3} ms（均 {:.3}）",
+                t / *c as f64
+            );
+        }
+        // top-20 热点（节点名）
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| deltas[b].partial_cmp(&deltas[a]).unwrap());
+        let full = std::env::var("QPPOCR_GPU_PROF").unwrap_or_default() == "full";
+        let top = if full { n } else { idx.len().min(20) };
+        for &i in &idx[..top] {
+            let (kernel, node, _, out_off, out_n, _, groups, _, shapes, _osh) = &plan.recs[i];
+            let sh: Vec<String> = shapes
+                .iter()
+                .take(2)
+                .map(|s| {
+                    if s.len() == 4 {
+                        format!("[{},{}, {},{}]", s[0], s[1], s[2], s[3])
+                    } else {
+                        format!("{s:?}")
+                    }
+                })
+                .collect();
+            eprintln!(
+                "[gpu][prof]   #{i:<4} {kernel:<20} {node:<28} {:.3} ms  grid {groups:?} in {} n={out_n}",
+                deltas[i],
+                sh.join(" × "),
+            );
+        }
+    }
+
+    /// n_ 模式的节点 → (内核名, 参数块, dispatch 网格)。
+    ///
+    /// 全图激活按 NHWC f16 语义路由；偏移一律 u32 word 单位。conv 族
+    /// 权重/偏置经 [`n_weight_off`] 惰性重排（k-major / tap-major）。
+    #[allow(clippy::too_many_arguments)]
+    fn map_node_n(
+        &self,
+        n: &Node,
+        table: &planner::ShapeTable,
+        offs: &HashMap<String, u32>,
+        fused: &std::collections::HashSet<String>,
+        layout: &mut Layout,
+        uploads: &mut Vec<(u32, Vec<u32>)>,
+        w_offs: &mut HashMap<String, u32>,
+        reduce_scratch: u32,
+    ) -> Result<Vec<(&'static str, ParamBlock, [u32; 3])>> {
+        use super::nhwc::{conv_bias, cpad4, repack_conv_w, repack_convt_w, repack_dw_w};
+        let shape_of = |name: &str| -> Vec<i64> {
+            table
+                .values
+                .get(name)
+                .map(|v| v.shape.clone())
+                .unwrap_or_default()
+        };
+        let off_of = |name: &str| -> Result<u32> {
+            offs.get(name).copied().ok_or_else(|| {
+                Error::Graph(format!(
+                    "{}: 输入 {} 无区域（非权重/前驱输出）",
+                    n.op_type, name
+                ))
+            })
+        };
+        let div256 = |t: u32| t.div_ceil(256);
+        let out = &n.outputs[0];
+        let out_shape = shape_of(out);
+        // act 参数（conv 族：0=无 1=gelu 2=relu，镜像 Activation）
+        let act = planner::get_i(n.attr("act"), 0) as u32;
+        let c1 = planner::get_f(n.attr("act_c1"), std::f32::consts::SQRT_2);
+        let c2 = planner::get_f(n.attr("act_c2"), 1.0);
+        let c3 = planner::get_f(n.attr("act_c3"), 0.5);
+
+        match n.op_type.as_str() {
+            "Conv" => {
+                let xs = shape_of(&n.inputs[0]);
+                let ws = shape_of(&n.inputs[1]); // [Co, Ci, kh, kw]
+                let (sh, sw) = strides(n);
+                let pads = pads4(n);
+                let (kh, kw) = (ws[2] as usize, ws[3] as usize);
+                let nb = xs[0] as u32;
+                let (oh, ow) = (out_shape[2] as u32, out_shape[3] as u32);
+                let m_dim = oh * ow;
+                let group = planner::get_i(n.attr("group"), 1);
+                if group == 1 {
+                    let (co, ci) = (ws[0] as usize, ws[1] as usize);
+                    let w_off = n_weight_off(
+                        &self.initializers,
+                        &n.inputs[1],
+                        layout,
+                        uploads,
+                        w_offs,
+                        |t| repack_conv_w(&t.f32, co, ci, kh, kw),
+                    )?;
+                    let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
+                    let mut pb = ParamBlock::new();
+                    pb.u(off_of(&n.inputs[0])?)
+                        .u(w_off)
+                        .u(b_off)
+                        .u(off_of(out)?)
+                        .u(m_dim)
+                        .u(cpad4(ws[0]))
+                        .u(ow)
+                        .u(xs[3] as u32)
+                        .u(xs[2] as u32)
+                        .u(cpad4(ws[1]) / 4)
+                        .u((kh * kw) as u32)
+                        .u(kw as u32)
+                        .u(sh as u32)
+                        .u(sw as u32)
+                        .u(pads.0 as u32)
+                        .u(pads.1 as u32)
+                        .u(act)
+                        .f(c1)
+                        .f(c2)
+                        .f(c3);
+                    let nv = cpad4(ws[0]) / 4;
+                    Ok(vec![(
+                        "n_conv",
+                        pb,
+                        [div256(m_dim.div_ceil(4) * nv), nb, 1],
+                    )])
+                } else if group == xs[1] && ws[0] == xs[1] {
+                    // depthwise：ws = [C, 1, kh, kw]
+                    let cch = ws[0] as usize;
+                    let w_off = n_weight_off(
+                        &self.initializers,
+                        &n.inputs[1],
+                        layout,
+                        uploads,
+                        w_offs,
+                        |t| repack_dw_w(&t.f32, cch, kh, kw),
+                    )?;
+                    let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
+                    let cp = cpad4(ws[0]);
+                    let mut pb = ParamBlock::new();
+                    pb.u(off_of(&n.inputs[0])?)
+                        .u(w_off)
+                        .u(b_off)
+                        .u(off_of(out)?)
+                        .u(m_dim)
+                        .u(cp)
+                        .u(ow)
+                        .u(xs[3] as u32)
+                        .u(xs[2] as u32)
+                        .u((kh * kw) as u32)
+                        .u(kw as u32)
+                        .u(sh as u32)
+                        .u(sw as u32)
+                        .u(pads.0 as u32)
+                        .u(pads.1 as u32)
+                        .u(act)
+                        .f(c1)
+                        .f(c2)
+                        .f(c3);
+                    Ok(vec![("n_conv_dw", pb, [div256(m_dim * cp / 4), nb, 1])])
+                } else {
+                    Err(Error::Graph(format!(
+                        "n_ 路径：Conv group={group} 不支持（仅 group=1 或 depthwise），节点 {}",
+                        n.name
+                    )))
+                }
+            }
+            "ConvTranspose" => {
+                let xs = shape_of(&n.inputs[0]);
+                let ws = shape_of(&n.inputs[1]); // [Ci, Co, kh, kw]
+                let (sh, sw) = strides(n);
+                let (kh, kw) = (ws[2] as usize, ws[3] as usize);
+                if kh > sh as usize || kw > sw as usize {
+                    return Err(Error::Graph(format!(
+                        "n_ 路径：ConvTranspose k{kh}x{kw} > s{sh}x{sw}（多 tap 输出未支持），节点 {}",
+                        n.name
+                    )));
+                }
+                let (ci, co) = (ws[0] as usize, ws[1] as usize);
+                let w_off = n_weight_off(
+                    &self.initializers,
+                    &n.inputs[1],
+                    layout,
+                    uploads,
+                    w_offs,
+                    |t| repack_convt_w(&t.f32, ci, co, kh, kw),
+                )?;
+                let b_off = self.n_bias_off(n, ws[1], layout, uploads, w_offs)?;
+                let (oh, ow) = (out_shape[2] as u32, out_shape[3] as u32);
+                let m_dim = oh * ow;
+                let nv = cpad4(ws[1]) / 4;
+                let cip = cpad4(ws[0]);
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(&n.inputs[0])?)
+                    .u(w_off)
+                    .u(b_off)
+                    .u(off_of(out)?)
+                    .u(m_dim)
+                    .u(cpad4(ws[1]))
+                    .u(ow)
+                    .u(xs[3] as u32)
+                    .u(xs[2] as u32)
+                    .u(cip)
+                    .u(cip / 4)
+                    .u(sh as u32)
+                    .u(sw as u32)
+                    .u(kw as u32)
+                    .u(act)
+                    .f(c1)
+                    .f(c2)
+                    .f(c3);
+                Ok(vec![("n_convt", pb, [div256(m_dim * nv), xs[0] as u32, 1])])
+            }
+            "MaxPool" | "AveragePool" => {
+                let xs = shape_of(&n.inputs[0]);
+                let ks = n
+                    .attr("kernel_shape")
+                    .filter(|a| a.ints.len() == 2)
+                    .ok_or_else(|| Error::Graph("kernel_shape required".into()))?;
+                let (sh, sw) = strides(n);
+                let pads = pads4(n);
+                let (oh, ow) = (out_shape[2] as u32, out_shape[3] as u32);
+                let m_dim = oh * ow;
+                let cp = cpad4(xs[1]);
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(&n.inputs[0])?)
+                    .u(off_of(out)?)
+                    .u(m_dim)
+                    .u(cp)
+                    .u(ow)
+                    .u(xs[3] as u32)
+                    .u(xs[2] as u32)
+                    .u(ks.ints[0] as u32)
+                    .u(ks.ints[1] as u32)
+                    .u(sh as u32)
+                    .u(sw as u32)
+                    .u(pads.0 as u32)
+                    .u(pads.1 as u32)
+                    .u(u32::from(n.op_type == "MaxPool"));
+                Ok(vec![(
+                    "n_pool",
+                    pb,
+                    [div256(m_dim * cp / 4), xs[0] as u32, 1],
+                )])
+            }
+            "GlobalAveragePool" | "ReduceMean" => {
+                if n.op_type == "ReduceMean" {
+                    let axes = planner::axes_from(n, &table.values)
+                        .map_err(|e| Error::Graph(format!("ReduceMean: {e}")))?;
+                    let r = shape_of(&n.inputs[0]).len() as i64;
+                    let norm: Vec<i64> = axes
+                        .iter()
+                        .map(|&a| if a < 0 { a + r } else { a })
+                        .collect();
+                    if !(norm.len() == 2 && norm.contains(&2) && norm.contains(&3)) {
+                        return Err(Error::Graph(format!(
+                            "n_ 路径 ReduceMean 只支持 axes={{2,3}}，实得 {axes:?}"
+                        )));
+                    }
+                }
+                let xs = shape_of(&n.inputs[0]);
+                if xs[0] != 1 {
+                    return Err(Error::Graph("n_ 路径 SE 归约只支持 N=1".into()));
+                }
+                let cp = cpad4(xs[1]);
+                if cp > 256 {
+                    return Err(Error::Graph(format!(
+                        "n_ 路径 SE 归约通道 {cp} > 256（两阶段内核上限）"
+                    )));
+                }
+                let m_dim = (xs[2] * xs[3]) as u32;
+                let m_blocks = m_dim.div_ceil(1024);
+                // 阶段 1：分块部分和 → scratch
+                let mut pb1 = ParamBlock::new();
+                pb1.u(off_of(&n.inputs[0])?)
+                    .u(reduce_scratch)
+                    .u(m_dim)
+                    .u(cp);
+                let r1 = ("n_reduce_hw", pb1, [m_blocks, 1, 1]);
+                // 阶段 2：scratch → f16 gate
+                let mut pb2 = ParamBlock::new();
+                pb2.u(reduce_scratch)
+                    .u(off_of(out)?)
+                    .u(m_blocks)
+                    .u(cp)
+                    .u(m_dim);
+                let r2 = ("n_reduce_fin", pb2, [1, 1, 1]);
+                Ok(vec![r1, r2])
+            }
+            "Resize" => {
+                let mode = n
+                    .attr("mode")
+                    .filter(|a| a.has_s)
+                    .map(|a| a.s.clone())
+                    .unwrap_or_else(|| "nearest".into());
+                if mode != "nearest" {
+                    return Err(Error::Graph(format!(
+                        "n_ 路径 Resize 只支持 nearest，实得 {mode}"
+                    )));
+                }
+                let xs = shape_of(&n.inputs[0]);
+                let (oh, ow) = (out_shape[2] as u32, out_shape[3] as u32);
+                let m_dim = oh * ow;
+                let cp = cpad4(xs[1]);
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(&n.inputs[0])?)
+                    .u(off_of(out)?)
+                    .u(m_dim)
+                    .u(cp)
+                    .u(ow)
+                    .u(xs[3] as u32)
+                    .u(xs[2] as u32);
+                Ok(vec![(
+                    "n_resize",
+                    pb,
+                    [div256(m_dim * cp / 4), xs[0] as u32, 1],
+                )])
+            }
+            "Concat" => {
+                let axis = planner::get_i(n.attr("axis"), 0);
+                if axis != 1 {
+                    return Err(Error::Graph(format!(
+                        "n_ 路径 Concat 只支持 axis=1，实得 {axis}"
+                    )));
+                }
+                let xs = shape_of(&n.inputs[0]);
+                // vec4 整段拷贝要求所有输入 C%4==0（否则段内 pad 会错位）
+                for inn in &n.inputs {
+                    if inn.is_empty() {
+                        continue;
+                    }
+                    let s = shape_of(inn);
+                    if s[1] % 4 != 0 {
+                        return Err(Error::Graph(format!(
+                            "n_ 路径 Concat 输入 {inn} 通道 {} 非 %4（段内 pad 会错位）",
+                            s[1]
+                        )));
+                    }
+                }
+                let hw = (xs[0] * xs[2] * xs[3]) as u32;
+                let out_c4 = cpad4(out_shape[1]) / 4;
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(out)?).u(hw).u(n.inputs.len() as u32).u(out_c4);
+                for inn in &n.inputs {
+                    if inn.is_empty() {
+                        continue;
+                    }
+                    let s = shape_of(inn);
+                    pb.u(off_of(inn)?).u(cpad4(s[1]) / 4);
+                }
+                Ok(vec![("n_concat_c", pb, [div256(hw * out_c4), 1, 1])])
+            }
+            "Sigmoid" | "Relu" | "HardSigmoid" | "Clip" => {
+                let (op, p1, p2) = match n.op_type.as_str() {
+                    "Sigmoid" => (1u32, 0f32, 0f32),
+                    "Relu" => (0, 0.0, 0.0),
+                    "HardSigmoid" => (
+                        2,
+                        planner::get_f(n.attr("alpha"), 0.2),
+                        planner::get_f(n.attr("beta"), 0.5),
+                    ),
+                    _ => (
+                        3,
+                        planner::get_f(n.attr("min"), -3.4e38),
+                        planner::get_f(n.attr("max"), 3.4e38),
+                    ),
+                };
+                let n_words = super::nhwc::nhwc_words(&shape_of(&n.inputs[0]));
+                let mut pb = ParamBlock::new();
+                pb.u(op)
+                    .u(off_of(&n.inputs[0])?)
+                    .u(OFF_NONE)
+                    .u(off_of(out)?)
+                    .u(n_words)
+                    .f(p1)
+                    .f(p2);
+                Ok(vec![("n_elem", pb, [div256(n_words / 4), 1, 1])])
+            }
+            "Add" | "Mul" => {
+                let a = shape_of(&n.inputs[0]);
+                let b = shape_of(&n.inputs[1]);
+                let b_n = numel(table, &n.inputs[1]);
+                let a_words = super::nhwc::nhwc_words(&a);
+                if a == b {
+                    let mut pb = ParamBlock::new();
+                    pb.u(if n.op_type == "Add" { 4 } else { 5 })
+                        .u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(off_of(out)?)
+                        .u(a_words)
+                        .f(0.0)
+                        .f(0.0);
+                    Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
+                } else if b.len() == 4 && b_n == b[1] as u32 {
+                    // [1,C,1,1] 通道广播；SE 融合门 → fused（读前激活值）
+                    let gate_producer = self
+                        .graph
+                        .nodes
+                        .iter()
+                        .find(|m| m.outputs.first() == Some(&n.inputs[1]));
+                    let is_fused_gate = gate_producer.is_some_and(|m| {
+                        fused.contains(&m.name)
+                            && (m.op_type == "HardSigmoid" || m.op_type == "Sigmoid")
+                    });
+                    let (op, gate_off, p1, p2) = if is_fused_gate {
+                        let gp = gate_producer.unwrap();
+                        let g_off = off_of(&gp.inputs[0])?; // 前激活门
+                        if gp.op_type == "HardSigmoid" {
+                            (
+                                3u32,
+                                g_off,
+                                planner::get_f(gp.attr("alpha"), 0.2),
+                                planner::get_f(gp.attr("beta"), 0.5),
+                            )
+                        } else {
+                            (4, g_off, 0.0, 0.0)
+                        }
+                    } else if n.op_type == "Mul" {
+                        (0, off_of(&n.inputs[1])?, 0.0, 0.0)
+                    } else {
+                        (1, off_of(&n.inputs[1])?, 0.0, 0.0)
+                    };
+                    let cp = cpad4(a[1]);
+                    let mut pb = ParamBlock::new();
+                    pb.u(op)
+                        .u(off_of(&n.inputs[0])?)
+                        .u(gate_off)
+                        .u(OFF_NONE) // r_off（muladd_scale 专用）
+                        .u(off_of(out)?)
+                        .u(a_words)
+                        .u(cp)
+                        .f(p1)
+                        .f(p2);
+                    Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
+                } else {
+                    Err(Error::Graph(format!(
+                        "n_ 路径 {}：只支持同形或 [1,C,1,1] 广播，实得 {a:?} vs {b:?}",
+                        n.op_type
+                    )))
+                }
+            }
+            "MulAddScale" => {
+                let fs = shape_of(&n.inputs[0]);
+                let a_words = super::nhwc::nhwc_words(&fs);
+                let cp = cpad4(fs[1]);
+                let mut pb = ParamBlock::new();
+                pb.u(2u32) // muladd_scale
+                    .u(off_of(&n.inputs[0])?)
+                    .u(off_of(&n.inputs[1])?)
+                    .u(off_of(&n.inputs[2])?)
+                    .u(off_of(out)?)
+                    .u(a_words)
+                    .u(cp)
+                    .f(0.0)
+                    .f(0.0);
+                Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
+            }
+            other => Err(Error::Graph(format!(
+                "n_ 路径不支持算子 {other}（节点 {}）",
+                n.name
+            ))),
+        }
+    }
+
+    /// conv 族 bias 的惰性 f16 重排区。
+    fn n_bias_off(
+        &self,
+        n: &Node,
+        co: i64,
+        layout: &mut Layout,
+        uploads: &mut Vec<(u32, Vec<u32>)>,
+        w_offs: &mut HashMap<String, u32>,
+    ) -> Result<u32> {
+        if n.inputs.len() <= 2 || n.inputs[2].is_empty() {
+            return Ok(OFF_NONE);
+        }
+        n_weight_off(
+            &self.initializers,
+            &n.inputs[2],
+            layout,
+            uploads,
+            w_offs,
+            |t| super::nhwc::conv_bias(&t.f32, co),
+        )
     }
 
     /// 节点 → (内核名, 参数块 | 内联 PC, dispatch 网格)。
@@ -847,7 +1777,10 @@ impl VulkanSession {
                     "reduce_hw",
                     Some(pb),
                     Vec::new(),
-                    [(xs[0] * xs[1]) as u32 / 256 + 1, 1, 1],
+                    // 一个 WG 归约一个 (n,c) 通道平面（内核内线程跨步 +
+                    // subgroup 归约）——曾误用 (n*c)/256+1，64 通道只给
+                    // 1 个 WG，每线程串行扫 5 万元素，单个 GAP 2.9 ms。
+                    [(xs[0] * xs[1]) as u32, 1, 1],
                 ))
             }
             "Resize" => {
@@ -1052,6 +1985,31 @@ impl VulkanSession {
     }
 }
 
+/// conv 族权重的惰性重排：首次引用时重排 + 静态占区 + 进上传列表。
+/// 名字键控（共享权重只重排一份）。
+fn n_weight_off(
+    initializers: &HashMap<String, Tensor>,
+    name: &str,
+    layout: &mut Layout,
+    uploads: &mut Vec<(u32, Vec<u32>)>,
+    w_offs: &mut HashMap<String, u32>,
+    repack: impl FnOnce(&Tensor) -> Vec<u32>,
+) -> Result<u32> {
+    if let Some(&o) = w_offs.get(name) {
+        return Ok(o);
+    }
+    let t = initializers.get(name).ok_or_else(|| {
+        Error::Graph(format!(
+            "n_ 路径：权重 {name} 不是 initializer（仅支持常量权重）"
+        ))
+    })?;
+    let data = repack(t);
+    let off = layout.alloc_static(data.len() as u32);
+    uploads.push((off, data));
+    w_offs.insert(name.to_string(), off);
+    Ok(off)
+}
+
 /// 输出名 → 产出它的节点序号（线性扫，调试路径，图 ≤ 数百节点）。
 fn node_index_of(graph: &Graph, out: &str) -> Option<usize> {
     graph
@@ -1137,8 +2095,14 @@ impl DeviceSession for VulkanSession {
         if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() {
             self.stepped_run_and_cmp(plan)?;
         } else {
+            let t0 = std::time::Instant::now();
             self.ctx.device.submit_wait_cb(plan.cb)?;
+            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if let Some(p) = plan.qpool {
+                self.prof_print(plan, p, wall_ms);
+            }
         }
+        let t_out = std::time::Instant::now();
 
         let mut outs = Vec::with_capacity(plan.out_offs.len());
         for (i, (name, off, n)) in plan.out_offs.iter().enumerate() {
@@ -1167,6 +2131,8 @@ impl DeviceSession for VulkanSession {
 /// 消费释放：输入若再无消费者，归还区域给布局复用。
 /// **豁免**：图输出（要读回）、权重（CB 每次重放都读）、图输入（每次
 /// run 重写）——这三类区域一旦被复用就是数据 corrupt。
+/// 区域大小按模式取：f32 元素数 / NHWC-f16 word 数（与分配一致，否则
+/// 空闲表尺寸错位）。
 #[allow(clippy::too_many_arguments)]
 fn release_inputs(
     n: &Node,
@@ -1177,6 +2143,7 @@ fn release_inputs(
     is_output: &dyn Fn(&str) -> bool,
     initializers: &HashMap<String, Tensor>,
     input_name: &str,
+    f32_mode: bool,
 ) {
     let dbg = std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some();
     for inn in &n.inputs {
@@ -1196,7 +2163,13 @@ fn release_inputs(
                     if dbg {
                         eprintln!("[gpu][live] {inn} @{} 释放于 {}", o, n.name);
                     }
-                    layout.free(o, numel(table, inn));
+                    let size = match table.values.get(inn) {
+                        Some(v) if !f32_mode => super::nhwc::nhwc_words(&v.shape),
+                        _ => numel(table, inn),
+                    };
+                    if std::env::var_os("QPPOCR_GPU_NO_FREE").is_none() {
+                        layout.free(o, size);
+                    }
                 }
             }
         }

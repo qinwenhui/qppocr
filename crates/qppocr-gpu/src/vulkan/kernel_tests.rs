@@ -527,14 +527,7 @@ fn reduce_resize_concat_vs_cpu() {
     let pc1 = pb.finish(&p1);
     // SAFETY: 同 conv。
     unsafe {
-        record_dispatch(
-            &dev,
-            cb,
-            &ks,
-            "reduce_hw",
-            pc1.bytes(),
-            [(n * c).div_ceil(256), 1, 1],
-        );
+        record_dispatch(&dev, cb, &ks, "reduce_hw", pc1.bytes(), [n * c, 1, 1]);
     }
     // resize_nearest.comp：in,out,n,c,h,w,oh,ow
     let mut pb = ParamBlock::new();

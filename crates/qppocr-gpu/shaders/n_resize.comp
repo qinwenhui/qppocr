@@ -1,0 +1,31 @@
+// 最近邻上/下采样（NHWC f32）：iy = trunc(oy * H / oh) 钳 [0,H-1]
+//（镜像 resize_nearest.comp 的纯算术映射）。一线程一 (输出位置, c4)。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(std430, binding = 0) buffer D32 { vec4 d[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint mDim = params[P + 2], cDim = params[P + 3], outW = params[P + 4];
+    uint inW = params[P + 5], inH = params[P + 6];
+
+    uint b = gl_WorkGroupID.y;
+    uint cv4 = cDim >> 2;
+    uint gid = gl_GlobalInvocationID.x;
+    uint tiles = mDim * cv4;
+    if (gid >= tiles) return;
+    uint c4 = gid % cv4;
+    uint m = gid / cv4;
+    uint oy = m / outW, ox = m - oy * outW;
+    uint ib = (in_off >> 2) + b * inH * inW * cv4;
+    uint ob = (out_off >> 2) + b * mDim * cv4;
+
+    uint iy = uint(float(oy) * float(inH) / float(mDim / outW));
+    uint ix = uint(float(ox) * float(inW) / float(outW));
+    iy = min(iy, inH - 1u);
+    ix = min(ix, inW - 1u);
+    d[ob + m * cv4 + c4] = d[ib + (iy * inW + ix) * cv4 + c4];
+}

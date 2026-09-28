@@ -1,0 +1,43 @@
+// 池化（NHWC f32，max/avg 通用带 pad）：越界跳过；avg 除满核面积
+//（镜像 pool.comp / pool2d.rs 语义）。一线程一 (输出位置, 通道组 c4)。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(std430, binding = 0) buffer D32 { vec4 d[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint mDim = params[P + 2], cDim = params[P + 3], outW = params[P + 4];
+    uint inW = params[P + 5], inH = params[P + 6];
+    uint kh = params[P + 7], kw = params[P + 8];
+    uint sH = params[P + 9], sW = params[P + 10];
+    uint padT = params[P + 11], padL = params[P + 12];
+    uint isMax = params[P + 13];
+
+    uint b = gl_WorkGroupID.y;
+    uint cv4 = cDim >> 2;
+    uint gid = gl_GlobalInvocationID.x;
+    uint tiles = mDim * cv4;
+    if (gid >= tiles) return;
+    uint c4 = gid % cv4;
+    uint m = gid / cv4;
+    uint oh = m / outW, ow = m - oh * outW;
+    uint ib = (in_off >> 2) + b * inH * inW * cv4;
+    uint ob = (out_off >> 2) + b * mDim * cv4;
+
+    vec4 acc = isMax != 0u ? vec4(-3.4e38) : vec4(0.0);
+    for (uint ky = 0u; ky < kh; ky++) {
+        int iy = int(oh * sH + ky) - int(padT);
+        if (iy < 0 || iy >= int(inH)) continue;
+        for (uint kx = 0u; kx < kw; kx++) {
+            int ix = int(ow * sW + kx) - int(padL);
+            if (ix < 0 || ix >= int(inW)) continue;
+            vec4 v = vec4(d[ib + (uint(iy) * inW + uint(ix)) * cv4 + c4]);
+            if (isMax != 0u) acc = max(acc, v); else acc += v;
+        }
+    }
+    if (isMax == 0u) acc /= float(kh * kw);
+    d[ob + m * cv4 + c4] = vec4(acc);
+}
