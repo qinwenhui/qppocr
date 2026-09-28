@@ -214,6 +214,7 @@ dependencies = [
  "ash",
  "libloading",
  "qppocr-core",
+ "qppocr-kernels",
 ]
 
 [[package]]

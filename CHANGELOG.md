@@ -10,6 +10,15 @@
 
 ### 新增（Added）
 
+- **GPU planner（`qppocr-gpu::planner`，Phase 1-E）**：装载期静态形状
+  推理 + i64 常量折叠（Shape/Cast/Slice/Concat/Transpose/Unsqueeze 链
+  求值——Resize 的 sizes、Reshape 目标、各类 axes 的来源）。语义逐字
+  镜像 executor/内核（conv/pool/ConvTranspose 输出公式、auto_pad 的
+  SAME_UPPER/LOWER、右对齐广播、slice 钳位、0/-1 reshape、右对齐批次
+  matmul、keepdims 归约），判据是真实 det 模型的 oracle 对拍：三个输入
+  尺寸（960×960/640×640/960×512）下逐节点与 `QPPOCR_DUMP_DIR` 落盘的
+  运行期形状**全部一致**（各 140 节点）。该测试即 Phase F 内核规划的
+  准入门；缺模型环境自动跳过。
 - **GPU 后端 crate 落地（`qppocr-gpu`，Phase 1 第一步）**：Vulkan 设备
   枚举与打开（ash；实例按 1.1 请求最大化枚举面，可用性按物理设备
   `apiVersion` 判定 1.4 基线，低于基线的设备枚举可见并标注）+ CUDA

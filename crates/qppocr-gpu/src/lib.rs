@@ -22,6 +22,9 @@
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
+/// 装载期图分析（静态形状推理 + 常量折叠；后端无关，无 GPU 也能用——
+/// tests/plan.rs 用它对真实模型做 oracle 对拍）。
+pub mod planner;
 pub mod vulkan;
 
 use qppocr_core::device::DeviceInfo;
