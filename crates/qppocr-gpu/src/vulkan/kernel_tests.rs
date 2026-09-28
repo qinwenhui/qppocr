@@ -1100,3 +1100,250 @@ fn gemm_f16_vs_f32_perf() {
         );
     }
 }
+
+/// NHWC GEMM 对拍：直接构造 NHWC 输入，与 CPU f32 参考比较。
+/// 同时验证 NCHW↔NHWC 转换内核。
+#[test]
+fn conv_gemm_nhwc_vs_cpu() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+
+    let (ci, m, h, w) = (32u32, 24u32, 16u32, 12u32);
+    let hw = h * w;
+    let x_nchw_n = (ci * hw) as usize; // NCHW input
+    let x_nhwc_n = (hw * ci) as usize; // NHWC input (same count)
+    let w_n = (m * ci) as usize;
+    let out_n = (m * hw) as usize; // NHWC output [hw, m]
+    arena
+        .alloc(((x_nchw_n + x_nhwc_n + w_n + m as usize + out_n) * 4 + 256) as vk::DeviceSize)
+        .unwrap();
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+
+    let mut seed = 0x1234_5678_9abc_def0_u64;
+    // 生成 NCHW 输入
+    let x_nchw = arena.alloc(x_nchw_n as vk::DeviceSize * 4).unwrap();
+    fill(&x_nchw, x_nchw_n, &mut seed);
+    let wgt = arena.alloc(w_n as vk::DeviceSize * 4).unwrap();
+    fill(&wgt, w_n, &mut seed);
+    let bias = arena.alloc(m as vk::DeviceSize * 4).unwrap();
+    fill(&bias, m as usize, &mut seed);
+
+    // NHWC 转换（GPU 内核）
+    let x_nhwc = arena.alloc(x_nhwc_n as vk::DeviceSize * 4).unwrap();
+    let out = arena.alloc(out_n as vk::DeviceSize * 4).unwrap();
+    let pp_conv = arena.alloc(64).unwrap(); // 转换内核的 PC
+    let pp_gemm = arena.alloc(128).unwrap(); // GEMM 的参数块
+
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
+
+    // 1) NCHW → NHWC 转换（GPU 内核，1D 平坦索引）
+    let pc_conv = super::pipeline::PcLayout {
+        in_off: el(&x_nchw),
+        out_off: el(&x_nhwc),
+        c: ci,
+        h,
+        w,
+    };
+    let total = (h * w * ci) as u32;
+    // SAFETY: cb 录制态。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb,
+            &ks,
+            "nchw_to_nhwc",
+            pc_conv.bytes(),
+            [total / 256 + 1, 1, 1],
+        );
+    }
+
+    // 2) NHWC GEMM
+    let mut pb = ParamBlock::new();
+    pb.u(el(&x_nhwc)) // in（NHWC [hw, ci]）
+        .u(el(&wgt)) // weight [m, ci]
+        .u(el(&bias)) // bias
+        .u(OFF_NONE) // 无残差
+        .u(el(&out)) // out（NHWC [hw, m]）
+        .u(1)
+        .u(ci)
+        .u(h)
+        .u(w)
+        .u(m)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(0)
+        .u(0)
+        .u(1)
+        .u(0) // group=1, act=0
+        .f(0.0)
+        .f(0.0)
+        .f(0.0)
+        .u(hw)
+        .u(w);
+    let pc_gemm = pb.finish(&pp_gemm);
+    // SAFETY: 同上。dispatch [M, HW]（x=M, y=HW——与 NCHW 版相反！）
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb,
+            &ks,
+            "conv_gemm_nhwc",
+            pc_gemm.bytes(),
+            [m / 16 + 1, hw / 16 + 1, 1],
+        );
+    }
+
+    ctx.inner.device.end_reusable_cb(cb).unwrap();
+    ctx.inner.device.submit_wait_cb(cb).unwrap();
+
+    // CPU 参考（NHWC 布局）
+    let xv = read(&x_nchw, x_nchw_n);
+    let wv = read(&wgt, w_n);
+    let bv = read(&bias, m as usize);
+    let mut want = vec![0f32; out_n]; // NHWC [hw, m]
+    for hw_i in 0..hw as usize {
+        for mi in 0..m as usize {
+            let mut acc = 0f32;
+            for c in 0..ci as usize {
+                // NHWC 输入：像素 hw_i 的通道 c
+                let nhwc_idx = hw_i * ci as usize + c;
+                // 从 NCHW 数据推 NHWC 值（避免依赖转换内核正确性）
+                let nchw_idx = c * hw as usize + hw_i;
+                let b = xv[nchw_idx]; // 直接用 NCHW 索引（数学等价）
+                let a = wv[mi * ci as usize + c];
+                acc += a * b;
+            }
+            want[hw_i * m as usize + mi] = acc + bv[mi];
+        }
+    }
+
+    // 读回 NHWC 输出并比较
+    let got = read(&out, out_n);
+    let e = rel_err(&got, &want);
+    eprintln!("[gpu] conv_gemm_nhwc(ci{ci} m{m} {h}x{w}) rel|diff| = {e:.3e}");
+    assert!(e < 1e-3, "NHWC GEMM 超容差: {e}");
+}
+
+/// NCHW vs NHWC GEMM 性能对比（det 典型形状）。
+#[test]
+fn gemm_nhwc_vs_nchw_perf() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    let (ci, m, hw) = (32u32, 64u32, 207_360u32);
+    let x_n = (ci * hw) as usize;
+    let w_n = (m * ci) as usize;
+    let out_n = (m * hw) as usize;
+    arena
+        .alloc(((x_n + w_n + m as usize + out_n) * 4 * 2) as vk::DeviceSize)
+        .unwrap();
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+
+    let mut seed = 0x0bad_c0de_1234_5678_u64;
+    let x = arena.alloc(x_n as vk::DeviceSize * 4).unwrap();
+    let w = arena.alloc(w_n as vk::DeviceSize * 4).unwrap();
+    let b = arena.alloc(m as vk::DeviceSize * 4).unwrap();
+    let out = arena.alloc(out_n as vk::DeviceSize * 4).unwrap();
+    fill(&x, x_n.min(1_000_000), &mut seed);
+    fill(&w, w_n, &mut seed);
+    let pp = arena.alloc(256).unwrap();
+
+    // NCHW GEMM
+    let cb1 = ctx.inner.device.alloc_reusable_cb().unwrap();
+    let mut pb = ParamBlock::new();
+    pb.u(el(&x))
+        .u(el(&w))
+        .u(el(&b))
+        .u(OFF_NONE)
+        .u(el(&out))
+        .u(1)
+        .u(ci)
+        .u(1)
+        .u(1)
+        .u(m)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(0)
+        .u(0)
+        .u(1)
+        .u(0)
+        .f(0.0)
+        .f(0.0)
+        .f(0.0)
+        .u(hw)
+        .u(1);
+    let pc1 = pb.finish(&pp);
+    // SAFETY: cb 录制态。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb1,
+            &ks,
+            "conv_gemm",
+            pc1.bytes(),
+            [hw / 16 + 1, m / 16 + 1, 1],
+        );
+    }
+    ctx.inner.device.end_reusable_cb(cb1).unwrap();
+
+    // NHWC GEMM（dispatch 相反：x=M, y=HW）
+    let cb2 = ctx.inner.device.alloc_reusable_cb().unwrap();
+    let mut pb = ParamBlock::new();
+    pb.u(el(&x))
+        .u(el(&w))
+        .u(el(&b))
+        .u(OFF_NONE)
+        .u(el(&out))
+        .u(1)
+        .u(ci)
+        .u(1)
+        .u(1)
+        .u(m)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(0)
+        .u(0)
+        .u(1)
+        .u(0)
+        .f(0.0)
+        .f(0.0)
+        .f(0.0)
+        .u(hw)
+        .u(1);
+    let pc2 = pb.finish(&pp);
+    // SAFETY: 同上。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb2,
+            &ks,
+            "conv_gemm_nhwc",
+            pc2.bytes(),
+            [m / 16 + 1, hw / 16 + 1, 1],
+        );
+    }
+    ctx.inner.device.end_reusable_cb(cb2).unwrap();
+
+    for (name, cb) in [("NCHW", cb1), ("NHWC", cb2)] {
+        let mut times = Vec::new();
+        for _ in 0..10 {
+            let t0 = std::time::Instant::now();
+            ctx.inner.device.submit_wait_cb(cb).unwrap();
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "[gpu] GEMM {name} (ci{ci} m{m} hw{hw}): 中位 {:.2} ms",
+            times[5]
+        );
+    }
+}
