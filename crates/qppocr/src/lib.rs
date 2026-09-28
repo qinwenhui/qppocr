@@ -55,6 +55,8 @@ mod sha256;
 
 pub use qppocr_core::Error as CoreError;
 pub use qppocr_core::pipeline::{Dictionary, OcrResult, TextLine, Timings};
+/// CPU 内核后端探测（AVX2 / NEON / 标量），诊断与基准报告用。
+pub use qppocr_core::{Backend, detect_backend};
 
 pub use image::{Image, rgb_from_bytes};
 // 解码 trio 只在 image-decode feature 下存在——不门控这行时，

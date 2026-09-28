@@ -16,6 +16,11 @@
 pub mod error;
 pub use error::Error;
 
+/// CPU 内核后端探测（AVX2 / NEON / 标量）。诊断与基准报告用；
+/// 引擎构造时会自动选好，生产路径无需关心。
+pub use qppocr_kernels::Backend;
+pub use qppocr_kernels::detect_backend;
+
 /// 引擎线程池的总线程数（含主线程）。批量多进程部署按它折算每进程
 /// 线程数（`thread_count / 进程数`）。
 pub fn thread_count() -> usize {
