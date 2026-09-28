@@ -230,7 +230,7 @@ pub unsafe fn sgemm_panel_impl<const BP: bool, const SW: usize>(
                 ];
                 for (row, regs) in rows {
                     let cp = c.add(row * ldc + cn);
-                    let vb = vdupq_n_f32(*bias.add(row));
+                    let vb = vdupq_n_f32(if has_bias { *bias.add(row) } else { 0.0 });
                     let mut t = [0f32; 16];
                     for (jj, reg) in regs.iter().enumerate() {
                         let val = if has_bias { vaddq_f32(*reg, vb) } else { *reg };
@@ -252,7 +252,7 @@ pub unsafe fn sgemm_panel_impl<const BP: bool, const SW: usize>(
                 continue;
             }
             let ar = a.add(row * k);
-            let vb = vdupq_n_f32(*bias.add(row));
+            let vb = vdupq_n_f32(if has_bias { *bias.add(row) } else { 0.0 });
             let mut g = 0usize;
             while g * 16 < nn {
                 let cn = n0 + g * 16;
