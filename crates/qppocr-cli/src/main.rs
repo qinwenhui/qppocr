@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use qppocr::{Engine, Error, Preset, Tier};
 
+#[derive(Clone)]
 struct Options {
     images: Vec<PathBuf>,
     models_dir: PathBuf,
@@ -26,6 +27,12 @@ struct Options {
     no_retry: bool,
     rec_height: u32,
     rec_shards: usize,
+    /// `bench` 子命令模式。
+    bench_mode: bool,
+    /// bench 的测量轮数（另有 1 轮 warmup 丢弃）。
+    rounds: usize,
+    /// bench 的扫描轴：`key=v1,v2,...`，逐值与基准配置交错对比。
+    sweep: Option<(String, Vec<String>)>,
 }
 
 fn print_usage() {
@@ -33,6 +40,7 @@ fn print_usage() {
         "qppocr — 纯 Rust 的 PP-OCRv6 推理引擎（上游官方模型）
 
 usage: qppocr <image> [<image> ...] [options]
+       qppocr bench <image> [<image> ...] [options] [--rounds n] [--sweep k=v1,v2]
 
 options:
   --models <dir>    model directory   (default: models/)
@@ -47,7 +55,15 @@ options:
   --no-cls          turn off the 0/180 direction classifier
   --rec-shards <n>  rec 两级并行的外层分片数（0 = 关，不传 = 按档位自动）
   --quiet           suppress the per-line listing
-  -h, --help        this help"
+  -h, --help        this help
+
+bench 子命令（测量纪律内建）：
+  同进程跑完整语料（不逐图起进程），1 轮 warmup 丢弃；多配置时逐轮
+  交错、各自取中位，报告探测到的内核后端与生效配置。
+  --rounds <n>      测量轮数（默认 3）
+  --sweep <k=vs>    扫一个轴：preset=balanced,speed | rec-height=40,48,56 |
+                    threads=4,8,16 | rec-shards=0,4,12。第一个值之外还能
+                    用 'base' 引用命令行给的基准配置。"
     );
 }
 
@@ -69,6 +85,9 @@ fn parse_args() -> Option<Options> {
         rec_height: 0,
         // `usize::MAX` = 自动（按档位），`0` = 关，其余 = 显式分片数。
         rec_shards: usize::MAX,
+        bench_mode: false,
+        rounds: 3,
+        sweep: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -79,6 +98,7 @@ fn parse_args() -> Option<Options> {
                 print_usage();
                 return None;
             }
+            "bench" if i == 0 && !o.bench_mode => o.bench_mode = true,
             "--models" => {
                 i += 1;
                 o.models_dir = args.get(i)?.clone().into();
@@ -132,6 +152,29 @@ fn parse_args() -> Option<Options> {
                 i += 1;
                 o.rec_shards = args.get(i)?.parse().ok()?;
             }
+            "--rounds" => {
+                i += 1;
+                o.rounds = args.get(i)?.parse().ok()?;
+            }
+            "--sweep" => {
+                i += 1;
+                let s = args.get(i)?;
+                let (k, vs) = s.split_once('=')?;
+                let k = k.trim().to_ascii_lowercase();
+                if !matches!(
+                    k.as_str(),
+                    "preset" | "rec-height" | "threads" | "rec-shards"
+                ) {
+                    eprintln!("--sweep: preset | rec-height | threads | rec-shards");
+                    return None;
+                }
+                let vs: Vec<String> = vs.split(',').map(|v| v.trim().to_string()).collect();
+                if vs.is_empty() || vs.iter().any(|v| v.is_empty()) {
+                    eprintln!("--sweep: 值列表不能为空");
+                    return None;
+                }
+                o.sweep = Some((k, vs));
+            }
             "--quiet" => o.quiet = true,
             _ => o.images.push(a.clone().into()),
         }
@@ -173,7 +216,8 @@ fn main() {
     let Some(o) = parse_args() else {
         std::process::exit(0);
     };
-    if let Err(e) = run(&o) {
+    let r = if o.bench_mode { run_bench(&o) } else { run(&o) };
+    if let Err(e) = r {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
@@ -339,8 +383,8 @@ fn process_one(engine: &Engine, o: &Options, path: &Path) -> Result<Outcome, Err
     })
 }
 
-fn run(o: &Options) -> Result<(), Error> {
-    let t0 = std::time::Instant::now();
+/// 从 Options 构造引擎（run 与 bench 共用；sweep 的每个配置各建一份）。
+fn build_engine(o: &Options) -> Result<Engine, Error> {
     let mut builder = Engine::builder()
         .tier(o.tier)
         .preset(o.preset)
@@ -363,7 +407,12 @@ fn run(o: &Options) -> Result<(), Error> {
             a.rec_height = rec_height as i32;
         }
     });
-    let engine = builder.build(&o.models_dir)?;
+    builder.build(&o.models_dir)
+}
+
+fn run(o: &Options) -> Result<(), Error> {
+    let t0 = std::time::Instant::now();
+    let engine = build_engine(o)?;
     let load_ms = t0.elapsed().as_secs_f64() * 1000.0;
     if !o.json {
         eprintln!("model: {} (load {:.0} ms)", o.tier.dir_name(), load_ms);
@@ -469,6 +518,232 @@ fn run(o: &Options) -> Result<(), Error> {
         json_out.push(']');
         let mut stdout = std::io::stdout().lock();
         let _ = writeln!(stdout, "{json_out}");
+    }
+    Ok(())
+}
+
+// ================================================================ bench 子命令
+
+/// 一轮语料测量的累计（引擎阶段时间不含图像解码）。
+struct RoundStats {
+    total: f64,
+    det: f64,
+    line: f64,
+    wall: f64,
+}
+
+/// 跑一遍完整语料（同进程、顺序；每图引擎计时累加，墙钟含解码）。
+fn corpus_round(engine: &Engine, o: &Options) -> Result<RoundStats, Error> {
+    let t0 = std::time::Instant::now();
+    let (mut total, mut det, mut line) = (0.0f64, 0.0f64, 0.0f64);
+    for path in &o.images {
+        let img = qppocr::decode_file(path)?;
+        let r = if o.det_only {
+            engine.run_det_only(&img)?
+        } else {
+            engine.run(&img)?
+        };
+        let t = &r.timings;
+        total += t.total_ms;
+        det += t.det_pre_ms + t.det_infer_ms + t.det_post_ms;
+        line += t.cls_ms + t.rec_pre_ms + t.rec_infer_ms + t.rec_post_ms;
+    }
+    Ok(RoundStats {
+        total,
+        det,
+        line,
+        wall: t0.elapsed().as_secs_f64() * 1000.0,
+    })
+}
+
+/// 中位数（偶数个取中间两数的均值）。
+fn med(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    }
+}
+
+/// 把 sweep 的一个值写进配置副本（`base` 引用命令行的基准值）。
+fn apply_sweep(o: &mut Options, key: &str, val: &str) -> Result<String, String> {
+    let resolve = |v: &str| -> Result<String, String> {
+        if v == "base" {
+            Ok(match key {
+                "preset" => preset_name(o.preset).to_string(),
+                "rec-height" => o.rec_height.to_string(),
+                "threads" => o.threads.to_string(),
+                _ => o.rec_shards.to_string(),
+            })
+        } else {
+            Ok(v.to_string())
+        }
+    };
+    let v = resolve(val)?;
+    match key {
+        "preset" => {
+            o.preset = match v.as_str() {
+                "speed" => Preset::Speed,
+                "balanced" => Preset::Balanced,
+                "accuracy" => Preset::Accuracy,
+                _ => return Err(format!("preset: {v}")),
+            };
+        }
+        "rec-height" => {
+            o.rec_height = v.parse().map_err(|_| format!("rec-height: {v} 不是整数"))?;
+        }
+        "threads" => {
+            o.threads = v.parse().map_err(|_| format!("threads: {v} 不是整数"))?;
+        }
+        "rec-shards" => {
+            o.rec_shards = v.parse().map_err(|_| format!("rec-shards: {v} 不是整数"))?;
+        }
+        _ => unreachable!("parse_args 已限定了 sweep 键"),
+    }
+    Ok(match key {
+        "rec-height" => format!("rec_height={v}"),
+        _ => format!("{key}={v}"),
+    })
+}
+
+/// `qppocr bench`：测量纪律内建的基准报告。
+///
+/// - **同进程跑完整语料**：逐图起进程会把冷启动摊到每张上；
+/// - **1 轮 warmup 丢弃**：首轮含权重加载后的缓存冷态；
+/// - **多配置逐轮交错**：配置间受同样的频率/热态影响，比值才是配置差异；
+/// - **取中位**：单轮极值不进场。
+fn run_bench(o: &Options) -> Result<(), Error> {
+    if o.images.is_empty() {
+        return Err(Error::Io("bench 需要至少一张图".into()));
+    }
+    let rounds = o.rounds.max(1);
+
+    // 配置列表：基准 + sweep 值（第一个 sweep 值通常就是 base）。
+    let mut configs: Vec<(String, Options)> = Vec::new();
+    let eff = format!(
+        "preset={} rec_h={} threads={} shards={}",
+        preset_name(o.preset),
+        if o.rec_height > 0 {
+            o.rec_height.to_string()
+        } else {
+            "preset".into()
+        },
+        if o.threads > 0 {
+            o.threads.to_string()
+        } else {
+            "auto".into()
+        },
+        match o.rec_shards {
+            usize::MAX => "auto".into(),
+            0 => "off".into(),
+            n => n.to_string(),
+        },
+    );
+    configs.push(("base".to_string(), o.clone()));
+    if let Some((key, vals)) = &o.sweep {
+        for v in vals {
+            let mut c = o.clone();
+            let label = apply_sweep(&mut c, key, v).map_err(Error::Io)?;
+            // 与基准完全相同的配置不重复测。
+            let dup = configs.iter().any(|(_, e)| {
+                e.preset == c.preset
+                    && e.rec_height == c.rec_height
+                    && e.threads == c.threads
+                    && e.rec_shards == c.rec_shards
+            });
+            if !dup {
+                configs.push((label, c));
+            }
+        }
+    }
+
+    // 每个配置一份引擎（构造期即生效各自的线程布局与分片规则）。
+    let mut engines = Vec::with_capacity(configs.len());
+    for (label, c) in &configs {
+        let t0 = std::time::Instant::now();
+        let e = build_engine(c)?;
+        eprintln!(
+            "[bench] engine ready: {label} ({:.0} ms)",
+            t0.elapsed().as_secs_f64() * 1000.0
+        );
+        engines.push(e);
+    }
+
+    let backend = match qppocr::detect_backend() {
+        qppocr::Backend::Avx2 => "avx2",
+        qppocr::Backend::Neon => "neon",
+        qppocr::Backend::Scalar => "scalar",
+    };
+    eprintln!(
+        "[bench] {} 张图 | tier={} | {} / {} | 后端 {} | {eff} | 轮数 {}（+1 warmup）| 阶段时间不含图像解码",
+        o.images.len(),
+        o.tier.dir_name(),
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        backend,
+        rounds,
+    );
+
+    // warmup：每个配置各跑一遍，丢弃。
+    for (ci, (label, _)) in configs.iter().enumerate() {
+        corpus_round(&engines[ci], o)?;
+        eprintln!("[bench] warmup done: {label}");
+    }
+
+    // 逐轮交错测量。
+    let mut stats: Vec<Vec<RoundStats>> = (0..configs.len()).map(|_| Vec::new()).collect();
+    for r in 0..rounds {
+        for (ci, _) in configs.iter().enumerate() {
+            stats[ci].push(corpus_round(&engines[ci], o)?);
+        }
+        eprintln!(
+            "[bench] round {}/{}: {}",
+            r + 1,
+            rounds,
+            configs
+                .iter()
+                .enumerate()
+                .map(|(ci, (l, _))| format!("{l} {:.0}", stats[ci][r].total))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
+    }
+
+    // 报告（stdout）：中位 + 相对第一个配置的比值。
+    let n_img = o.images.len() as f64;
+    let base_total = med(&stats[0].iter().map(|s| s.total).collect::<Vec<_>>());
+    println!(
+        "config                          total/img   det/img  line/img  wall/img   img/s  ratio"
+    );
+    for (ci, (label, _)) in configs.iter().enumerate() {
+        let (t, d, l, w) = (
+            med(&stats[ci].iter().map(|s| s.total).collect::<Vec<_>>()),
+            med(&stats[ci].iter().map(|s| s.det).collect::<Vec<_>>()),
+            med(&stats[ci].iter().map(|s| s.line).collect::<Vec<_>>()),
+            med(&stats[ci].iter().map(|s| s.wall).collect::<Vec<_>>()),
+        );
+        println!(
+            "{:<30} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.1} {:>6.2}x",
+            label,
+            t / n_img,
+            d / n_img,
+            l / n_img,
+            w / n_img,
+            1000.0 * n_img / w,
+            base_total / t.max(1e-9),
+        );
+    }
+    // 逐轮明细（判断噪声量级用）。
+    for (ci, (label, _)) in configs.iter().enumerate() {
+        let rounds_str = stats[ci]
+            .iter()
+            .map(|s| format!("{:.0}", s.total))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("  rounds[{label}]: {rounds_str}");
     }
     Ok(())
 }
