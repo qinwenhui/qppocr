@@ -19,6 +19,7 @@ pub(crate) mod device;
 pub(crate) mod memory;
 #[allow(dead_code)]
 pub(crate) mod pipeline;
+pub(crate) mod session;
 
 #[cfg(test)]
 mod kernel_tests;
@@ -98,6 +99,15 @@ pub(crate) fn enumerate() -> Vec<DeviceInfo> {
     out
 }
 
+/// loader 库的「永不卸载」守卫。
+///
+/// 退出时 FreeLibrary(vulkan-1.dll) 会与驱动内部线程赛跑——实测：
+/// stdout 重定向到文件时 100% 段错误、管道时 0%（纯时序）。Vulkan
+/// 应用的通行做法就是**不卸载 loader**：进程结束由 OS 回收。泄漏量
+/// = 每进程一个库句柄，可忽略。
+#[allow(dead_code)] // 字段 0 故意不读不释放（见上文档）
+struct NeverUnload(std::mem::ManuallyDrop<Entry>);
+
 /// 实例的销毁守卫：ash 0.38 的 `Instance` 没有 Drop，不显式销毁即泄漏。
 ///
 /// 包成独立结构是为了让 drop **排序**可表达：字段按声明序释放，
@@ -114,29 +124,31 @@ impl Drop for InstanceGuard {
     }
 }
 
-/// 一个 Vulkan 设备的上下文：实例 + 选定的物理设备 + 执行基建。
-///
-/// `device`（逻辑设备/队列/提交）与 `mem_types`（含 UMA 判定）在
-/// [`VulkanContext::open`] 时一并就绪；`create_session` 待 Phase F 的
-/// planner 与内核接入。
-pub struct VulkanContext {
+/// 上下文的实体（Arc 内共享；字段序即销毁序 device → instance → entry）。
+pub(crate) struct Inner {
     name: String,
     api: String,
-    /// 逻辑设备与提交基建（Phase F 起由会话消费；当前仅测试使用）。
-    #[allow(dead_code)]
-    pub(crate) device: device::VulkanDevice,
-    /// 选定的 memory types 与 UMA 判定（同上）。
-    #[allow(dead_code)]
+    /// 逻辑设备与提交基建。
+    pub(crate) device: std::sync::Arc<device::VulkanDevice>,
+    /// 选定的 memory types 与 UMA 判定。
     pub(crate) mem_types: memory::MemoryTypes,
-    /// 字段序即销毁序（device → instance → entry）：见 [`InstanceGuard`]。
-    /// 字段从不读取——存在即销毁序职责，豁免 dead_code。
+    /// 实例句柄：`Drop::drop` 里显式 destroy（ash 0.38 无 Drop）。
+    /// 字段从不读取——存在即销毁序职责（见 [`InstanceGuard`]）。
     #[allow(dead_code)]
     instance: InstanceGuard,
-    /// loader 库句柄，**必须声明在最后**：它的卸载要晚于前面所有字段
-    /// Drop 里对 loader/驱动函数表（驻留在库内）的最后一次调用。
-    /// 字段本身从不读取，存在即职责，豁免 dead_code。
+    /// loader 库句柄，声明在最后；经 [`NeverUnload`] 故意不卸载（见其文档）。
     #[allow(dead_code)]
-    entry: Entry,
+    entry: NeverUnload,
+}
+
+/// 一个 Vulkan 设备的上下文：实例 + 选定的物理设备 + 执行基建。
+///
+/// **Clone = Arc 共享**：会话持有整个上下文（实例的存活期必须盖住
+/// 它派生的全部逻辑设备——门面把 ctx 当局部变量用完就扔，会话若只
+/// 持设备不持实例，实例销毁后提交即 UB，实测 SEGV）。
+#[derive(Clone)]
+pub struct VulkanContext {
+    pub(crate) inner: std::sync::Arc<Inner>,
 }
 
 impl VulkanContext {
@@ -215,15 +227,21 @@ impl VulkanContext {
             })
             .ok_or_else(|| Error::Device(format!("设备 {name} 没有计算队列")))?
             as u32;
-        let device = device::VulkanDevice::new(&instance, physical, queue_family)?;
+        let device = std::sync::Arc::new(device::VulkanDevice::new(
+            &instance,
+            physical,
+            queue_family,
+        )?);
         let mem_types = memory::MemoryTypes::pick(&instance, physical)?;
         Ok(Self {
-            name: name.clone(),
-            api: api_str(props.api_version),
-            device,
-            mem_types,
-            instance: InstanceGuard(instance),
-            entry,
+            inner: std::sync::Arc::new(Inner {
+                name: name.clone(),
+                api: api_str(props.api_version),
+                device,
+                mem_types,
+                instance: InstanceGuard(instance),
+                entry: NeverUnload(std::mem::ManuallyDrop::new(entry)),
+            }),
         })
     }
 }
@@ -236,8 +254,8 @@ impl DeviceContext for VulkanContext {
     fn info(&self) -> DeviceInfo {
         DeviceInfo {
             kind: DeviceKind::Vulkan,
-            name: self.name.clone(),
-            api: self.api.clone(),
+            name: self.inner.name.clone(),
+            api: self.inner.api.clone(),
         }
     }
 
@@ -245,18 +263,23 @@ impl DeviceContext for VulkanContext {
         &self,
         graph: Graph,
         initializers: HashMap<String, Tensor>,
-        _opts: &SessionOptions,
+        opts: &SessionOptions,
     ) -> Result<Arc<dyn DeviceSession>> {
-        // Phase 1-D 已到：设备/队列/timeline/内存基建就绪。下一步是
-        // planner（静态形状推理）+ 计算管线与内核（Phase E/F）。
-        // 图与权重在此显式释放。
-        drop(graph);
-        drop(initializers);
-        Err(Error::Device(
-            "Vulkan 计算内核尚未实现（Phase 1 进行中：设备与内存基建已就绪，\
-             planner 与内核随后接入）；当前请用 --device cpu"
-                .into(),
-        ))
+        // bring-up 旋钮：QPPOCR_GPU_STAGES=det → 仅 det 上 GPU，
+        // rec/cls 委托 CPU 会话（**stderr 声明**，不是静默降级）。
+        let stages = std::env::var("QPPOCR_GPU_STAGES").unwrap_or_default();
+        if stages == "det" && opts.model != qppocr_core::device::ModelRole::Det {
+            eprintln!(
+                "[gpu] QPPOCR_GPU_STAGES=det：{:?} 模型走 CPU 会话（bring-up 混合部署）",
+                opts.model
+            );
+            return Ok(Arc::new(qppocr_core::executor::Session::from_parts(
+                graph,
+                initializers,
+            )));
+        }
+        let session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
+        Ok(Arc::new(session))
     }
 }
 
@@ -283,7 +306,7 @@ mod tests {
                 assert_eq!(ctx.kind(), DeviceKind::Vulkan);
                 eprintln!(
                     "[vulkan] opened: {} ({}) | UMA={}",
-                    ctx.name, ctx.api, ctx.mem_types.uma
+                    ctx.inner.name, ctx.inner.api, ctx.inner.mem_types.uma
                 );
             }
             Err(e) => eprintln!("[vulkan] open 跳过（无满足基线的设备）: {e}"),
@@ -303,7 +326,11 @@ mod tests {
             }
         };
         const N: usize = 4096;
-        let mut arena = memory::Arena::new(ctx.device.raw().clone(), ctx.mem_types.staging, true);
+        let mut arena = memory::Arena::new(
+            ctx.inner.device.raw().clone(),
+            ctx.inner.mem_types.staging,
+            true,
+        );
         let src = arena.alloc(N as vk::DeviceSize).expect("arena src");
         let dst = arena.alloc(N as vk::DeviceSize).expect("arena dst");
         assert_eq!(src.buffer, dst.buffer);
@@ -317,7 +344,8 @@ mod tests {
             }
             std::ptr::write_bytes(dst.ptr, 0, N);
         }
-        ctx.device
+        ctx.inner
+            .device
             .submit_one_shot(|d, cb| {
                 // SAFETY: cb 处于录制态；两段同一缓冲、区域不相交——
                 // BufferCopy 的偏移必须是**区域**偏移（漏了就是拷回自己）。
@@ -338,6 +366,9 @@ mod tests {
         let got = unsafe { std::slice::from_raw_parts(dst.ptr, N) };
         let want: Vec<u8> = (0..N).map(|i| (i % 251) as u8).collect();
         assert_eq!(got, want, "GPU 拷贝回读不符");
-        eprintln!("[vulkan] copy roundtrip OK (UMA={})", ctx.mem_types.uma);
+        eprintln!(
+            "[vulkan] copy roundtrip OK (UMA={})",
+            ctx.inner.mem_types.uma
+        );
     }
 }

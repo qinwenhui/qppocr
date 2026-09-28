@@ -18,6 +18,7 @@ use std::collections::HashMap;
 /// 全部内核：`(名, SPIR-V 字节)`。include_bytes! 编进二进制。
 const SHADERS: &[(&str, &[u8])] = &[
     ("add", include_bytes!("../../shaders/spirv/add.spv")),
+    ("add_c", include_bytes!("../../shaders/spirv/add_c.spv")),
     ("clip", include_bytes!("../../shaders/spirv/clip.spv")),
     (
         "concat_c",
@@ -171,6 +172,16 @@ impl ParamBlock {
         self
     }
 
+    /// 字数（布局分配用）。
+    pub(crate) fn len_words(&self) -> u32 {
+        self.words.len() as u32
+    }
+
+    /// 只读视图（session 直接写进整块布局）。
+    pub(crate) fn words(&self) -> &[u32] {
+        &self.words
+    }
+
     /// f32 按位写入（内核侧 uintBitsToFloat 读回）。
     pub(crate) fn f(&mut self, v: f32) -> &mut Self {
         self.words.push(v.to_bits());
@@ -198,7 +209,6 @@ impl ParamBlock {
 pub(crate) struct KernelSet {
     layout: vk::PipelineLayout,
     pool: vk::DescriptorPool,
-    #[allow(dead_code)]
     set: vk::DescriptorSet,
     pipes: HashMap<&'static str, vk::Pipeline>,
     device: Device,
@@ -326,6 +336,11 @@ impl KernelSet {
             .unwrap_or_else(|| panic!("内核不存在: {name}"))
     }
 
+    /// 描述符集（单 SSBO 双视图）——录制时必须显式绑定。
+    pub(crate) fn set(&self) -> vk::DescriptorSet {
+        self.set
+    }
+
     pub(crate) fn layout(&self) -> vk::PipelineLayout {
         self.layout
     }
@@ -361,6 +376,30 @@ pub(crate) unsafe fn record_dispatch(
 ) {
     unsafe {
         // SAFETY: 前置条件见本函数的 # Safety 文档。
+        // 先录内存/执行屏障：同一 CB 里前一个 dispatch 的 SSBO 写对
+        // 本 dispatch 可见（规范要求；驱动短序列可能容忍，长图必炸——
+        // 实测 140-dispatch 无屏障时结果错乱、有屏障后逐位恢复）。
+        let barriers = [vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)];
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::DependencyFlags::empty(),
+            &barriers,
+            &[],
+            &[],
+        );
+        let sets = [ks.set()];
+        device.cmd_bind_descriptor_sets(
+            cb,
+            vk::PipelineBindPoint::COMPUTE,
+            ks.layout(),
+            0,
+            &sets,
+            &[],
+        );
         device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, ks.pipeline(name));
         device.cmd_push_constants(cb, ks.layout(), vk::ShaderStageFlags::COMPUTE, 0, pc);
         device.cmd_dispatch(cb, groups[0], groups[1], groups[2]);
@@ -403,8 +442,8 @@ mod tests {
                 return;
             }
         };
-        let dev = ctx.device.raw().clone();
-        let mut arena = Arena::new(dev.clone(), ctx.mem_types.staging, true);
+        let dev = ctx.inner.device.raw().clone();
+        let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
 
         // 区域总量必须落在一块内（KernelSet 绑单缓冲——Phase F 的
         // 已知边界；Phase G 的图计划按总量一次开块）：14 区域 × 1MB。
@@ -447,7 +486,7 @@ mod tests {
         let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
 
         let el = |reg: &Region| reg.offset as u32 / 4;
-        let cb = ctx.device.alloc_reusable_cb().unwrap();
+        let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
         let g1 = [(N as u32).div_ceil(256), 1, 1];
         let gc = [(HW as u32).div_ceil(256), C as u32, 1];
         // SAFETY: cb 处于录制态；PC 结构与各内核的块逐字段对应。
@@ -586,8 +625,8 @@ mod tests {
                 gc,
             );
         }
-        ctx.device.end_reusable_cb(cb).unwrap();
-        ctx.device.submit_wait_cb(cb).unwrap();
+        ctx.inner.device.end_reusable_cb(cb).unwrap();
+        ctx.inner.device.submit_wait_cb(cb).unwrap();
 
         // SAFETY: 已等到信号；coherent 映射直接可读。
         let read = |reg: &Region| unsafe { std::slice::from_raw_parts(reg.ptr as *const f32, N) };
@@ -676,7 +715,7 @@ mod tests {
         let mut times: Vec<f64> = Vec::new();
         for _ in 0..10 {
             let t0 = std::time::Instant::now();
-            ctx.device.submit_wait_cb(cb).unwrap();
+            ctx.inner.device.submit_wait_cb(cb).unwrap();
             times.push(t0.elapsed().as_secs_f64() * 1000.0);
         }
         times.sort_by(|x, y| x.partial_cmp(y).unwrap());

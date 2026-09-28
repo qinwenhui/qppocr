@@ -9,7 +9,7 @@
 
 use super::VulkanContext;
 use super::memory::{Arena, Region};
-use super::pipeline::{KernelSet, OFF_NONE, ParamBlock, record_dispatch};
+use super::pipeline::{KernelSet, OFF_NONE, ParamBlock, PcUnaryF, record_dispatch};
 use ash::vk;
 use qppocr_kernels::activation::Activation;
 use qppocr_kernels::buf::F32Buf;
@@ -74,8 +74,8 @@ struct Check {
 }
 
 fn finish(ctx: &VulkanContext, cb: vk::CommandBuffer, checks: Vec<Check>) {
-    ctx.device.end_reusable_cb(cb).unwrap();
-    ctx.device.submit_wait_cb(cb).unwrap();
+    ctx.inner.device.end_reusable_cb(cb).unwrap();
+    ctx.inner.device.submit_wait_cb(cb).unwrap();
     for c in checks {
         let got = read(&c.out, c.n);
         let e = rel_err(&got, &c.want);
@@ -94,8 +94,8 @@ fn finish(ctx: &VulkanContext, cb: vk::CommandBuffer, checks: Vec<Check>) {
 #[test]
 fn conv_vs_cpu() {
     let Some(ctx) = open_or_skip() else { return };
-    let dev = ctx.device.raw().clone();
-    let mut arena = Arena::new(dev.clone(), ctx.mem_types.staging, true);
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
 
     struct Case {
         m: u32,
@@ -176,7 +176,7 @@ fn conv_vs_cpu() {
     let (buf, buf_size) = arena.chunk_range().unwrap();
     let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
 
-    let cb = ctx.device.alloc_reusable_cb().unwrap();
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
     let mut checks: Vec<Check> = Vec::new();
     for (i, c) in cases.iter().enumerate() {
         let oh = (c.h + 2 * c.pad - c.k) / c.s + 1;
@@ -223,7 +223,7 @@ fn conv_vs_cpu() {
             .u(c.pad)
             .u(c.group)
             .u(c.act)
-            .f(1.414_213_5)
+            .f(std::f32::consts::SQRT_2)
             .f(1.0)
             .f(0.5)
             .u(oh * ow)
@@ -247,7 +247,7 @@ fn conv_vs_cpu() {
         let bv = read(&b, c.m as usize);
         let rv = r.as_ref().map(|r| read(r, out_n));
         let act = match c.act {
-            1 => Activation::gelu(1.414_213_5, 1.0, 0.5),
+            1 => Activation::gelu(std::f32::consts::SQRT_2, 1.0, 0.5),
             2 => Activation::relu(),
             _ => Activation::default(),
         };
@@ -292,8 +292,8 @@ fn conv_vs_cpu() {
 #[test]
 fn convtranspose_vs_cpu() {
     let Some(ctx) = open_or_skip() else { return };
-    let dev = ctx.device.raw().clone();
-    let mut arena = Arena::new(dev.clone(), ctx.mem_types.staging, true);
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
     // in [1,ci,h,w]，权重 [ci,m,2,2]，out [1,m,2h,2w]
     let (ci, m, h, w) = (16u32, 24u32, 8u32, 6u32);
     let x_n = (ci * h * w) as usize;
@@ -313,7 +313,7 @@ fn convtranspose_vs_cpu() {
     fill(&x, x_n, &mut seed);
     fill(&wgt, w_n, &mut seed);
 
-    let cb = ctx.device.alloc_reusable_cb().unwrap();
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
     // convtranspose.comp 参数序：in,w,out,n,ci,h,w,m
     let mut pb = ParamBlock::new();
     pb.u(el(&x))
@@ -366,8 +366,8 @@ fn convtranspose_vs_cpu() {
 #[test]
 fn pool_vs_cpu() {
     let Some(ctx) = open_or_skip() else { return };
-    let dev = ctx.device.raw().clone();
-    let mut arena = Arena::new(dev.clone(), ctx.mem_types.staging, true);
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
     // 两个 case：max 3x3 s2 pad1；avg 2x2 s2
     let (n, c, h, w) = (1u32, 12u32, 16u32, 16u32);
     let in_n = (n * c * h * w) as usize;
@@ -390,7 +390,7 @@ fn pool_vs_cpu() {
     let pp1 = arena.alloc(64).unwrap();
     let pp2 = arena.alloc(64).unwrap();
 
-    let cb = ctx.device.alloc_reusable_cb().unwrap();
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
     // pool.comp 参数序：in,out,n,c,h,w,kh,kw,sh,sw,ph,pw,is_max,oh,ow
     let mut pb = ParamBlock::new();
     pb.u(el(&x))
@@ -485,8 +485,8 @@ fn pool_vs_cpu() {
 #[test]
 fn reduce_resize_concat_vs_cpu() {
     let Some(ctx) = open_or_skip() else { return };
-    let dev = ctx.device.raw().clone();
-    let mut arena = Arena::new(dev.clone(), ctx.mem_types.staging, true);
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
     let (n, c, h, w) = (1u32, 8u32, 12u32, 10u32);
     let in_n = (n * c * h * w) as usize;
     let (oh, ow) = (h * 2, w * 2);
@@ -520,7 +520,7 @@ fn reduce_resize_concat_vs_cpu() {
     let p2 = arena.alloc(64).unwrap();
     let p3 = arena.alloc(64).unwrap();
 
-    let cb = ctx.device.alloc_reusable_cb().unwrap();
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
     // reduce_hw.comp：in,out,n,c,h,w
     let mut pb = ParamBlock::new();
     pb.u(el(&x)).u(el(&red)).u(n).u(c).u(h).u(w);
@@ -635,4 +635,87 @@ fn reduce_resize_concat_vs_cpu() {
             },
         ],
     );
+}
+
+#[test]
+fn hardsigmoid_then_conv_min_repro() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    // 小张量：hardsigmoid 32 元素 + 一个 1x1 conv（镜像 Conv.8 的形态）
+    let (ci, m, h, w) = (32u32, 64u32, 8u32, 8u32);
+    let x_n = (ci * h * w) as usize;
+    let w_n = (m * ci) as usize;
+    let out_n = (m * h * w) as usize;
+    arena
+        .alloc(((x_n + w_n + m as usize + out_n + 32 + 64) * 4) as vk::DeviceSize)
+        .unwrap();
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+
+    let mut seed = 0xdead_beef_cafe_1234_u64;
+    let x = arena.alloc(x_n as vk::DeviceSize * 4).unwrap();
+    let wgt = arena.alloc(w_n as vk::DeviceSize * 4).unwrap();
+    let bias = arena.alloc(m as vk::DeviceSize * 4).unwrap();
+    let out = arena.alloc(out_n as vk::DeviceSize * 4).unwrap();
+    let gate = arena.alloc(128).unwrap();
+    let pp = arena.alloc(128).unwrap();
+    fill(&x, x_n, &mut seed);
+    fill(&wgt, w_n, &mut seed);
+    fill(&bias, m as usize, &mut seed);
+    fill(&gate, 32, &mut seed);
+
+    let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
+    // 1) hardsigmoid（PcUnaryF，20 字节 PC——和会话里 #11 同款）
+    let pc1 = PcUnaryF {
+        in_off: el(&gate),
+        out_off: el(&gate),
+        n: 32,
+        p1: 0.2,
+        p2: 0.5,
+    };
+    // SAFETY: 同 elementwise 测试。
+    unsafe {
+        record_dispatch(&dev, cb, &ks, "hardsigmoid", pc1.bytes(), [1, 1, 1]);
+    }
+    // 2) conv（PcParams 参数块——和会话里 #13 同款，act=1 gelu）
+    let mut pb = ParamBlock::new();
+    pb.u(el(&x))
+        .u(el(&wgt))
+        .u(el(&bias))
+        .u(OFF_NONE)
+        .u(el(&out))
+        .u(1)
+        .u(ci)
+        .u(h)
+        .u(w)
+        .u(m)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(1)
+        .u(0)
+        .u(0)
+        .u(1)
+        .u(1)
+        .f(std::f32::consts::SQRT_2)
+        .f(1.0)
+        .f(0.5)
+        .u(h * w)
+        .u(w);
+    let pc2 = pb.finish(&pp);
+    // SAFETY: 同上。
+    unsafe {
+        record_dispatch(
+            &dev,
+            cb,
+            &ks,
+            "conv",
+            pc2.bytes(),
+            [w / 8 + 1, h / 8 + 1, m],
+        );
+    }
+    ctx.inner.device.end_reusable_cb(cb).unwrap();
+    ctx.inner.device.submit_wait_cb(cb).unwrap();
+    eprintln!("[gpu] hardsigmoid→conv 序列通过（该形态未复现设备丢失）");
 }
