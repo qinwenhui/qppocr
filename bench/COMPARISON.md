@@ -293,3 +293,35 @@ GPU 路线上首次「可用」（<120ms）。
   目标把 a 压到 ~5ms 级；带宽墙 → 隐式 GEMM（免 im2col）+ 后置 fp16；
 - 验收：同 H365 同 100 图，bench --device gpu 对拍三档全胜；
   开发用任意 Vulkan 卡，880M 数据可由社区/实机回传。
+
+## 2026-09-29 我方 Vulkan det 路线落地（Intel Arc Pro 核显，本机实测）
+
+后端：ash + 计算着色器（glslc 编译、SPIR-V 签入），NHWC f32 存储 +
+k-major 权重预排（f16 曾实测 GPU 总 16.9ms，但 SE 门乘性放大逐层
+舍入、真实图概率图衰减——det 上 fp16 存储不可行，已转 f32）。
+
+单 det 前向（960×864，微基准 det_session_end_to_end，GPU 二跑）：
+
+| 路径 | 墙钟 | GPU 总时间 |
+|---|---|---|
+| 旧 NCHW f32（conv/conv_gemm） | 77.2ms | — |
+| n_ NHWC f32（本轮） | 28.4ms | 24.7ms |
+
+分解（QPPOCR_GPU_PROF）：n_conv 12.8ms / n_conv_dw 2.2 / n_channel
+2.1 / n_elem 1.7 / concat 1.6 / convT 1.2 / resize 0.9 / reduce 0.7。
+
+正确性口径：两条 GPU 路径末图 mean|d| = 2.1e-8（逐位一致）；对 CPU
+executor 的浮点序差异（概率图 mean|d| ~5e-2、>0.3 像素 52508 vs
+51538）与旧路径相同——引擎级 verify.py 表现一致（文本同、conf 浮点差）。
+
+端到端（ab.py tiny 4，--workers 1，QPPOCR_GPU_STAGES=det）：比值中位
+1.088（GPU 整链比 CPU 慢 9%）——det 本身 43→31ms，但 GPU 会话的
+prefers_host_parallelism=false 保守门控把 rec/cls 批退化为串行，吃掉
+det 的收益。Phase 2 待办：rec/cls 上 GPU 或门控改按会话粒度。
+
+途中修的三个横切 bug（值得记录）：
+- reduce_hw 曾单 WG 串行（8.4ms）；staging 非 HOST_CACHED 型主机读回
+  慢百倍（26ms）——两者都曾伪装成「GPU 慢」；
+- fuse_conv_residual 折进 conv 的 inputs[3] 残差，n_ 内核曾整个漏读
+  （随机输入对拍不暴露，真实图才发散）——跨会话对拍要两条 GPU 路径
+  互比，CPU dump 的节点序与 GPU 计划不同源不可直接配对。
