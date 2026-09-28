@@ -34,6 +34,7 @@ pub fn thread_count() -> usize {
     }
 }
 
+pub mod device;
 pub mod executor;
 pub mod graph;
 pub mod onnx;

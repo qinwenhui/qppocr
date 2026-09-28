@@ -142,26 +142,61 @@ pub struct Session {
 impl Session {
     /// 从内存打开模型。
     pub fn from_memory(data: &[u8], display_name: &str) -> Result<Self> {
+        let (graph, initializers) = Self::parts_from_memory(data, display_name)?;
+        Ok(Self::from_parts(graph, initializers))
+    }
+
+    /// 从文件打开模型。
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let (graph, initializers) = Self::parts_from_path(path)?;
+        Ok(Self::from_parts(graph, initializers))
+    }
+
+    /// 解析 ONNX 文件并把权重 take 成独立一份（装载前半程，pipeline 的
+    /// 设备路径共用；之后 `graph.initializers` 为空）。
+    pub(crate) fn parts_from_path(
+        path: &std::path::Path,
+    ) -> Result<(Graph, HashMap<String, Tensor>)> {
+        let mut graph = crate::onnx::load_onnx(path)?;
+        // ★ 权重单份持有（take 而非 clone）：见 [`Self::from_parts`]。
+        let initializers = std::mem::take(&mut graph.initializers);
+        Ok((graph, initializers))
+    }
+
+    /// 解析 ONNX 字节并把权重 take 成独立一份（同 [`Self::parts_from_path`]）。
+    pub(crate) fn parts_from_memory(
+        data: &[u8],
+        display_name: &str,
+    ) -> Result<(Graph, HashMap<String, Tensor>)> {
         let mut graph = crate::onnx::load_onnx_memory(data, display_name)?;
         // ★ 权重单份持有（take 而非 clone）：clone 让 det+rec+cls 的全部
         // 权重双份常驻（small 档 ≈33 MB × 2），PeakWS 实测多 ~19 MB。
         // graph.initializers 留空——运行期读者只有下面的 run（已改读
         // self.initializers）；optimize 系列都在 load 期、take 之前跑完。
         let initializers = std::mem::take(&mut graph.initializers);
-        Ok(Self {
-            graph,
-            initializers,
-        })
+        Ok((graph, initializers))
     }
 
-    /// 从文件打开模型。
-    pub fn open(path: &std::path::Path) -> Result<Self> {
-        let mut graph = crate::onnx::load_onnx(path)?;
-        let initializers = std::mem::take(&mut graph.initializers);
-        Ok(Self {
+    /// 从已解析的图与权重组装（图优化须已在装载期跑完）。
+    ///
+    /// 契约（设备工厂同样适用）：权重全在 `initializers` 参数，
+    /// `graph.initializers` 必须为空——装载链路 take 之后就空了。
+    /// `run` 的释放判定读 `graph.initializers`，混入权重会让 arena 里
+    /// 同名张量永不释放。
+    pub fn from_parts(graph: Graph, initializers: HashMap<String, Tensor>) -> Self {
+        debug_assert!(
+            graph.initializers.is_empty(),
+            "from_parts: 权重应在 initializers 参数里，graph.initializers 须为空"
+        );
+        Self {
             graph,
             initializers,
-        })
+        }
+    }
+
+    /// 拆回 (图, 权重)，所有权移出（供设备工厂重组用）。
+    pub fn into_parts(self) -> (Graph, HashMap<String, Tensor>) {
+        (self.graph, self.initializers)
     }
 
     /// 跑一遍图。`inputs` 是 (名字, 张量) 列表；返回按 `graph.outputs`
@@ -191,11 +226,12 @@ impl Session {
 
         // 对拍落盘（QPPOCR_DUMP_DIR 同格式）
         // 按会话分目录（s0_/s1_/s2_）：det/cls/rec 三个会话的节点索引都从
-        // 0 起，共用目录会互相覆盖——对拍时无法区分归属。
+        // 0 起，共用目录会互相覆盖——对拍时无法区分归属。计数器在
+        // device 模块全局共享：混合部署（det-GPU + rec-CPU）下各持一个
+        // 会互相覆盖对拍目录。
         let dump_dir = std::env::var("QPPOCR_DUMP_DIR").ok().map(|d| {
             let _ = std::fs::create_dir_all(&d);
-            static SESSION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-            let id = SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let id = crate::device::next_dump_session_id();
             (d, id)
         });
 

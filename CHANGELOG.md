@@ -10,6 +10,20 @@
 
 ### 新增（Added）
 
+- **设备接缝（GPU 地基）**：`qppocr-core` 新增 `device` 模块——
+  `DeviceContext`（装载期工厂，权重按值一次性移交设备）与
+  `DeviceSession`（与 CPU `Session::run` 同签名的执行入口）两个 trait
+  把设备边界定在 Session 层（kernels 层的 `Backend` 枚举保持纯 CPU 概念）；
+  pipeline 的 det/cls/rec 会话字段改为 `Arc<dyn DeviceSession>`，CPU
+  路径行为零变化（100 图逐字符对拍双基线 IDENTICAL、`--device cpu`
+  abx 比值 1.008）。会话不受益于宿主侧扇出时（`prefers_host_parallelism`
+  = false）cls/rec 批自动退化为串行提交、跳过分片池布局。门面新增
+  `DeviceChoice` / `EngineBuilder::device()` / `Engine::device()`；CLI
+  新增 `--device cpu|gpu|vulkan[:N]|cuda[:N]`（多进程 worker 回传，
+  bench `--sweep device=` 可用）。GPU 实现本体（`qppocr-gpu` crate，
+  Vulkan 计算后端）后续版本接入；显式要 GPU 而未编译支持时构造报错，
+  不静默回退 CPU。`Session` 新增 `from_parts` / `into_parts`；
+  `qppocr-core::Error` 新增 `Device` 变体（下游 exhaustive match 需跟进）。
 - **CLI `bench` 子命令**：测量纪律内建——同进程跑完整语料、1 轮 warmup
   丢弃、多配置逐轮交错、中位数汇总，报告探测到的内核后端与生效配置；
   `--sweep` 对自己的图集扫 preset / rec-height / threads / rec-shards。
