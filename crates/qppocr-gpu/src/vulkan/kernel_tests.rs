@@ -838,3 +838,42 @@ fn conv_gemm_vs_cpu() {
     );
     assert!(e < 1e-3, "conv_gemm 超容差: {e}");
 }
+
+/// 最小共享内存测试：16 线程各自写入 shared，barrier 后读邻居。
+/// 如果这个都不过，说明 naga + patch 的共享内存基础就坏了。
+#[test]
+fn shared_memory_basic() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    // ★ 内核读写 SSBO 偏移 0（data[0..31]）——必须用第一个分配（offset=0）
+    let probe = arena.alloc(256).unwrap();
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+
+    // _shared_test 读 data[0..16] 写 data[16..32]（不走 PC）
+    // SAFETY: probe 在偏移 0；前 32 float 在块内。
+    unsafe {
+        let base = &probe;
+        let s = std::slice::from_raw_parts_mut(base.ptr as *mut f32, 16);
+        for (i, v) in s.iter_mut().enumerate() {
+            *v = i as f32 * 1.5;
+        }
+        let o = std::slice::from_raw_parts_mut(base.ptr.add(64) as *mut f32, 16);
+        o.fill(-999.0);
+
+        let cb = ctx.inner.device.alloc_reusable_cb().unwrap();
+        let pc = super::pipeline::PcParams { p_off: 0 };
+        record_dispatch(&dev, cb, &ks, "_shared_test", pc.bytes(), [1, 1, 1]);
+        ctx.inner.device.end_reusable_cb(cb).unwrap();
+        ctx.inner.device.submit_wait_cb(cb).unwrap();
+
+        // 验证：data[i+16] = s[(i+1)%16] = input[(i+1)%16]
+        let got = std::slice::from_raw_parts(base.ptr.add(64) as *const f32, 16);
+        for i in 0..16 {
+            let want = ((i + 1) % 16) as f32 * 1.5;
+            assert_eq!(got[i], want, "shared memory: [{i}] got={}", got[i]);
+        }
+    }
+    eprintln!("[gpu] 共享内存基础测试通过");
+}

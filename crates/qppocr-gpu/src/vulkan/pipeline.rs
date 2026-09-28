@@ -25,9 +25,10 @@ const SHADERS: &[(&str, &[u8])] = &[
         include_bytes!("../../shaders/spirv/concat_c.spv"),
     ),
     ("conv", include_bytes!("../../shaders/spirv/conv.spv")),
+    ("conv_dw", include_bytes!("../../shaders/spirv/conv_dw.spv")),
     (
-        "conv_dw",
-        include_bytes!("../../shaders/spirv/conv_dw.spv"),
+        "_shared_test",
+        include_bytes!("../../shaders/spirv/_shared_test.spv"),
     ),
     (
         "conv_gemm",
