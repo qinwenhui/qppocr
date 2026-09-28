@@ -10,6 +10,21 @@
 
 ### 新增（Added）
 
+- **GPU 计算内核 G1（Phase 1-G 第一批，det 全算子覆盖）**：按 det 图
+  真实分布（83 Conv：61×1x1 + 16×3x3 + 4×5x5 + 17 分组/深度；Conv
+  ×2、池化/归约 14、Resize×6、通道 Concat×2）实现 conv（通用 group、
+  bias/relu/GELU/残差 epilogue——顺序镜像 CPU conv2d_res：acc+bias→
+  act→+residual；erf1 逐字镜像 A&S 7.1.26 fma 链）、convtranspose
+  （输出线程跨 ci 累加）、pool（max/avg 通用带 pad；avg 除满核面积）、
+  reduce_hw（GAP/ReduceMean 同核）、resize_nearest、concat_c。
+  参数块进 arena（binding 1 = 同缓冲 u32 视图，解 128 B push constant
+  上限，装载期写一次零每帧成本）。Intel Arc 对拍全绿：11 项中 8 项
+  **逐位一致**（1x1+relu / depthwise / 5x5s2+residual / convT / pool
+  max+avg / resize / concat），3x3+GELU 1.2e-7、reduce 1.4e-8。
+  开发中 oracle 抓出两个真 bug：conv 输出公式漏 +1（两侧）、convT
+  最初按输入线程写成了覆盖而非跨 ci 累加（对拍首元素吻合、整体 0.83
+  相对误差的典型形态）。
+
 - **GPU 计算管线与首批内核（Phase 1-F）**：单 SSBO + push constant
   偏移寻址的绑定模型（一个会话一个描述符集，零描述符churn）；
   **可复用命令缓冲**——整图 dispatch 序列装载期录一次、每帧只

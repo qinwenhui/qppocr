@@ -20,6 +20,9 @@ pub(crate) mod memory;
 #[allow(dead_code)]
 pub(crate) mod pipeline;
 
+#[cfg(test)]
+mod kernel_tests;
+
 use ash::vk;
 use ash::{Entry, Instance};
 use qppocr_core::device::{DeviceContext, DeviceInfo, DeviceKind, DeviceSession, SessionOptions};

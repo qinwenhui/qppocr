@@ -1,0 +1,34 @@
+// 池化（max/avg 通用带 pad 路径）：越界读跳过；avg 除**满**核面积
+//（镜像 pool2d.rs 通用路径——分母不是有效元素数）。
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint n = params[P + 2], c = params[P + 3], h = params[P + 4], w = params[P + 5];
+    uint kh = params[P + 6], kw = params[P + 7], sh = params[P + 8], sw = params[P + 9];
+    uint ph = params[P + 10], pw = params[P + 11], is_max = params[P + 12];
+    uint oh = params[P + 13], ow = params[P + 14];
+
+    uint ox = gl_GlobalInvocationID.x, oy = gl_GlobalInvocationID.y;
+    uint nc = gl_GlobalInvocationID.z;
+    if (ox >= ow || oy >= oh) return;
+
+    float acc = is_max != 0u ? -3.4e38 : 0.0;
+    for (uint ky = 0; ky < kh; ky++) {
+        int iy = int(oy * sh) - int(ph) + int(ky);
+        if (iy < 0 || iy >= int(h)) continue;
+        for (uint kx = 0; kx < kw; kx++) {
+            int ix = int(ox * sw) - int(pw) + int(kx);
+            if (ix < 0 || ix >= int(w)) continue;
+            float v = data[in_off + nc * h * w + uint(iy) * w + uint(ix)];
+            if (is_max != 0u) { if (v > acc) acc = v; } else { acc += v; }
+        }
+    }
+    data[out_off + nc * oh * ow + oy * ow + ox] =
+        is_max != 0u ? acc : acc / float(kh * kw);
+}

@@ -361,3 +361,47 @@ mod tests {
         eprintln!("[plan] det@{h}x{w}: {checked} 个节点形状与 executor 逐节点一致");
     }
 }
+
+#[cfg(test)]
+mod extra_tests {
+    use super::*;
+    use qppocr_core::executor::Session;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    /// det 图的算子/属性直方图——内核覆盖清单（写内核前先看真实分布）。
+    #[test]
+    fn det_op_histogram() {
+        let p = PathBuf::from("../../models/tiny/det.onnx");
+        if !p.is_file() {
+            eprintln!("[plan] 无模型，跳过");
+            return;
+        }
+        let session = Session::from_memory(&std::fs::read(&p).unwrap(), "tiny.det").unwrap();
+        let (graph, _) = session.into_parts();
+        let mut ops: BTreeMap<String, usize> = BTreeMap::new();
+        let mut conv_act: BTreeMap<String, usize> = BTreeMap::new();
+        let mut conv_group: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut conv_k: BTreeMap<(i64, i64), usize> = BTreeMap::new();
+        for n in &graph.nodes {
+            *ops.entry(n.op_type.clone()).or_default() += 1;
+            if n.op_type == "Conv" {
+                let act = n.attr("act").filter(|a| a.has_i).map(|a| a.i).unwrap_or(0);
+                *conv_act.entry(format!("act={act}")).or_default() += 1;
+                *conv_group.entry(get_i(n.attr("group"), 1)).or_default() += 1;
+                // 权重形状不在图里——内核形状在 planner 推理里，这里先记属性
+                let ks = n
+                    .attr("kernel_shape")
+                    .map(|a| a.ints.clone())
+                    .unwrap_or_default();
+                if ks.len() == 2 {
+                    *conv_k.entry((ks[0], ks[1])).or_default() += 1;
+                }
+            }
+        }
+        eprintln!("[plan] det 算子直方图: {ops:?}");
+        eprintln!(
+            "[plan] Conv act: {conv_act:?} | group: {conv_group:?} | kernel_shape: {conv_k:?}"
+        );
+    }
+}

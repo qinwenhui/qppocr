@@ -1,0 +1,79 @@
+// 直接卷积（通用 group，含 depthwise）：每线程一个输出像素。
+// epilogue 顺序镜像 CPU conv2d_res：acc + bias → act → + residual。
+//   （bias 在 CPU 折进 GEMM store；act/残差在 finish_res——顺序即此。）
+// 参数块在 arena（binding 1 的 u32 视图）——push constant 装不下 20+ 个
+// 形状参数。act：0=无、1=gelu(c1,c2,c3)、2=relu（镜像 Activation）。
+// erf1 是 kernels::activation::erf1 的逐字镜像（A&S 7.1.26 fma 链）。
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+float erf1(float x) {
+    float ax = abs(x);
+    float t = 1.0 / fma(0.3275911, ax, 1.0);
+    float p = 1.0614054;
+    p = fma(p, t, -1.453152027);
+    p = fma(p, t, 1.421413741);
+    p = fma(p, t, -0.284496736);
+    p = fma(p, t, 0.2548296);
+    p *= t;
+    float e = exp(-ax * ax);
+    float r = fma(-p, e, 1.0);
+    return uintBitsToFloat(floatBitsToUint(r) | (floatBitsToUint(x) & 0x80000000u));
+}
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1];
+    uint b_off = params[P + 2], r_off = params[P + 3], out_off = params[P + 4];
+    uint n = params[P + 5], ci = params[P + 6], h = params[P + 7], w = params[P + 8];
+    uint m = params[P + 9], kh = params[P + 10], kw = params[P + 11];
+    uint sh = params[P + 12], sw = params[P + 13];
+    uint ph = params[P + 14], pw = params[P + 15];
+    uint group = params[P + 16], act = params[P + 17];
+    float c1 = uintBitsToFloat(params[P + 18]);
+    float c2 = uintBitsToFloat(params[P + 19]);
+    float c3 = uintBitsToFloat(params[P + 20]);
+
+    uint ox = gl_GlobalInvocationID.x, oy = gl_GlobalInvocationID.y;
+    uint nm = gl_GlobalInvocationID.z;
+    // 输出尺寸由主机侧算好传入 dispatch；此处用 out 平面的 ohw 反推
+    uint ohw = params[P + 21];
+    uint ow = params[P + 22];
+    uint oh = ohw / ow;
+    if (ox >= ow || oy >= oh) return;
+    uint bn = nm / m, co = nm % m;
+
+    uint cig = ci / group;          // 每组输入通道
+    uint mpg = m / group;           // 每组输出通道
+    uint c0 = (co / mpg) * cig;     // 本组的输入通道起点
+
+    float acc = 0.0;
+    for (uint c = 0; c < cig; c++) {
+        for (uint ky = 0; ky < kh; ky++) {
+            int iy = int(oy * sh) - int(ph) + int(ky);
+            if (iy < 0 || iy >= int(h)) continue;
+            for (uint kx = 0; kx < kw; kx++) {
+                int ix = int(ox * sw) - int(pw) + int(kx);
+                if (ix < 0 || ix >= int(w)) continue;
+                // 权重 [M, cig, kh, kw]
+                float wv = data[w_off + ((co * cig + c) * kh + ky) * kw + kx];
+                float xv = data[in_off + ((bn * ci + c0 + c) * h + uint(iy)) * w + uint(ix)];
+                acc += xv * wv;
+            }
+        }
+    }
+    if (b_off != NONE) acc += data[b_off + co];
+    if (act == 2) {
+        acc = acc > 0.0 ? acc : 0.0;
+    } else if (act == 1) {
+        float inv_c1 = 1.0 / c1;
+        acc = c3 * acc * (erf1(acc * inv_c1) + c2);
+    }
+    if (r_off != NONE) acc += data[r_off + (bn * m + co) * ohw + oy * ow + ox];
+    data[out_off + (bn * m + co) * ohw + oy * ow + ox] = acc;
+}
