@@ -20,6 +20,15 @@ const SHADERS: &[(&str, &[u8])] = &[
     ("add", include_bytes!("../../shaders/spirv/add.spv")),
     ("clip", include_bytes!("../../shaders/spirv/clip.spv")),
     (
+        "concat_c",
+        include_bytes!("../../shaders/spirv/concat_c.spv"),
+    ),
+    ("conv", include_bytes!("../../shaders/spirv/conv.spv")),
+    (
+        "convtranspose",
+        include_bytes!("../../shaders/spirv/convtranspose.spv"),
+    ),
+    (
         "fused_hardsigmoid_mul",
         include_bytes!("../../shaders/spirv/fused_hardsigmoid_mul.spv"),
     ),
@@ -37,7 +46,16 @@ const SHADERS: &[(&str, &[u8])] = &[
         "muladd_scale",
         include_bytes!("../../shaders/spirv/muladd_scale.spv"),
     ),
+    ("pool", include_bytes!("../../shaders/spirv/pool.spv")),
+    (
+        "reduce_hw",
+        include_bytes!("../../shaders/spirv/reduce_hw.spv"),
+    ),
     ("relu", include_bytes!("../../shaders/spirv/relu.spv")),
+    (
+        "resize_nearest",
+        include_bytes!("../../shaders/spirv/resize_nearest.spv"),
+    ),
     ("sigmoid", include_bytes!("../../shaders/spirv/sigmoid.spv")),
 ];
 
@@ -89,6 +107,14 @@ pub(crate) struct PcMulAddScale {
     pub c: u32,
 }
 
+/// 参数块内核（conv/pool/resize/convT/reduce/concat）：全部形状参数
+/// 放 arena（128 B 的 push constant 装不下），PC 只带参数块偏移。
+#[repr(C)]
+pub(crate) struct PcParams {
+    /// 参数块在 SSBO 里的 **u32 下标**（binding 1 的 uint 视图同源）。
+    pub p_off: u32,
+}
+
 /// fused_hardsigmoid_mul。
 #[repr(C)]
 pub(crate) struct PcChannelF {
@@ -121,8 +147,52 @@ pc_bytes!(
     PcBinary,
     PcChannel,
     PcMulAddScale,
-    PcChannelF
+    PcChannelF,
+    PcParams
 );
+
+/// 参数块写入器：形状参数太多（conv 20+ 项）装不进 128 B 的 push
+/// constant，写进 arena 一小块，内核经 binding 1（同一缓冲的 u32
+/// 视图）读取。装载期写一次、随 CB 复用——零每帧成本。
+pub(crate) struct ParamBlock {
+    words: Vec<u32>,
+}
+
+/// 「无此输入」的哨兵偏移（conv 的 bias/residual 等）。
+pub(crate) const OFF_NONE: u32 = u32::MAX;
+
+impl ParamBlock {
+    pub(crate) fn new() -> Self {
+        Self { words: Vec::new() }
+    }
+
+    pub(crate) fn u(&mut self, v: u32) -> &mut Self {
+        self.words.push(v);
+        self
+    }
+
+    /// f32 按位写入（内核侧 uintBitsToFloat 读回）。
+    pub(crate) fn f(&mut self, v: f32) -> &mut Self {
+        self.words.push(v.to_bits());
+        self
+    }
+
+    /// 写入 arena 区域（u32 视图），返回 push constant。
+    /// `region` 必须按 words.len()*4 分配（调用方保证）。
+    pub(crate) fn finish(self, region: &super::memory::Region) -> PcParams {
+        // SAFETY: 持久映射可写内存；写入长度 ≤ 分配长度，无越界。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.words.as_ptr(),
+                region.ptr as *mut u32,
+                self.words.len(),
+            );
+        }
+        PcParams {
+            p_off: region.offset as u32 / 4,
+        }
+    }
+}
 
 /// 一套内核：共享的管线布局/描述符集 + 名字 → 管线。
 pub(crate) struct KernelSet {
@@ -138,11 +208,20 @@ impl KernelSet {
     /// 建：单 SSBO 绑定（绑定 arena 的块缓冲）+ push constant 区
     /// （compute，0..128）+ 全部管线。
     pub(crate) fn new(device: &Device, buffer: vk::Buffer, size: vk::DeviceSize) -> Result<Self> {
-        let bindings = [vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)];
+        // 双视图绑定：binding 0 = f32[]（计算数据）、binding 1 = u32[]
+        //（参数块）——同一 VkBuffer，只读别名，GLSL 侧按需声明。
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
         let dsl_ci = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: dsl_ci 合法；布局只被本 KernelSet 使用。
         let dsl = unsafe { device.create_descriptor_set_layout(&dsl_ci, None) }
@@ -162,7 +241,7 @@ impl KernelSet {
 
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(SHADERS.len() as u32)];
+            .descriptor_count(2 * SHADERS.len() as u32)];
         let pool_ci = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(SHADERS.len() as u32);
@@ -180,12 +259,20 @@ impl KernelSet {
             .buffer(buffer)
             .offset(0)
             .range(size);
-        let buf_infos = [buf_info];
-        let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&buf_infos)];
+        // 两个绑定指向同一缓冲（f32 视图 / u32 视图）
+        let buf_infos = [buf_info, buf_info];
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&buf_infos[..1]),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&buf_infos[1..]),
+        ];
         // SAFETY: set/buffer 存活；写入结构在调用期间有效。
         unsafe { device.update_descriptor_sets(&writes, &[]) };
 
