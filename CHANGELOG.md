@@ -10,6 +10,19 @@
 
 ### 新增（Added）
 
+- **GPU 计算管线与首批内核（Phase 1-F）**：单 SSBO + push constant
+  偏移寻址的绑定模型（一个会话一个描述符集，零描述符churn）；
+  **可复用命令缓冲**——整图 dispatch 序列装载期录一次、每帧只
+  submit+等信号（Intel Arc 实测 10-dispatch 序列重提交中位
+  0.355 ms，这是把每图固定开销压到 ~5ms 级的载体）。首批 10 个
+  compute 内核（sigmoid/hardsigmoid/relu/clip/add/mul/mul_c/
+  muladd_scale + 融合 SE 链 fused_sigmoid_mul/fused_hardsigmoid_mul
+  ——SE 门与特征图的 Mul 融成一个内核，省一整趟 NCHW 读写），全部
+  与 CPU 判据对拍：纯算术内核逐位一致，exp 族 ≤1.8e-7，fma 收缩
+  ≤1.9e-6。着色器工具链：naga（纯 Rust）的 GLSL→SPIR-V 编译工具
+  （`tools/shader-build`，独立于 workspace），SPIR-V 签入，仓库仍零
+  C++ 依赖。
+
 - **GPU planner（`qppocr-gpu::planner`，Phase 1-E）**：装载期静态形状
   推理 + i64 常量折叠（Shape/Cast/Slice/Concat/Transpose/Unsqueeze 链
   求值——Resize 的 sizes、Reshape 目标、各类 axes 的来源）。语义逐字

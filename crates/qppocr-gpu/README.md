@@ -26,5 +26,17 @@ let engine = Engine::builder()
 # }
 ```
 
-状态：Phase 1 开发中——设备枚举与选择已就绪，计算内核随后续版本接入；
-显式要求 GPU 而内核未就绪时会得到明确的错误说明，不静默回退 CPU。
+状态：Phase 1 开发中——设备枚举/执行基建/装载期形状推理已就绪；
+计算内核逐批接入中。显式要求 GPU 而内核未就绪时会得到明确的错误
+说明，不静默回退 CPU。
+
+## 改着色器
+
+SPIR-V **签入**（`shaders/spirv/`），构建零着色器依赖。改 `shaders/*.comp`
+后必须重编译并提交产物：
+
+```
+cargo run --manifest-path tools/shader-build/Cargo.toml
+```
+
+编译器是 naga（纯 Rust）——仓库不依赖 Vulkan SDK / glslang。

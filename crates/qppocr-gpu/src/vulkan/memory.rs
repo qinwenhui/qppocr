@@ -137,6 +137,14 @@ impl Arena {
         })
     }
 
+    /// 当前（最后一块）的缓冲与整块大小——KernelSet 绑定 SSBO 用。
+    ///
+    /// 已知边界（Phase F）：多块时只有最后一块可绑定。Phase G 的图
+    /// 计划保证全部区域落在一块里（按计划总量一次开块）。
+    pub(crate) fn chunk_range(&self) -> Option<(vk::Buffer, vk::DeviceSize)> {
+        self.chunks.last().map(|c| (c.buffer, c.size))
+    }
+
     fn push_chunk(&mut self, size: vk::DeviceSize) -> Result<()> {
         let device = &self.device;
         let bci = vk::BufferCreateInfo::default()

@@ -149,6 +149,65 @@ impl VulkanDevice {
     pub(crate) fn raw(&self) -> &Device {
         &self.device
     }
+
+    /// 分配一个**可复用**命令缓冲：录制一次、反复提交（不释放不重置）。
+    ///
+    /// 这是「每帧一次提交」的载体——整图的 dispatch 序列在装载期录好，
+    /// 每帧只 submit。池没开 RESET_COMMAND_BUFFER，靠不重置保证语义。
+    pub(crate) fn alloc_reusable_cb(&self) -> Result<vk::CommandBuffer> {
+        let ai = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: 池存活；缓冲从不重置/释放（SIMULTANEOUS_USE 语义靠
+        // 「录制一次、多帧提交」保证——每帧提交前上一帧已等完信号）。
+        let cb = unsafe { self.device.allocate_command_buffers(&ai) }
+            .map_err(|e| Error::Device(format!("分配命令缓冲失败: {e}")))?[0];
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
+        // SAFETY: cb 刚分配，处于初始态。
+        unsafe { self.device.begin_command_buffer(cb, &begin) }
+            .map_err(|e| Error::Device(format!("begin 命令缓冲失败: {e}")))?;
+        Ok(cb)
+    }
+
+    /// 结束可复用命令缓冲的录制（录制完才能提交）。
+    pub(crate) fn end_reusable_cb(&self, cb: vk::CommandBuffer) -> Result<()> {
+        // SAFETY: cb 处于录制态。
+        unsafe { self.device.end_command_buffer(cb) }
+            .map_err(|e| Error::Device(format!("end 命令缓冲失败: {e}")))
+    }
+
+    /// 提交**已录制**的命令缓冲并等它完成（timeline 信号）。
+    ///
+    /// 与 `submit_one_shot` 的区别：不录不释放——热路径的每帧成本就
+    /// 是这里：一次 submit + 一次主机等值。
+    pub(crate) fn submit_wait_cb(&self, cb: vk::CommandBuffer) -> Result<()> {
+        let signal = self.take_signal();
+        let cbs = [cb];
+        let signal_values = [signal];
+        let sems = [self.timeline];
+        let mut tl_submit =
+            vk::TimelineSemaphoreSubmitInfo::default().signal_semaphore_values(&signal_values);
+        let si = vk::SubmitInfo::default()
+            .command_buffers(&cbs)
+            .signal_semaphores(&sems)
+            .push_next(&mut tl_submit);
+        // SAFETY: cb 已结束录制且未被并发提交（调用方串行）；信号量有效。
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[si], vk::Fence::null())
+        }
+        .map_err(|e| Error::Device(format!("vkQueueSubmit 失败: {e}")))?;
+        let values = [signal];
+        let wait = vk::SemaphoreWaitInfo::default()
+            .semaphores(&sems)
+            .values(&values);
+        // SAFETY: 等待值是刚提交的信号值。
+        unsafe { self.device.wait_semaphores(&wait, WAIT_TIMEOUT_NS) }
+            .map_err(|e| Error::Device(format!("等待 timeline 信号失败: {e}")))?;
+        Ok(())
+    }
 }
 
 impl Drop for VulkanDevice {
