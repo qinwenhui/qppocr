@@ -7,7 +7,7 @@
 //! 上层（`qppocr-core`）以 `#![forbid(unsafe_code)]` 强制走安全 API。
 //!
 //! 每个内核文件的结构（循环顺序、分块、寄存器分配意图、位级语义）
-//! 有明确约定，注释里的实测结论一并携带。
+//! 有明确约定；注释里的性能结论来自本项目的参考环境，仅供参考。
 //!
 //! `scalar`（本 crate 的标量参考实现）不是备用方案，是判据：SIMD 版与它
 //! 逐位比对。
@@ -18,8 +18,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 // 内核保持下标循环与手写 clamp 的结构——f32::clamp 的 NaN 行为不同，
-// 惯用改写会改变位级语义。见
-// Rust 的写法」。
+// 惯用改写会改变位级语义。
 #![allow(
     clippy::needless_range_loop,
     clippy::manual_clamp,

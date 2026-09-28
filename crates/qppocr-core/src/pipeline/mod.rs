@@ -6,7 +6,7 @@
 //! - [`crop`]：透视裁剪、pack_crop、cls_view
 //! - [`rec`]：CTC 解码、逐列墨迹、像素空格
 //! - [`engine`]：OcrEngine 主流程（含区域重试）
-//! - [`config`]：全部行为参数与默认值（实测标定）
+//! - [`config`]：全部行为参数与默认值
 
 pub mod config;
 pub mod crop;

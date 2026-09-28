@@ -1,23 +1,22 @@
 //! 激活函数与归约类数值内核（softmax / 层归一化）。
 //!
-//! # ★ 多项式近似——系数与运算顺序逐字照抄，不要换成 libm
+//! # 多项式近似
 //!
-//!  用手写的向量多项式（`erf256_ps` / `exp256_ps`），这既影响速度也影响
-//! **数值逐位一致**：
+//! erf / exp 用手写的向量多项式，这既影响速度也影响**数值逐位一致**：
 //!
 //! - `erf`：Abramowitz & Stegun 7.1.26，|err| < 1.5e-7，branch-free。
 //!   erf(-x) = -erf(x)，取 |x| 算、末尾还原符号。
 //! - `exp`：range-reduce 到 k·ln2 + r，r 上多项式，按 2^k 缩放。
 //!   ±88 截断保证两端饱和与 libm 路径一致（1/(1+inf) == 0）。
 //!
-//! 标量版 [`erf1`] / [`exp1`] 是 AVX2 版的**逐 lane 镜像**（同样的
+//! 标量版 [`erf1`] / [`exp1`] 是向量版的**逐 lane 镜像**（同样的
 //! `mul_add` 序列、同样的 round-ties-even），因此标量与 SIMD 逐位一致——
-//! 这是把 scalar 当判据的前提。标量尾巴调 libm（`erff`/`exp`），
-//! 与其向量版本本来就不逐位一致；我们不沿用那个尾巴。
+//! 这是把 scalar 当判据的前提。标量尾巴沿用同一多项式，不用 libm：
+//! libm 与向量版本本就不逐位一致。
 //!
-//! ⚠ 已声明的偏差：仅在 `inner % 8` 的标量尾巴上，用 libm、
-//! 我们用同一多项式，差异 ≤1 ulp。文本级对拍（阶段 3 判据）不受影响；
-//! 若阶段 2 的中间张量对拍在这里翻车，再局部处理。
+//! 已声明的偏差：与 libm 参考相比有 ≤1 ulp 量级的系统性差异（多项式
+//! 近似与两段拆分的固有舍入）；引擎内部各实现之间不受影响，仍逐位
+//! 一致。
 
 /// `exp(x)`：`exp256_ps` 的标量镜像（f32）。
 ///
@@ -253,8 +252,8 @@ pub fn hardsigmoid(x: &[f32], alpha: f32, beta: f32, y: &mut [f32]) {
 
 /// `y = 1 / (1 + exp(-x))`（整张量，拷贝语义）。
 ///
-/// det 的 sigmoid 面是 1x1x1504x1984（3M 元素）： 标量版逐元素调 libm
-/// 实测 17 ms，向量版 ~2 ms。
+/// det 的 sigmoid 面是 1x1x1504x1984（3M 元素）：逐元素调 libm 的标量
+/// 版比向量版慢一个数量级。
 pub fn sigmoid_tensor(x: &[f32], y: &mut [f32]) {
     assert_eq!(x.len(), y.len(), "sigmoid: size mismatch");
     let yp = par::SyncPtr::new(y.as_mut_ptr());
@@ -334,7 +333,7 @@ pub fn softmax_last_dim(t: &mut [f32], inner: usize) {
 /// softmax 一行的标量判据：max / exp / 归约按 8-lane 结构逐 lane 镜像向量
 /// 内核，水平归约走 [`hsum8`] 的结合树。行宽不足 8 时逐元素。
 ///
-/// ⚠ 行必须凑满一个向量再首次读：不满时多余的 lane 会读到**下一行**，
+/// 行必须凑满一个向量再首次读：不满时多余的 lane 会读到**下一行**，
 /// mx 偏大、每个 exp 下溢、结果是 0·inf。
 ///
 /// # Safety
@@ -406,8 +405,8 @@ use crate::par;
 ///
 /// 段布局：`seg(m) = t[(o·mid + m)·inner + i]`，m 是归约维。
 /// core 是 `forbid(unsafe_code)` 的，所以这条带裸指针并行路径住在 kernels。
-/// ★  原版这里用 libm exp；我们用 `exp1`（同一多项式），低 位差异
-/// ≤1 ulp——见模块头「已声明的偏差」。末维 softmax 别走这条，
+/// 通用路径用 `exp1`（与向量版同一多项式），与 libm 参考有 ≤1 ulp 量级
+/// 的差异。末维 softmax 别走这条，
 /// 用 [`softmax_last_dim`]（有向量内核）。
 pub fn softmax_axis_generic(t: &mut [f32], outer: i64, mid: i64, inner: i64) {
     let tp = par::SyncPtr::new(t.as_mut_ptr());

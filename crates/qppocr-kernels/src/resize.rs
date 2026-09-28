@@ -117,8 +117,8 @@ pub fn resize_bilinear(
 ///
 /// 与 `qppocr_core::pipeline::image::resize_bilinear_img` 的标量实现
 /// **逐位相同**（同一套半像素中心映射与「首项两乘、其余 fma」的收缩形态），
-/// 只是把行循环交给池子。det 输入准备（848×816 → 832×832）实测 6.9 ms，
-/// 全图缩放是串行热点。
+/// 只是把行循环交给池子。det 的输入准备是一整张图的双线性缩放，
+/// 串行跑是预处理里的大项。
 ///
 /// 输出按 clamp(0,255) 取整；`dst` 长度必须为 `dw*dh*3`。
 pub fn resize_bilinear_rgb_u8(
@@ -181,7 +181,7 @@ pub fn resize_bilinear_rgb_u8(
 /// 逐位语义：`out[y][x] = max(窗口内所有界内样本)`。max 可交换，
 /// 所以向量化不改变结果——与标量三重循环**逐位相同**。
 ///
-/// 标量版在 832×832 掩码上实测 3.8 ms（DB 后处理里最大的一项）。
+/// 百万像素级的掩码上逐字节跑，这是 DB 后处理里的大项之一。
 pub fn dilate2x2_max(mask: &[u8], dst: &mut [u8], h: usize, w: usize) {
     assert_eq!(mask.len(), h * w);
     assert_eq!(dst.len(), h * w);

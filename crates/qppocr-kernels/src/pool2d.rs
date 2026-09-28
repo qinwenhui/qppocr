@@ -53,8 +53,8 @@ pub fn pool2d(
 
     // 2x2 max pool s1 SAME_UPPER——v6 每一个 MaxPool 的形状（det 的是
     // 1x16x752x992）。max 可分：先垂直 max 进 scratch 行，再水平 max，
-    // 两半都能向量化。标量版做 4 load、3 compare、4 边界测试/输出元素，
-    // 实测 12.7 ms，约是这张 op 实际搬运量的 9 倍。
+    // 两半都能向量化。标量版每个输出元素 4 load、3 compare、4 边界测试，
+    // 代价远超这张 op 的搬运本身。
     // ph==pw==0、peh==pew==1：输出行 oy 读输入行 {oy, oy+1}（钳制），
     // 列同理；scratch 行尾放一个 -inf 哨兵让钳制落进普通 max。
     let pool2x2_s1 = max_pool

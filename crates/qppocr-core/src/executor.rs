@@ -59,8 +59,8 @@ fn axes_from(
 
 /// 任意 axis 的 softmax（外维并行；exp 占大头，中等张量也值得并行）。
 /// axis 是最后一维时委托给向量化内核（rec 注意力的每个 softmax 都是）；
-/// 通用路径是逐元素标量。★ 参考路径用 libm exp、我们用同一多项式
-/// （`exp1`），低位差异 ≤1 ulp——声明过的偏差，对拍若在此翻车有据可查。
+/// 通用路径是逐元素标量，exp 用 `exp1`（与向量版同一多项式），与 libm
+/// 参考有 ≤1 ulp 量级的差异。
 fn softmax_axis(t: &mut Tensor, axis: isize) {
     let r = t.rank() as isize;
     let axis = if axis < 0 { axis + r } else { axis };
