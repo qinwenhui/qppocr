@@ -114,6 +114,9 @@ models/
 cargo install --path crates/qppocr-cli
 qppocr img.png --tier small --json        # 单图（--json 含九项分阶段耗时）
 qppocr *.jpg --workers 8                  # 批量：进程扇出，自动分图
+qppocr bench *.jpg --tier small           # 基准：同进程全语料、交错取中位，
+                                          # 报告内核后端（AVX2/NEON/标量）
+qppocr bench *.jpg --sweep preset=base,speed   # 用自己的图集扫一个轴
 ```
 
 常用参数：`--models <dir>`（默认 `models/`）· `--tier tiny|small|medium`
@@ -122,6 +125,13 @@ qppocr *.jpg --workers 8                  # 批量：进程扇出，自动分图
 （每图跑 n 次取最好）· `--det-only`（只要框）· `--boxes`（输出带坐标）
 · `--no-cls`（关方向分类）。环境变量 `QPPOCR_THREADS` 等价 `--threads`；
 `QPPOCR_PROF=1` 输出逐算子耗时剖析。
+
+`bench` 子命令把测量纪律内建：同进程跑完整语料（不逐图起进程）、
+1 轮 warmup 丢弃、多配置**逐轮交错**后取中位——配置间受同样的热态与
+频率影响，比值才是配置差异。`--sweep` 支持 `preset / rec-height /
+threads / rec-shards` 四个轴，值可用 `base` 引用命令行给的基准配置。
+默认值只是我们的参考环境（x86 桌面机、商品图语料）上的折中，建议拿
+自己的机器和图源量一量再定。
 
 ## 已知限制（如实）
 

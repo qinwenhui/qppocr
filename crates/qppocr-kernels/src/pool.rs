@@ -19,10 +19,15 @@
 //! join 保证）。 用 `shared_ptr` 兜底的是迟醒 worker，参与者计数下
 //! 迟醒 worker 必须醒来才能放行主线程，指针必然仍有效。
 //!
-//! 嵌套 `parallel_for` 是死锁：内核用 `sgemm_serial` /
-//! 串行 im2col 避免嵌套。设计取舍：**跨线程并发 `fork_join`
-//! 在这里串行化**（`fork_mu`）而不是挂死——公开 API 允许两个引擎在
-//! 两个线程上各跑推理，「单调用方」的假设在库里不成立。
+//! 嵌套 `parallel_for`（并行区的 chunk 里再次 fork）会争 `fork_mu` 死锁：
+//! 外层发布方持锁到 join 完成，卡在锁上的 worker 永远凑不齐参与者计数
+//! （等待 condvar 的 50ms 兜底救不了它——它等的不是条件变量）。内核层用
+//! `sgemm_serial` / 串行 im2col 避免嵌套；此外 [`fork_join`] 对
+//! **worker 线程内的调用**（thread-local 标记）结构性降级为就地串行——
+//! 与 [`set_serial_exec`] 同款语义，切分决策不变、逐位一致。于是嵌套
+//! 最坏是「多花一点调度判断」，不再是挂死。设计取舍：**跨线程并发
+//! `fork_join` 串行化**（`fork_mu`）而不是挂死——公开 API 允许两个引擎
+//! 在两个线程上各跑推理，「单调用方」的假设在库里不成立。
 //! worker 永不触碰 `fork_mu`，无递归问题。
 
 use std::cell::Cell;
@@ -140,6 +145,19 @@ thread_local! {
     /// 再在本池内 fork。单池做不到——`fork_mu` 会把并发的 fork 串起来，
     /// 外层线程互相排队，等于白给。
     static POOL_SLOT: Cell<usize> = const { Cell::new(0) };
+}
+
+thread_local! {
+    /// 本线程是否为池 worker：0 = 否，1 = 是（未告警），2 = 是（已告警）。
+    /// [`fork_join`] 据此把 worker 内的调用（嵌套 fork）降级为就地串行。
+    static WORKER_STATE: Cell<u8> = const { Cell::new(0) };
+}
+
+thread_local! {
+    /// 本线程是否正处在一次 fork_join 的发布-执行-join 区间内。
+    /// 发布方线程自己也参与 chunk 执行且持着 `fork_mu`——它内部再调
+    /// [`fork_join`] 是同线程重入锁（std::Mutex 不可重入），同样降级串行。
+    static FORK_ACTIVE: Cell<bool> = const { Cell::new(false) };
 }
 
 /// 请求池布局（必须在**第一次 fork 之前**调用；之后请求不再生效）。
@@ -264,6 +282,7 @@ fn resolve_threads() -> usize {
 }
 
 fn worker_loop(p: &'static Pool) {
+    WORKER_STATE.with(|c| c.set(1));
     let mut seen = 0u64;
     loop {
         // 快路径：热 worker 在锁内直接命中新 epoch，不进内核等待
@@ -326,18 +345,36 @@ unsafe fn run_chunks(j: &Job) {
 
 /// 在池上跑 `f(i, i+1)` for i in `[0, nchunk)`——`nchunk` 已经是 chunk 数
 /// （`[0, n)` 的区间合成为 nchunk 个下标，见 [`crate::par::parallel_for`]）。
-/// 主线程参与，共 `threads` 个参与者。**禁止嵌套**（死锁）。
+/// 主线程参与，共 `threads` 个参与者。
+///
+/// **嵌套调用（并行区内再次并行）降级为就地串行**：worker 线程内是争
+/// `fork_mu`（外层发布方持锁到 join 完成），发布方线程内是同线程重入锁
+/// ——两种都会挂死（见模块注释）。降级只改执行方式、不改切分决策，与
+/// 并行路径逐位一致；每线程提示一次。
 pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
     if nchunk == 0 {
         return;
     }
     let p = pool();
-    if p.threads == 1 || serial_exec() {
+    let nested = WORKER_STATE.with(|c| c.get()) != 0 || FORK_ACTIVE.with(|c| c.get());
+    if nested && p.threads > 1 && !serial_exec() {
+        WORKER_STATE.with(|c| {
+            if c.get() == 1 {
+                c.set(2);
+                eprintln!(
+                    "[pool] 嵌套 fork_join：并行区内再次并行，已降级为就地串行 \
+                     （内层应改用 *_serial 入口）；本次运行后续不再提示"
+                );
+            }
+        });
+    }
+    if p.threads == 1 || serial_exec() || nested {
         for i in 0..nchunk {
             f(i, i + 1);
         }
         return;
     }
+    FORK_ACTIVE.with(|c| c.set(true));
     let job = Job {
         // SAFETY: join 协议保证闭包在所有解引用完成前存活（见上）。
         f: unsafe { erase_lifetime(f) },
@@ -396,6 +433,7 @@ pub(crate) fn fork_join(nchunk: usize, f: &(dyn Fn(usize, usize) + Sync)) {
     // （毒化测试实测：下一次 fork_join 的 lock().unwrap() 直接
     // PoisonError——这就是「panic 一次、整个进程池报废」的第二种形态）。
     let payload = job.panic.into_inner().unwrap();
+    FORK_ACTIVE.with(|c| c.set(false));
     drop(_fk);
     if let Some(p) = payload {
         std::panic::resume_unwind(p);
