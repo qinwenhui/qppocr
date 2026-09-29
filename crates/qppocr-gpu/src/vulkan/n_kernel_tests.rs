@@ -1887,11 +1887,11 @@ fn cls_dw_forensics() {
     };
     let gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
     let in_name = gpu.input_name_for_test();
-    let t0_ref = t0.clone();
+    let _t0_ref = t0.clone();
     let _ = qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name, t0)]).unwrap();
 
     let (base, recs) = gpu
-        .debug_recs(&vec![b as i64, 3, hh as i64, ww as i64])
+        .debug_recs(&[b as i64, 3, hh as i64, ww as i64])
         .expect("无计划");
     // 找 Conv.27 的 rec
     let idx = recs
@@ -1901,8 +1901,7 @@ fn cls_dw_forensics() {
     let (kernel, node, _, out_off, out_n, pc, osh, _ins) = &recs[idx];
     let _ = (kernel, node);
     eprintln!("[dw] #{idx} osh={osh:?} out@{out_off} n={out_n}，前驱 recs:");
-    for j in idx.saturating_sub(3)..idx {
-        let (k2, n2, _, o2, n_2, _, _, _) = &recs[j];
+    for (j, (k2, n2, _, o2, n_2, _, _, _)) in recs.iter().enumerate().skip(idx - 3).take(3) {
         eprintln!("  #{j} {k2} {n2} out@{o2} n={n_2}");
     }
     // 参数块 words
@@ -1967,7 +1966,7 @@ fn cls_dw_forensics() {
         .to_vec();
         eprintln!("[dw] 对拍头8: gpu={:?}", &got[..8]);
         let want: Vec<f32> = (0..8usize)
-            .map(|smp| yv[(smp / 128) * 0 + (smp % 128) * hw27 + smp / 128])
+            .map(|smp| yv[(smp % 128) * hw27 + smp / 128])
             .collect();
         eprintln!("[dw] 对拍头8: cpu={:?}", want);
     }
@@ -2007,6 +2006,7 @@ fn dw_h3_repro() {
     let out_off = sub(out_w);
     let w_off = sub(w_w);
     let p_off = sub(p_w);
+    // SAFETY: big 是单区持久映射；ww 在区内（段互不相交）。
     let p_of = |ww: u32| unsafe { big.ptr.add(ww as usize * 4) };
     // SAFETY: big 持久映射；各段互不相交。
     unsafe {
@@ -2065,6 +2065,7 @@ fn dw_h3_repro() {
         unsafe { std::slice::from_raw_parts(p_of(out_off) as *const f32, 8) }.to_vec();
     // 批 3 的输出（ob + 3*m*cp）——cls 里坏的是批 3
     let got3: Vec<f32> =
+        // SAFETY: 已等信号；批 3 偏移在输出区内。
         unsafe { std::slice::from_raw_parts(p_of(out_off + (3 * m * cp) as u32) as *const f32, 8) }
             .to_vec();
     // CPU 参考
