@@ -4,7 +4,10 @@
 // gate 直接按 vec4 取（gate[Cpad4]）。
 // 语义镜像：mul_c/add_c（广播）、muladd_scale.comp（out=f*gate+r）、
 // fused_*_mul（out=f*act(gate)，gate 为前激活值）。
-// 布局：op, a_off, gate_off, r_off, out_off, n(元素数), cpad, p1(f32bits), p2
+// 布局：op, a_off, gate_off, r_off, out_off, n(元素数), cpad, p1(f32bits), p2,
+//       hw(每门行的特征行数——[N,C,H,W] 特征 × [N,C,1,1] 门 = H*W；
+//       [V] 单行门 = 全部行。曾有 bug：门恒读批 0 的行——det N=1 恰好
+//       恒对，cls B=17 全批用了批 0 的 SE 门）
 #version 450
 layout(local_size_x = 256) in;
 layout(std430, binding = 1) buffer Params { uint params[]; };
@@ -20,6 +23,7 @@ void main() {
     uint out_off = params[P + 4], n = params[P + 5], cpad = params[P + 6];
     float p1 = uintBitsToFloat(params[P + 7]);
     float p2 = uintBitsToFloat(params[P + 8]);
+    uint hw = params[P + 9]; // 每门行的特征行数
 
     uint nv = n >> 2;
     uint c4 = cpad >> 2;
@@ -28,12 +32,17 @@ void main() {
     uint rowC4 = gid % c4; // 该位置的通道 vec4 下标
 
     vec4 a = vec4(d[(a_off >> 2) + gid]);
-    vec4 g = vec4(d[(gate_off >> 2) + rowC4]);
+    // 门行 = 特征行 / hw（批维）；det N=1 时 hw=特征行数 → 恒第 0 行
+    uint gateRow = (gid / c4) / hw;
+    vec4 g = vec4(d[(gate_off >> 2) + gateRow * c4 + rowC4]);
     vec4 o;
     if (op == 0u) o = a * g;
     else if (op == 1u) o = a + g;
     else if (op == 2u) o = a * g + vec4(d[(r_off >> 2) + gid]);
-    else if (op == 5u) o = a * g + vec4(d[(r_off >> 2) + rowC4]); // BN: scale/shift 均通道广播
+    else if (op == 5u) {
+        vec4 rb = vec4(d[(r_off >> 2) + gateRow * c4 + rowC4]); // BN shift 同批寻址
+        o = a * g + rb;
+    }
     else if (op == 3u) o = a * clamp(g * p1 + p2, vec4(0.0), vec4(1.0));
     else o = a * (1.0 / (1.0 + exp(-g)));
     d[(out_off >> 2) + gid] = vec4(o);

@@ -123,8 +123,8 @@ void main() {
         }
     }
     if (b_off != OFF_NONE) {
-        vec4 bv0 = vec4(d[(b_off >> 2) + b * nv + n4]);
-        vec4 bv1 = vec4(d[(b_off >> 2) + b * nv + n4 + 1u]);
+        vec4 bv0 = vec4(d[(b_off >> 2) + n4]); // bias 全批共享（曾有 b*nv 越界）
+        vec4 bv1 = vec4(d[(b_off >> 2) + n4 + 1u]);
         a0c0 += bv0; a1c0 += bv0; a2c0 += bv0; a3c0 += bv0;
         a0c1 += bv1; a1c1 += bv1; a2c1 += bv1; a3c1 += bv1;
     }
