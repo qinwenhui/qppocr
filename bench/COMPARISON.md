@@ -325,3 +325,22 @@ det 的收益。Phase 2 待办：rec/cls 上 GPU 或门控改按会话粒度。
 - fuse_conv_residual 折进 conv 的 inputs[3] 残差，n_ 内核曾整个漏读
   （随机输入对拍不暴露，真实图才发散）——跨会话对拍要两条 GPU 路径
   互比，CPU dump 的节点序与 GPU 计划不同源不可直接配对。
+
+## 2026-09-29（二）端到端反超 CPU + 计划重建三级缓存
+
+上一节的「ab tiny 1.088」已翻到 **0.93-0.95**（GPU 快 5-9%，交错
+ab.py，--workers 1；small 0.75-0.90）。两个独立根因：
+
+1. **EngineBuilder 一刀切**：--device gpu 时无条件 rec_shards=0，
+   把 QPPOCR_GPU_STAGES=det 下仍是 CPU 会话的 rec/cls 行并行也关了
+   （CPU rec 拖慢 37%，吃掉 det 的全部收益）。运行时
+   prefers_host_parallelism() 三处门控本就按会话判断——构造期这道
+   是冗余保险，删掉。
+2. **形状多样性 × 计划逐出 → 每帧重建**：100 图语料 91 个 distinct
+   形状、重建 11-18ms，det p50 曾被推到 52ms。三级缓存：
+   VkPipelineCache（38 管线 5-9→1-2ms）、权重 k-major 重排缓存
+   （与形状无关）、arena 池（逐出计划整块 reset 复用，免 137MB 页
+   提交 ~7ms）；计划缓存计数 LRU→字节预算。重建 → 2.5-3.2ms。
+
+教训存档：计时开关与日志开关必须分离（QPPOCR_GPU_STEP_DEBUG 的
+日志自身 ~6ms，曾把节点环误判成热点）。
