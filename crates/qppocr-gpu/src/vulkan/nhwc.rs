@@ -102,8 +102,18 @@ pub(crate) fn conv_bias(bias: &[f32], co: i64) -> Vec<u32> {
 ///（如 Resize 的 f32 scales [4]）按前置 1 补齐到 [1,C,1,1]。
 pub(crate) fn init_to_nhwc(t: &Tensor) -> Vec<u32> {
     let mut s: Vec<i64> = t.shape.clone();
-    while s.len() < 4 {
+    if s.len() == 1 {
+        // rank-1 = 通道向量：补成 [1, V, 1, 1]（NHWC 展开为平铺 V）。
+        // front-pad 会得到 [1,1,1,V]——C=1/W=V，值散布到每 cpad 个位置，
+        // 通道广播读到的 vec4 只有 lane0 有值（Add.104 实测踩过）。
         s.insert(0, 1);
+        while s.len() < 4 {
+            s.push(1);
+        }
+    } else {
+        while s.len() < 4 {
+            s.insert(0, 1);
+        }
     }
     if s.len() > 4 {
         panic!("n_ 路径的 initializer 需 rank≤4：{s:?}");

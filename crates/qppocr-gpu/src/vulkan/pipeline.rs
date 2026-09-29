@@ -120,6 +120,15 @@ const SHADERS: &[(&str, &[u8])] = &[
         "n_resize",
         include_bytes!("../../shaders/spirv/n_resize.spv"),
     ),
+    (
+        "n_transpose",
+        include_bytes!("../../shaders/spirv/n_transpose.spv"),
+    ),
+    (
+        "n_softmax",
+        include_bytes!("../../shaders/spirv/n_softmax.spv"),
+    ),
+    ("n_exit3", include_bytes!("../../shaders/spirv/n_exit3.spv")),
 ];
 
 /// push constant 块（与各 .comp 的 PC 布局一一对应；float 元素偏移）。

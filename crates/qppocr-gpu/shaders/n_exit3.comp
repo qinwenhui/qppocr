@@ -1,0 +1,19 @@
+// rank-3 出口（rec 的 [B,T,V]）：存储 [rows × cpad] → f32 NCHW 恒等拷贝。
+// cols=V 是 NCHW 最后轴——逐元素同序；pad 列不写出。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer F32 { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint rows = params[P + 2], cols = params[P + 3], cpad = params[P + 4];
+
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= rows * cols) return;
+    uint row = gid / cols;
+    uint col = gid - row * cols;
+    data[out_off + gid] = data[in_off + row * cpad + col];
+}
