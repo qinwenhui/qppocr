@@ -104,6 +104,11 @@ struct Chunk {
     mapped: *mut u8,
 }
 
+// SAFETY: Arena 携带 Vulkan 句柄（整数）与持久映射裸指针，跨线程仅经
+// 会话的 Mutex 串行访问（与 Plan 的 unsafe Send 同一纪律）；无内部
+// 可变状态逃逸。
+unsafe impl Send for Arena {}
+
 const FIRST_CHUNK: vk::DeviceSize = 16 << 20;
 
 impl Arena {
@@ -142,6 +147,22 @@ impl Arena {
             size,
             ptr,
         })
+    }
+
+    /// 首块容量（池的淘汰比较用）。
+    pub(crate) fn chunk_bytes(&self) -> vk::DeviceSize {
+        self.chunks.first().map(|c| c.size).unwrap_or(0)
+    }
+
+    /// 游标归零复用：单块且容量 ≥ need 时清空复用（免掉 vkAllocateMemory
+    /// 的页提交——137MB 新块实测 ~7ms，复用 ~0）。多块 arena 不复用。
+    pub(crate) fn reset_if_fits(&mut self, need: vk::DeviceSize) -> bool {
+        if self.chunks.len() == 1 && self.chunks[0].size >= need {
+            self.cursor = 0;
+            true
+        } else {
+            false
+        }
     }
 
     /// 当前（最后一块）的缓冲与整块大小——KernelSet 绑定 SSBO 用。

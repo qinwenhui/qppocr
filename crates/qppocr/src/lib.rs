@@ -515,15 +515,12 @@ impl EngineBuilder {
         let ctx = resolve_device(&device)?;
         let loaded = source.load(tier, self.verify.unwrap_or(true))?;
         let mut cfg = resolve_config(preset, &self.cfg, self.advanced_fn);
-        if matches!(device, DeviceChoice::Gpu { .. }) {
-            // GPU 会话不受益于宿主侧行扇出（提交在设备队列上串行化），
-            // 分片只会增加线程 spawn 与争抢。pipeline 侧还有
-            // `prefers_host_parallelism()` 运行时门控——这里是构造期
-            // 第一道，cfg 快照也如实反映。
-            cfg.rec_shards = 0;
-        } else {
-            cfg.rec_shards = auto_rec_shards(tier, cfg.rec_shards);
-        }
+        // rec_shards 按 CPU 全速给（不再因 --device gpu 全局关零）：
+        // 会话粒度的 `prefers_host_parallelism()` 运行时门控才是真值——
+        // QPPOCR_GPU_STAGES=det 时 rec/cls 是 CPU 会话，行并行应当保留
+        //（构造期一刀切曾把 CPU rec 拖慢 37%，吃掉 det 的全部 GPU 收益）。
+        // 真全 GPU（rec 会话也是设备）时，engine.rs 的三处门控自动串行。
+        cfg.rec_shards = auto_rec_shards(tier, cfg.rec_shards);
         // 关方向分类 = 真不装配 cls（不加载、不推理）。曾经只把 cls_thresh
         // 设成 INFINITY：cls 照跑、时间照花、模型照占内存。
         let cls_bytes = if self.cfg.detect_orientation {

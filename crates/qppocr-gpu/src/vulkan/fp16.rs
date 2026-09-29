@@ -173,7 +173,7 @@ mod tests {
     #[test]
     fn f16_roundtrip() {
         let vals = [
-            0.0f32, 1.0, -1.0, 0.5, -0.5, 3.14159, 1e-5, 65504.0, -65504.0,
+            0.0f32, 1.0, -1.0, 0.5, -0.5, 3.14158, 1e-5, 65504.0, -65504.0,
         ];
         let words = f32_to_f16_words(&vals);
         let back = f16_words_to_f32(&words);
