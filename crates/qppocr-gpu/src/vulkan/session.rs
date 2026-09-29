@@ -1286,12 +1286,25 @@ impl VulkanSession {
                         .f(c2)
                         .f(c3)
                         .u(r_off);
+                    // 寄存器分块：Co%8==0 走 m4×n8（两列共享输入 gather，
+                    // 输入流量减半）；奇数列回 m4×n4 基线。
+                    // n16（Co=16 全列进一线程）实测全面更慢：m4 版寄存器
+                    // 崩（Conv.82 4×慢）、m2 版权重 L1 流量翻倍成新瓶颈
+                    // （5×慢）——n8 是本机（Arc Pro，无 coopmat）的均衡点。
                     let nv = cpad4(ws[0]) / 4;
-                    Ok(vec![(
-                        "n_conv",
-                        pb,
-                        [div256(m_dim.div_ceil(4) * nv), nb, 1],
-                    )])
+                    if nv % 2 == 0 {
+                        Ok(vec![(
+                            "n_conv8",
+                            pb,
+                            [div256(m_dim.div_ceil(4) * (nv / 2)), nb, 1],
+                        )])
+                    } else {
+                        Ok(vec![(
+                            "n_conv",
+                            pb,
+                            [div256(m_dim.div_ceil(4) * nv), nb, 1],
+                        )])
+                    }
                 } else if group == xs[1] && ws[0] == xs[1] {
                     // depthwise：ws = [C, 1, kh, kw]
                     let cch = ws[0] as usize;
