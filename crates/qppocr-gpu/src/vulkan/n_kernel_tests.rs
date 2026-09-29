@@ -1853,3 +1853,267 @@ fn cls_forensics() {
         }
     }
 }
+
+/// Conv.27（dw 5x5 p2 [17,128,3,80]）数值取证：参数块 + 输入/输出/权重
+/// 与 conv2d_res 逐 tap 对拍，定位 dw 批 bug。
+#[test]
+fn cls_dw_forensics() {
+    let p = std::path::Path::new("../../models/cls.onnx");
+    if !p.is_file() {
+        eprintln!("[dw] 无模型，跳过");
+        return;
+    }
+    let Some(ctx) = open_or_skip() else { return };
+    let bytes = std::fs::read(p).unwrap();
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+    let (b, hh, ww) = (17usize, 80usize, 160usize);
+    let mut seed = 0x1234_5678_abcd_ef01_u64;
+    let mut buf = F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    let t0 = Tensor {
+        name: String::new(),
+        shape: vec![b as i64, 3, hh as i64, ww as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    let (graph, init) = {
+        let s = Session::from_memory(&bytes, "cls.dw").unwrap();
+        s.into_parts()
+    };
+    let gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
+    let in_name = gpu.input_name_for_test();
+    let t0_ref = t0.clone();
+    let _ = qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name, t0)]).unwrap();
+
+    let (base, recs) = gpu
+        .debug_recs(&vec![b as i64, 3, hh as i64, ww as i64])
+        .expect("无计划");
+    // 找 Conv.27 的 rec
+    let idx = recs
+        .iter()
+        .position(|(_, node, _, _, _, _, _, _)| node == "Conv.27")
+        .expect("无 Conv.27");
+    let (kernel, node, _, out_off, out_n, pc, osh, _ins) = &recs[idx];
+    let _ = (kernel, node);
+    eprintln!("[dw] #{idx} osh={osh:?} out@{out_off} n={out_n}，前驱 recs:");
+    for j in idx.saturating_sub(3)..idx {
+        let (k2, n2, _, o2, n_2, _, _, _) = &recs[j];
+        eprintln!("  #{j} {k2} {n2} out@{o2} n={n_2}");
+    }
+    // 参数块 words
+    let p_off = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
+    // SAFETY: base 持久映射。
+    let pw: Vec<u32> =
+        unsafe { std::slice::from_raw_parts(base.add(p_off * 4) as *const u32, 21) }.to_vec();
+    eprintln!("[dw] 参数 words={pw:?}");
+    // 直接用参数块里的 in_off 做 conv2d_res 对拍（不再猜前驱）
+    {
+        use qppocr_kernels::activation::Activation;
+        use qppocr_kernels::conv::{ConvParams, conv2d_res};
+        let in_o = pw[0] as usize;
+        let hw27 = 3usize * 80usize;
+        // SAFETY: base 持久映射。
+        let feat: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(in_o * 4) as *const f32, 17 * hw27 * 128)
+        }
+        .to_vec();
+        // 批 0 的 NHWC → NCHW
+        let mut nchw = vec![0f32; 128 * hw27];
+        for l in 0..hw27 {
+            for ci in 0..128 {
+                nchw[ci * hw27 + l] = feat[l * 128 + ci];
+            }
+        }
+        let bytes2 = std::fs::read(p).unwrap();
+        let (g2, i2) = {
+            let s2 = Session::from_memory(&bytes2, "cls.dw2").unwrap();
+            s2.into_parts()
+        };
+        let c27 = g2.nodes.iter().find(|m| m.name == "Conv.27").unwrap();
+        let wt = i2.get(&c27.inputs[1]).unwrap();
+        let cp27 = ConvParams {
+            sh: 1,
+            sw: 1,
+            ph: 2,
+            pw: 2,
+            peh: 2,
+            pew: 2,
+            dh: 1,
+            dw: 1,
+            group: 128,
+        };
+        let mut y = F32Buf::new();
+        conv2d_res(
+            &nchw,
+            &[1, 128, 3, 80],
+            &wt.f32,
+            &[128, 1, 5, 5],
+            None,
+            &cp27,
+            &Activation::default(),
+            &mut y,
+            None,
+        );
+        let yv = y.as_slice();
+        // SAFETY: 已等信号。
+        let got: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(*out_off as usize * 4) as *const f32, 16)
+        }
+        .to_vec();
+        eprintln!("[dw] 对拍头8: gpu={:?}", &got[..8]);
+        let want: Vec<f32> = (0..8usize)
+            .map(|smp| yv[(smp / 128) * 0 + (smp % 128) * hw27 + smp / 128])
+            .collect();
+        eprintln!("[dw] 对拍头8: cpu={:?}", want);
+    }
+}
+
+/// dw 5x5 p2 于 H=3 的最小复现：单批 [1,128,3,80]，conv2d_res 对拍。
+#[test]
+fn dw_h3_repro() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    let (nb3, ci, oh, ow, ih, iw) = (17usize, 128usize, 3usize, 80usize, 3usize, 80usize);
+    let hw = ih * iw;
+    let m = oh * ow;
+    let cp = super::nhwc::cpad4(ci as i64) as usize;
+    let mut seed = 0xbeef_cafe_1234_5678_u64;
+    let x: Vec<f32> = (0..nb3 * ci * hw).map(|_| lcg(&mut seed)).collect();
+    let wt: Vec<f32> = (0..ci * 25).map(|_| lcg(&mut seed) * 0.3).collect();
+    let w16 = super::nhwc::repack_dw_w(&wt, ci, 5, 5);
+
+    let seg = |nn: usize| nn.div_ceil(4) * 4;
+    let in_w = seg(nb3 * hw * cp);
+    let out_w = seg(nb3 * m * cp);
+    let w_w = seg(w16.len());
+    let p_w = 256;
+    let big = arena
+        .alloc(((in_w + out_w + w_w + p_w) * 4) as vk::DeviceSize)
+        .unwrap();
+    let base = big.offset as u32 / 4;
+    let mut cur = base;
+    let mut sub = |nn: usize| {
+        let o = cur;
+        cur += nn as u32;
+        o
+    };
+    let in_off = sub(in_w);
+    let out_off = sub(out_w);
+    let w_off = sub(w_w);
+    let p_off = sub(p_w);
+    let p_of = |ww: u32| unsafe { big.ptr.add(ww as usize * 4) };
+    // SAFETY: big 持久映射；各段互不相交。
+    unsafe {
+        for bb in 0..nb3 {
+            for l in 0..hw {
+                for ch in 0..ci {
+                    *(p_of(in_off + ((bb * hw + l) * cp + ch) as u32) as *mut f32) =
+                        x[bb * ci * hw + ch * hw + l];
+                }
+            }
+        }
+        std::ptr::copy_nonoverlapping(w16.as_ptr(), p_of(w_off) as *mut u32, w16.len());
+    }
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+    let mut pb = ParamBlock::new();
+    pb.u(in_off)
+        .u(w_off)
+        .u(OFF_NONE)
+        .u(out_off)
+        .u(m as u32)
+        .u(cp as u32)
+        .u(ow as u32)
+        .u(iw as u32)
+        .u(ih as u32)
+        .u(25)
+        .u(5)
+        .u(1)
+        .u(1)
+        .u(2)
+        .u(2)
+        .u(0)
+        .f(std::f32::consts::SQRT_2)
+        .f(1.0)
+        .f(0.5)
+        .u(OFF_NONE);
+    // SAFETY: 同上。
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            pb.words().as_ptr(),
+            p_of(p_off) as *mut u32,
+            pb.words().len(),
+        );
+    }
+    let pc = PcParams { p_off };
+    let grid = [(m as u32 * (cp as u32 / 4)).div_ceil(256), nb3 as u32, 1];
+    ctx.inner
+        .device
+        .submit_one_shot(|d, cb| {
+            // SAFETY: 同上。
+            unsafe { record_dispatch(d, cb, &ks, "n_conv_dw", pc.bytes(), grid) }
+        })
+        .unwrap();
+    // SAFETY: 已等信号。
+    let got: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(p_of(out_off) as *const f32, 8) }.to_vec();
+    // 批 3 的输出（ob + 3*m*cp）——cls 里坏的是批 3
+    let got3: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(p_of(out_off + (3 * m * cp) as u32) as *const f32, 8) }
+            .to_vec();
+    // CPU 参考
+    use qppocr_kernels::activation::Activation;
+    use qppocr_kernels::buf::F32Buf;
+    use qppocr_kernels::conv::{ConvParams, conv2d_res};
+    let cpp = ConvParams {
+        sh: 1,
+        sw: 1,
+        ph: 2,
+        pw: 2,
+        peh: 2,
+        pew: 2,
+        dh: 1,
+        dw: 1,
+        group: ci,
+    };
+    let mut y = F32Buf::new();
+    conv2d_res(
+        &x[..ci * hw],
+        &[1, ci as i64, ih as i64, iw as i64],
+        &wt,
+        &[ci as i64, 1, 5, 5],
+        None,
+        &cpp,
+        &Activation::default(),
+        &mut y,
+        None,
+    );
+    let want: Vec<f32> = (0..8usize).map(|s| y.as_slice()[s * hw]).collect();
+    let mut y3 = F32Buf::new();
+    conv2d_res(
+        &x[3 * ci * hw..],
+        &[1, ci as i64, ih as i64, iw as i64],
+        &wt,
+        &[ci as i64, 1, 5, 5],
+        None,
+        &cpp,
+        &Activation::default(),
+        &mut y3,
+        None,
+    );
+    let want3: Vec<f32> = (0..8usize).map(|s| y3.as_slice()[s * hw]).collect();
+    eprintln!("[dw3] B0 gpu={got:?} cpu={want:?}");
+    eprintln!("[dw3] B3 gpu={got3:?} cpu={want3:?}");
+    let bad3 = got3
+        .iter()
+        .zip(&want3)
+        .filter(|(a, b)| (**a - **b).abs() > 1e-4)
+        .count();
+    assert!(bad3 == 0, "dw 批 3 错 {bad3}/8");
+}
