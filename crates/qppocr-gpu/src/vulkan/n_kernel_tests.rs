@@ -1437,6 +1437,12 @@ fn cls_session_end_to_end() {
         let gb = pick(&bw[r * cls_dim..(r + 1) * cls_dim]);
         if ga != gb {
             top_mis += 1;
+            let gp = a[r * cls_dim + ga];
+            let gb_v = bw[r * cls_dim + gb];
+            let gc_p = a[r * cls_dim + gb]; // GPU 给 CPU 所选类的概率
+            eprintln!(
+                "  行{r}: gpu 选 {ga}（p={gp:.4}）cpu 选 {gb}（p={gb_v:.4}）gpu 给 cpu 选项 p={gc_p:.4}"
+            );
         }
         let s: f32 = a[r * cls_dim..(r + 1) * cls_dim].iter().sum();
         if (s - 1.0).abs() > 1e-3 {
@@ -1527,6 +1533,19 @@ fn cls_forensics() {
         recs_dbg.len()
     );
     let mut first = true;
+    // entry 输出 NaN 扫描（rec 0）
+    {
+        let e_off = recs_dbg[0].3;
+        // SAFETY: base 持久映射。
+        let full_n = 17 * 80 * 160 * 4; // NHWC 全长（逻辑 numel 之外还有 pad）
+        // SAFETY: base 持久映射；full_n 在 entry 输出区内。
+        let ev: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(e_off as usize * 4) as *const f32, full_n)
+        }
+        .to_vec();
+        let bad = ev.iter().filter(|v| !v.is_finite()).count();
+        eprintln!("[cls][nan] #0 n_entry NHWC 输出非有限 {bad}/{full_n}");
+    }
     for (i, (kernel, node, _idx, off, n, _pc, osh, _ins)) in recs_dbg.iter().enumerate() {
         if *n == 0 || kernel.starts_with("n_entry") || kernel.starts_with("n_exit") {
             continue;
@@ -1595,6 +1614,101 @@ fn cls_forensics() {
                 }
             }
         }
+        if i == 74 {
+            // GAP 输出 vs 所有 numel=1088 的 dump（[17,64,1,1] 唯一）
+            let per = 64usize;
+            for (k, (sh, dv)) in dumps.iter().enumerate() {
+                if sh.iter().product::<i64>() == 1088 {
+                    let mut e_max = 0.0f32;
+                    for smp in (0..1088usize).step_by(64) {
+                        let bb = smp / per;
+                        let c = smp % per;
+                        let want = dv[bb * per + c];
+                        e_max = e_max.max((gv[smp] - want).abs() / (1.0 + want.abs()));
+                    }
+                    eprintln!("[cls][gap] dump#{k} sh={sh:?} rel_max={e_max:.4}");
+                }
+            }
+            eprintln!("[cls][gap] GPU 头4={:?}", &gv[..4]);
+        }
+        // NaN/Inf 扫描：非有限值出现 = 该 dispatch 或其输入已坏
+        let n_bad = gv.iter().filter(|v| !v.is_finite()).count();
+        if n_bad > 0 {
+            // 逐批定位（假设 rank-4 且批维为 0）
+            let per_batch = (osh.iter().product::<i64>() as usize) / osh[0] as usize;
+            let mut bad_batches = Vec::new();
+            if per_batch > 0 {
+                for bb in 0..osh[0] as usize {
+                    let sl = &gv[bb * per_batch..(bb + 1) * per_batch];
+                    if sl.iter().any(|v| !v.is_finite()) {
+                        bad_batches.push(bb);
+                    }
+                }
+            }
+            eprintln!(
+                "[cls][nan] #{i:<3} {kernel:<12} {node:<18} osh={osh:?} 非有限 {n_bad}/{} 坏批={bad_batches:?}",
+                gv.len()
+            );
+            if i == 1 {
+                // NaN 元素的 (批内偏移, 位置, 通道)——存储 [rows=17*3200, cols=8]
+                let cpad = 8usize;
+                for (k, v) in gv.iter().enumerate() {
+                    if !v.is_finite() {
+                        let row = k / cpad;
+                        let ch = k % cpad;
+                        let bb = row / 3200;
+                        let l = row % 3200;
+                        eprintln!(
+                            "  NaN@k={k} 批{bb} l={l}(oh={} ow={}) ch={ch}",
+                            l / 80,
+                            l % 80
+                        );
+                        if k > 0 {
+                            break;
+                        }
+                    }
+                }
+                // NaN 总数里 ch 分布
+                let mut by_ch = [0usize; 8];
+                for (k, v) in gv.iter().enumerate() {
+                    if !v.is_finite() {
+                        by_ch[k % 8] += 1;
+                    }
+                }
+                eprintln!("  NaN 通道分布={by_ch:?}");
+                // 权重区 [k][co] 的 co=4 列是否 NaN（k-major：vec4 index
+                // (t*cin4v+ci4)*4*nv + i*nv + n4，n4=1 的 lane0 = co=4）
+                {
+                    let pc1 = &recs_dbg[1].5;
+                    let p_off1 = u32::from_le_bytes([pc1[0], pc1[1], pc1[2], pc1[3]]) as usize;
+                    // SAFETY: base 持久映射。
+                    let pw1: Vec<u32> = unsafe {
+                        std::slice::from_raw_parts(base.add(p_off1 * 4) as *const u32, 20)
+                    }
+                    .to_vec();
+                    let w_off1 = pw1[1] as usize;
+                    // SAFETY: 同上；72 vec4 = 288 words
+                    let wv: Vec<f32> = unsafe {
+                        std::slice::from_raw_parts(base.add(w_off1 * 4) as *const f32, 288)
+                    }
+                    .to_vec();
+                    let wnan = wv.iter().filter(|v| !v.is_finite()).count();
+                    eprintln!("  Conv.0 权重 NaN 数={wnan}/288");
+                    // n4=1 lane0 = co=4 的 9*4=36 个 k 位置
+                    let mut co4_nan = 0;
+                    for t in 0..9 {
+                        for i in 0..4 {
+                            let vec4_i = t * 4 * 2 + i * 2 + 1;
+                            let v = wv[vec4_i * 4];
+                            if !v.is_finite() {
+                                co4_nan += 1;
+                            }
+                        }
+                    }
+                    eprintln!("  权重 co=4 列 NaN 数={co4_nan}/36");
+                }
+            }
+        }
         if !matched && first {
             eprintln!(
                 "[cls][cmp] #{i:<3} {kernel:<12} {node:<18} osh={osh:?} 最好 rel={best_e:.4}",
@@ -1604,6 +1718,7 @@ fn cls_forensics() {
                 eprintln!("[cls][cmp] entry 输入 {inm} @{ioff} n={in_n}");
                 // SAFETY: base 持久映射。
                 let o_off = recs_dbg[0].3 as usize;
+                // SAFETY: base 持久映射。
                 let ev: Vec<f32> =
                     unsafe { std::slice::from_raw_parts(base.add(o_off * 4) as *const f32, 8) }
                         .to_vec();

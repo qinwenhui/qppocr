@@ -1851,7 +1851,8 @@ impl VulkanSession {
                     .u(rows * cpad)
                     .u(cpad)
                     .f(0.0)
-                    .f(0.0);
+                    .f(0.0)
+                    .u(rows); // 门单行：全部特征行映到第 0 行
                 Ok(vec![("n_channel", pb, [div256(rows * cpad / 4), 1, 1])])
             }
             "Sigmoid" | "Relu" | "HardSigmoid" | "Clip" => {
@@ -1936,6 +1937,7 @@ impl VulkanSession {
                         (1, off_of(&n.inputs[1])?, 0.0, 0.0)
                     };
                     let cp = cpad4(a[1]);
+                    let hw_gate = (a[2] * a[3]) as u32; // 每门行的特征行数
                     let mut pb = ParamBlock::new();
                     pb.u(op)
                         .u(off_of(&n.inputs[0])?)
@@ -1945,7 +1947,8 @@ impl VulkanSession {
                         .u(a_words)
                         .u(cp)
                         .f(p1)
-                        .f(p2);
+                        .f(p2)
+                        .u(hw_gate);
                     Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
                 } else if b.len() == 1 && a.last() == Some(&b[0]) && a.len() >= 2 {
                     // [V] 尾轴广播（rank-2/3 的 a：cls 的 Add([B,2],[2])、
@@ -1963,7 +1966,8 @@ impl VulkanSession {
                         .u(rows * cpad)
                         .u(cpad)
                         .f(0.0)
-                        .f(0.0);
+                        .f(0.0)
+                        .u(rows); // 门单行：全部特征行映到第 0 行
                     Ok(vec![("n_channel", pb, [div256(rows * cpad / 4), 1, 1])])
                 } else if b.len() == 1 && b_n == 1 {
                     // 标量广播：[V] 退化成单值（cls 的 gate×标量）
@@ -1996,7 +2000,8 @@ impl VulkanSession {
                     .u(a_words)
                     .u(cp)
                     .f(0.0)
-                    .f(0.0);
+                    .f(0.0)
+                    .u((fs[2] * fs[3]) as u32); // 每门行的特征行数
                 Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
             }
             other => Err(Error::Graph(format!(

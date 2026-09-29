@@ -81,7 +81,7 @@ void main() {
         vec4 w = vec4(d[wb + t * cv4 + c4]);
         acc += x * w;
     }
-    if (b_off != OFF_NONE) acc += vec4(d[(b_off >> 2) + b * cv4 + c4]);
+    if (b_off != OFF_NONE) acc += vec4(d[(b_off >> 2) + c4]); // bias 全批共享（曾有 b*cv4 越界）
     if (act == 2u) acc = max(acc, vec4(0.0));
     else if (act == 1u) {
         float inv = 1.0 / c1;

@@ -116,7 +116,7 @@ void main() {
         }
     }
     if (b_off != OFF_NONE) {
-        vec4 bv = vec4(d[(b_off >> 2) + b * nv + n4]);
+        vec4 bv = vec4(d[(b_off >> 2) + n4]); // bias 全批共享——无 b 项（曾有 b*nv 越界读未初始化内存，cls 批 NaN 的根因）
         acc0 += bv; acc1 += bv; acc2 += bv; acc3 += bv;
     }
     if (act != 0u) {
