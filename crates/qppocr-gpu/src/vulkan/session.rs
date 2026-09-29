@@ -64,7 +64,11 @@ struct Plan {
     /// 剖析查询池（QPPOCR_GPU_PROF 时存在；索引 0 = 首个 dispatch 前，
     /// i = 第 i-1 个 dispatch 后）。录制在 CB 里，每次重放自复位。
     qpool: Option<vk::QueryPool>,
-    _arena: Arena,
+    /// 整块字节数（计划缓存的预算记账）。
+    block_bytes: u64,
+    /// 计划存活期归本计划；逐出时 take 归还会话 arena 池（见
+    /// [`VulkanSession::arena_pool`]——免掉大块页提交）。
+    arena: Option<Arena>,
     _ks: KernelSet,
     /// 查询池销毁用的设备句柄（drop 序：先于 ctx 释放）。
     _dev: ash::Device,
@@ -184,6 +188,16 @@ pub(crate) struct VulkanSession {
     initializers: HashMap<String, Tensor>,
     input_name: String,
     plans: Mutex<Vec<(Vec<i64>, Plan)>>,
+    /// 会话级管线缓存：按形状重建计划时驱动侧复用编译产物
+    ///（形状多样性 × LRU 驱逐会让每帧都重建，38 条管线重建 ~5ms）。
+    pipeline_cache: vk::PipelineCache,
+    /// 会话级权重重排缓存：重排算术（83 层 conv 的 k-major 循环 ~9ms）
+    /// 与形状无关——按名缓存，重建只付 memcpy（~1ms）。
+    repack_cache: Mutex<HashMap<String, std::sync::Arc<Vec<u32>>>>,
+    /// 会话级 arena 池：逐出计划归还整块，新形状 reset 复用（容量够时）。
+    /// 137MB 新块页提交 ~7ms vs 复用 ~0——形状多样性 × LRU 驱逐下每帧
+    /// 重建曾把它当固定税。池封顶 2 块（按容量优先留大）。
+    arena_pool: Mutex<Vec<Arena>>,
     /// 持有整个上下文。**必须声明在最后**：字段按声明序 drop——plans
     /// 里的管线/缓冲销毁要用设备，而设备销毁发生在 ctx（Arc<Inner>）
     /// 的最后一个引用释放时。ctx 在前 = 先毁设备再毁管线 = 对已销毁
@@ -210,11 +224,21 @@ impl VulkanSession {
             .find(|s| !s.is_empty())
             .cloned()
             .unwrap_or_default();
+        // SAFETY: 空初始数据；缓存归本会话（Drop 销毁），创建先于任何管线。
+        let pipeline_cache = unsafe {
+            ctx.device
+                .raw()
+                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+        }
+        .map_err(|e| Error::Device(format!("建管线缓存失败: {e}")))?;
         Ok(Self {
             graph,
             initializers,
             input_name,
             plans: Mutex::new(Vec::new()),
+            pipeline_cache,
+            repack_cache: Mutex::new(HashMap::new()),
+            arena_pool: Mutex::new(Vec::new()),
             ctx,
         })
     }
@@ -439,12 +463,23 @@ impl VulkanSession {
     }
 
     fn build_plan(&self, in_shape: &[i64]) -> Result<Plan> {
+        let t_build = std::time::Instant::now();
+        let t_shape0 = std::time::Instant::now();
         let table = planner::infer_shapes(
             &self.graph,
             &self.initializers,
             &[(self.input_name.clone(), in_shape.to_vec(), DType::F32)],
         )?;
 
+        let dbg2 = std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some();
+        if dbg2 {
+            eprintln!(
+                "[gpu][dbg] infer_shapes {:.1} ms",
+                t_shape0.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let t_node0 = std::time::Instant::now();
+        let mut t_map_acc = 0.0f64;
         let refs = consumer_counts(&self.graph);
         if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() {
             if let Some(n0) = self.graph.nodes.first() {
@@ -701,6 +736,7 @@ impl VulkanSession {
 
             // 节点 → 内核路由：n_ 路径可能展开多条 rec（reduce 两阶段），
             // f32 路径恒单条。
+            let t_map = std::time::Instant::now();
             #[allow(clippy::type_complexity)]
             let routes: Vec<(&'static str, Option<ParamBlock>, Vec<u8>, [u32; 3])> = if f32_mode {
                 let (k, pb, pc_inline, groups) = self.map_node(n, &table, &offs, &fused)?;
@@ -720,6 +756,7 @@ impl VulkanSession {
                 .map(|(k, pb, g)| (k, Some(pb), Vec::new(), g))
                 .collect()
             };
+            t_map_acc += t_map.elapsed().as_secs_f64();
             for (kernel, pb, pc_inline, groups) in routes {
                 if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() && n.name == "Conv.5" {
                     eprintln!(
@@ -801,6 +838,13 @@ impl VulkanSession {
             );
         }
 
+        if dbg2 {
+            eprintln!(
+                "[gpu][dbg] 节点环 {:.1} ms（其中 map_node_n {:.1}）",
+                t_node0.elapsed().as_secs_f64() * 1000.0,
+                t_map_acc * 1000.0
+            );
+        }
         // n_ 模式：exit 转换（每个图输出一条；sigmoid 融合的在节点环里挂单）。
         // 输出区按图输出顺序分配 f32 NCHW word 数——out_offs 指它（host 读回）。
         if !f32_mode {
@@ -884,21 +928,47 @@ impl VulkanSession {
             }
         }
         // === 实分配：整块一次（KernelSet 绑单缓冲）===
-        let mut arena = Arena::new(
-            self.ctx.device.raw().clone(),
-            self.ctx.mem_types.staging,
-            true,
-        );
-        let whole = arena
-            .alloc(layout.total as vk::DeviceSize * 4)
-            .map_err(|e| {
-                Error::Device(format!("计划整块分配失败（{} floats）: {e}", layout.total))
-            })?;
+        let t_alloc = std::time::Instant::now();
+        let dbg_time = std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some();
+        let need = layout.total as vk::DeviceSize * 4;
+        // 池里找容量够的块 reset 复用；没有再新建
+        let mut arena = {
+            let mut pool = self
+                .arena_pool
+                .lock()
+                .map_err(|_| Error::Device("arena 池锁中毒".into()))?;
+            let mut hit = None;
+            for i in 0..pool.len() {
+                if pool[i].reset_if_fits(need) {
+                    hit = Some(i);
+                    break;
+                }
+            }
+            match hit {
+                Some(i) => pool.swap_remove(i),
+                None => Arena::new(
+                    self.ctx.device.raw().clone(),
+                    self.ctx.mem_types.staging,
+                    true,
+                ),
+            }
+        };
+        let whole = arena.alloc(need).map_err(|e| {
+            Error::Device(format!("计划整块分配失败（{} floats）: {e}", layout.total))
+        })?;
         let (buf, buf_size) = arena
             .chunk_range()
             .ok_or_else(|| Error::Device("arena 空".into()))?;
-        let ks = KernelSet::new(self.ctx.device.raw(), buf, buf_size)?;
+        let ks =
+            KernelSet::new_with_cache(self.ctx.device.raw(), buf, buf_size, self.pipeline_cache)?;
 
+        if dbg_time {
+            eprintln!(
+                "[gpu][dbg] arena+KernelSet {:.1} ms",
+                t_alloc.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let t_up = std::time::Instant::now();
         // 权重 + 参数块上传（coherent 映射直写；统一 u32 word 视图）
         // 越界自查：主机侧写越界映射内存 = 打死设备（本机实测形态）。
         for (off, data) in upload.iter().chain(params.iter()) {
@@ -927,6 +997,13 @@ impl VulkanSession {
             }
         }
 
+        if dbg_time {
+            eprintln!(
+                "[gpu][dbg] 上传 {:.1} ms",
+                t_up.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        let t_rec = std::time::Instant::now();
         // 录制整图 dispatch 序列
         let dev = self.ctx.device.raw().clone();
         let cb = self.ctx.device.alloc_reusable_cb()?;
@@ -971,6 +1048,12 @@ impl VulkanSession {
         }
         self.ctx.device.end_reusable_cb(cb)?;
 
+        if dbg_time {
+            eprintln!(
+                "[gpu][dbg] CB 录制 {:.1} ms",
+                t_rec.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         let out_offs: Vec<(String, u32, usize)> = self
             .graph
             .outputs
@@ -994,9 +1077,10 @@ impl VulkanSession {
             .collect();
 
         eprintln!(
-            "[gpu] 计划就绪：输入 {in_shape:?}，{} 个 dispatch，整块 {:.1} MB",
+            "[gpu] 计划就绪：输入 {in_shape:?}，{} 个 dispatch，整块 {:.1} MB（建 {:.1} ms）",
             recs.len(),
-            layout.total as f64 * 4.0 / 1e6
+            layout.total as f64 * 4.0 / 1e6,
+            t_build.elapsed().as_secs_f64() * 1000.0
         );
         let dbg_recs: Vec<PlanRec> = recs
             .iter()
@@ -1017,6 +1101,8 @@ impl VulkanSession {
             .collect();
         Ok(Plan {
             base: whole.ptr,
+            block_bytes: layout.total as u64 * 4,
+            arena: Some(arena),
             recs: dbg_recs,
             // in_offs 指向 **f32 区**（host 每次 memcpy 的目标）。n_ 模式下
             // offs[input] 是 entry 转换出的 f16 区——拿它当 memcpy 目标会把
@@ -1028,7 +1114,6 @@ impl VulkanSession {
             out_shapes,
             cb,
             qpool,
-            _arena: arena,
             _ks: ks,
             _dev: dev.clone(),
         })
@@ -1167,9 +1252,11 @@ impl VulkanSession {
                         layout,
                         uploads,
                         w_offs,
+                        &self.repack_cache,
                         |t| repack_conv_w(&t.f32, co, ci, kh, kw),
                     )?;
-                    let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
+                    let b_off =
+                        self.n_bias_off(n, ws[0], layout, uploads, w_offs, &self.repack_cache)?;
                     // 残差（fuse_conv_residual 折进 conv 的 inputs[3]；
                     // NHWC 同布局直加，act 之后——镜像 CPU conv2d_res）
                     let r_off = if n.inputs.len() > 3 && !n.inputs[3].is_empty() {
@@ -1214,9 +1301,11 @@ impl VulkanSession {
                         layout,
                         uploads,
                         w_offs,
+                        &self.repack_cache,
                         |t| repack_dw_w(&t.f32, cch, kh, kw),
                     )?;
-                    let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
+                    let b_off =
+                        self.n_bias_off(n, ws[0], layout, uploads, w_offs, &self.repack_cache)?;
                     let r_off = if n.inputs.len() > 3 && !n.inputs[3].is_empty() {
                         off_of(&n.inputs[3])?
                     } else {
@@ -1270,9 +1359,11 @@ impl VulkanSession {
                     layout,
                     uploads,
                     w_offs,
+                    &self.repack_cache,
                     |t| repack_convt_w(&t.f32, ci, co, kh, kw),
                 )?;
-                let b_off = self.n_bias_off(n, ws[1], layout, uploads, w_offs)?;
+                let b_off =
+                    self.n_bias_off(n, ws[1], layout, uploads, w_offs, &self.repack_cache)?;
                 let (oh, ow) = (out_shape[2] as u32, out_shape[3] as u32);
                 let m_dim = oh * ow;
                 let nv = cpad4(ws[1]) / 4;
@@ -1550,6 +1641,7 @@ impl VulkanSession {
     }
 
     /// conv 族 bias 的惰性 f16 重排区。
+    #[allow(clippy::too_many_arguments)]
     fn n_bias_off(
         &self,
         n: &Node,
@@ -1557,6 +1649,7 @@ impl VulkanSession {
         layout: &mut Layout,
         uploads: &mut Vec<(u32, Vec<u32>)>,
         w_offs: &mut HashMap<String, u32>,
+        _repack_cache: &Mutex<HashMap<String, std::sync::Arc<Vec<u32>>>>,
     ) -> Result<u32> {
         if n.inputs.len() <= 2 || n.inputs[2].is_empty() {
             return Ok(OFF_NONE);
@@ -1567,6 +1660,7 @@ impl VulkanSession {
             layout,
             uploads,
             w_offs,
+            &self.repack_cache,
             |t| super::nhwc::conv_bias(&t.f32, co),
         )
     }
@@ -2010,6 +2104,7 @@ fn n_weight_off(
     layout: &mut Layout,
     uploads: &mut Vec<(u32, Vec<u32>)>,
     w_offs: &mut HashMap<String, u32>,
+    repack_cache: &Mutex<HashMap<String, std::sync::Arc<Vec<u32>>>>,
     repack: impl FnOnce(&Tensor) -> Vec<u32>,
 ) -> Result<u32> {
     if let Some(&o) = w_offs.get(name) {
@@ -2020,9 +2115,19 @@ fn n_weight_off(
             "n_ 路径：权重 {name} 不是 initializer（仅支持常量权重）"
         ))
     })?;
-    let data = repack(t);
+    // 重排与形状无关：会话级按名缓存（首次算，重建 memcpy）
+    let data = {
+        let mut cache = repack_cache
+            .lock()
+            .map_err(|_| Error::Device("重排缓存锁中毒".into()))?;
+        std::sync::Arc::clone(
+            cache
+                .entry(name.to_string())
+                .or_insert_with(|| std::sync::Arc::new(repack(t))),
+        )
+    };
     let off = layout.alloc_static(data.len() as u32);
-    uploads.push((off, data));
+    uploads.push((off, (*data).to_vec()));
     w_offs.insert(name.to_string(), off);
     Ok(off)
 }
@@ -2060,6 +2165,19 @@ fn pads4(n: &Node) -> (i64, i64, i64, i64) {
     }
 }
 
+impl Drop for VulkanSession {
+    fn drop(&mut self) {
+        // SAFETY: 缓存句柄由本会话独占；此刻 plans（含管线）已先行
+        // drop（字段声明序），ctx 的设备仍存活（ctx 是最后字段）。
+        unsafe {
+            self.ctx
+                .device
+                .raw()
+                .destroy_pipeline_cache(self.pipeline_cache, None)
+        };
+    }
+}
+
 impl DeviceSession for VulkanSession {
     fn kind(&self) -> DeviceKind {
         DeviceKind::Vulkan
@@ -2082,13 +2200,41 @@ impl DeviceSession for VulkanSession {
         if !plans.iter().any(|(s, _)| *s == in_shape) {
             let plan = self.build_plan(&in_shape)?;
             plans.push((in_shape.clone(), plan));
-            // LRU 封顶：每个计划 ≈ 整块 arena（62-125 MB @ 960 输入），
-            // 100 图语料的形状多样性会无界增长。4 个计划封顶——淘汰
-            // 最旧的（Vec 头部）。命中的形状下次重建（~10ms）。
-            const MAX_PLANS: usize = 4;
-            if plans.len() > MAX_PLANS {
-                let removed = plans.len() - MAX_PLANS;
-                plans.drain(0..removed);
+            // 字节预算封顶：每个计划 ≈ 整块 arena（100-140 MB @ 960 输入），
+            // 100 图语料的形状多样性会无界增长。按块大小淘汰最旧的
+            // （Vec 头部）直到总额 ≤ 预算；命中的形状下次重建
+            // （管线缓存已把重建压到 ~2ms）。
+            const DEFAULT_BUDGET_MB: u64 = 768;
+            let budget: u64 = std::env::var("QPPOCR_GPU_PLAN_MB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_BUDGET_MB);
+            let mut total: u64 = plans.iter().map(|(_, p)| p.block_bytes).sum();
+            let mut evicted_arenas: Vec<Arena> = Vec::new();
+            while total > budget * (1 << 20) && plans.len() > 1 {
+                let (_, mut evicted) = plans.remove(0);
+                total -= evicted.block_bytes;
+                if let Some(a) = evicted.arena.take() {
+                    evicted_arenas.push(a);
+                }
+            }
+            // 归还的块进池（封顶 2，按容量留大——下一形状 reset 复用）
+            if !evicted_arenas.is_empty() {
+                if let Ok(mut pool) = self.arena_pool.lock() {
+                    for a in evicted_arenas {
+                        pool.push(a);
+                        if pool.len() > 2 {
+                            // 淘汰容量最小的
+                            let mut min_i = 0;
+                            for i in 1..pool.len() {
+                                if pool[i].chunk_bytes() < pool[min_i].chunk_bytes() {
+                                    min_i = i;
+                                }
+                            }
+                            pool.swap_remove(min_i);
+                        }
+                    }
+                }
             }
         }
         let plan = plans

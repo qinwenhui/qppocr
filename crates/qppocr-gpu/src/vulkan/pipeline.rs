@@ -287,9 +287,23 @@ pub(crate) struct KernelSet {
 }
 
 impl KernelSet {
+    /// 无缓存版（一次性测试用）；会话内请走 [`Self::new_with_cache`]。
+    pub(crate) fn new(device: &Device, buffer: vk::Buffer, size: vk::DeviceSize) -> Result<Self> {
+        Self::new_with_cache(device, buffer, size, vk::PipelineCache::null())
+    }
+
     /// 建：单 SSBO 绑定（绑定 arena 的块缓冲）+ push constant 区
     /// （compute，0..128）+ 全部管线。
-    pub(crate) fn new(device: &Device, buffer: vk::Buffer, size: vk::DeviceSize) -> Result<Self> {
+    ///
+    /// `cache`：会话级管线缓存——同会话按形状重建计划时驱动侧复用
+    /// 编译产物（重建从 ~5-9ms 掉到 ~1-2ms；形状多样性 × LRU 驱逐会让
+    /// 每帧都重建，实测曾吃掉 det 的全部 GPU 收益）。
+    pub(crate) fn new_with_cache(
+        device: &Device,
+        buffer: vk::Buffer,
+        size: vk::DeviceSize,
+        cache: vk::PipelineCache,
+    ) -> Result<Self> {
         // 三视图绑定：binding 0 = f32[]（计算数据）、binding 1 = u32[]
         //（参数块）、binding 2 = f16vec4[]（NHWC-f16 内核族 + coopmat 装载）
         //——同一 VkBuffer 的别名视图，GLSL 侧按需声明。
@@ -392,10 +406,8 @@ impl KernelSet {
                 .layout(layout);
             // SAFETY: stage 引用的 module 存活；layout 存活。
             // （ash 0.38 返回 Result<Vec, (Vec, Result)>——部分失败也带产物，我们只要整体失败码。）
-            let made = unsafe {
-                device.create_compute_pipelines(vk::PipelineCache::null(), &[cp_ci], None)
-            }
-            .map_err(|(_, e)| Error::Device(format!("{name}: 建管线失败: {e}")))?;
+            let made = unsafe { device.create_compute_pipelines(cache, &[cp_ci], None) }
+                .map_err(|(_, e)| Error::Device(format!("{name}: 建管线失败: {e}")))?;
             let pipe = made[0];
             // SAFETY: module 可在管线创建后释放（管线持有其引用）。
             unsafe { device.destroy_shader_module(module, None) };
