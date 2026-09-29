@@ -173,6 +173,55 @@ fn numel(table: &planner::ShapeTable, name: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// 节点输出的存储形状 (rows, cols)——cols 为连续维。
+///
+/// rank-4 conv 族 = (N·H·W, Cpad)；MatMul = (批展开 M, Npad)；
+/// rank-3 的逐元素/softmax/BN 继承输入 rc（同形或广播不变行列）。
+fn node_out_rc(
+    n: &Node,
+    table: &planner::ShapeTable,
+    rc: &HashMap<String, (u32, u32)>,
+) -> std::result::Result<(u32, u32), String> {
+    let sh = |name: &str| -> Vec<i64> {
+        table
+            .values
+            .get(name)
+            .map(|v| v.shape.clone())
+            .unwrap_or_default()
+    };
+    if n.op_type == "MatMul" {
+        let a = sh(&n.inputs[0]);
+        let b = sh(&n.inputs[1]);
+        if a.len() < 2 || b.len() != 2 {
+            return Err(format!("MatMul 形状不支持：A={a:?} B={b:?}"));
+        }
+        let m: i64 = a[..a.len() - 1].iter().product();
+        let k = a[a.len() - 1];
+        let nn = b[1];
+        if k != b[0] {
+            return Err(format!("MatMul K 不符：A={a:?} B={b:?}"));
+        }
+        if k % 4 != 0 {
+            return Err(format!("MatMul K={k} 非 %4（A={a:?}）"));
+        }
+        return Ok((m as u32, super::nhwc::cpad4(nn)));
+    }
+    // 其余：rank-4 按形状；rank-3/2 继承输入
+    let o = sh(&n.outputs[0]);
+    if o.len() == 4 {
+        Ok(((o[0] * o[2] * o[3]) as u32, super::nhwc::cpad4(o[1])))
+    } else if let Some(r) = rc.get(&n.inputs[0]).copied() {
+        Ok(r)
+    } else {
+        Err(format!(
+            "{} 输出 rank-{} 无 rc 来源（输入 {} 未记账）",
+            n.op_type,
+            o.len(),
+            n.inputs[0]
+        ))
+    }
+}
+
 /// planner 形状表里取形状（缺项给空——调用方容错）。
 fn shape_of(table: &planner::ShapeTable, name: &str) -> Vec<i64> {
     table
@@ -243,15 +292,23 @@ impl VulkanSession {
         })
     }
 
-    /// 调试：给定形状返回 (整块基址, [(内核, 节点, 输出偏移, 输出元素数)])。
-    /// 测试读中间量统计用（n_ 模式的区域是 f16 NHWC）。
+    /// 调试：给定形状返回 (整块基址, [(内核, 节点, 偏移, 元素数, PC, 形状, 输入明细)])。
     #[allow(clippy::type_complexity)]
     pub(crate) fn debug_recs(
         &self,
         in_shape: &[i64],
     ) -> Option<(
         *mut u8,
-        Vec<(String, String, usize, u32, u32, Vec<u8>, Vec<i64>)>,
+        Vec<(
+            String,
+            String,
+            usize,
+            u32,
+            u32,
+            Vec<u8>,
+            Vec<i64>,
+            Vec<(String, u32, u32)>,
+        )>,
     )> {
         let plans = self.plans.lock().ok()?;
         let p = plans.iter().find(|(s, _)| s == in_shape).map(|(_, p)| p)?;
@@ -259,8 +316,17 @@ impl VulkanSession {
             p.base,
             p.recs
                 .iter()
-                .map(|(k, n, idx, o, on, pc, _, _, _, osh)| {
-                    (k.clone(), n.clone(), *idx, *o, *on, pc.clone(), osh.clone())
+                .map(|(k, n, idx, o, on, pc, _, ins, _, osh)| {
+                    (
+                        k.clone(),
+                        n.clone(),
+                        *idx,
+                        *o,
+                        *on,
+                        pc.clone(),
+                        osh.clone(),
+                        ins.clone(),
+                    )
                 })
                 .collect(),
         ))
@@ -488,6 +554,9 @@ impl VulkanSession {
             }
         }
         let mut live: HashMap<String, u32> = refs.clone();
+        // 环内 env 查询一次算好（Windows 上 var_os 是系统调用级开销，
+        // 曾以每节点 3 次的频率吃掉节点环 2/3 的时间——rec 计划实测 4.4ms）
+        let dbg_env = std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some();
 
         // 路径选择：默认 = n_ 内核族（NHWC f32 + k-major 权重；真实图与
         // 旧路径逐位一致 2e-8、GPU 总时间 24.7ms vs 旧路径 77ms）。
@@ -624,10 +693,10 @@ impl VulkanSession {
                             }))
                 {
                     let xs = shape_of(&table, &n.inputs[0]);
-                    if xs.len() == 4 && xs[0] == 1 {
-                        let m_blocks = (xs[2] * xs[3]) as u32;
-                        let m_blocks = m_blocks.div_ceil(1024);
-                        need = need.max(m_blocks * super::nhwc::cpad4(xs[1]));
+                    if xs.len() == 4 {
+                        let m_blocks = ((xs[2] * xs[3]) as u32).div_ceil(1024);
+                        let nb = xs[0] as u32;
+                        need = need.max(nb * m_blocks * super::nhwc::cpad4(xs[1]));
                     }
                 }
             }
@@ -641,6 +710,17 @@ impl VulkanSession {
         };
         // n_ 模式：exit 转换列表 (f16 源名, 图输出名, act)——节点环后统一发
         let mut pending_exits: Vec<(String, String, u32)> = Vec::new();
+        // n_ 模式：每张量的存储形状 (rows, cols)——cols 是连续维。
+        // rank-4 conv 族 = (N*H*W, Cpad)；MatMul 尾部 = (M, Npad)；
+        // Squeeze/Unsqueeze/Transpose(0,2,1) 是存储恒等（别名）。
+        // 形状不可从逻辑 shape 单向推导（同形 rank-3 有两种来源），
+        // 必须按生产者记账。
+        let mut rc: HashMap<String, (u32, u32)> = HashMap::new();
+        if !f32_mode {
+            let ish: Vec<i64> = in_shape.to_vec();
+            let (nr, cr) = (ish[0] * ish[2] * ish[3], super::nhwc::cpad4(ish[1]));
+            rc.insert(self.input_name.clone(), (nr as u32, cr));
+        }
         for i in 0..self.graph.nodes.len() {
             let n = &self.graph.nodes[i];
             if n.op_type != "HardSigmoid" && n.op_type != "Sigmoid" {
@@ -682,6 +762,38 @@ impl VulkanSession {
 
         for (node_idx, n) in self.graph.nodes.iter().enumerate() {
             let out = n.outputs[0].clone();
+            // ---- 存储恒等节点（Squeeze/Unsqueeze/Transpose(0,2,1)）：
+            // 零分配零 dispatch，输出别名输入。输入不释放（存活期 =
+            // 别名的最后消费者——记 immortal，泄漏量 ~25KB/节点可忽略）。
+            if !f32_mode {
+                let is_alias = match n.op_type.as_str() {
+                    "Reshape" => {
+                        // 存储恒等条件：元素数不变（纯形状重排）。
+                        // cls 尾部 Reshape([B,2]→[B,2]) 走这里；带 0/-1
+                        // 推断的动态 reshape 若改 numel 会在下方显式报错。
+                        let inn = table.values.get(&n.inputs[0]);
+                        let outn = table.values.get(&out);
+                        inn.map(|v| v.shape.iter().product::<i64>())
+                            == outn.map(|v| v.shape.iter().product::<i64>())
+                    }
+                    "Squeeze" | "Unsqueeze" => true,
+                    "Transpose" => {
+                        let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
+                        perm == [0, 2, 1] || perm == [0, 2, 3, 1] && false
+                    }
+                    _ => false,
+                };
+                if is_alias {
+                    let src = &n.inputs[0];
+                    if let Some(o) = offs.get(src).copied() {
+                        offs.insert(out.clone(), o);
+                        if let Some(r) = rc.get(src).copied() {
+                            rc.insert(out.clone(), r);
+                        }
+                        continue;
+                    }
+                }
+            }
             // 被融合的节点：跳过（其消费者 Mul 用 fused_* 内核替代）。
             // 不清输入——Mul 的 fused 内核直接读 HardSigmoid 的**输入**
             //（前激活门值），该张量仍需存活。
@@ -703,6 +815,7 @@ impl VulkanSession {
                     &self.initializers,
                     &self.input_name,
                     f32_mode,
+                    &rc,
                 );
                 continue;
             }
@@ -719,10 +832,23 @@ impl VulkanSession {
             // 输出区域先占（map_node 的参数要引用它）。
             // n_ 模式按 NHWC-f16 word 数（含 Cpad4 padding）。
             let out_n = numel(&table, &out);
+            // 输出存储形状（n_ 模式）：rank-4 按形状；MatMul 按 [M,N]；
+            // rank-3 逐元素/softmax/BN 继承输入的 rc（生产者记账）。
+            let out_rc = if f32_mode {
+                None
+            } else {
+                Some(
+                    node_out_rc(n, &table, &rc)
+                        .map_err(|e| Error::Graph(format!("{}: {e}", n.name)))?,
+                )
+            };
             let out_words = if f32_mode {
                 out_n
-            } else {
+            } else if out_v.shape.len() == 4 {
                 super::nhwc::nhwc_words(&out_v.shape)
+            } else {
+                let (r, c) = out_rc.unwrap_or((out_n, super::nhwc::cpad4(1)));
+                r * c
             };
             let out_off = layout.alloc(out_words);
             if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() {
@@ -733,6 +859,9 @@ impl VulkanSession {
             }
             ledger.push((format!("n:{}", n.name), out_off, out_words));
             offs.insert(out.clone(), out_off);
+            if let Some(r) = out_rc {
+                rc.insert(out.clone(), r);
+            }
 
             // 节点 → 内核路由：n_ 路径可能展开多条 rec（reduce 两阶段），
             // f32 路径恒单条。
@@ -751,6 +880,7 @@ impl VulkanSession {
                     &mut upload,
                     &mut w_offs,
                     reduce_scratch,
+                    &mut rc,
                 )?
                 .into_iter()
                 .map(|(k, pb, g)| (k, Some(pb), Vec::new(), g))
@@ -758,7 +888,7 @@ impl VulkanSession {
             };
             t_map_acc += t_map.elapsed().as_secs_f64();
             for (kernel, pb, pc_inline, groups) in routes {
-                if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() && n.name == "Conv.5" {
+                if dbg_env && n.name == "Conv.5" {
                     eprintln!(
                         "[gpu][dbg] {} 输入形状: {:?}",
                         n.name,
@@ -835,6 +965,7 @@ impl VulkanSession {
                 &self.initializers,
                 &self.input_name,
                 f32_mode,
+                &rc,
             );
         }
 
@@ -869,9 +1000,37 @@ impl VulkanSession {
                 let Some(v) = table.values.get(&name) else {
                     return Err(Error::Graph(format!("exit：图输出 {name} 无形状")));
                 };
-                let (nb, c, h, w) = (v.shape[0], v.shape[1], v.shape[2], v.shape[3]);
                 let out_words = numel(&table, &name);
                 let out_off = layout.alloc(out_words);
+                if v.shape.len() != 4 {
+                    // rank-3 输出（rec 的 [B,T,V]）：存储 = NCHW 行主序
+                    // 的恒等拷贝（cols=V 连续 = NCHW 最后轴），f32→f32。
+                    // pad 列（cpad 超出 V）不写出。
+                    let (rows, cpad) = rc.get(&src_name).copied().ok_or_else(|| {
+                        Error::Graph(format!("exit：rank-{} 输出 {name} 无 rc", v.shape.len()))
+                    })?;
+                    let real_cols = *v.shape.last().unwrap() as u32;
+                    let mut pb = ParamBlock::new();
+                    pb.u(src_off).u(out_off).u(rows).u(real_cols).u(cpad);
+                    let p_off = layout.alloc_static(pb.len_words());
+                    ledger.push((format!("p:<exit3:{name}>"), p_off, pb.len_words()));
+                    params.push((p_off, pb.words().to_vec()));
+                    recs.push(Rec {
+                        kernel: "n_exit3",
+                        node: format!("<exit3:{name}>"),
+                        node_idx: usize::MAX,
+                        out_off,
+                        out_n: out_words,
+                        pc: super::pipeline::PcParams { p_off }.bytes().to_vec(),
+                        groups: [(rows * real_cols).div_ceil(256), 1, 1],
+                        ins: vec![(src_name.clone(), src_off, out_words)],
+                        in_shapes: vec![v.shape.clone()],
+                        out_shape: v.shape.clone(),
+                    });
+                    offs.insert(name.clone(), out_off);
+                    continue;
+                }
+                let (nb, c, h, w) = (v.shape[0], v.shape[1], v.shape[2], v.shape[3]);
                 let mut pb = ParamBlock::new();
                 pb.u(src_off)
                     .u(out_off)
@@ -1207,6 +1366,7 @@ impl VulkanSession {
         uploads: &mut Vec<(u32, Vec<u32>)>,
         w_offs: &mut HashMap<String, u32>,
         reduce_scratch: u32,
+        rc: &mut HashMap<String, (u32, u32)>,
     ) -> Result<Vec<(&'static str, ParamBlock, [u32; 3])>> {
         use super::nhwc::{cpad4, repack_conv_w, repack_convt_w, repack_dw_w};
         let shape_of = |name: &str| -> Vec<i64> {
@@ -1450,32 +1610,30 @@ impl VulkanSession {
                     }
                 }
                 let xs = shape_of(&n.inputs[0]);
-                if xs[0] != 1 {
-                    return Err(Error::Graph("n_ 路径 SE 归约只支持 N=1".into()));
-                }
                 let cp = cpad4(xs[1]);
                 if cp > 256 {
                     return Err(Error::Graph(format!(
                         "n_ 路径 SE 归约通道 {cp} > 256（两阶段内核上限）"
                     )));
                 }
+                let nb = xs[0] as u32;
                 let m_dim = (xs[2] * xs[3]) as u32;
                 let m_blocks = m_dim.div_ceil(1024);
-                // 阶段 1：分块部分和 → scratch
+                // 阶段 1：分块部分和 → scratch（每批一段）
                 let mut pb1 = ParamBlock::new();
                 pb1.u(off_of(&n.inputs[0])?)
                     .u(reduce_scratch)
                     .u(m_dim)
                     .u(cp);
-                let r1 = ("n_reduce_hw", pb1, [m_blocks, 1, 1]);
-                // 阶段 2：scratch → f16 gate
+                let r1 = ("n_reduce_hw", pb1, [m_blocks, nb, 1]);
+                // 阶段 2：scratch → gate
                 let mut pb2 = ParamBlock::new();
                 pb2.u(reduce_scratch)
                     .u(off_of(out)?)
                     .u(m_blocks)
                     .u(cp)
                     .u(m_dim);
-                let r2 = ("n_reduce_fin", pb2, [1, 1, 1]);
+                let r2 = ("n_reduce_fin", pb2, [nb, 1, 1]);
                 Ok(vec![r1, r2])
             }
             "Resize" => {
@@ -1541,6 +1699,161 @@ impl VulkanSession {
                 }
                 Ok(vec![("n_concat_c", pb, [div256(hw * out_c4), 1, 1])])
             }
+            "MatMul" => {
+                // [.., M, K] × [K, N] = 1×1 conv 语义复用 n_conv8：
+                // A 存储天然 [M 行, K 列]（NHWC C=K）；B 转置成 [N,K] 后
+                // 按 [Co=N, Ci=K, 1,1] k-major 重排。
+                let a = shape_of(&n.inputs[0]);
+                let b = shape_of(&n.inputs[1]);
+                if b.len() != 2 {
+                    return Err(Error::Graph(format!("MatMul B 需 2D [K,N]，实得 {b:?}")));
+                }
+                let m_dim = a[..a.len() - 1].iter().product::<i64>() as u32;
+                let (k, nn) = (b[0] as usize, b[1] as usize);
+                let bt = self.initializers.get(&n.inputs[1]).ok_or_else(|| {
+                    Error::Graph(format!(
+                        "MatMul B {} 不是 initializer（仅支持常量）",
+                        n.inputs[1]
+                    ))
+                })?;
+                let mut w_t = vec![0f32; nn * k];
+                for i in 0..k {
+                    for j in 0..nn {
+                        w_t[j * k + i] = bt.f32[i * nn + j];
+                    }
+                }
+                let w_off = n_weight_off(
+                    &self.initializers,
+                    &n.inputs[1],
+                    layout,
+                    uploads,
+                    w_offs,
+                    &self.repack_cache,
+                    |_| super::nhwc::repack_conv_w(&w_t, nn, k, 1, 1),
+                )?;
+                let (_, cols) = rc
+                    .get(out)
+                    .copied()
+                    .ok_or_else(|| Error::Graph("MatMul 输出无 rc".into()))?;
+                let nv = cols / 4;
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(&n.inputs[0])?)
+                    .u(w_off)
+                    .u(OFF_NONE)
+                    .u(off_of(out)?)
+                    .u(m_dim)
+                    .u(cols)
+                    .u(m_dim) // outW
+                    .u(m_dim) // inW：边界检查用（iw 最大 = m-1）
+                    .u(1) // inH
+                    .u(super::nhwc::cpad4(k as i64) / 4)
+                    .u(1)
+                    .u(1)
+                    .u(1)
+                    .u(1)
+                    .u(0)
+                    .u(0)
+                    .u(0)
+                    .f(std::f32::consts::SQRT_2)
+                    .f(1.0)
+                    .f(0.5)
+                    .u(OFF_NONE);
+                if nv % 2 == 0 {
+                    Ok(vec![(
+                        "n_conv8",
+                        pb,
+                        [div256(m_dim.div_ceil(4) * (nv / 2)), 1, 1],
+                    )])
+                } else {
+                    Ok(vec![("n_conv", pb, [div256(m_dim.div_ceil(4) * nv), 1, 1])])
+                }
+            }
+            "Softmax" => {
+                let axis = planner::get_i(n.attr("axis"), -1);
+                let osh = shape_of(out);
+                let r = if axis < 0 {
+                    osh.len() as i64 + axis
+                } else {
+                    axis
+                };
+                if r != osh.len() as i64 - 1 {
+                    return Err(Error::Graph(format!(
+                        "Softmax 只支持最后轴，实得 axis={axis}"
+                    )));
+                }
+                let (rows, cpad) = rc
+                    .get(&n.inputs[0])
+                    .copied()
+                    .ok_or_else(|| Error::Graph("Softmax 输入无 rc".into()))?;
+                let cols = osh.last().copied().unwrap_or(0) as u32;
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(&n.inputs[0])?)
+                    .u(off_of(out)?)
+                    .u(rows)
+                    .u(cols)
+                    .u(cpad);
+                Ok(vec![("n_softmax", pb, [rows, 1, 1])])
+            }
+            "BatchNormalization" => {
+                let xs = shape_of(&n.inputs[0]);
+                if xs.len() != 3 && xs.len() != 4 {
+                    return Err(Error::Graph(format!("BN 只支持 rank-3/4，实得 {xs:?}")));
+                }
+                let c = xs[1] as usize;
+                let eps = planner::get_f(n.attr("epsilon"), 1e-5);
+                let get = |nm: &str| -> Result<Vec<f32>> {
+                    self.initializers
+                        .get(nm)
+                        .map(|t| t.f32.to_vec())
+                        .ok_or_else(|| Error::Graph(format!("BN 参数 {nm} 不是 initializer")))
+                };
+                let scale = get(&n.inputs[1])?;
+                let bv = get(&n.inputs[2])?;
+                let mean = get(&n.inputs[3])?;
+                let var = get(&n.inputs[4])?;
+                let mut g = vec![0f32; c];
+                let mut bb = vec![0f32; c];
+                for i in 0..c {
+                    let sc = scale.get(i).copied().unwrap_or(1.0)
+                        / (var.get(i).copied().unwrap_or(0.0) + eps).sqrt();
+                    g[i] = sc;
+                    bb[i] = bv.get(i).copied().unwrap_or(0.0)
+                        - mean.get(i).copied().unwrap_or(0.0) * sc;
+                }
+                let pack_c = |vals: &[f32]| -> Vec<u32> {
+                    let cp = super::nhwc::cpad4(c as i64) as usize;
+                    let mut v = vec![0f32; cp];
+                    v[..c].copy_from_slice(vals);
+                    v.iter().map(|f| f.to_bits()).collect()
+                };
+                let g_off = {
+                    let data = pack_c(&g);
+                    let off = layout.alloc_static(data.len() as u32);
+                    uploads.push((off, data));
+                    off
+                };
+                let b_off2 = {
+                    let data = pack_c(&bb);
+                    let off = layout.alloc_static(data.len() as u32);
+                    uploads.push((off, data));
+                    off
+                };
+                let (rows, cpad) = rc
+                    .get(&n.inputs[0])
+                    .copied()
+                    .ok_or_else(|| Error::Graph("BN 输入无 rc".into()))?;
+                let mut pb = ParamBlock::new();
+                pb.u(5u32) // op=bn：a*g + b 双通道广播
+                    .u(off_of(&n.inputs[0])?)
+                    .u(g_off)
+                    .u(b_off2)
+                    .u(off_of(out)?)
+                    .u(rows * cpad)
+                    .u(cpad)
+                    .f(0.0)
+                    .f(0.0);
+                Ok(vec![("n_channel", pb, [div256(rows * cpad / 4), 1, 1])])
+            }
             "Sigmoid" | "Relu" | "HardSigmoid" | "Clip" => {
                 let (op, p1, p2) = match n.op_type.as_str() {
                     "Sigmoid" => (1u32, 0f32, 0f32),
@@ -1556,7 +1869,12 @@ impl VulkanSession {
                         planner::get_f(n.attr("max"), 3.4e38),
                     ),
                 };
-                let n_words = super::nhwc::nhwc_words(&shape_of(&n.inputs[0]));
+                let n_words = if shape_of(&n.inputs[0]).len() == 4 {
+                    super::nhwc::nhwc_words(&shape_of(&n.inputs[0]))
+                } else {
+                    let (r, c) = rc.get(&n.inputs[0]).copied().unwrap_or((0, 0));
+                    r * c
+                };
                 let mut pb = ParamBlock::new();
                 pb.u(op)
                     .u(off_of(&n.inputs[0])?)
@@ -1571,7 +1889,12 @@ impl VulkanSession {
                 let a = shape_of(&n.inputs[0]);
                 let b = shape_of(&n.inputs[1]);
                 let b_n = numel(table, &n.inputs[1]);
-                let a_words = super::nhwc::nhwc_words(&a);
+                let a_words = if a.len() == 4 {
+                    super::nhwc::nhwc_words(&a)
+                } else {
+                    let (r, c) = rc.get(&n.inputs[0]).copied().unwrap_or((0, 0));
+                    r * c
+                };
                 if a == b {
                     let mut pb = ParamBlock::new();
                     pb.u(if n.op_type == "Add" { 4 } else { 5 })
@@ -1582,7 +1905,8 @@ impl VulkanSession {
                         .f(0.0)
                         .f(0.0);
                     Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
-                } else if b.len() == 4 && b_n == b[1] as u32 {
+                } else if b.len() == 4 && b[2] == 1 && b[3] == 1 && b[0] == a[0] && b[1] == a[1] {
+                    // [N,C,1,1] 通道广播（rec 批的 SE 门；n==b 的批维）
                     // [1,C,1,1] 通道广播；SE 融合门 → fused（读前激活值）
                     let gate_producer = self
                         .graph
@@ -1623,9 +1947,38 @@ impl VulkanSession {
                         .f(p1)
                         .f(p2);
                     Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
+                } else if b.len() == 1 && a.last() == Some(&b[0]) && a.len() >= 2 {
+                    // [V] 尾轴广播（rank-2/3 的 a：cls 的 Add([B,2],[2])、
+                    // rec 的 MatMul bias）——存储列 = 尾轴 → n_channel
+                    let (rows, cpad) = rc
+                        .get(&n.inputs[0])
+                        .copied()
+                        .ok_or_else(|| Error::Graph("[1,V] 广播输入无 rc".into()))?;
+                    let mut pb = ParamBlock::new();
+                    pb.u(if n.op_type == "Add" { 1u32 } else { 0u32 })
+                        .u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(OFF_NONE)
+                        .u(off_of(out)?)
+                        .u(rows * cpad)
+                        .u(cpad)
+                        .f(0.0)
+                        .f(0.0);
+                    Ok(vec![("n_channel", pb, [div256(rows * cpad / 4), 1, 1])])
+                } else if b.len() == 1 && b_n == 1 {
+                    // 标量广播：[V] 退化成单值（cls 的 gate×标量）
+                    let mut pb = ParamBlock::new();
+                    pb.u(if n.op_type == "Add" { 6u32 } else { 7u32 })
+                        .u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(off_of(out)?)
+                        .u(a_words)
+                        .f(0.0)
+                        .f(0.0);
+                    Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
                 } else {
                     Err(Error::Graph(format!(
-                        "n_ 路径 {}：只支持同形或 [1,C,1,1] 广播，实得 {a:?} vs {b:?}",
+                        "n_ 路径 {}：只支持同形或 [1,C,1,1]/[V] 广播，实得 {a:?} vs {b:?}",
                         n.op_type
                     )))
                 }
@@ -2032,7 +2385,7 @@ impl VulkanSession {
             "Add" | "Mul" => {
                 let a = shape_of(&n.inputs[0]);
                 let b = shape_of(&n.inputs[1]);
-                let b_n = numel(table, &n.inputs[1]);
+                let _b_n = numel(table, &n.inputs[1]);
                 if a == b {
                     let pc = PcBinary {
                         a_off: off_of(&n.inputs[0])?,
@@ -2046,7 +2399,8 @@ impl VulkanSession {
                         pc.bytes().to_vec(),
                         [out_n / 256 + 1, 1, 1],
                     ))
-                } else if b.len() == 4 && b_n == b[1] as u32 {
+                } else if b.len() == 4 && b[2] == 1 && b[3] == 1 && b[0] == a[0] && b[1] == a[1] {
+                    // [N,C,1,1] 通道广播（rec 批的 SE 门；n==b 的批维）
                     // [1,C,1,1] 通道广播
                     // SE 融合：门的激活算子被跳过时，用 fused_*_mul
                     //（一趋 NCHW 读写替代独立门 dispatch + mul_c 两趋）
@@ -2258,6 +2612,14 @@ impl DeviceSession for VulkanSession {
 
         for (nm, t) in &inputs {
             if let Some(off) = plan.in_offs.get(nm) {
+                if std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some() {
+                    eprintln!(
+                        "[gpu][io] 输入 {nm} → @{off}（tensor.name={:?} len={} 头={:?})",
+                        t.name,
+                        t.f32.len(),
+                        &t.f32.as_slice()[..4.min(t.f32.len())]
+                    );
+                }
                 // SAFETY: base 是整块持久映射；off+len 在 total 内（按输入形状分配）。
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -2318,6 +2680,7 @@ fn release_inputs(
     initializers: &HashMap<String, Tensor>,
     input_name: &str,
     f32_mode: bool,
+    rc_free: &HashMap<String, (u32, u32)>,
 ) {
     let dbg = std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some();
     for inn in &n.inputs {
@@ -2338,7 +2701,13 @@ fn release_inputs(
                         eprintln!("[gpu][live] {inn} @{} 释放于 {}", o, n.name);
                     }
                     let size = match table.values.get(inn) {
-                        Some(v) if !f32_mode => super::nhwc::nhwc_words(&v.shape),
+                        Some(v) if !f32_mode && v.shape.len() == 4 => {
+                            super::nhwc::nhwc_words(&v.shape)
+                        }
+                        Some(_) if !f32_mode => {
+                            // rank-3 等：按记账的 (rows, cols)（MatMul 尾链）
+                            rc_free.get(inn).copied().map(|(r, c)| r * c).unwrap_or(0)
+                        }
                         _ => numel(table, inn),
                     };
                     if std::env::var_os("QPPOCR_GPU_NO_FREE").is_none() {

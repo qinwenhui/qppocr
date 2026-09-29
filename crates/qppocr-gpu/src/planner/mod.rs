@@ -426,3 +426,63 @@ mod extra_tests {
         );
     }
 }
+
+/// rec 图（优化后）的算子直方图 + 形状——评估 n_ 内核族覆盖面。
+#[test]
+fn rec_op_histogram() {
+    use qppocr_core::executor::Session;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    let p = PathBuf::from("../../models/tiny/rec.onnx");
+    if !p.is_file() {
+        eprintln!("[plan] 无模型，跳过");
+        return;
+    }
+    let session = Session::from_memory(&std::fs::read(&p).unwrap(), "tiny.rec").unwrap();
+    let (graph, init) = session.into_parts();
+    let mut ops: BTreeMap<String, usize> = BTreeMap::new();
+    for n in &graph.nodes {
+        *ops.entry(n.op_type.clone()).or_default() += 1;
+    }
+    eprintln!("[rec] ops: {:?}", ops);
+    eprintln!("[rec] nodes={} inits={}", graph.nodes.len(), init.len());
+    eprintln!("[rec] inputs: {:?}", graph.inputs);
+    eprintln!("[rec] outputs: {:?}", graph.outputs);
+    // 逐节点打印（非 Conv 的细节 + Conv 的形状由 planner 推）
+    let table = crate::planner::infer_shapes(
+        &graph,
+        &init,
+        &[(
+            graph
+                .inputs
+                .iter()
+                .find(|s| !s.is_empty())
+                .cloned()
+                .unwrap(),
+            vec![1, 3, 48, 320],
+            qppocr_core::tensor::DType::F32,
+        )],
+    )
+    .unwrap();
+    for (i, n) in graph.nodes.iter().enumerate() {
+        if n.op_type != "Conv" {
+            let sh: Vec<String> = n
+                .inputs
+                .iter()
+                .map(|inn| {
+                    table
+                        .values
+                        .get(inn)
+                        .map(|v| format!("{:?}", v.shape))
+                        .unwrap_or_else(|| "?".into())
+                })
+                .collect();
+            let osh = table
+                .values
+                .get(&n.outputs[0])
+                .map(|v| format!("{:?}", v.shape))
+                .unwrap_or_else(|| "?".into());
+            eprintln!("[rec] #{i} {} {:?} -> {}", n.op_type, sh, osh);
+        }
+    }
+}

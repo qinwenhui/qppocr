@@ -16,10 +16,11 @@ void main() {
     uint mBlocks = params[P + 2], cDim = params[P + 3], mDim = params[P + 4];
 
     uint lid = gl_LocalInvocationID.x;
+    uint nb_idx = gl_GlobalInvocationID.x / 256u; // grid.x=nb，每 WG 一批
     float acc = 0.0;
     if (lid < cDim) {
         for (uint b = 0u; b < mBlocks; b++) {
-            acc += data[scratch_off + b * cDim + lid];
+            acc += data[scratch_off + (nb_idx * mBlocks + b) * cDim + lid];
         }
     }
     accs[lid] = acc;
@@ -27,6 +28,6 @@ void main() {
     // 每 4 通道一线程拼 vec4 写出（cDim 为 %4 对齐——分配保证）
     if (lid % 4u == 0u && lid < cDim) {
         vec4 v = vec4(accs[lid], accs[lid + 1u], accs[lid + 2u], accs[lid + 3u]);
-        d[(out_off >> 2) + (lid >> 2)] = vec4(v / float(mDim));
+        d[(out_off >> 2) + nb_idx * (cDim >> 2) + (lid >> 2)] = vec4(v / float(mDim));
     }
 }

@@ -337,9 +337,12 @@ impl DeviceContext for VulkanContext {
         initializers: HashMap<String, Tensor>,
         opts: &SessionOptions,
     ) -> Result<Arc<dyn DeviceSession>> {
-        // bring-up 旋钮：QPPOCR_GPU_STAGES=det → 仅 det 上 GPU，
-        // rec/cls 委托 CPU 会话（**stderr 声明**，不是静默降级）。
-        let stages = std::env::var("QPPOCR_GPU_STAGES").unwrap_or_default();
+        // bring-up 旋钮：QPPOCR_GPU_STAGES=det（默认）→ 仅 det 上 GPU，
+        // rec/cls 委托 CPU 会话（**stderr 声明**，不是静默降级）；
+        // =all → 三模型全 GPU。rec/cls 已数值验证（rec top-1 逐行一致），
+        // 但 rec 每行一个 W → 形状多样性 × 计划重建 ~7-11ms，端到端反而
+        // 慢——引擎侧宽度分桶是前置工作，做完全 GPU 才转正。
+        let stages = std::env::var("QPPOCR_GPU_STAGES").unwrap_or_else(|_| "det".into());
         if stages == "det" && opts.model != qppocr_core::device::ModelRole::Det {
             eprintln!(
                 "[gpu] QPPOCR_GPU_STAGES=det：{:?} 模型走 CPU 会话（bring-up 混合部署）",

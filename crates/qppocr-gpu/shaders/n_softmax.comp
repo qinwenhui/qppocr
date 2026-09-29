@@ -1,0 +1,74 @@
+// 逐行 softmax（rec 头：[rows × vocab]，最后轴；pad 列按 -inf 处理）。
+// 一 WG（256 线程）一行：block 归约 max → exp → sum → 归一。
+//   params: in_off, out_off, rows, cols, cpad（存储列数，cols ≤ cpad）
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer F32 { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+shared float red[256];
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint rows = params[P + 2], cols = params[P + 3], cpad = params[P + 4];
+
+    uint row = gl_WorkGroupID.x;
+    if (row >= rows) return;
+    uint base = in_off + row * cpad;
+    uint obase = out_off + row * cpad;
+    uint lid = gl_LocalInvocationID.x;
+
+    // 1) 行 max（pad 列视 -inf）
+    float m = -3.4e38;
+    for (uint j = lid; j < cols; j += 256u) {
+        m = max(m, data[base + j]);
+    }
+    float wm = subgroupMax(m);
+    if (subgroupElect()) red[gl_SubgroupID] = wm;
+    barrier();
+    if (lid < gl_NumSubgroups && lid % 4u == 0u) {
+        float v = red[lid];
+        if (lid + 1u < gl_NumSubgroups) v = max(v, red[lid + 1u]);
+        if (lid + 2u < gl_NumSubgroups) v = max(v, red[lid + 2u]);
+        if (lid + 3u < gl_NumSubgroups) v = max(v, red[lid + 3u]);
+        red[lid / 4u] = v;
+    }
+    barrier();
+    float rowmax = red[0];
+    for (uint g = 1u; g < (gl_NumSubgroups + 3u) / 4u; g++) {
+        rowmax = max(rowmax, red[g]);
+    }
+
+    // 2) exp(x - max) 求和（CPU 镜像：softmax.rs 用 exp 多项式；这里
+    // 硬件 exp——rec 的输出是概率，容差在 verify.py 逐字符层兜底）
+    float s = 0.0;
+    for (uint j = lid; j < cols; j += 256u) {
+        float e = exp(data[base + j] - rowmax);
+        data[obase + j] = e;
+        s += e;
+    }
+    float ws = subgroupAdd(s);
+    if (subgroupElect()) red[gl_SubgroupID] = ws;
+    barrier();
+    if (lid < gl_NumSubgroups && lid % 4u == 0u) {
+        float v = red[lid];
+        if (lid + 1u < gl_NumSubgroups) v += red[lid + 1u];
+        if (lid + 2u < gl_NumSubgroups) v += red[lid + 2u];
+        if (lid + 3u < gl_NumSubgroups) v += red[lid + 3u];
+        red[lid / 4u] = v;
+    }
+    barrier();
+    float rowsum = red[0];
+    for (uint g = 1u; g < (gl_NumSubgroups + 3u) / 4u; g++) {
+        rowsum += red[g];
+    }
+
+    // 3) 归一；pad 列写 0
+    for (uint j = lid; j < cpad; j += 256u) {
+        data[obase + j] = j < cols ? data[obase + j] / rowsum : 0.0;
+    }
+}

@@ -23,7 +23,11 @@ void main() {
     if (gid >= nv) return;
     uint ib = in_off >> 2;
 
-    if (op == 4u) { // add
+    if (op == 6u || op == 7u) { // 标量广播（cls 的 Mul([1,C,1,1],[1])）
+        vec4 a = vec4(d[ib + gid]);
+        vec4 sv = vec4(d[(in2_off >> 2)]); // 标量在 lane0（旁 lane 是分配对齐垃圾）
+        d[(out_off >> 2) + gid] = vec4(op == 6u ? a + sv.x : a * sv.x);
+    } else if (op == 4u) { // add
         vec4 a = vec4(d[ib + gid]), b = vec4(d[(in2_off >> 2) + gid]);
         d[(out_off >> 2) + gid] = vec4(a + b);
     } else if (op == 5u) { // mul
