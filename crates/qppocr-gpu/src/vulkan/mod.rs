@@ -337,18 +337,15 @@ impl DeviceContext for VulkanContext {
         initializers: HashMap<String, Tensor>,
         opts: &SessionOptions,
     ) -> Result<Arc<dyn DeviceSession>> {
-        // 部署分级（QPPOCR_GPU_STAGES，默认 **detrec**）：det+rec 上 GPU、
-        // cls 留 CPU。=det 可退回仅-det（rec 走 CPU——一次性单图冷进程
-        // 避付 rec 计划构建税 ~13ms×桶数，冷机单图实测 85 vs 158ms）。
-        // 转正依据（bench/COMPARISON.md 2026-09-30 各节）：持续/批量
-        // detrec 全链反超纯 CPU 26% 且 CPU 线程全释放、机器热态下
-        // det-only 的 CPU rec 劣化 37→60ms 而 detrec 恒稳；冷机语料
-        // 1.028 平手；精度逐位同（GT 860/1036）。
-        // cls 恒 CPU（=all 才上 GPU）：GPU cls argmax 真实图 ~14% 行边界
-        // 翻转分歧（翻转错=毁整行）且更慢（5.3 vs 4.2ms）。委托 CPU 时
-        // **stderr 声明**，不是静默降级。
-        let stages =
-            std::env::var("QPPOCR_GPU_STAGES").unwrap_or_else(|_| "detrec".into());
+        // 部署分级（QPPOCR_GPU_STAGES，默认 **all**）：det+rec+cls 全上
+        // GPU。=detrec 可退回 cls-CPU、=det 退回仅-det（rec 走 CPU——
+        // 一次性单图冷进程避付 rec 计划构建税 ~13ms×桶数）。
+        // cls 上 GPU 的旧否决已双双翻案（2026-09-30（十三）节）：①「~14%
+        // 行翻转分歧」是批维 bug 时代的产物——现 GT 两档逐位全同、100 图
+        // 1096 行（含 rotation）逐位同；②「GPU cls 更慢 5.3 vs 4.2ms」是
+        // 引擎 cls 批化（per=8）前的旧账——现 =all 比 detrec 快 1.3%
+        // （abx 0.987 稳定）。委托 CPU 时 **stderr 声明**，不是静默降级。
+        let stages = std::env::var("QPPOCR_GPU_STAGES").unwrap_or_else(|_| "all".into());
         let gpu_ok = match opts.model {
             qppocr_core::device::ModelRole::Det => true,
             qppocr_core::device::ModelRole::Rec => stages == "detrec" || stages == "all",
