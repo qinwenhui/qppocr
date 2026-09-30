@@ -33,9 +33,12 @@ void main() {
 
     vec4 a = vec4(d[(a_off >> 2) + gid]);
     // 门行 = 特征行 / hw（批维）；det N=1 时 hw=特征行数 → 恒第 0 行
-    uint gateRow = (gid / c4) / hw;
-    // real_n 早退：gateRow 即批下标（[V] 单行门恒 0 不触发）
-    if (params[0] != 0u && gateRow >= params[0]) return; // real_n=0 = 不限（裸 dispatch 安全默认）
+    uint featRow = gid / c4;
+    uint gateRow = featRow / hw;
+    // real_n 早退（按特征行判批，两种门形都覆盖：[N,C,1,1] 门 featRow/hw
+    // 即批下标；[V] 单行门 hw=批内全部行 → featRow ≥ rn*hw 即空批行，
+    // 旧守卫 gateRow>=rn 对它恒不触发、曾白算全部补齐行）
+    if (params[0] != 0u && featRow >= params[0] * hw) return; // real_n=0 = 不限（裸 dispatch 安全默认）
     vec4 g = vec4(d[(gate_off >> 2) + gateRow * c4 + rowC4]);
     vec4 o;
     if (op == 0u) o = a * g;
