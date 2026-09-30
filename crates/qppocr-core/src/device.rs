@@ -45,8 +45,8 @@ pub struct DeviceInfo {
     pub api: String,
 }
 
-/// 模型在流水线里的角色（GPU 路径按角色决定部署策略——bring-up 期的
-/// 混合部署：`QPPOCR_GPU_STAGES=det` 时 rec/cls 走 CPU）。
+/// 模型在流水线里的角色（GPU 路径按角色决定部署分级：默认 det+rec
+/// 上 GPU、cls 留 CPU；`QPPOCR_GPU_STAGES=det` 退回仅 det）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ModelRole {
     /// 检测模型（det）。
