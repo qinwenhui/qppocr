@@ -3036,84 +3036,119 @@ fn small_rec_gpu_vs_cpu() {
     unsafe { std::env::remove_var("QPPOCR_GPU_NO_FREE") };
     let (base, recs) = gpu.debug_recs(&[b as i64, 3, hh as i64, ww as i64]).expect("无计划");
 
-    // GPU 张量 vs 全部 CPU dump（形状乘积相同即比）：报首个大分歧
-    let mut first_bad: Option<(usize, String)> = None;
-    // 全量非有限扫描（无论匹配与否）：NaN/Inf 的首个生产者
-    for (i, (kernel, node, _idx, off, n, _pc, _osh, _ins2)) in recs.iter().enumerate() {
-        if *n == 0 || kernel == "n_entry" {
-            continue;
-        }
-        let gv2: Vec<f32> = unsafe {
-            std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
-        }
-        .to_vec();
-        let nf = gv2.iter().filter(|v| !v.is_finite()).count();
-        if nf > 0 {
-            eprintln!("[small][nan] #{i} {kernel} {node} 非有限 {}/{}", nf, gv2.len());
-            let pcb: &[u8] = &recs[i].5;
-            let p_off2 = u32::from_le_bytes([pcb[0], pcb[1], pcb[2], pcb[3]]) as usize;
-            let pw2: Vec<u32> = unsafe {
-                std::slice::from_raw_parts(base.add(p_off2 * 4) as *const u32, 8)
+    // === 关键链精确探针：rec（按节点名）↔ dump（按 manifest 节点索引），
+    // 全量对比（不用形状猜——numel 碰撞曾拿错张量、浅采样曾漏深处分歧）。
+    // dump 索引 = CPU 节点索引：87 transpose 出（=LN 输入）、88 mean、
+    // 89 Sub.1、90 Pow.1、93 Sqrt.1、94 Div.27、102-115 attention 头链、
+    // 189 transpose.7（尾段真转置）。
+    {
+        // 文件名前缀 s{sid}_ 的 sid 是进程级会话计数（全套跑时非 0）——
+        // 按 `_{idx:06}.f32` 后缀匹配，勿硬编码 s0_。
+        let read_dump = |idx: usize| -> Option<(Vec<i64>, Vec<f32>)> {
+            let suffix = format!("_{idx:06}.f32");
+            let path = std::fs::read_dir(&dump_dir)
+                .ok()?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(&suffix))
+                })?;
+            let bb = std::fs::read(path).ok()?;
+            let r = i32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]) as usize;
+            let sh: Vec<i64> = bb[4..4 + 8 * r]
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let v: Vec<f32> = bb[4 + 8 * r..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            Some((sh, v))
+        };
+        // (rec 节点名, op 判别（None=唯一）, dump 索引, lane0?)——op 取参数块
+        // 首 word（n_elem：5=mul 4=add；行广播 8=sub 11=div）。
+        // 尾段 MatMul.12/Add.204/Softmax.2（cpad 行填充布局）与
+        // fused:Add.202（NHWC 出 vs NCHW dump）不在此直读——由末尾输出
+        // 全量对拍断言覆盖。
+        let probes: &[(&str, Option<u32>, usize, bool)] = &[
+            ("fused:Add.156", Some(4), 87, false),
+            ("ReduceMean.10", None, 88, true),
+            ("Sub.0", None, 89, false),
+            ("Pow.0", None, 90, false),
+            ("Sqrt.0", None, 93, true),
+            ("Div.26", None, 94, false),
+            // attention 头链（rec↔dump 直读；Transpose.1 rank-5 已验直读存储）
+            ("Mul.54", None, 102, false),
+            ("Transpose.2", None, 109, false),
+            ("MatMul.1", None, 110, false),
+            ("Softmax.0", None, 111, false),
+            ("MatMul.2", None, 112, false),
+            ("Transpose.3", None, 113, false),
+            ("MatMul.3", None, 115, false),
+            ("Transpose.7", None, 189, false),
+        ];
+        for (want, want_op, di, lane0) in probes {
+            let Some(rec_i) = recs.iter().position(|(k, node, _, _, _, pc, _, _)| {
+                if !node.starts_with(want) || k == "n_entry" {
+                    return false;
+                }
+                match want_op {
+                    None => true,
+                    Some(op) => {
+                        let p = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
+                        let w0 = unsafe { *(base.add(p * 4) as *const u32) };
+                        w0 == *op
+                    }
+                }
+            }) else {
+                eprintln!("[probe] {want} rec 未找到");
+                continue;
+            };
+            let (_, node, _, off, n, _, _, _) = &recs[rec_i];
+            let Some((sh, dv)) = read_dump(*di) else {
+                eprintln!("[probe] dump {di} 未找到");
+                continue;
+            };
+            // lane0（[rows,4] 存储）：区宽 dv.len()*4 字，比 lane0；rec.n 只
+            // 记逻辑元素数（192），按分配宽读。
+            let gv: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(
+                    base.add(*off as usize * 4) as *const f32,
+                    if *lane0 { dv.len() * 4 } else { *n as usize },
+                )
             }
             .to_vec();
-            eprintln!("[small][nan] params={pw2:?}");
-            // b 区 lane0 采样（行 0/1/8/23/24/…）与 a 区对应首值
-            let b_off2 = pw2[2] as usize;
-            let a_off2 = pw2[1] as usize;
-            eprintln!("  std bits 行0={:#x} 行24={:#x}",
-                unsafe { *(base.add(b_off2) as *const u32) },
-                unsafe { *(base.add(b_off2 + 24 * 4) as *const u32) });
-            // LN 输入区：从 recs 找 ReduceMean.10 解码 in_off
-            let mut ln_in = 0usize;
-            let mut mean_off = 0usize;
-            for (kernel, node, _i, off, _n, pc, _osh, _ins2) in recs.iter() {
-                if node.starts_with("ReduceMean.10") && ln_in == 0 {
-                    let p3 = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
-                    let w3: Vec<u32> = unsafe {
-                        std::slice::from_raw_parts(base.add(p3 * 4) as *const u32, 6)
-                    }
-                    .to_vec();
-                    ln_in = w3[0] as usize;
-                    mean_off = w3[1] as usize;
-                    eprintln!("[small][nan] ReduceMean.10 params={w3:?}");
-            for (kernel, node, _i, _off, _n, pc, _osh, _ins2) in recs.iter() {
-                if node.starts_with("fused:Add.156") {
-                    let p4 = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
-                    let w4: Vec<u32> = unsafe {
-                        std::slice::from_raw_parts(base.add(p4 * 4) as *const u32, 6)
-                    }
-                    .to_vec();
-                    eprintln!("[small][sw] {kernel} {node} params={w4:?}");
-                    // 深采各输入
-                    for (lab, off) in [("a", w4[1]), ("b", w4[2]), ("out", w4[3])] {
-                        let v: Vec<f32> = (0..4)
-                            .map(|k| unsafe {
-                                *(base.add(off as usize + 5000 + k * 5000) as *const f32)
-                            })
-                            .collect();
-                        eprintln!("   {lab} off={} 深4={:?}", off, v);
+            let (mut worst, mut nbad, mut first_bad_i) = (0.0f64, 0usize, None);
+            let lane0 = *lane0;
+            let rows = if lane0 { dv.len() } else { dv.len().min(gv.len()) };
+            for j in 0..rows {
+                let g = if lane0 { gv[j * 4] } else { gv[j] };
+                let d = dv[j];
+                let e = ((g - d).abs() / (1.0 + d.abs())) as f64;
+                if e > 0.05 {
+                    nbad += 1;
+                    if first_bad_i.is_none() {
+                        first_bad_i = Some(j);
                     }
                 }
+                worst = worst.max(e);
             }
-                }
+            eprintln!(
+                "[probe] #{rec_i} {node} ↔ dump{di} {sh:?} lane0={lane0} n={}：worst={worst:.4} 不符={nbad}/{} 首坏idx={:?}",
+                gv.len(),
+                rows,
+                first_bad_i
+            );
+            if let Some(j) = first_bad_i {
+                let g = if lane0 { gv[j * 4] } else { gv[j] };
+                eprintln!("        首坏 j={j}（行{} 列{}）gpu={g:.6} cpu={:.6}", j / 120, j % 120, dv[j]);
             }
-            for &r in &[0usize, 1, 24, 25] {
-                let v0: f32 = unsafe { *(base.add(ln_in + r * 120) as *const f32) };
-                let v1: f32 = unsafe { *(base.add(ln_in + r * 120 + 1) as *const f32) };
-                eprintln!("  LN输入 行{r}: c0={v0:.4} c1={v1:.4}");
-            }
-            for &r in &[0usize, 1, 24] {
-                let mv: f32 = unsafe { *(base.add(mean_off + r * 4) as *const f32) };
-                eprintln!("  mean 行{r}: {mv:.6}");
-            }
-            for &r in &[0usize, 1, 24, 25, 100, 191] {
-                let sv: f32 = unsafe { *(base.add((b_off2 + r * 4)) as *const f32) };
-                let av: f32 = unsafe { *(base.add(a_off2 + r * 120) as *const f32) };
-                eprintln!("  行{r}: std={sv:.6} x首={av:.4} 商={:.4}", if sv != 0.0 { av / sv } else { f32::NAN });
-            }
-            break;
         }
     }
+    // 全图对拍（诊断性，无断言）：形状精确优先、numel 回退，rank-4 双解释
+    //（NHWC↔NCHW 与直读取优——头维张量是直读存储）。
+    let mut first_bad: Option<(usize, String)> = None;
     let mut n_bad = 0;
     for (i, (kernel, node, _idx, off, n, _pc, osh, _ins)) in recs.iter().enumerate() {
         if *n == 0 || kernel == "n_entry" || kernel.starts_with("n_exit") {
@@ -3150,26 +3185,36 @@ fn small_rec_gpu_vs_cpu() {
                 let _ = direct;
                 e = e.max(0.0); // 占位——用下方统一比较
             }
-            // rank-4：NHWC(row=N*H*W,col=C) ↔ dump NCHW 直读；
-            // rank-3/2：直读（行主序）。
+            // rank-4 双解释取优：backbone 卷积量是 NHWC 存储（↔dump NCHW），
+            // attention 头维量（[B,H,T,D] 等）是朴素直读——曾只按 NHWC 解释
+            // 把 Mul.54 [8,8,24,15] 误报 rel=0.97。
             let e2 = if sh.len() == 4 {
                 let (nn, c3, h3, w3) = (sh[0] as usize, sh[1] as usize, sh[2] as usize, sh[3] as usize);
                 let hw = h3 * w3;
                 let c4 = (c3 + 3) / 4 * 4;
                 let rows = nn * hw;
-                let mut e = 0.0f64;
+                // NHWC 解释：gv[row*NHWC 列 c] ↔ dump NCHW
+                let mut e_nhwc = 0.0f64;
                 let ns = 96.min(rows);
                 for k in 0..ns {
                     let row = k * rows / ns.max(1);
                     let (n, hwr) = (row / hw, row % hw);
                     let (h, w) = (hwr / w3, hwr % w3);
                     for c in [0usize, 1, c3 / 2, c3 - 1] {
-                        let g = gv[row * c4 + c];
+                        let g = gv.get(row * c4 + c).copied().unwrap_or(f32::NAN);
                         let d = dv[(n * c3 + c) * hw + h * w3 + w];
-                        e = e.max(((g - d).abs() / (1.0 + d.abs())) as f64);
+                        e_nhwc = e_nhwc.max(((g - d).abs() / (1.0 + d.abs())) as f64);
                     }
                 }
-                e
+                // 直读解释：同一线性下标逐位对（attention 头维量是行主序无 cpad）
+                let mut e_direct = 0.0f64;
+                let n_tot = dv.len().min(gv.len());
+                let ns2 = 64.min(n_tot);
+                for k in 0..ns2 {
+                    let idx = k * n_tot / ns2.max(1);
+                    e_direct = e_direct.max(((gv[idx] - dv[idx]).abs() / (1.0 + dv[idx].abs())) as f64);
+                }
+                e_nhwc.min(e_direct)
             } else {
                 // [rows,4] lane0 存储（末维=1 的归约出）：gv[r*4] ↔ dv[r]
                 let lane0 = sh.last() == Some(&1) && sh.len() == 3;
@@ -3250,12 +3295,83 @@ fn small_rec_gpu_vs_cpu() {
         "[small][cmp] 可比节点中分歧 {n_bad} 个；首个：{:?}",
         first_bad
     );
-    // 输出层 top-1 抽查
+    // 最终闸门：GPU 输出 vs CPU 输出全量对拍（注意力头全链正确的判据——
+    // 中间对拍循环有 rank-4 NHWC 解释假警报，以此断言为准）。
     let o = &out[0];
     eprintln!(
         "[small][cmp] 输出 shape={:?} 头4={:?}",
         o.shape,
         &o.f32.as_slice()[..4.min(o.f32.len())]
+    );
+    let oc = &_out_cpu[0];
+    assert_eq!(o.shape, oc.shape, "GPU/CPU 输出形状不符");
+    let g = o.f32.as_slice();
+    let c = oc.f32.as_slice();
+    let mut worst = 0.0f64;
+    let mut nbad = 0usize;
+    let mut first_bad_j = None;
+    for j in 0..g.len() {
+        let e = ((g[j] - c[j]).abs() / (1.0 + c[j].abs())) as f64;
+        worst = worst.max(e);
+        if e > 0.02 {
+            nbad += 1;
+            if first_bad_j.is_none() {
+                first_bad_j = Some(j);
+            }
+        }
+    }
+    eprintln!(
+        "[small][cmp] 输出对拍：worst={worst:.5} 不符(>0.02)={}/{} 首坏idx={:?}",
+        nbad,
+        g.len(),
+        first_bad_j
+    );
+    // 坏点分布：按图（b）与时间步（t）聚合——集中某图=批错位、某步=时间步错位。
+    {
+        let (t_steps, vocab) = (o.shape[1] as usize, o.shape[2] as usize);
+        let mut per_b = [0usize; 8];
+        let mut per_t_acc: Vec<(usize, usize, f32, f32)> = Vec::new(); // (t, n, gpu, cpu)
+        for j in 0..g.len() {
+            let e = ((g[j] - c[j]).abs() / (1.0 + c[j].abs())) as f64;
+            if e > 0.02 {
+                let (b, t) = (j / (t_steps * vocab), (j / vocab) % t_steps);
+                per_b[b.min(7)] += 1;
+                if per_t_acc.len() < 12 && per_t_acc.iter().all(|x| x.0 != t) {
+                    per_t_acc.push((t, 0, g[j], c[j]));
+                }
+                per_t_acc.iter_mut().for_each(|x| {
+                    if x.0 == t {
+                        x.1 += 1
+                    }
+                });
+            }
+        }
+        eprintln!("[small][cmp] 坏点按图分布 {per_b:?}；按时间步（前若干）：{per_t_acc:?}");
+        // 按词表列 v 聚合：集中单列 = GEMM 列错位/权重错读
+        let mut per_v: Vec<(usize, usize)> = Vec::new();
+        for j in 0..g.len() {
+            let e = ((g[j] - c[j]).abs() / (1.0 + c[j].abs())) as f64;
+            if e > 0.02 {
+                let v = j % vocab;
+                match per_v.iter_mut().find(|x| x.0 == v) {
+                    Some(x) => x.1 += 1,
+                    None => per_v.push((v, 1)),
+                }
+            }
+        }
+        per_v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        eprintln!("[small][cmp] 坏点按词表列 top：{:?}", &per_v[..12.min(per_v.len())]);
+    }
+    if let Some(j) = first_bad_j {
+        eprintln!("        首坏 j={j} gpu={:.6} cpu={:.6}", g[j], c[j]);
+    }
+    assert!(
+        nbad == 0,
+        "small rec GPU↔CPU 输出对拍 {nbad}/{} 超 0.02（worst={worst:.4}，首坏 j={:?} gpu={:?} cpu={:?}）",
+        g.len(),
+        first_bad_j,
+        first_bad_j.map(|j| g[j]),
+        first_bad_j.map(|j| c[j]),
     );
 }
 

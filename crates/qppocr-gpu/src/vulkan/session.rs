@@ -2250,15 +2250,26 @@ impl VulkanSession {
                         "Sub" => 12,
                         _ => 13,
                     };
+                    // 定向一致性（同 MulAddScale 门分支）：rc 不一致先中转。
+                    let mut pre: Vec<(&'static str, ParamBlock, [u32; 3])> = Vec::new();
+                    let mut b_off = off_of(&n.inputs[1])?;
+                    if let (Some(t), Some(s)) = (
+                        rc.get(&n.inputs[0]).copied(),
+                        rc.get(&n.inputs[1]).copied(),
+                    ) {
+                        b_off = orient4(layout, &mut pre, b_off, &b, s, t)?;
+                    }
                     let mut pb = ParamBlock::new();
                     pb.u(op)
                         .u(off_of(&n.inputs[0])?)
-                        .u(off_of(&n.inputs[1])?)
+                        .u(b_off)
                         .u(off_of(out)?)
                         .u(a_words)
                         .f(0.0)
                         .f(0.0);
-                    Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
+                    let mut ds = pre;
+                    ds.push(("n_elem", pb, [div256(a_words / 4), 1, 1]));
+                    Ok(ds)
                 } else if a.len() == 3
                     && b.len() == 3
                     && b[2] == 1
@@ -2446,23 +2457,38 @@ impl VulkanSession {
                 let gate_shape = shape_of(&n.inputs[1]);
                 if gate_shape == fs {
                     let tmp_off = layout.alloc(a_words);
+                    // 定向一致性：mul/add 三操作数的存储 rc 必须相同；不一致
+                    // （真转置产物遇上 NHWC 卷积链）先中转成 inputs[0] 的定向。
+                    let base_rc = rc.get(&n.inputs[0]).copied();
+                    let mut pre: Vec<(&'static str, ParamBlock, [u32; 3])> = Vec::new();
+                    let mut g_off = off_of(&n.inputs[1])?;
+                    let mut r_off = off_of(&n.inputs[2])?;
+                    if let Some(t) = base_rc {
+                        if let Some(s) = rc.get(&n.inputs[1]).copied() {
+                            g_off = orient4(layout, &mut pre, g_off, &gate_shape, s, t)?;
+                        }
+                        let r_shape = shape_of(&n.inputs[2]);
+                        if let Some(s) = rc.get(&n.inputs[2]).copied() {
+                            r_off = orient4(layout, &mut pre, r_off, &r_shape, s, t)?;
+                        }
+                    }
                     let mk_pb = |op: u32, a: u32, b: u32, o: u32| -> ParamBlock {
                         let mut p = ParamBlock::new();
                         p.u(op).u(a).u(b).u(o).u(a_words).f(0.0).f(0.0);
                         p
                     };
-                    return Ok(vec![
-                        (
-                            "n_elem",
-                            mk_pb(5, off_of(&n.inputs[0])?, off_of(&n.inputs[1])?, tmp_off),
-                            [div256(a_words / 4), 1, 1],
-                        ),
-                        (
-                            "n_elem",
-                            mk_pb(4, tmp_off, off_of(&n.inputs[2])?, off_of(out)?),
-                            [div256(a_words / 4), 1, 1],
-                        ),
-                    ]);
+                    let mut ds = pre;
+                    ds.push((
+                        "n_elem",
+                        mk_pb(5, off_of(&n.inputs[0])?, g_off, tmp_off),
+                        [div256(a_words / 4), 1, 1],
+                    ));
+                    ds.push((
+                        "n_elem",
+                        mk_pb(4, tmp_off, r_off, off_of(out)?),
+                        [div256(a_words / 4), 1, 1],
+                    ));
+                    return Ok(ds);
                 }
                 let mut pb = ParamBlock::new();
                 pb.u(2u32) // muladd_scale
@@ -2972,6 +2998,49 @@ impl VulkanSession {
 
 /// conv 族权重的惰性重排：首次引用时重排 + 静态占区 + 进上传列表。
 /// 名字键控（共享权重只重排一份）。
+/// 逐元素操作数的**存储定向中转**：rc 不一致（同逻辑形、异字节序——
+/// 长跳跃相遇：NHWC 卷积链张量 × 真转置产物，small rec Add.203 的分类器
+/// 全烂根因）时，把真线性一方用 n_transpose_nd（perm [0,2,3,1]）转成基准
+/// 的 NHWC 族定向。一致时原 off 直用；不可中转的组合显式报错（不静默搅拌）。
+/// 仅支持 C%4==0：pad 通道的零填充中转不覆盖，宁可拒绝。
+fn orient4(
+    layout: &mut Layout,
+    pre: &mut Vec<(&'static str, ParamBlock, [u32; 3])>,
+    off: u32,
+    shape: &[i64],
+    src_rc: (u32, u32),
+    tgt_rc: (u32, u32),
+) -> Result<u32> {
+    if src_rc == tgt_rc {
+        return Ok(off);
+    }
+    let prod = shape.iter().product::<i64>();
+    let true_linear = shape.len() == 4
+        && src_rc == ((prod / shape[3]) as u32, shape[3] as u32);
+    let (nn, cc, hh, ww) = (shape[0], shape[1], shape[2], shape[3]);
+    let nhwc_tgt = cc % 4 == 0 && tgt_rc == ((nn * hh * ww) as u32, cc as u32);
+    if !true_linear || !nhwc_tgt {
+        return Err(Error::Graph(format!(
+            "逐元素操作数存储定向不可中转：rc={src_rc:?} → {tgt_rc:?}（shape={shape:?}）"
+        )));
+    }
+    let total = (prod as u32).max(1);
+    let tmp = layout.alloc(total);
+    let mut pb = ParamBlock::new();
+    pb.u(off).u(tmp).u(total).u(shape.len() as u32);
+    for &d in shape {
+        pb.u(d as u32);
+    }
+    for _ in shape.len()..5 {
+        pb.u(1);
+    }
+    for &p in &[0i64, 2, 3, 1] {
+        pb.u(p as u32);
+    }
+    pre.push(("n_transpose_nd", pb, [total.div_ceil(256), 1, 1]));
+    Ok(tmp)
+}
+
 fn n_weight_off(
     initializers: &HashMap<String, Tensor>,
     name: &str,
