@@ -546,7 +546,15 @@ impl VulkanSession {
                 }
             }
         }
+        let t_submit = std::time::Instant::now();
         let submitted = self.ctx.device.submit_cb(plan.cb);
+        if std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some() {
+            eprintln!(
+                "[gpu][dbg] submit 主机 {:.2} ms（{} dispatch）",
+                t_submit.elapsed().as_secs_f64() * 1000.0,
+                plan.recs.len()
+            );
+        }
         match submitted {
             Ok(signal) => Ok((plan, signal, n_real, n_pad)),
             Err(e) => {
@@ -3531,7 +3539,15 @@ impl qppocr_core::device::DeferredRun for VulkanDeferred {
         self.plan
             .inflight
             .store(false, std::sync::atomic::Ordering::Release);
-        Ok(readback_outputs(&self.plan, self.n_real, self.n_pad))
+        let t_rb = std::time::Instant::now();
+        let out = readback_outputs(&self.plan, self.n_real, self.n_pad);
+        if std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some() {
+            eprintln!(
+                "[gpu][dbg] complete：wait {wall_ms:.2} ms + readback {:.2} ms",
+                t_rb.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        Ok(out)
     }
 }
 
