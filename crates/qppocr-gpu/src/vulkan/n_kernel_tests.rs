@@ -1855,7 +1855,33 @@ fn rec_deferred_pipeline() {
         .fold(0f32, f32::max);
     assert_eq!(m1, 0.0, "同计划收后重发(1) 不一致");
     assert_eq!(m2, 0.0, "同计划收后重发(2) 不一致");
-    eprintln!("[rec][defer] 双计划在飞 + 同计划连发：与同步逐位一致");
+
+    // **影子计划**：同形状第一条在飞时直接提交第二条（引擎同桶流水）——
+    // session 分流影子（独立 arena/CB/rn），两条并发结果都与同步逐位
+    // 一致。第三条同形状在飞 = 深度超限，应显式报错。
+    let d5 = gpu
+        .run_deferred(vec![(in_name.clone(), t_a.clone())])
+        .unwrap();
+    let d6 = gpu
+        .run_deferred(vec![(in_name.clone(), t_a.clone())])
+        .unwrap();
+    let out_s1 = d5.complete().unwrap();
+    let out_s2 = d6.complete().unwrap();
+    let s1 = out_s1[0]
+        .f32
+        .iter()
+        .zip(out_a_sync[0].f32.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    let s2 = out_s2[0]
+        .f32
+        .iter()
+        .zip(out_a_sync[0].f32.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    assert_eq!(s1, 0.0, "影子路径 primary 侧不一致");
+    assert_eq!(s2, 0.0, "影子路径 shadow 侧不一致");
+    eprintln!("[rec][defer] 双计划在飞 + 同计划连发 + 影子并发：与同步逐位一致");
 }
 
 /// cls 端到端：GPU vs CPU executor 同输入对拍（B>1 批 + 尾部 rank-3）。

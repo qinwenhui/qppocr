@@ -287,12 +287,31 @@ fn shape_of(table: &planner::ShapeTable, name: &str) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+/// 一个形状的计划槽：primary + 可选影子（同形状双批在飞时分流）。
+struct PlanSlot {
+    shape: Vec<i64>,
+    primary: std::sync::Arc<Plan>,
+    shadow: Option<std::sync::Arc<Plan>>,
+}
+
+impl PlanSlot {
+    fn bytes(&self) -> u64 {
+        self.primary.block_bytes
+            + self.shadow.as_ref().map_or(0, |s| s.block_bytes)
+    }
+}
+
 /// GPU 会话：设备共享句柄 + 形状键计划缓存。
 pub(crate) struct VulkanSession {
     graph: Graph,
     initializers: HashMap<String, Tensor>,
     input_name: String,
-    plans: Mutex<Vec<(Vec<i64>, std::sync::Arc<Plan>)>>,
+    /// 形状键计划缓存（含**影子计划**槽）：primary 服务串行重放；同形状
+    /// 第二条在飞时（引擎同桶批 k+1 提交而 k 未收账）自动分流 shadow——
+    /// 独立 arena/CB/rn_word，与 primary 零共享，防写穿不需要「先收账再
+    /// 提交」的串行化（rec_infer 35ms 的主因）。惰性建：首次同桶并发才
+    /// 付一份构建（池化后 ~2-3ms，一次性）。
+    plans: Mutex<Vec<PlanSlot>>,
     /// 会话级管线缓存：按形状重建计划时驱动侧复用编译产物
     ///（形状多样性 × LRU 驱逐会让每帧都重建，38 条管线重建 ~5ms）。
     pipeline_cache: vk::PipelineCache,
@@ -402,8 +421,9 @@ impl VulkanSession {
     /// → 输入 memcpy → **提交不等**。返回 (计划 Arc, 信号值, 真实行数,
     /// 补齐行数)；调用方 wait_signal(signal) 后 readback_outputs。
     ///
-    /// 同形状两条在飞 = 输入/输出区同址互踩——调用方负责先收账再提交
-    /// 同形状批（引擎的桶宽分组知道形状；debug 断言兜底）。
+    /// 同形状两条在飞自动分流影子计划（独立 arena/CB/rn_word，零共享）
+    /// ——引擎同桶批 k+1 可在 k 收账前提交。第三条在飞报错（流水深度
+    /// 应 ≤2）。
     fn stage(
         &self,
         inputs: Vec<(String, Tensor)>,
@@ -431,43 +451,66 @@ impl VulkanSession {
         } else {
             in_shape.clone()
         };
-        if !plans.iter().any(|(s, _)| *s == plan_shape) {
+        // 选计划：primary 空闲用 primary；同形状在飞（引擎同桶批 k+1 而
+        // k 未收账）分流影子——惰性建，独立 arena/CB/rn_word 零共享。
+        let mut just_built = false;
+        let plan = if let Some(slot) = plans.iter_mut().find(|s| s.shape == plan_shape) {
+            let claim = |p: &Plan| {
+                p.inflight.store(true, std::sync::atomic::Ordering::Release);
+            };
+            if !slot
+                .primary
+                .inflight
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                claim(&slot.primary);
+                slot.primary.clone()
+            } else if slot.shadow.as_ref().is_some_and(|s| {
+                !s.inflight.load(std::sync::atomic::Ordering::Acquire)
+            }) {
+                let s = slot.shadow.clone().unwrap();
+                claim(&s);
+                s
+            } else if slot.shadow.is_some() {
+                return Err(Error::Device(
+                    "同形状三条在飞：引擎流水深度应 ≤2（primary+shadow 均忙）".into(),
+                ));
+            } else {
+                let shadow = std::sync::Arc::new(self.build_plan(&plan_shape)?);
+                claim(&shadow);
+                slot.shadow = Some(shadow.clone());
+                just_built = true;
+                shadow
+            }
+        } else {
             let plan = std::sync::Arc::new(self.build_plan(&plan_shape)?);
-            plans.push((plan_shape.clone(), plan));
+            plan.inflight.store(true, std::sync::atomic::Ordering::Release);
+            plans.push(PlanSlot {
+                shape: plan_shape.clone(),
+                primary: plan.clone(),
+                shadow: None,
+            });
+            just_built = true;
+            plan
+        };
+        if just_built {
             // 字节预算封顶（per-session，角色分配见字段文档；env 覆写）：
-            // det ~137MB/计划、逐图一次性（~41 个形状装不下任何预算，
-            // 靠三级缓存把重建压到 ~2.5-3ms）；rec 桶 ~24 个 × 60MB
-            // 均值，预算 ≥1.4GB 时全命中（p50 37ms），过小则每图驱逐
-            // （旧 768 默认曾把 rec 推到 71ms/93 次重建）。按块大小
-            // 淘汰最旧的（Vec 头部）。
+            // det ~137MB/计划、逐图一次性（~41 个形状装不下任何预算，靠
+            // 三级缓存把重建压到 ~2.5-3ms）；rec 桶 ~24 个 × 60MB 均值，
+            // 预算 ≥1.4GB 时全命中。按块大小淘汰最旧的（Vec 头部）；
+            // 影子一并计入/驱逐。
             let budget: u64 = std::env::var("QPPOCR_GPU_PLAN_MB")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(self.plan_budget_mb);
-            let mut total: u64 = plans.iter().map(|(_, p)| p.block_bytes).sum();
+            let mut total: u64 = plans.iter().map(|s| s.bytes()).sum();
             while total > budget * (1 << 20) && plans.len() > 1 {
-                let (_, evicted) = plans.remove(0);
-                total -= evicted.block_bytes;
+                let evicted = plans.remove(0);
+                total -= evicted.bytes();
                 // 归池在 Plan::drop（最后引用释放时）：deferred 在飞持有
                 // Arc 的时刻此处不强取——drop 时自然归还池。
             }
         }
-        let plan = plans
-            .iter()
-            .find(|(s, _)| *s == plan_shape)
-            .map(|(_, p)| p.clone())
-            .ok_or_else(|| Error::Device("计划缓存刚插入即缺失".into()))?;
-        debug_assert!(
-            plan.inflight
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Relaxed,
-                )
-                .is_ok(),
-            "同形状计划重复在飞（调用方必须先 complete 前一条）"
-        );
         let reset_inflight = |p: &Plan| {
             p.inflight
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -532,7 +575,10 @@ impl VulkanSession {
         )>,
     )> {
         let plans = self.plans.lock().ok()?;
-        let p = plans.iter().find(|(s, _)| s == in_shape).map(|(_, p)| p)?;
+        let p = plans
+            .iter()
+            .find(|s| s.shape == in_shape)
+            .map(|s| &s.primary)?;
         Some((
             p.base,
             p.recs
@@ -578,8 +624,8 @@ impl VulkanSession {
             .map_err(|_| Error::Device("计划缓存锁中毒".into()))?;
         let plan = plans
             .iter_mut()
-            .find(|(s, _)| s == in_shape)
-            .map(|(_, p)| p)
+            .find(|s| s.shape == in_shape)
+            .map(|s| &mut s.primary)
             .ok_or_else(|| Error::Device("debug_replay：无该形状计划".into()))?;
         if let Some(f) = mutate {
             f(plan.base);
