@@ -211,6 +211,19 @@ fn node_out_rc(
         }
         return Ok((m as u32, super::nhwc::cpad4(nn)));
     }
+    // 末轴均值（LN 分解链）：输出 [.., 1] → rc = (行数, 4)——不能继承
+    // 输入的 rc（列数塌成 1，cpad4(1)=4）。
+    if n.op_type == "ReduceMean" {
+        if let Ok(axes) = planner::axes_from(n, &table.values) {
+            let ish = sh(&n.inputs[0]);
+            let r = ish.len() as i64;
+            let norm: Vec<i64> = axes.iter().map(|&a| if a < 0 { a + r } else { a }).collect();
+            if norm.len() == 1 && norm[0] == r - 1 {
+                let m: i64 = ish[..(r as usize - 1)].iter().product();
+                return Ok((m as u32, 4));
+            }
+        }
+    }
     // 其余：rank-4 按形状；rank-3/2 继承输入
     let o = sh(&n.outputs[0]);
     if o.len() == 4 {
@@ -308,6 +321,12 @@ impl VulkanSession {
             argmax_exit: false,
             ctx,
         })
+    }
+
+    /// 覆盖面探针：小形状试建一次计划（不出执行、计划即弃）。装载期
+    /// 分级用——不支持的算子与形状无关，探针必现（见 mod.rs）。
+    pub(crate) fn probe(&self, in_shape: &[i64]) -> Result<()> {
+        self.build_plan(in_shape).map(|_| ())
     }
 
     /// 执行的前半段（run / run_deferred 共用）：计划建/查 → real_n 写入
@@ -1758,22 +1777,49 @@ impl VulkanSession {
                 if n.op_type == "ReduceMean" {
                     let axes = planner::axes_from(n, &table.values)
                         .map_err(|e| Error::Graph(format!("ReduceMean: {e}")))?;
-                    let r = shape_of(&n.inputs[0]).len() as i64;
+                    let xs = shape_of(&n.inputs[0]);
+                    let r = xs.len() as i64;
                     let norm: Vec<i64> = axes
                         .iter()
                         .map(|&a| if a < 0 { a + r } else { a })
                         .collect();
+                    if norm.len() == 1 && norm[0] == r - 1 {
+                        // 末轴均值（small rec 的 LayerNorm 分解链）：一行 WG
+                        // 归约，出 [rows,4]（lane0=均值）。rpb 供空行早退。
+                        let rows: u32 =
+                            xs[..xs.len() - 1].iter().product::<i64>() as u32;
+                        let cols = *xs.last().unwrap() as u32;
+                        let (in_rows, cpad) = rc
+                            .get(&n.inputs[0])
+                            .copied()
+                            .ok_or_else(|| Error::Graph("末轴均值输入无 rc".into()))?;
+                        if in_rows != rows {
+                            return Err(Error::Graph(format!(
+                                "末轴均值行数不符：rc={in_rows} 形状={rows}"
+                            )));
+                        }
+                        let rpb = (rows / xs[0].max(1) as u32).max(1);
+                        let mut pb = ParamBlock::new();
+                        pb.u(off_of(&n.inputs[0])?)
+                            .u(off_of(out)?)
+                            .u(rows)
+                            .u(cols)
+                            .u(cpad)
+                            .u(rpb);
+                        return Ok(vec![("n_reduce_last", pb, [rows, 1, 1])]);
+                    }
                     if !(norm.len() == 2 && norm.contains(&2) && norm.contains(&3)) {
                         return Err(Error::Graph(format!(
-                            "n_ 路径 ReduceMean 只支持 axes={{2,3}}，实得 {axes:?}"
+                            "n_ 路径 ReduceMean 只支持 axes={{2,3}} 或末轴，实得 {axes:?}"
                         )));
                     }
                 }
                 let xs = shape_of(&n.inputs[0]);
                 let cp = cpad4(xs[1]);
-                if cp > 256 {
+                if cp > 1024 {
                     return Err(Error::Graph(format!(
-                        "n_ 路径 SE 归约通道 {cp} > 256（两阶段内核上限）"
+                        "n_ 路径 SE 归约通道 {cp} > 1024（两阶段内核上限：\
+                         cp4 ≤ 256 线程平铺；超出会静默算零，必须显式拒绝）"
                     )));
                 }
                 let nb = xs[0] as u32;
@@ -2023,7 +2069,7 @@ impl VulkanSession {
                     .u(rows); // 门单行：全部特征行映到第 0 行
                 Ok(vec![("n_channel", pb, [div256(rows * cpad / 4), 1, 1])])
             }
-            "Sigmoid" | "Relu" | "HardSigmoid" | "Clip" => {
+            "Sigmoid" | "Relu" | "HardSigmoid" | "Clip" | "Sqrt" => {
                 let (op, p1, p2) = match n.op_type.as_str() {
                     "Sigmoid" => (1u32, 0f32, 0f32),
                     "Relu" => (0, 0.0, 0.0),
@@ -2032,6 +2078,7 @@ impl VulkanSession {
                         planner::get_f(n.attr("alpha"), 0.2),
                         planner::get_f(n.attr("beta"), 0.5),
                     ),
+                    "Sqrt" => (10, 0.0, 0.0),
                     _ => (
                         3,
                         planner::get_f(n.attr("min"), -3.4e38),
@@ -2054,7 +2101,7 @@ impl VulkanSession {
                     .f(p2);
                 Ok(vec![("n_elem", pb, [div256(n_words / 4), 1, 1])])
             }
-            "Add" | "Mul" => {
+            "Add" | "Mul" | "Sub" | "Div" => {
                 let a = shape_of(&n.inputs[0]);
                 let b = shape_of(&n.inputs[1]);
                 let b_n = numel(table, &n.inputs[1]);
@@ -2065,8 +2112,14 @@ impl VulkanSession {
                     r * c
                 };
                 if a == b {
+                    let op = match n.op_type.as_str() {
+                        "Add" => 4u32,
+                        "Mul" => 5,
+                        "Sub" => 12,
+                        _ => 13,
+                    };
                     let mut pb = ParamBlock::new();
-                    pb.u(if n.op_type == "Add" { 4 } else { 5 })
+                    pb.u(op)
                         .u(off_of(&n.inputs[0])?)
                         .u(off_of(&n.inputs[1])?)
                         .u(off_of(out)?)
@@ -2074,9 +2127,39 @@ impl VulkanSession {
                         .f(0.0)
                         .f(0.0);
                     Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
-                } else if b.len() == 4 && b[2] == 1 && b[3] == 1 && b[0] == a[0] && b[1] == a[1] {
+                } else if a.len() == 3
+                    && b.len() == 3
+                    && b[2] == 1
+                    && b[0] == a[0]
+                    && b[1] == a[1]
+                {
+                    // rank-3 行向量广播（LN 链的 x-mean、x/std）：b 是
+                    // [B,T,1] → 存储 [rows,4]（lane0 有效），行内 4 通道
+                    // 同减/除。p1 携带每行 vec4 数 c4 的位型。
+                    let (_, cpad) = rc
+                        .get(&n.inputs[0])
+                        .copied()
+                        .ok_or_else(|| Error::Graph("行向量广播输入无 rc".into()))?;
+                    let op = if n.op_type == "Sub" { 8u32 } else { 11 };
+                    let mut pb = ParamBlock::new();
+                    pb.u(op)
+                        .u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(off_of(out)?)
+                        .u(a_words)
+                        .f(f32::from_bits(cpad / 4))
+                        .f(0.0);
+                    Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
+                } else if b.len() == 4
+                    && b[2] == 1
+                    && b[3] == 1
+                    && b[0] == a[0]
+                    && b[1] == a[1]
+                    && matches!(n.op_type.as_str(), "Add" | "Mul")
+                {
                     // [N,C,1,1] 通道广播（rec 批的 SE 门；n==b 的批维）
                     // [1,C,1,1] 通道广播；SE 融合门 → fused（读前激活值）
+                    //（Sub/Div 无通道广播形态——不进此分支）
                     let gate_producer = self
                         .graph
                         .nodes
@@ -2122,7 +2205,12 @@ impl VulkanSession {
                 // 守卫时 cls-on-GPU 全图错位（cls_dw_precise 断言与
                 // cls_session_end_to_end 双双失败；引擎默认 cls 走 CPU，
                 // 100 图分数测不出，勿以引擎 A/B 判此分支）。
-                } else if b.len() == 1 && b_n > 1 && a.last() == Some(&b[0]) && a.len() >= 2 {
+                } else if b.len() == 1
+                    && b_n > 1
+                    && a.last() == Some(&b[0])
+                    && a.len() >= 2
+                    && matches!(n.op_type.as_str(), "Add" | "Mul")
+                {
                     // [V] 尾轴广播（rank-2/3 的 a：cls 的 Add([B,2],[2])、
                     // rec 的 MatMul bias）——存储列 = 尾轴 → n_channel
                     let (rows, cpad) = rc
@@ -2141,8 +2229,11 @@ impl VulkanSession {
                         .f(0.0)
                         .u(rows); // 门单行：全部特征行映到第 0 行
                     Ok(vec![("n_channel", pb, [div256(rows * cpad / 4), 1, 1])])
-                } else if b.len() == 1 && b_n == 1 {
-                    // 标量广播：[V] 退化成单值（cls 的 gate×标量）
+                } else if (b.is_empty() || (b.len() == 1 && b_n == 1))
+                    && matches!(n.op_type.as_str(), "Add" | "Mul")
+                {
+                    // 标量广播：[V] 退化成单值（cls 的 gate×标量）或 rank-0
+                    //（LN 的 var+eps——paddle2onnx 导出 helper.constant 无维）
                     let mut pb = ParamBlock::new();
                     pb.u(if n.op_type == "Add" { 6u32 } else { 7u32 })
                         .u(off_of(&n.inputs[0])?)
@@ -2154,13 +2245,66 @@ impl VulkanSession {
                     Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
                 } else {
                     Err(Error::Graph(format!(
-                        "n_ 路径 {}：只支持同形或 [1,C,1,1]/[V] 广播，实得 {a:?} vs {b:?}",
+                        "n_ 路径 {}：只支持同形或 [1,C,1,1]/[V]/行向量 广播，实得 {a:?} vs {b:?}",
                         n.op_type
                     )))
                 }
             }
+            "Pow" => {
+                // 常量指数 2（LN 方差链）→ square；其它指数不支持。
+                let e2 = self
+                    .initializers
+                    .get(&n.inputs[1])
+                    .and_then(|t| t.f32.first().copied());
+                if e2 != Some(2.0) {
+                    return Err(Error::Graph(format!(
+                        "n_ 路径 Pow 只支持常量指数 2（LN 方差），实得 {e2:?}"
+                    )));
+                }
+                let a_words = if shape_of(&n.inputs[0]).len() == 4 {
+                    super::nhwc::nhwc_words(&shape_of(&n.inputs[0]))
+                } else {
+                    let (r, c) = rc.get(&n.inputs[0]).copied().unwrap_or((0, 0));
+                    r * c
+                };
+                let mut pb = ParamBlock::new();
+                pb.u(9u32) // square
+                    .u(off_of(&n.inputs[0])?)
+                    .u(OFF_NONE)
+                    .u(off_of(out)?)
+                    .u(a_words)
+                    .f(0.0)
+                    .f(0.0);
+                Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
+            }
             "MulAddScale" => {
                 let fs = shape_of(&n.inputs[0]);
+                if fs.len() != 4 {
+                    // rank-3 门控（small rec 的 LN 尾巴 ×scale+shift）：门与
+                    // 残差都是 [C] 常量广播——正是 op5（bn 的 a*g+b 双行
+                    // 广播）的语义，单 dispatch（hw=rows 全部行映到门 0 行）。
+                    // 镜像 CPU 慢路径（Mul 广播 + Add 广播）。
+                    let (rows, cpad) = rc
+                        .get(&n.inputs[0])
+                        .copied()
+                        .ok_or_else(|| Error::Graph("rank-3 MulAddScale 输入无 rc".into()))?;
+                    let mut pb = ParamBlock::new();
+                    pb.u(5u32)
+                        .u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(off_of(&n.inputs[2])?)
+                        .u(off_of(out)?)
+                        .u(rows * cpad)
+                        .u(cpad)
+                        .f(0.0)
+                        .f(0.0)
+                        .u(rows); // 门单行
+                    return Ok(vec![(
+                        "n_channel",
+                        pb,
+                        [div256(rows * cpad / 4), 1, 1],
+                    )]);
+                }
                 let a_words = super::nhwc::nhwc_words(&fs);
                 let cp = cpad4(fs[1]);
                 let mut pb = ParamBlock::new();

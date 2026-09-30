@@ -133,6 +133,10 @@ const SHADERS: &[(&str, &[u8])] = &[
         "n_exit3_argmax",
         include_bytes!("../../shaders/spirv/n_exit3_argmax.spv"),
     ),
+    (
+        "n_reduce_last",
+        include_bytes!("../../shaders/spirv/n_reduce_last.spv"),
+    ),
 ];
 
 /// push constant 块（与各 .comp 的 PC 布局一一对应；float 元素偏移）。

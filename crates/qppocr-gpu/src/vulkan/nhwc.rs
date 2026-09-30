@@ -15,7 +15,9 @@ pub(crate) fn cpad4(c: i64) -> u32 {
 
 /// NHWC f32 张量 [N,C,H,W] 的 word 数（= 元素数，含 Cpad4）。
 pub(crate) fn nhwc_words(shape: &[i64]) -> u32 {
-    debug_assert!(shape.len() == 4, "n_ 路径只收 rank-4：{shape:?}");
+    if shape.len() != 4 {
+        panic!("n_ 路径只收 rank-4：{shape:?}");
+    }
     (shape[0] as u64 * shape[2] as u64 * shape[3] as u64 * cpad4(shape[1]) as u64) as u32
 }
 
