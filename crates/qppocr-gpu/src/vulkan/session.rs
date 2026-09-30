@@ -263,7 +263,7 @@ pub(crate) struct VulkanSession {
     repack_cache: Mutex<HashMap<String, std::sync::Arc<Vec<u32>>>>,
     /// 会话级 arena 池：逐出计划归还整块，新形状 reset 复用（容量够时）。
     /// 137MB 新块页提交 ~7ms vs 复用 ~0——形状多样性 × LRU 驱逐下每帧
-    /// 重建曾把它当固定税。池封顶 2 块（按容量优先留大）。
+    /// 重建曾把它当固定税。池封顶 1 块（按容量优先留大）。
     arena_pool: Mutex<Vec<Arena>>,
     /// 批维补齐粒度（rec 会话=8，其余 1）：run() 把输入批维向上取整到
     /// 该值建计划，空行由内核 real_n 早退守卫零算力——(bsz,W) 形状塌缩
@@ -276,6 +276,13 @@ pub(crate) struct VulkanSession {
     /// 全量读回实测 ~18 ms/图，是 rec 上 GPU 的大头。引擎侧用
     /// `DeviceSession::rec_argmax_pairs` 探测并走 ctc_decode_pairs。
     pub(crate) argmax_exit: bool,
+    /// 计划缓存的字节预算（MB，每会话独立；QPPOCR_GPU_PLAN_MB 覆写）。
+    /// **预算 per-session**——det 与 rec 会话各一份，create_session 按
+    /// 角色设定：det 形状逐图一次性、暖缓存重建仅 ~2.5-3ms → 小预算；
+    /// rec 桶形状每图复用、重建 ~13ms → 大预算。旧的一刀切 2048/会话
+    /// 曾把单进程推到 5.5GB（对决实测 6× 竞品，见 COMPARISON.md（九）
+    /// 节）。直接构造（测试）默认 2048 不变。
+    pub(crate) plan_budget_mb: u64,
     /// 持有整个上下文。**必须声明在最后**：字段按声明序 drop——plans
     /// 里的管线/缓冲销毁要用设备，而设备销毁发生在 ctx（Arc<Inner>）
     /// 的最后一个引用释放时。ctx 在前 = 先毁设备再毁管线 = 对已销毁
@@ -319,6 +326,7 @@ impl VulkanSession {
             arena_pool: Mutex::new(Vec::new()),
             batch_grain: 1,
             argmax_exit: false,
+            plan_budget_mb: 2048,
             ctx,
         })
     }
@@ -365,18 +373,16 @@ impl VulkanSession {
         if !plans.iter().any(|(s, _)| *s == plan_shape) {
             let plan = std::sync::Arc::new(self.build_plan(&plan_shape)?);
             plans.push((plan_shape.clone(), plan));
-            // 字节预算封顶：每个计划 ≈ 整块 arena（det ~137 MB；rec 批式
-            // 30-165 MB @ (8,48,W)）。100 图语料：rec 桶 ~24 个 × 60MB
-            // 均值 ≈ 1.4GB——768 旧默认下 rec 计划每图互相驱逐（实测
-            // rec 71ms、93 次重建），2048 全命中（24 次构建，rec p50
-            // 37ms）。det 的逐图形状（~41 个）任何预算都装不下，靠
-            // 管线缓存把重建压到 ~2-3ms（见三级缓存）。按块大小淘汰
-            // 最旧的（Vec 头部）；命中的形状下次重建。
-            const DEFAULT_BUDGET_MB: u64 = 2048;
+            // 字节预算封顶（per-session，角色分配见字段文档；env 覆写）：
+            // det ~137MB/计划、逐图一次性（~41 个形状装不下任何预算，
+            // 靠三级缓存把重建压到 ~2.5-3ms）；rec 桶 ~24 个 × 60MB
+            // 均值，预算 ≥1.4GB 时全命中（p50 37ms），过小则每图驱逐
+            // （旧 768 默认曾把 rec 推到 71ms/93 次重建）。按块大小
+            // 淘汰最旧的（Vec 头部）。
             let budget: u64 = std::env::var("QPPOCR_GPU_PLAN_MB")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_BUDGET_MB);
+                .unwrap_or(self.plan_budget_mb);
             let mut total: u64 = plans.iter().map(|(_, p)| p.block_bytes).sum();
             let mut evicted_arenas: Vec<Arena> = Vec::new();
             while total > budget * (1 << 20) && plans.len() > 1 {
@@ -395,7 +401,7 @@ impl VulkanSession {
                 if let Ok(mut pool) = self.arena_pool.lock() {
                     for a in evicted_arenas {
                         pool.push(a);
-                        if pool.len() > 2 {
+                        if pool.len() > 1 {
                             // 淘汰容量最小的
                             let mut min_i = 0;
                             for i in 1..pool.len() {
