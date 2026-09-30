@@ -17,6 +17,7 @@ void main() {
 
     uint lid = gl_LocalInvocationID.x;
     uint nb_idx = gl_GlobalInvocationID.x / 256u; // grid.x=nb，每 WG 一批
+    if (params[0] != 0u && nb_idx >= params[0]) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
     float acc = 0.0;
     if (lid < cDim) {
         for (uint b = 0u; b < mBlocks; b++) {

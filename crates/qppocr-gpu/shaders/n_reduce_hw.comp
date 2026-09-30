@@ -26,6 +26,7 @@ void main() {
     uint pg = t / cp4;
     uint npg = 256 / cp4;
     uint nb_idx = gl_WorkGroupID.y; // 批维：每批独立归约
+    if (params[0] != 0u && nb_idx >= params[0]) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
     uint in_base = (in_off >> 2) + nb_idx * mDim * cp4;
     uint m_blocks_total = (mDim + 1023u) / 1024u; // scratch 行距
     uint m0 = gl_WorkGroupID.x * 1024u;

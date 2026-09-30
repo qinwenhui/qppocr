@@ -17,7 +17,7 @@ use super::config::PipelineConfig;
 use super::crop::{batch_ratio, cls_view, crop_pads, crop_text_box, pack_crop};
 use super::geometry::{box_margin_clutter, db_postprocess, merge_same_line, sort_reading_order};
 use super::image::{Image, resize_bilinear_img, rotate_image};
-use super::rec::{add_gap_spaces, column_ink, ctc_decode};
+use super::rec::{add_gap_spaces, column_ink, ctc_decode, ctc_decode_pairs};
 use qppocr_kernels::buf::F32Buf;
 
 /// 单个字符的坐标（[`TextLine::chars`] 的元素）。
@@ -307,6 +307,10 @@ impl Engine {
             Some(b) => {
                 let (g, init) = Session::parts_from_memory(b, &format!("{display_name}.cls.onnx"))?;
                 let name = first_input(&g);
+                // ★ 此前漏设：opts 残留 Rec——cls 会话被按 Rec 路由
+                //（QPPOCR_GPU_STAGES=detrec 曾因此把 cls 误上 GPU，
+                //  翻转边界分歧毁掉 ~14% 行的文本才暴露）。
+                opts.model = crate::device::ModelRole::Cls;
                 (Some(ctx.create_session(g, init, &opts)?), name)
             }
             None => (None, String::new()),
@@ -1072,7 +1076,18 @@ impl Engine {
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|&v| v > 0)
             .unwrap_or(self.cfg.rec_batch);
-        let per_batch = if std::env::var_os("QPPOCR_REC_BATCH_NOCLAMP").is_some() {
+        let per_batch = if !self.rec.prefers_host_parallelism() {
+            // GPU 会话：同桶行合批至上限 batch_grain（下方桶宽分组分支），
+            // 会话侧批维补齐 + 内核空行早退——形状塌缩成 (grain,W桶)、
+            // 每图提交次数 = 桶数而非行数。历史上两条歧路都已封死：不补齐的
+            // per=8 是 (bsz∈1..8)×宽桶 ≈106 形状/百图（重建摊销 88ms/图）；
+            // 无早退的补齐是纯 8× 算力（宽行网格 bsz=1 已吃满 EU）。
+            std::env::var("QPPOCR_REC_CHUNK")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&v| v > 0)
+                .unwrap_or(self.rec.batch_grain().max(1) as usize)
+        } else if std::env::var_os("QPPOCR_REC_BATCH_NOCLAMP").is_some() {
             rec_batch_cfg.max(1)
         } else {
             rec_batch_cfg
@@ -1084,10 +1099,41 @@ impl Engine {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .unwrap_or(self.cfg.rec_batch_ratio);
         let mut batches: Vec<(usize, usize)> = Vec::new();
+        // 分桶粒度（与 rec_fn 同一条优先级链）：env 显式值 > 配置 > 设备
+        // 上报（GPU 会话 64——每新形状付 ~10ms 计划重建，见 DeviceSession::
+        // bucket_grain）。
+        let rec_grain = std::env::var("QPPOCR_REC_GRAIN")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|&v| v > 1)
+            .or_else(|| {
+                let g = self.cfg.rec_width_grain;
+                (g > 1).then_some(g)
+            })
+            .unwrap_or_else(|| self.rec.bucket_grain());
+        let bucket_w = |r: f32| -> i32 {
+            let w = (img_h as f32 * r) as i32;
+            if rec_grain > 1 {
+                (w + rec_grain - 1) / rec_grain * rec_grain
+            } else {
+                w
+            }
+        };
         let mut beg = 0usize;
         while beg < order.len() {
             let mut end = beg + 1;
-            if batch_ratio > 0.0 {
+            if rec_grain > 1 {
+                // 桶宽分组：同桶行合批（GPU 批内并行近零成本、计划形状
+                // 塌缩成少数桶；桶间零填充 ≤ grain 列）。order 按比例排序，
+                // 同桶行连续。CPU（grain=1）维持原比例分组不动。
+                let wb = bucket_w(wh_ratio[order[beg]]);
+                while end < order.len()
+                    && end - beg < per_batch
+                    && bucket_w(wh_ratio[order[end]]) == wb
+                {
+                    end += 1;
+                }
+            } else if batch_ratio > 0.0 {
                 let base = wh_ratio[order[beg]].max(1e-6);
                 while end < order.len()
                     && end - beg < per_batch
@@ -1110,7 +1156,13 @@ impl Engine {
             let (ch, cw) = (self.cfg.cls_height, self.cfg.cls_width);
             // cls 也用同一套扇出：按 `cls_batch` 行一组切批，批间扇出、批内
             // 串行。cls 画布固定 48×192，批起来只是把 N 填进批次维。
-            let per = self.cfg.cls_batch.max(1);
+            // GPU：批内并行由设备吃掉，下限 8（cls_batch=1 是 CPU 的取舍，
+            // 批化在 CPU 上 4.12→11.95ms 被回退，GPU 反向——逐行提交纯亏）。
+            let per = if !cls.prefers_host_parallelism() {
+                self.cfg.cls_batch.max(8)
+            } else {
+                self.cfg.cls_batch.max(1)
+            };
             let cls_batches: Vec<(usize, usize)> = (0..crops.len())
                 .step_by(per)
                 .map(|b| (b, (b + per).min(crops.len())))
@@ -1167,23 +1219,25 @@ impl Engine {
             res.timings.cls_ms = t_ri.elapsed_ms();
         }
         let t_ri = now(); // ★ 重新起表：cls 的墙钟不能算进 rec
-        let rec_fn = |beg: usize, end: usize| -> Result<Vec<RecLineOut>> {
-            let mut batch_lines = Vec::with_capacity(end - beg);
+        // 打包+提交（异步）：GPU 批间流水的前半——pack(k+1) 与 GPU(k)
+        // 执行重叠；CPU 会话的 run_deferred 默认实现 = 同步 run（语义等价）。
+        let rec_stage = |beg: usize,
+                         end: usize|
+         -> Result<(Box<dyn crate::device::DeferredRun + Send>, i32)> {
             let mut max_wh_ratio = self.cfg.rec_min_width as f32 / img_h as f32;
             for &i in &order[beg..end] {
                 max_wh_ratio = max_wh_ratio.max(wh_ratio[i]);
             }
             let mut img_w = (img_h as f32 * max_wh_ratio) as i32;
-            let grain = std::env::var("QPPOCR_REC_GRAIN")
-                .ok()
-                .and_then(|v| v.trim().parse::<i32>().ok())
-                .filter(|&v| v > 1)
-                .unwrap_or(self.cfg.rec_width_grain);
-            if grain > 1 {
-                img_w = (img_w + grain - 1) / grain * grain;
+            if rec_grain > 1 {
+                img_w = (img_w + rec_grain - 1) / rec_grain * rec_grain;
             }
 
             let bsz = end - beg;
+            // 注：GPU 会话把批维补齐到 batch_grain，空行由内核 real_n
+            // 早退守卫零算力（曾实测无守卫的补齐 = 纯 8× 算力）；
+            // (bsz≤grain, W桶) 形状多样性由桶宽分组 + 补齐塌缩掉。
+            // CPU 会话批维即行数，不补。
             let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (img_h as usize) * (img_w as usize));
             for (k, &i) in order[beg..end].iter().enumerate() {
                 let c = &line_crop[i];
@@ -1196,7 +1250,7 @@ impl Engine {
                 );
             }
 
-            let out = self.rec.run(vec![(
+            let deferred = self.rec.run_deferred(vec![(
                 self.rec_in.clone(),
                 Tensor {
                     name: String::new(),
@@ -1206,22 +1260,40 @@ impl Engine {
                     i64: Vec::new(),
                 },
             )])?;
-
-            let o = &out[0]; // [B, T, C]
+            Ok((deferred, img_w))
+        };
+        // 解码（纯 CPU，与设备无关）：argmax 对或概率矩阵 → 文本/置信度/
+        // 每字坐标。img_w 是该批的打包宽（时间步→列映射要用）。
+        let rec_decode = |out: Vec<Tensor>,
+                          beg: usize,
+                          end: usize,
+                          img_w: i32|
+         -> Result<Vec<RecLineOut>> {
+            let mut batch_lines = Vec::with_capacity(end - beg);
+            let o = &out[0]; // [B, T, C]（或 GPU argmax 出口的 [B, T, 2] 对）
             let t_len = o.shape[1] as usize;
-            let c_len = o.shape[2] as usize;
-            // ★ 字典/模型配对硬校验。换错字典时 C 与字符表长度错位，
-            // ctc_decode 的越界索引是静默跳过——整表错位且不报错。
-            if c_len != self.charset.len() {
-                return Err(crate::error::Error::Graph(format!(
-                    "识别输出类别数 {c_len} 与字符表 {} 不符：字典与 rec 模型不配对\n  期望行数：tiny 档 6904、small/medium 档 18708",
-                    self.charset.len()
-                )));
+            // GPU argmax 出口：每时间步 (val, idx) 对，解码语义与概率
+            // 路径逐字相同（ctc_decode_pairs）；CPU 会话恒概率矩阵。
+            let pairs = self.rec.rec_argmax_pairs();
+            let c_len = if pairs { 2 } else { o.shape[2] as usize };
+            if !pairs {
+                // ★ 字典/模型配对硬校验。换错字典时 C 与字符表长度错位，
+                // ctc_decode 的越界索引是静默跳过——整表错位且不报错。
+                let c_real = o.shape[2] as usize;
+                if c_real != self.charset.len() {
+                    return Err(crate::error::Error::Graph(format!(
+                        "识别输出类别数 {c_real} 与字符表 {} 不符：字典与 rec 模型不配对\n  期望行数：tiny 档 6904、small/medium 档 18708",
+                        self.charset.len()
+                    )));
+                }
             }
             let want_gaps = self.cfg.rec_space_gap > 0.0;
             for (k, &i) in order[beg..end].iter().enumerate() {
-                let (mut text, conf, marks) =
-                    ctc_decode(&o.f32[k * t_len * c_len..], t_len, c_len, &self.charset);
+                let (mut text, conf, marks) = if pairs {
+                    ctc_decode_pairs(&o.f32[k * t_len * 2..], t_len, &self.charset)
+                } else {
+                    ctc_decode(&o.f32[k * t_len * c_len..], t_len, c_len, &self.charset)
+                };
                 // 时间步 → 裁剪图 x 的左缘（像素空格与每字坐标共用这套映射）。
                 let cr = &line_crop[i];
                 let cols: Vec<i32> = if cr.w > 0 && cr.h > 0 {
@@ -1282,6 +1354,20 @@ impl Engine {
             }
             Ok(batch_lines)
         };
+        // 收账+解码（两路共用）：GPU 的 complete = 等信号+读回。
+        let rec_collect = |staged: (Box<dyn crate::device::DeferredRun + Send>, i32),
+                           beg: usize,
+                           end: usize|
+         -> Result<Vec<RecLineOut>> {
+            let (deferred, img_w) = staged;
+            let out = deferred.complete()?;
+            rec_decode(out, beg, end, img_w)
+        };
+        // 串行兼容路：CPU 会话 / 分片并行路径用（deferred 默认=同步）。
+        let rec_fn = |beg: usize, end: usize| -> Result<Vec<RecLineOut>> {
+            let staged = rec_stage(beg, end)?;
+            rec_collect(staged, beg, end)
+        };
         // ★ 两种并行的切法只能二选一（池不支持嵌套 fork）：**行间并行**
         //   （一批一个线程、批内串行，即 `run_batches`）还是**行内并行**
         //   （批次顺序执行、算子内部 fork 铺满池）。100 图逐图交错实测，
@@ -1290,11 +1376,35 @@ impl Engine {
         //   每次 fork ~97 us 的协调开销乘上去不划算。换方案前先看这条。
         let shards = self.cfg.rec_shards;
         let outs = if !self.rec.prefers_host_parallelism() {
-            // 设备会话：行间扇出只会把提交串在会话内部的队列锁上——
-            // 串行批即可（与 cls 阶段同一门控）。
-            let mut outs = Vec::with_capacity(batches.len());
+            // 设备会话：批间流水——pack(k+1)+提交(k+1) 与 GPU(k) 执行
+            // 重叠，收账(k-1)（等信号+读回+解码）也与 GPU(k) 重叠。
+            // GPU 空隙从「pack+提交+等待+读回+解码」缩到 pack+提交
+            //（实测批均 ~1ms 对 ~4ms GPU）。同桶连续批 = 同一计划
+            //（输入/输出区同址）：先收账在飞批再提交，防写穿。
+            let mut outs: Vec<Vec<RecLineOut>> = Vec::with_capacity(batches.len());
+            /// 在飞批：(staged 句柄+打包宽, beg, end, 桶宽)
+            struct Pending(
+                Option<(Box<dyn crate::device::DeferredRun + Send>, i32)>,
+                usize,
+                usize,
+                i32,
+            );
+            let mut pending: Option<Pending> = None;
             for &(b, e) in &batches {
-                outs.push(rec_fn(b, e)?);
+                let bucket = bucket_w(wh_ratio[order[b]]);
+                // 同桶连续批 = 同一计划：先收账再提交（防写穿在飞区）
+                if pending.as_ref().is_some_and(|p| p.3 == bucket) {
+                    let p = pending.take().unwrap();
+                    outs.push(rec_collect(p.0.unwrap(), p.1, p.2)?);
+                }
+                let staged = rec_stage(b, e)?;
+                if let Some(p) = pending.take() {
+                    outs.push(rec_collect(p.0.unwrap(), p.1, p.2)?);
+                }
+                pending = Some(Pending(Some(staged), b, e, bucket));
+            }
+            if let Some(p) = pending.take() {
+                outs.push(rec_collect(p.0.unwrap(), p.1, p.2)?);
             }
             outs
         } else if shards > 1 {

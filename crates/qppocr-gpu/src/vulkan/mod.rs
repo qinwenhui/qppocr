@@ -337,15 +337,22 @@ impl DeviceContext for VulkanContext {
         initializers: HashMap<String, Tensor>,
         opts: &SessionOptions,
     ) -> Result<Arc<dyn DeviceSession>> {
-        // bring-up 旋钮：QPPOCR_GPU_STAGES=det（默认）→ 仅 det 上 GPU，
-        // rec/cls 委托 CPU 会话（**stderr 声明**，不是静默降级）；
-        // =all → 三模型全 GPU。rec/cls 已数值验证（rec top-1 逐行一致），
-        // 但 rec 每行一个 W → 形状多样性 × 计划重建 ~7-11ms，端到端反而
-        // 慢——引擎侧宽度分桶是前置工作，做完全 GPU 才转正。
+        // bring-up 旋钮：QPPOCR_GPU_STAGES=det（默认）→ 仅 det 上 GPU；
+        // =detrec → det+rec 上 GPU、cls 留 CPU（cls-GPU 的 argmax 在真实
+        // 图上与 CPU 有 ~14% 边界翻转分歧——翻转错一行毁一行文本，且
+        // GPU cls 5.3ms 还慢于 CPU 4.2ms，无收益纯风险）；
+        // =all → 三模型全 GPU（cls 分歧仍在，仅作对照）。委托 CPU 时
+        // **stderr 声明**，不是静默降级。
         let stages = std::env::var("QPPOCR_GPU_STAGES").unwrap_or_else(|_| "det".into());
-        if stages == "det" && opts.model != qppocr_core::device::ModelRole::Det {
+        let gpu_ok = match opts.model {
+            qppocr_core::device::ModelRole::Det => true,
+            qppocr_core::device::ModelRole::Rec => stages == "detrec" || stages == "all",
+            qppocr_core::device::ModelRole::Cls => stages == "all",
+            _ => false,
+        };
+        if !gpu_ok && opts.model != qppocr_core::device::ModelRole::Det {
             eprintln!(
-                "[gpu] QPPOCR_GPU_STAGES=det：{:?} 模型走 CPU 会话（bring-up 混合部署）",
+                "[gpu] QPPOCR_GPU_STAGES={stages}：{:?} 模型走 CPU 会话（分级部署）",
                 opts.model
             );
             return Ok(Arc::new(qppocr_core::executor::Session::from_parts(
@@ -353,7 +360,17 @@ impl DeviceContext for VulkanContext {
                 initializers,
             )));
         }
-        let session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
+        let mut session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
+        // rec 会话批维补齐粒度 8：引擎按此合批（宽填充到批内最大桶），
+        // 会话补齐空行 + 内核 real_n 早退——实测每行提交往返 ~0.85ms、
+        // 11 行图 11 次提交吃 9.3ms；合批后 (8,W桶) 形状全命中。det/cls
+        // 批维恒 1（det 单图；cls 留 CPU）。
+        if opts.model == qppocr_core::device::ModelRole::Rec {
+            session.batch_grain = 8;
+            // CTC 头只吃每时间步 argmax：GPU 端归约成 (val, idx) 对再回读
+            //（全量 T×V 概率回读实测 ~18 ms/图，clflush 读回带宽是大头）。
+            session.argmax_exit = true;
+        }
         Ok(Arc::new(session))
     }
 }

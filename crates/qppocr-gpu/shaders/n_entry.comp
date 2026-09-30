@@ -19,6 +19,7 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= nb * hw) return;
     uint n = gid / hw, pos = gid - n * hw;
+    if (params[0] != 0u && n >= params[0]) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
     uint plane = c * hw;
     for (uint c4 = 0u; c4 < cp4; c4++) {
         vec4 v = vec4(0.0);

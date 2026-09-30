@@ -73,6 +73,7 @@ void main() {
     uint r_off = params[P + 20]; // 残差（NHWC 同布局；OFF_NONE=无）
 
     uint b = gl_WorkGroupID.y;
+    if (params[0] != 0u && b >= params[0]) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
     uint nv = nDim >> 2;
     uint gid = gl_GlobalInvocationID.x;
     uint tiles = ((mDim + 3u) >> 2) * nv;

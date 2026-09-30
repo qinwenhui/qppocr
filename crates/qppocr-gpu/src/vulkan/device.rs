@@ -226,6 +226,22 @@ impl VulkanDevice {
     /// 与 `submit_one_shot` 的区别：不录不释放——热路径的每帧成本就
     /// 是这里：一次 submit + 一次主机等值。
     pub(crate) fn submit_wait_cb(&self, cb: vk::CommandBuffer) -> Result<()> {
+        let signal = self.submit_cb(cb)?;
+        let sems = [self.timeline];
+        let values = [signal];
+        let wait = vk::SemaphoreWaitInfo::default()
+            .semaphores(&sems)
+            .values(&values);
+        // SAFETY: 等待值是刚提交的信号值。
+        unsafe { self.device.wait_semaphores(&wait, WAIT_TIMEOUT_NS) }
+            .map_err(|e| Error::Device(format!("等待 timeline 信号失败: {e}")))?;
+        Ok(())
+    }
+
+    /// 只提交不等（批间流水）：返回信号值，调用方稍后
+    /// `wait_semaphores(signal)` 收账。timeline 单调——等值 k 即保证
+    /// 队列中 k 之前的全部提交完成。
+    pub(crate) fn submit_cb(&self, cb: vk::CommandBuffer) -> Result<u64> {
         let signal = self.take_signal();
         let cbs = [cb];
         let signal_values = [signal];
@@ -242,11 +258,17 @@ impl VulkanDevice {
                 .queue_submit(self.queue, &[si], vk::Fence::null())
         }
         .map_err(|e| Error::Device(format!("vkQueueSubmit 失败: {e}")))?;
+        Ok(signal)
+    }
+
+    /// 等待指定的 timeline 信号值（提交有序 ⇒ 队列内先序工作全部完成）。
+    pub(crate) fn wait_signal(&self, signal: u64) -> Result<()> {
+        let sems = [self.timeline];
         let values = [signal];
         let wait = vk::SemaphoreWaitInfo::default()
             .semaphores(&sems)
             .values(&values);
-        // SAFETY: 等待值是刚提交的信号值。
+        // SAFETY: 信号值来自本设备的提交。
         unsafe { self.device.wait_semaphores(&wait, WAIT_TIMEOUT_NS) }
             .map_err(|e| Error::Device(format!("等待 timeline 信号失败: {e}")))?;
         Ok(())
