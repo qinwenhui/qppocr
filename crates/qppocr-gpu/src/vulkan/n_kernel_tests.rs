@@ -2949,6 +2949,104 @@ fn cls_dw_precise() {
     );
 }
 
+/// small rec 对右零填充的**模型不变性**（纯 CPU，与 GPU 无关）：
+/// 自然宽 w 的输出 vs 桶宽 W（右侧补零）的重叠时间步。引擎 GPU 小 rec 走
+/// 桶宽填充、CPU 走自然宽——不变性不成立则两侧文本必然分叉（无注意力
+/// mask 的 SVTR 混合填充步；竞品 small GPU 丢 47 行同症）。
+#[test]
+fn small_rec_padding_invariance() {
+    let model = std::env::var("SMALL_CMP_MODEL").unwrap_or_else(|_| "small".into());
+    let mpath = format!("../../models/{model}/rec.onnx");
+    if !std::path::Path::new(&mpath).is_file() {
+        eprintln!("[gpu] 无 {model} rec 模型，跳过");
+        return;
+    }
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    let (hh, w_nat, w_pad) = (48usize, 192usize, 256usize);
+    let bytes = std::fs::read(&mpath).unwrap();
+    let mut seed = 0x1234_5678_9abc_def0_u64;
+    let mut buf = F32Buf::with_zeroed(3 * hh * w_nat);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed) * 2.0 - 1.0;
+    }
+    let mk = |buf: F32Buf, w: usize| Tensor {
+        name: String::new(),
+        shape: vec![1, 3, hh as i64, w as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    let in_name = {
+        let s = Session::from_memory(&bytes, "small.rec.pad.a").unwrap();
+        s.graph
+            .inputs
+            .iter()
+            .find(|s| !s.is_empty())
+            .cloned()
+            .unwrap()
+    };
+    let mut sa = Session::from_memory(&bytes, "small.rec.pad.a").unwrap();
+    let out_a = sa.run(vec![(in_name.clone(), mk(buf.clone(), w_nat))]).unwrap();
+    let mut padded = F32Buf::with_zeroed(3 * hh * w_pad);
+    for c in 0..3 {
+        for y in 0..hh {
+            let src = (c * hh + y) * w_nat;
+            let dst = (c * hh + y) * w_pad;
+            padded.as_mut_slice()[dst..dst + w_nat]
+                .copy_from_slice(&buf.as_slice()[src..src + w_nat]);
+        }
+    }
+    let mut sb = Session::from_memory(&bytes, "small.rec.pad.b").unwrap();
+    let out_b = sb.run(vec![(in_name, mk(padded, w_pad))]).unwrap();
+    // 重叠时间步：T = w/8，自然宽 24 步、桶宽 32 步。
+    let (va, vb) = (out_a[0].f32.as_slice(), out_b[0].f32.as_slice());
+    let (t_nat, t_pad, vocab) = (24usize, 32usize, va.len() / 24);
+    let mut worst = 0.0f64;
+    let mut nbad = 0usize;
+    let mut first = None;
+    for t in 0..t_nat {
+        for v in 0..vocab {
+            let (a, b) = (va[t * vocab + v], vb[t * vocab + v]);
+            let e = ((a - b).abs() / (1.0 + a.abs())) as f64;
+            if e > 0.02 {
+                nbad += 1;
+                if first.is_none() {
+                    first = Some((t, v, a, b));
+                }
+            }
+            worst = worst.max(e);
+        }
+    }
+    let argmax = |base: &[f32], t: usize| -> i32 {
+        let s = &base[t * vocab..(t + 1) * vocab];
+        s.iter()
+            .enumerate()
+            .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+            .map(|(i, _)| i as i32)
+            .unwrap_or(-1)
+    };
+    let am_diff = (0..t_nat)
+        .filter(|&t| argmax(va, t) != argmax(vb, t))
+        .count();
+    eprintln!(
+        "[pad] 重叠 {t_nat} 步：worst={worst:.4} 不符(>0.02)={}/{} argmax 异步数={am_diff}/{t_nat} 首坏={:?}",
+        nbad,
+        t_nat * vocab,
+        first
+    );
+    // 断言（声明=断言）：**不不变性是预期行为**——动态 B MatMul 的注意力
+    // rec 桶宽右零填充会改真步输出（引擎因此对这类模型启用 exact_width/
+    // bucket_grain=1，见 mod.rs open_bytes_with）。若某日此断言失败
+    // （填充变成无害），可重新评估 exact_width 的形状税是否可退。
+    assert!(
+        nbad > 0,
+        "small rec 已对右零填充不变——exact_width（精确宽）的形状税可能可退役"
+    );
+}
+
 /// small rec 注意力头的 GPU↔CPU 逐节点对拍：找首个分歧节点（调试用，
 /// 非回归闸门——注意力值正确后本测试应全绿，可留作守卫）。
 #[test]
@@ -2966,11 +3064,36 @@ fn small_rec_gpu_vs_cpu() {
     use qppocr_core::tensor::{DType, Tensor};
     use qppocr_kernels::buf::F32Buf;
 
-    let (b, hh, ww) = (8usize, 48usize, 192usize);
+    // 形状可由环境变量覆写（宽行对拍：QPPOCR_CMP_W=640 复现长行乱码）。
+    let (b, hh, ww) = (
+        std::env::var("QPPOCR_CMP_B")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8usize),
+        48usize,
+        std::env::var("QPPOCR_CMP_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(192usize),
+    );
     let mut seed = 0x5566_7788_99aa_bbcc_u64;
     let mut buf = F32Buf::with_zeroed(b * 3 * hh * ww);
     for v in buf.as_mut_slice().iter_mut() {
         *v = lcg(&mut seed) * 2.0 - 1.0;
+    }
+    // 零尾巴（复现引擎桶宽右填充：内容左对齐、右侧 grain 内补零）。
+    if let Ok(zt) = std::env::var("QPPOCR_CMP_ZEROTAIL") {
+        let zt: usize = zt.parse().unwrap();
+        for bi in 0..b {
+            for c in 0..3 {
+                for y in 0..hh {
+                    let row = ((bi * 3 + c) * hh + y) * ww;
+                    for x in (ww - zt)..ww {
+                        buf.as_mut_slice()[row + x] = 0.0;
+                    }
+                }
+            }
+        }
     }
     let mk = |buf: F32Buf| Tensor {
         name: String::new(),
@@ -3034,7 +3157,11 @@ fn small_rec_gpu_vs_cpu() {
     unsafe { std::env::set_var("QPPOCR_GPU_NO_FREE", "1") };
     let out = qppocr_core::device::DeviceSession::run(&gpu, vec![(in2, mk(buf))]).unwrap();
     unsafe { std::env::remove_var("QPPOCR_GPU_NO_FREE") };
-    let (base, recs) = gpu.debug_recs(&[b as i64, 3, hh as i64, ww as i64]).expect("无计划");
+    // 计划键按批维补齐（grain 8）——real_n<8 的部分批也查得到计划。
+    let b_pad = b.div_ceil(8) * 8;
+    let (base, recs) = gpu
+        .debug_recs(&[b_pad as i64, 3, hh as i64, ww as i64])
+        .expect("无计划");
 
     // === 关键链精确探针：rec（按节点名）↔ dump（按 manifest 节点索引），
     // 全量对比（不用形状猜——numel 碰撞曾拿错张量、浅采样曾漏深处分歧）。
@@ -3086,6 +3213,16 @@ fn small_rec_gpu_vs_cpu() {
             ("MatMul.2", None, 112, false),
             ("Transpose.3", None, 113, false),
             ("MatMul.3", None, 115, false),
+            // 第二 attention 头链（同构第二块）
+            ("MatMul.6", None, 141, false),
+            ("Transpose.4", None, 144, false),
+            ("Mul.61", None, 147, false),
+            ("Transpose.5", None, 154, false),
+            ("MatMul.7", None, 155, false),
+            ("Softmax.1", None, 156, false),
+            ("MatMul.8", None, 157, false),
+            ("Transpose.6", None, 158, false),
+            ("MatMul.9", None, 160, false),
             ("Transpose.7", None, 189, false),
         ];
         for (want, want_op, di, lane0) in probes {
@@ -3120,6 +3257,8 @@ fn small_rec_gpu_vs_cpu() {
             }
             .to_vec();
             let (mut worst, mut nbad, mut first_bad_i) = (0.0f64, 0usize, None);
+            let (mut n1e3, mut n1e5) = (0usize, 0usize);
+            let mut bad_rows: Vec<usize> = Vec::new();
             let lane0 = *lane0;
             let rows = if lane0 { dv.len() } else { dv.len().min(gv.len()) };
             for j in 0..rows {
@@ -3132,10 +3271,29 @@ fn small_rec_gpu_vs_cpu() {
                         first_bad_i = Some(j);
                     }
                 }
+                if e > 1e-3 {
+                    n1e3 += 1;
+                    let row_w = (*sh.last().unwrap_or(&1)).max(1) as usize;
+                    if !lane0 && bad_rows.len() < 64 && !bad_rows.contains(&(j / row_w)) {
+                        bad_rows.push(j / row_w);
+                    }
+                }
+                if e > 1e-5 {
+                    n1e5 += 1;
+                }
                 worst = worst.max(e);
             }
+            let e1k = if worst > 1e-3 {
+                if !bad_rows.is_empty() {
+                    format!(" >1e-3:{n1e3} >1e-5:{n1e5} 坏行(≤64)={bad_rows:?}")
+                } else {
+                    format!(" >1e-3:{n1e3} >1e-5:{n1e5}")
+                }
+            } else {
+                String::new()
+            };
             eprintln!(
-                "[probe] #{rec_i} {node} ↔ dump{di} {sh:?} lane0={lane0} n={}：worst={worst:.4} 不符={nbad}/{} 首坏idx={:?}",
+                "[probe] #{rec_i} {node} ↔ dump{di} {sh:?} lane0={lane0} n={}：worst={worst:.4} 不符={nbad}/{}{e1k} 首坏idx={:?}",
                 gv.len(),
                 rows,
                 first_bad_i
@@ -3146,6 +3304,13 @@ fn small_rec_gpu_vs_cpu() {
             }
         }
     }
+    // rec 名册（QPPOCR_CMP_RECS=1 时打印——现场取证用）。
+    if std::env::var_os("QPPOCR_CMP_RECS").is_some() {
+        for (i, (kernel, node, _, off, n, _, osh, _)) in recs.iter().enumerate() {
+            eprintln!("[rec] #{i} {kernel} {node} osh={osh:?} off={off} n={n}");
+        }
+    }
+
     // 全图对拍（诊断性，无断言）：形状精确优先、numel 回退，rank-4 双解释
     //（NHWC↔NCHW 与直读取优——头维张量是直读存储）。
     let mut first_bad: Option<(usize, String)> = None;
@@ -3309,9 +3474,13 @@ fn small_rec_gpu_vs_cpu() {
     let c = oc.f32.as_slice();
     let mut worst = 0.0f64;
     let mut nbad = 0usize;
+    let mut nbit = 0usize; // 逐位（含 <0.02 的微差）不相等数
     let mut first_bad_j = None;
     for j in 0..g.len() {
         let e = ((g[j] - c[j]).abs() / (1.0 + c[j].abs())) as f64;
+        if g[j].to_bits() != c[j].to_bits() {
+            nbit += 1;
+        }
         worst = worst.max(e);
         if e > 0.02 {
             nbad += 1;
@@ -3321,9 +3490,10 @@ fn small_rec_gpu_vs_cpu() {
         }
     }
     eprintln!(
-        "[small][cmp] 输出对拍：worst={worst:.5} 不符(>0.02)={}/{} 首坏idx={:?}",
+        "[small][cmp] 输出对拍：worst={worst:.5} 不符(>0.02)={}/{} 逐位不等={} 首坏idx={:?}",
         nbad,
         g.len(),
+        nbit,
         first_bad_j
     );
     // 坏点分布：按图（b）与时间步（t）聚合——集中某图=批错位、某步=时间步错位。
@@ -3373,6 +3543,93 @@ fn small_rec_gpu_vs_cpu() {
         first_bad_j.map(|j| g[j]),
         first_bad_j.map(|j| c[j]),
     );
+}
+
+/// n_softmax 裸内核抗扰测试：T=120 注意力分数 [7680,120] 固定输入，单
+/// dispatch ×30 次提交，跨次比较自身一致性——图级曾观测到整行级非确定
+/// （同输入 16/51/13 行随运行变，T≤80 恒稳），在此隔离：裸形态仍抖 =
+/// 内核内竞态；稳定 = 图上下文（大 CB/驱动屏障）问题。
+#[test]
+fn n_softmax_flaky_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+
+    let (rows, cols) = (7680usize, 120usize);
+    let mut seed = 0xabcd_ef01_2345_6789_u64;
+    let mut src = vec![0f32; rows * cols];
+    for v in src.iter_mut() {
+        *v = lcg(&mut seed) * 20.0 - 10.0;
+    }
+    let seg = |n: usize| n.div_ceil(4) * 4;
+    let in_w = seg(rows * cols);
+    let out_w = seg(rows * cols);
+    let p_w = 64;
+    let big = arena.alloc(((in_w + out_w + p_w) * 4) as vk::DeviceSize).unwrap();
+    let base_word = big.offset as u32 / 4;
+    let (in_off, out_off) = (base_word, base_word + in_w as u32);
+    let p_off = base_word + (in_w + out_w) as u32;
+    let p_of = |w: u32| unsafe { big.ptr.add(w as usize * 4) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), p_of(in_off) as *mut f32, rows * cols);
+        let mut pb = ParamBlock::new();
+        pb.u(in_off)
+            .u(out_off)
+            .u(rows as u32)
+            .u(cols as u32)
+            .u(cols as u32)
+            .u((rows / 8) as u32); // rpb
+        std::ptr::copy_nonoverlapping(
+            pb.words().as_ptr(),
+            p_of(p_off) as *mut u32,
+            pb.words().len(),
+        );
+    }
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+    let mut ref_out: Option<Vec<f32>> = None;
+    let mut n_flaky = 0usize;
+    for run in 0..30 {
+        ctx.inner
+            .device
+            .submit_one_shot(|d, cb| {
+                unsafe {
+                    record_dispatch(
+                        d,
+                        cb,
+                        &ks,
+                        "n_softmax",
+                        PcParams { p_off }.bytes(),
+                        [rows as u32, 1, 1],
+                    );
+                }
+            })
+            .unwrap();
+        let got: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(p_of(out_off) as *const f32, rows * cols)
+        }
+        .to_vec();
+        // clflush 读回（本机驱动 HOST_COHERENT 陷阱，生产路径同款）
+        super::memory::readback_clean(p_of(out_off) as *const u8, rows * cols * 4);
+        match &ref_out {
+            None => ref_out = Some(got),
+            Some(r) => {
+                let d = r
+                    .iter()
+                    .zip(got.iter())
+                    .filter(|(a, b)| (**a - **b).abs() > 1e-6)
+                    .count();
+                if d > 0 {
+                    n_flaky += 1;
+                    eprintln!("[sm-flaky] run {run}: 与首跑分歧 {d}/{}", rows * cols);
+                }
+            }
+        }
+        // 复位输入区（softmax 非原位，输入不动；无需复位）
+    }
+    eprintln!("[sm-flaky] 30 次提交，跨次分歧运行数 {n_flaky}");
+    assert_eq!(n_flaky, 0, "n_softmax 裸形态自身不一致——内核内竞态");
 }
 
 /// n_transpose_nd 裸内核：rank-5 [2,0,3,1,4] 与 rank-4 [0,2,1,3] 对拍
