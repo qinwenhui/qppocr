@@ -1,5 +1,9 @@
-// 最近邻上/下采样（NHWC f32）：iy = trunc(oy * H / oh) 钳 [0,H-1]
-//（镜像 resize_nearest.comp 的纯算术映射）。一线程一 (输出位置, c4)。
+// 最近邻上/下采样（NHWC f32）：iy = trunc(oy * sy) 钳 [0,H-1]。
+// sy/sx 由主机端 f64 预计算入参（P+7/P+8）——内核只乘不除：GPU 浮点
+// 除法在本机 Arc Pro 上走倒数近似，trunc(oy*H/oh) 在整除边界偶发
+// 少 1（曾致 det 图 29/60 行错位、GT 逐行精确掉 24 点）；整数除法版
+// 正确但慢（模拟指令，det +15%）。乘法版：2 的幂比例 f32 精确，
+// 其余 ≤0.5ulp（min 钳兜底）。
 #version 450
 layout(local_size_x = 256) in;
 layout(std430, binding = 1) buffer Params { uint params[]; };
@@ -11,6 +15,8 @@ void main() {
     uint in_off = params[P + 0], out_off = params[P + 1];
     uint mDim = params[P + 2], cDim = params[P + 3], outW = params[P + 4];
     uint inW = params[P + 5], inH = params[P + 6];
+    float sy = uintBitsToFloat(params[P + 7]);
+    float sx = uintBitsToFloat(params[P + 8]);
 
     uint b = gl_WorkGroupID.y;
     uint cv4 = cDim >> 2;
@@ -23,9 +29,7 @@ void main() {
     uint ib = (in_off >> 2) + b * inH * inW * cv4;
     uint ob = (out_off >> 2) + b * mDim * cv4;
 
-    uint iy = uint(float(oy) * float(inH) / float(mDim / outW));
-    uint ix = uint(float(ox) * float(inW) / float(outW));
-    iy = min(iy, inH - 1u);
-    ix = min(ix, inW - 1u);
+    uint iy = min(uint(float(oy) * sy), inH - 1u);
+    uint ix = min(uint(float(ox) * sx), inW - 1u);
     d[ob + m * cv4 + c4] = d[ib + (iy * inW + ix) * cv4 + c4];
 }

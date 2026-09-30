@@ -66,6 +66,11 @@ struct Plan {
     qpool: Option<vk::QueryPool>,
     /// 整块字节数（计划缓存的预算记账）。
     block_bytes: u64,
+    /// real_n 单元的 word 偏移（构造上恒 0；显式存字段防布局演算漂移）。
+    rn_word: u32,
+    /// 本计划是否有一条在飞的 deferred 提交（同形状两条在飞 = 输入/
+    /// 输出区同址互踩；stage 置位、收账复位，debug 断言兜底）。
+    inflight: std::sync::atomic::AtomicBool,
     /// 计划存活期归本计划；逐出时 take 归还会话 arena 池（见
     /// [`VulkanSession::arena_pool`]——免掉大块页提交）。
     arena: Option<Arena>,
@@ -236,7 +241,7 @@ pub(crate) struct VulkanSession {
     graph: Graph,
     initializers: HashMap<String, Tensor>,
     input_name: String,
-    plans: Mutex<Vec<(Vec<i64>, Plan)>>,
+    plans: Mutex<Vec<(Vec<i64>, std::sync::Arc<Plan>)>>,
     /// 会话级管线缓存：按形状重建计划时驱动侧复用编译产物
     ///（形状多样性 × LRU 驱逐会让每帧都重建，38 条管线重建 ~5ms）。
     pipeline_cache: vk::PipelineCache,
@@ -247,6 +252,17 @@ pub(crate) struct VulkanSession {
     /// 137MB 新块页提交 ~7ms vs 复用 ~0——形状多样性 × LRU 驱逐下每帧
     /// 重建曾把它当固定税。池封顶 2 块（按容量优先留大）。
     arena_pool: Mutex<Vec<Arena>>,
+    /// 批维补齐粒度（rec 会话=8，其余 1）：run() 把输入批维向上取整到
+    /// 该值建计划，空行由内核 real_n 早退守卫零算力——(bsz,W) 形状塌缩
+    /// 成 (grain,W桶)，计划全命中。与 `DeviceSession::batch_grain` 同源
+    /// （mod.rs 按模型角色设置；引擎按 trait 值分批）。
+    pub(crate) batch_grain: i32,
+    /// rec 会话的 CTC argmax 出口：rank-3 概率输出不走 n_exit3 全量
+    /// 拷贝，改 n_exit3_argmax 每时间步写 (val, idx) 对——读回从
+    /// T×V×4 B/行（~3 MB）降到 8 B/行。本机 clflush 读回 ~1 ms/MB，
+    /// 全量读回实测 ~18 ms/图，是 rec 上 GPU 的大头。引擎侧用
+    /// `DeviceSession::rec_argmax_pairs` 探测并走 ctc_decode_pairs。
+    pub(crate) argmax_exit: bool,
     /// 持有整个上下文。**必须声明在最后**：字段按声明序 drop——plans
     /// 里的管线/缓冲销毁要用设备，而设备销毁发生在 ctx（Arc<Inner>）
     /// 的最后一个引用释放时。ctx 在前 = 先毁设备再毁管线 = 对已销毁
@@ -288,8 +304,151 @@ impl VulkanSession {
             pipeline_cache,
             repack_cache: Mutex::new(HashMap::new()),
             arena_pool: Mutex::new(Vec::new()),
+            batch_grain: 1,
+            argmax_exit: false,
             ctx,
         })
+    }
+
+    /// 执行的前半段（run / run_deferred 共用）：计划建/查 → real_n 写入
+    /// → 输入 memcpy → **提交不等**。返回 (计划 Arc, 信号值, 真实行数,
+    /// 补齐行数)；调用方 wait_signal(signal) 后 readback_outputs。
+    ///
+    /// 同形状两条在飞 = 输入/输出区同址互踩——调用方负责先收账再提交
+    /// 同形状批（引擎的桶宽分组知道形状；debug 断言兜底）。
+    fn stage(
+        &self,
+        inputs: Vec<(String, Tensor)>,
+    ) -> Result<(std::sync::Arc<Plan>, u64, i64, i64)> {
+        let mut plans = self
+            .plans
+            .lock()
+            .map_err(|_| Error::Device("计划缓存锁中毒".into()))?;
+        let in_shape: Vec<i64> = inputs
+            .iter()
+            .find(|(nm, _)| nm == &self.input_name)
+            .map(|(_, t)| t.shape.clone())
+            .ok_or_else(|| Error::Graph(format!("缺少输入 {}", self.input_name)))?;
+        // 批维补齐（batch_grain>1 的 rec 会话）：计划按补齐形状建/查，
+        // 真实行数写 real_n 单元，内核空行工作组早退——(bsz,W) 形状
+        // 塌缩成 (grain,W桶)。空行的输入/输出区是陈旧数据，但被守卫
+        // 恒不读，无需清零。
+        let n_real = *in_shape.first().unwrap_or(&1);
+        let grain = self.batch_grain.max(1) as i64;
+        let n_pad = (n_real + grain - 1) / grain * grain;
+        let plan_shape = if n_pad != n_real {
+            let mut s = in_shape.clone();
+            s[0] = n_pad;
+            s
+        } else {
+            in_shape.clone()
+        };
+        if !plans.iter().any(|(s, _)| *s == plan_shape) {
+            let plan = std::sync::Arc::new(self.build_plan(&plan_shape)?);
+            plans.push((plan_shape.clone(), plan));
+            // 字节预算封顶：每个计划 ≈ 整块 arena（det ~137 MB；rec 批式
+            // 30-165 MB @ (8,48,W)）。100 图语料：rec 桶 ~24 个 × 60MB
+            // 均值 ≈ 1.4GB——768 旧默认下 rec 计划每图互相驱逐（实测
+            // rec 71ms、93 次重建），2048 全命中（24 次构建，rec p50
+            // 37ms）。det 的逐图形状（~41 个）任何预算都装不下，靠
+            // 管线缓存把重建压到 ~2-3ms（见三级缓存）。按块大小淘汰
+            // 最旧的（Vec 头部）；命中的形状下次重建。
+            const DEFAULT_BUDGET_MB: u64 = 2048;
+            let budget: u64 = std::env::var("QPPOCR_GPU_PLAN_MB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_BUDGET_MB);
+            let mut total: u64 = plans.iter().map(|(_, p)| p.block_bytes).sum();
+            let mut evicted_arenas: Vec<Arena> = Vec::new();
+            while total > budget * (1 << 20) && plans.len() > 1 {
+                let (_, mut evicted) = plans.remove(0);
+                total -= evicted.block_bytes;
+                // get_mut 失败 = deferred 在飞引用该计划：不能归池
+                //（整块随最后一个 Arc drop 释放，池少一块可接受）。
+                if let Some(p) = std::sync::Arc::get_mut(&mut evicted) {
+                    if let Some(a) = p.arena.take() {
+                        evicted_arenas.push(a);
+                    }
+                }
+            }
+            // 归还的块进池（封顶 2，按容量留大——下一形状 reset 复用）
+            if !evicted_arenas.is_empty() {
+                if let Ok(mut pool) = self.arena_pool.lock() {
+                    for a in evicted_arenas {
+                        pool.push(a);
+                        if pool.len() > 2 {
+                            // 淘汰容量最小的
+                            let mut min_i = 0;
+                            for i in 1..pool.len() {
+                                if pool[i].chunk_bytes() < pool[min_i].chunk_bytes() {
+                                    min_i = i;
+                                }
+                            }
+                            pool.swap_remove(min_i);
+                        }
+                    }
+                }
+            }
+        }
+        let plan = plans
+            .iter()
+            .find(|(s, _)| *s == plan_shape)
+            .map(|(_, p)| p.clone())
+            .ok_or_else(|| Error::Device("计划缓存刚插入即缺失".into()))?;
+        debug_assert!(
+            plan.inflight
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok(),
+            "同形状计划重复在飞（调用方必须先 complete 前一条）"
+        );
+        let reset_inflight = |p: &Plan| {
+            p.inflight
+                .store(false, std::sync::atomic::Ordering::Release);
+        };
+        // real_n 必须先于提交写入（内核读 params[0] 做早退；步进对拍路径
+        // 同样经此后重放 CB）。**写后过发布屏障**（SFENCE+clflush 写回
+        // 逐出）：4 字节小写无容量压力、不会自我逐出，与 CB 头部屏障
+        // 配对（两道都做过缺一复现的 A/B，见 memory.rs publish_clean）。
+        // SAFETY: base 是整块持久映射；rn_word 是 build 期静态分配。
+        unsafe {
+            let p = plan.base.add(plan.rn_word as usize * 4) as *mut u32;
+            std::ptr::write_volatile(p, n_real as u32);
+            super::memory::publish_clean(p as *const u8, 4);
+        }
+
+        for (nm, t) in &inputs {
+            if let Some(off) = plan.in_offs.get(nm) {
+                if std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some() {
+                    eprintln!(
+                        "[gpu][io] 输入 {nm} → @{off}（tensor.name={:?} len={} 头={:?})",
+                        t.name,
+                        t.f32.len(),
+                        &t.f32.as_slice()[..4.min(t.f32.len())]
+                    );
+                }
+                // SAFETY: base 是整块持久映射；off+len 在 total 内（按输入形状分配）。
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        t.f32.as_ptr(),
+                        plan.base.add(*off as usize * 4) as *mut f32,
+                        t.f32.len(),
+                    );
+                }
+            }
+        }
+        let submitted = self.ctx.device.submit_cb(plan.cb);
+        match submitted {
+            Ok(signal) => Ok((plan, signal, n_real, n_pad)),
+            Err(e) => {
+                reset_inflight(&plan);
+                Err(e)
+            }
+        }
     }
 
     /// 调试：给定形状返回 (整块基址, [(内核, 节点, 偏移, 元素数, PC, 形状, 输入明细)])。
@@ -570,6 +729,14 @@ impl VulkanSession {
         // 权重**永不释放**：命令缓冲每次重放都读它，区域复用=数据被覆盖。
         // 统一 word 上传：f32 数据按位转 u32。
         let mut upload: Vec<(u32, Vec<u32>)> = Vec::new();
+        // real_n 单元（arena 第 0 词）：本次 run 的真实批维行数，run() 每
+        // 次提交前主机直写；n_ 内核读 params[0] 做批维早退——批维补齐
+        // （batch_grain）后空行工作组零算力。必须**最先**分配：内核按
+        // params[0] 绝对寻址，静态区只增不复用，word 0 不能让给权重/激活。
+        // 初值 1 = 全通过（等 run() 覆写）。
+        let rn_word = layout.alloc_static(1);
+        debug_assert_eq!(rn_word, 0);
+        upload.push((rn_word, vec![1u32]));
         // conv 族权重（重排目标）名单：预环跳过，节点处理时惰性重排。
         let mut conv_w_names: std::collections::HashSet<String> = std::collections::HashSet::new();
         if !f32_mode {
@@ -710,6 +877,8 @@ impl VulkanSession {
         };
         // n_ 模式：exit 转换列表 (f16 源名, 图输出名, act)——节点环后统一发
         let mut pending_exits: Vec<(String, String, u32)> = Vec::new();
+        // argmax 出口的图输出名（读回长度/形状按 [N,T,2] 覆写，见 out_offs）
+        let mut argmax_outs: std::collections::HashSet<String> = std::collections::HashSet::new();
         // n_ 模式：每张量的存储形状 (rows, cols)——cols 是连续维。
         // rank-4 conv 族 = (N*H*W, Cpad)；MatMul 尾部 = (M, Npad)；
         // Squeeze/Unsqueeze/Transpose(0,2,1) 是存储恒等（别名）。
@@ -1001,35 +1170,48 @@ impl VulkanSession {
                     return Err(Error::Graph(format!("exit：图输出 {name} 无形状")));
                 };
                 let out_words = numel(&table, &name);
-                let out_off = layout.alloc(out_words);
                 if v.shape.len() != 4 {
                     // rank-3 输出（rec 的 [B,T,V]）：存储 = NCHW 行主序
                     // 的恒等拷贝（cols=V 连续 = NCHW 最后轴），f32→f32。
-                    // pad 列（cpad 超出 V）不写出。
+                    // pad 列（cpad 超出 V）不写出。argmax_exit 时改走
+                    // n_exit3_argmax：每行写 (val, idx) 2 word，出区同缩。
                     let (rows, cpad) = rc.get(&src_name).copied().ok_or_else(|| {
                         Error::Graph(format!("exit：rank-{} 输出 {name} 无 rc", v.shape.len()))
                     })?;
                     let real_cols = *v.shape.last().unwrap() as u32;
+                    // 每批行数（rows = N_pad×T，批是外维）：空行早退用。
+                    let rpb = (rows / v.shape[0].max(1) as u32).max(1);
+                    let argmax = self.argmax_exit;
+                    let out_n_words = if argmax { rows * 2 } else { out_words };
+                    let out_off = layout.alloc(out_n_words);
                     let mut pb = ParamBlock::new();
-                    pb.u(src_off).u(out_off).u(rows).u(real_cols).u(cpad);
+                    pb.u(src_off).u(out_off).u(rows).u(real_cols).u(cpad).u(rpb);
                     let p_off = layout.alloc_static(pb.len_words());
                     ledger.push((format!("p:<exit3:{name}>"), p_off, pb.len_words()));
                     params.push((p_off, pb.words().to_vec()));
                     recs.push(Rec {
-                        kernel: "n_exit3",
+                        kernel: if argmax { "n_exit3_argmax" } else { "n_exit3" },
                         node: format!("<exit3:{name}>"),
                         node_idx: usize::MAX,
                         out_off,
-                        out_n: out_words,
+                        out_n: out_n_words,
                         pc: super::pipeline::PcParams { p_off }.bytes().to_vec(),
-                        groups: [(rows * real_cols).div_ceil(256), 1, 1],
-                        ins: vec![(src_name.clone(), src_off, out_words)],
+                        groups: if argmax {
+                            [rows, 1, 1]
+                        } else {
+                            [(rows * real_cols).div_ceil(256), 1, 1]
+                        },
+                        ins: vec![(src_name.clone(), src_off, out_n_words)],
                         in_shapes: vec![v.shape.clone()],
                         out_shape: v.shape.clone(),
                     });
+                    if argmax {
+                        argmax_outs.insert(name.clone());
+                    }
                     offs.insert(name.clone(), out_off);
                     continue;
                 }
+                let out_off = layout.alloc(out_words);
                 let (nb, c, h, w) = (v.shape[0], v.shape[1], v.shape[2], v.shape[3]);
                 let mut pb = ParamBlock::new();
                 pb.u(src_off)
@@ -1187,6 +1369,24 @@ impl VulkanSession {
                 dev.cmd_reset_query_pool(cb, p, 0, recs.len() as u32 + 1);
                 dev.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, p, 0);
             }
+            // 头部全量内存屏障（每次重放都执行）：本机驱动的第三个
+            // 一致性缺口——GPU 侧缓存会保留旧地址行，主机写穿到 DRAM
+            // 也被它遮住（img-003 间歇整行空文本的现场：批内稀疏行、
+            // 主机侧 sfence+clflush 输入发布无效）。屏障强制设备缓存
+            // 对本次重放前的全部写入（含主机写）失效。代价每次重放
+            // 一道屏障（µs 级）。
+            let bar = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            dev.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[bar],
+                &[],
+                &[],
+            );
         }
         for (i, r) in recs.iter().enumerate() {
             // SAFETY: cb 处于录制态；PC 与内核参数块逐字段对应（map_node 保证）。
@@ -1219,7 +1419,19 @@ impl VulkanSession {
             .iter()
             .map(|o| {
                 let off = offs.get(o).copied().unwrap_or(0);
-                (o.clone(), off, numel(&table, o) as usize)
+                // argmax 出口：元素数 = 行数×2（(val,idx) 对），非逻辑 numel
+                let n = if argmax_outs.contains(o) {
+                    numel(&table, o) as usize
+                        / table
+                            .values
+                            .get(o)
+                            .map(|v| *v.shape.last().unwrap_or(&1) as usize)
+                            .unwrap_or(1)
+                        * 2
+                } else {
+                    numel(&table, o) as usize
+                };
+                (o.clone(), off, n)
             })
             .collect();
         let out_shapes: Vec<Vec<i64>> = self
@@ -1230,7 +1442,16 @@ impl VulkanSession {
                 table
                     .values
                     .get(o)
-                    .map(|v| v.shape.clone())
+                    .map(|v| {
+                        if argmax_outs.contains(o) {
+                            // [N,T,V] → [N,T,2]
+                            let mut s = v.shape.clone();
+                            *s.last_mut().unwrap() = 2;
+                            s
+                        } else {
+                            v.shape.clone()
+                        }
+                    })
                     .unwrap_or_default()
             })
             .collect();
@@ -1261,6 +1482,8 @@ impl VulkanSession {
         Ok(Plan {
             base: whole.ptr,
             block_bytes: layout.total as u64 * 4,
+            rn_word,
+            inflight: std::sync::atomic::AtomicBool::new(false),
             arena: Some(arena),
             recs: dbg_recs,
             // in_offs 指向 **f32 区**（host 每次 memcpy 的目标）。n_ 模式下
@@ -1285,70 +1508,7 @@ impl VulkanSession {
     /// `=full` 额外逐 dispatch 列表。附 GPU 总时间 vs 提交往返的墙钟
     /// （差值 = 主机等待/提交开销）。
     fn prof_print(&self, plan: &Plan, pool: vk::QueryPool, wall_ms: f64) {
-        let dev = self.ctx.device.raw();
-        let n = plan.recs.len();
-        let mut stamps = vec![0u64; n + 1];
-        // SAFETY: pool 归本计划且提交已等完信号；data 切片长度即查询数。
-        let ok = unsafe {
-            dev.get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
-        }
-        .is_ok();
-        if !ok {
-            eprintln!("[gpu][prof] 时间戳查询不可用（查询未完成？）");
-            return;
-        }
-        let (_, period) = self.ctx.device.timestamps();
-        let ms = |d: u64| d as f64 * period as f64 / 1e6;
-        let deltas: Vec<f64> = (0..n)
-            .map(|i| ms(stamps[i + 1].saturating_sub(stamps[i])))
-            .collect();
-        let total: f64 = deltas.iter().sum();
-
-        // 按内核聚合
-        let mut by_kernel: HashMap<&str, (usize, f64)> = HashMap::new();
-        for (r, d) in plan.recs.iter().zip(&deltas) {
-            let e = by_kernel.entry(r.0.as_str()).or_default();
-            e.0 += 1;
-            e.1 += *d;
-        }
-        let mut kers: Vec<(&str, usize, f64)> =
-            by_kernel.into_iter().map(|(k, (c, t))| (k, c, t)).collect();
-        kers.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-        eprintln!(
-            "[gpu][prof] GPU 总 {total:.2} ms / 提交往返墙钟 {wall_ms:.2} ms / \
-             {n} dispatch（均 {:.3} ms）",
-            total / n as f64
-        );
-        for (k, c, t) in &kers {
-            eprintln!(
-                "[gpu][prof]   {k:<22} ×{c:<4} {t:8.3} ms（均 {:.3}）",
-                t / *c as f64
-            );
-        }
-        // top-20 热点（节点名）
-        let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&a, &b| deltas[b].partial_cmp(&deltas[a]).unwrap());
-        let full = std::env::var("QPPOCR_GPU_PROF").unwrap_or_default() == "full";
-        let top = if full { n } else { idx.len().min(20) };
-        for &i in &idx[..top] {
-            let (kernel, node, _, _out_off, _out_n, _, groups, _, shapes, _osh) = &plan.recs[i];
-            let sh: Vec<String> = shapes
-                .iter()
-                .take(2)
-                .map(|s| {
-                    if s.len() == 4 {
-                        format!("[{},{}, {},{}]", s[0], s[1], s[2], s[3])
-                    } else {
-                        format!("{s:?}")
-                    }
-                })
-                .collect();
-            eprintln!(
-                "[gpu][prof]   #{i:<4} {kernel:<20} {node:<28} {:.3} ms  grid {groups:?} in {} n={_out_n}",
-                deltas[i],
-                sh.join(" × "),
-            );
-        }
+        prof_print_with(&self.ctx, plan, pool, wall_ms);
     }
 
     /// n_ 模式的节点 → (内核名, 参数块, dispatch 网格)。
@@ -1658,7 +1818,11 @@ impl VulkanSession {
                     .u(cp)
                     .u(ow)
                     .u(xs[3] as u32)
-                    .u(xs[2] as u32);
+                    .u(xs[2] as u32)
+                    // 主机端 f64 预计算的比例系数：内核乘法版索引
+                    //（GPU 浮点除法在本机有倒数截断缺陷，见 n_resize.comp）。
+                    .f((xs[2] as f64 / oh as f64) as f32)
+                    .f((xs[3] as f64 / ow as f64) as f32);
                 Ok(vec![(
                     "n_resize",
                     pb,
@@ -1786,12 +1950,16 @@ impl VulkanSession {
                     .copied()
                     .ok_or_else(|| Error::Graph("Softmax 输入无 rc".into()))?;
                 let cols = osh.last().copied().unwrap_or(0) as u32;
+                // 每批行数（rows = N_pad×T，批是外维）：n_softmax 的空行
+                // 早退要用 real_n×rpb 定位真实行段。
+                let rpb = (rows / osh[0].max(1) as u32).max(1);
                 let mut pb = ParamBlock::new();
                 pb.u(off_of(&n.inputs[0])?)
                     .u(off_of(out)?)
                     .u(rows)
                     .u(cols)
-                    .u(cpad);
+                    .u(cpad)
+                    .u(rpb);
                 Ok(vec![("n_softmax", pb, [rows, 1, 1])])
             }
             "BatchNormalization" => {
@@ -1950,7 +2118,11 @@ impl VulkanSession {
                         .f(p2)
                         .u(hw_gate);
                     Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
-                } else if b.len() == 1 && a.last() == Some(&b[0]) && a.len() >= 2 {
+                // [V] 尾轴广播——b_n==1 是标量，须走后面的标量分支：不设此
+                // 守卫时 cls-on-GPU 全图错位（cls_dw_precise 断言与
+                // cls_session_end_to_end 双双失败；引擎默认 cls 走 CPU，
+                // 100 图分数测不出，勿以引擎 A/B 判此分支）。
+                } else if b.len() == 1 && b_n > 1 && a.last() == Some(&b[0]) && a.len() >= 2 {
                     // [V] 尾轴广播（rank-2/3 的 a：cls 的 Add([B,2],[2])、
                     // rec 的 MatMul bias）——存储列 = 尾轴 → n_channel
                     let (rows, cpad) = rc
@@ -2559,113 +2731,188 @@ impl DeviceSession for VulkanSession {
         false // GPU 内部已并行：pipeline 走串行批（Phase 0 接缝）
     }
 
-    fn run(&self, inputs: Vec<(String, Tensor)>) -> Result<Vec<Tensor>> {
-        let mut plans = self
-            .plans
-            .lock()
-            .map_err(|_| Error::Device("计划缓存锁中毒".into()))?;
-        let in_shape: Vec<i64> = inputs
-            .iter()
-            .find(|(nm, _)| nm == &self.input_name)
-            .map(|(_, t)| t.shape.clone())
-            .ok_or_else(|| Error::Graph(format!("缺少输入 {}", self.input_name)))?;
-        if !plans.iter().any(|(s, _)| *s == in_shape) {
-            let plan = self.build_plan(&in_shape)?;
-            plans.push((in_shape.clone(), plan));
-            // 字节预算封顶：每个计划 ≈ 整块 arena（100-140 MB @ 960 输入），
-            // 100 图语料的形状多样性会无界增长。按块大小淘汰最旧的
-            // （Vec 头部）直到总额 ≤ 预算；命中的形状下次重建
-            // （管线缓存已把重建压到 ~2ms）。
-            const DEFAULT_BUDGET_MB: u64 = 768;
-            let budget: u64 = std::env::var("QPPOCR_GPU_PLAN_MB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_BUDGET_MB);
-            let mut total: u64 = plans.iter().map(|(_, p)| p.block_bytes).sum();
-            let mut evicted_arenas: Vec<Arena> = Vec::new();
-            while total > budget * (1 << 20) && plans.len() > 1 {
-                let (_, mut evicted) = plans.remove(0);
-                total -= evicted.block_bytes;
-                if let Some(a) = evicted.arena.take() {
-                    evicted_arenas.push(a);
-                }
-            }
-            // 归还的块进池（封顶 2，按容量留大——下一形状 reset 复用）
-            if !evicted_arenas.is_empty() {
-                if let Ok(mut pool) = self.arena_pool.lock() {
-                    for a in evicted_arenas {
-                        pool.push(a);
-                        if pool.len() > 2 {
-                            // 淘汰容量最小的
-                            let mut min_i = 0;
-                            for i in 1..pool.len() {
-                                if pool[i].chunk_bytes() < pool[min_i].chunk_bytes() {
-                                    min_i = i;
-                                }
-                            }
-                            pool.swap_remove(min_i);
-                        }
-                    }
-                }
-            }
-        }
-        let plan = plans
-            .iter()
-            .find(|(s, _)| *s == in_shape)
-            .map(|(_, p)| p)
-            .unwrap();
+    fn bucket_grain(&self) -> i32 {
+        // rec 每行一个裸宽 → 每形状一次 ~10ms 计划重建（曾把全 GPU 的
+        // rec 拖到 2× CPU）。64 桶把语料宽度塌缩到 ~20 个形状，重建
+        // 只付一次；右侧零填充的额外计算远小于重建税。
+        64
+    }
 
-        for (nm, t) in &inputs {
-            if let Some(off) = plan.in_offs.get(nm) {
-                if std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some() {
-                    eprintln!(
-                        "[gpu][io] 输入 {nm} → @{off}（tensor.name={:?} len={} 头={:?})",
-                        t.name,
-                        t.f32.len(),
-                        &t.f32.as_slice()[..4.min(t.f32.len())]
-                    );
-                }
-                // SAFETY: base 是整块持久映射；off+len 在 total 内（按输入形状分配）。
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        t.f32.as_ptr(),
-                        plan.base.add(*off as usize * 4) as *mut f32,
-                        t.f32.len(),
-                    );
-                }
-            }
-        }
+    fn batch_grain(&self) -> i32 {
+        self.batch_grain
+    }
+
+    fn rec_argmax_pairs(&self) -> bool {
+        self.argmax_exit
+    }
+
+    fn run(&self, inputs: Vec<(String, Tensor)>) -> Result<Vec<Tensor>> {
+        let staged = self.stage(inputs)?;
         if std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some() {
-            self.stepped_run_and_cmp(plan)?;
+            self.stepped_run_and_cmp(&staged.0)?;
+        }
+        let t0 = std::time::Instant::now();
+        self.ctx.device.wait_signal(staged.1)?;
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if let Some(p) = staged.0.qpool {
+            self.prof_print(&staged.0, p, wall_ms);
+        }
+        staged
+            .0
+            .inflight
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(readback_outputs(&staged.0, staged.2, staged.3))
+    }
+
+    fn run_deferred(
+        &self,
+        inputs: Vec<(String, Tensor)>,
+    ) -> Result<Box<dyn qppocr_core::device::DeferredRun + Send>> {
+        let (plan, signal, n_real, n_pad) = self.stage(inputs)?;
+        Ok(Box::new(VulkanDeferred {
+            ctx: self.ctx.clone(),
+            plan,
+            signal,
+            n_real,
+            n_pad,
+        }))
+    }
+}
+
+/// prof_print 的自由函数形态（run 与 VulkanDeferred::complete 共用）。
+fn prof_print_with(ctx: &Arc<super::Inner>, plan: &Plan, pool: vk::QueryPool, wall_ms: f64) {
+    let dev = ctx.device.raw();
+    let n = plan.recs.len();
+    let mut stamps = vec![0u64; n + 1];
+    // SAFETY: pool 归本计划且提交已等完信号；data 切片长度即查询数。
+    let ok = unsafe {
+        dev.get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
+    }
+    .is_ok();
+    if !ok {
+        eprintln!("[gpu][prof] 时间戳查询不可用（查询未完成？）");
+        return;
+    }
+    let (_, period) = ctx.device.timestamps();
+    let ms = |d: u64| d as f64 * period as f64 / 1e6;
+    let deltas: Vec<f64> = (0..n)
+        .map(|i| ms(stamps[i + 1].saturating_sub(stamps[i])))
+        .collect();
+    let total: f64 = deltas.iter().sum();
+
+    // 按内核聚合
+    let mut by_kernel: HashMap<&str, (usize, f64)> = HashMap::new();
+    for (r, d) in plan.recs.iter().zip(&deltas) {
+        let e = by_kernel.entry(r.0.as_str()).or_default();
+        e.0 += 1;
+        e.1 += *d;
+    }
+    let mut kers: Vec<(&str, usize, f64)> =
+        by_kernel.into_iter().map(|(k, (c, t))| (k, c, t)).collect();
+    kers.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    eprintln!(
+        "[gpu][prof] GPU 总 {total:.2} ms / 提交往返墙钟 {wall_ms:.2} ms / \
+         {n} dispatch（均 {:.3} ms）",
+        total / n as f64
+    );
+    for (k, c, t) in &kers {
+        eprintln!(
+            "[gpu][prof]   {k:<22} ×{c:<4} {t:8.3} ms（均 {:.3}）",
+            t / *c as f64
+        );
+    }
+    // top-20 热点（节点名）
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| deltas[b].partial_cmp(&deltas[a]).unwrap());
+    let full = std::env::var("QPPOCR_GPU_PROF").unwrap_or_default() == "full";
+    let top = if full { n } else { idx.len().min(20) };
+    for &i in &idx[..top] {
+        let (kernel, node, _, _out_off, _out_n, _, groups, _, shapes, _osh) = &plan.recs[i];
+        let sh: Vec<String> = shapes
+            .iter()
+            .take(2)
+            .map(|s| {
+                if s.len() == 4 {
+                    format!("[{},{}, {},{}]", s[0], s[1], s[2], s[3])
+                } else {
+                    format!("{s:?}")
+                }
+            })
+            .collect();
+        eprintln!(
+            "[gpu][prof]   #{i:<4} {kernel:<20} {node:<28} {:.3} ms  grid {groups:?} in {} n={_out_n}",
+            deltas[i],
+            sh.join(" × "),
+        );
+    }
+    }
+
+
+/// 执行的后半段（run / deferred::complete 共用）：等信号后按真实行数
+/// 拷出图输出（含 clflush 读回屏障与补齐缩行）。
+fn readback_outputs(plan: &Plan, n_real: i64, n_pad: i64) -> Vec<Tensor> {
+    let mut outs = Vec::with_capacity(plan.out_offs.len());
+    for (i, (name, off, n)) in plan.out_offs.iter().enumerate() {
+        let mut shape = plan.out_shapes.get(i).cloned().unwrap_or_default();
+        // 补齐计划的真实行读回：只取前 n_real 行（批是外维、行连续，
+        // 空行区是陈旧数据）。n 按 n_pad 建的——按比例缩回。
+        let n_take: usize = if n_pad != n_real {
+            n / n_pad.max(1) as usize * n_real as usize
         } else {
-            let t0 = std::time::Instant::now();
-            self.ctx.device.submit_wait_cb(plan.cb)?;
-            let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if let Some(p) = plan.qpool {
-                self.prof_print(plan, p, wall_ms);
-            }
+            *n
+        };
+        if !shape.is_empty() {
+            shape[0] = n_real;
         }
-        let mut outs = Vec::with_capacity(plan.out_offs.len());
-        for (i, (name, off, n)) in plan.out_offs.iter().enumerate() {
-            let shape = plan.out_shapes.get(i).cloned().unwrap_or_default();
-            let mut buf = F32Buf::with_zeroed(*n);
-            // SAFETY: 已等信号；off+n ≤ total。
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    plan.base.add(*off as usize * 4) as *const f32,
-                    buf.as_mut_slice().as_mut_ptr(),
-                    *n,
-                );
-            }
-            outs.push(Tensor {
-                name: name.clone(),
-                shape,
-                dtype: DType::F32,
-                f32: buf,
-                i64: Vec::new(),
-            });
+        let mut buf = F32Buf::with_zeroed(n_take);
+        // 读回屏障：本机驱动对 coherent 映射的设备写不做主机缓存一致
+        //（vkInvalidate 无效），读前 clflush 逐出陈旧行（见 memory.rs）。
+        // SAFETY: base 是整块持久映射；off+n_take ≤ total（计划保证）。
+        super::memory::readback_clean(
+            unsafe { plan.base.add(*off as usize * 4) } as *const u8,
+            n_take * 4,
+        );
+        // SAFETY: 已等信号；off+n_take ≤ total。
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                plan.base.add(*off as usize * 4) as *const f32,
+                buf.as_mut_slice().as_mut_ptr(),
+                n_take,
+            );
         }
-        Ok(outs)
+        outs.push(Tensor {
+            name: name.clone(),
+            shape,
+            dtype: DType::F32,
+            f32: buf,
+            i64: Vec::new(),
+        });
+    }
+    outs
+}
+
+/// 批间流水的收账句柄：持有计划 Arc（防预算逐出悬空）与提交信号，
+/// complete = 等信号 + 读回 + 解除在飞标记。
+struct VulkanDeferred {
+    ctx: Arc<super::Inner>,
+    plan: std::sync::Arc<Plan>,
+    signal: u64,
+    n_real: i64,
+    n_pad: i64,
+}
+
+impl qppocr_core::device::DeferredRun for VulkanDeferred {
+    fn complete(self: Box<Self>) -> Result<Vec<Tensor>> {
+        let t0 = std::time::Instant::now();
+        self.ctx.device.wait_signal(self.signal)?;
+        let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if let Some(p) = self.plan.qpool {
+            prof_print_with(&self.ctx, &self.plan, p, wall_ms);
+        }
+        self.plan
+            .inflight
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(readback_outputs(&self.plan, self.n_real, self.n_pad))
     }
 }
 
@@ -2786,9 +3033,8 @@ mod tests {
         let dump_dir = std::env::temp_dir().join("qppocr-g2-dbg");
         let _ = std::fs::remove_dir_all(&dump_dir);
         std::fs::create_dir_all(&dump_dir).unwrap();
-        // SAFETY: 测试独占该环境变量（仅 Session::run 读）。
-        unsafe { std::env::set_var("QPPOCR_DUMP_DIR", &dump_dir) };
-        let cpu = Session::from_memory(&bytes, "tiny.det").unwrap();
+        let mut cpu = Session::from_memory(&bytes, "tiny.det").unwrap();
+        cpu.set_dump_dir(dump_dir.to_str().unwrap());
         let in_name = cpu
             .graph
             .inputs
@@ -2798,8 +3044,6 @@ mod tests {
             .unwrap();
         let t0 = std::time::Instant::now();
         let out_cpu = cpu.run(vec![(in_name.clone(), cl(&in_name))]).unwrap();
-        // SAFETY: 同上。
-        unsafe { std::env::remove_var("QPPOCR_DUMP_DIR") };
         eprintln!(
             "[gpu] CPU 前向 {:.1} ms",
             t0.elapsed().as_secs_f64() * 1000.0

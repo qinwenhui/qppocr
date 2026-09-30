@@ -1,0 +1,75 @@
+// rank-3 出口的 argmax 变体（rec 的 CTC 头）：softmax 输出 [rows × cpad]
+// f32，每行取**首个严格最大**（平局取最小下标——与 CPU ctc_decode 的
+// 逐元素 `>` 首胜语义逐字等价），写 (val, idx) 对（每行 2 word：
+// val + idx 的位型）。
+// 读回从 T×V×4 B/行（~3 MB）降到 8 B/行——CTC 只吃 argmax 路径，
+// 全量概率矩阵回主机纯属带宽浪费（本机 clflush 读回 ~1 ms/MB 实测）。
+//   params: in_off, out_off, rows, cols, cpad, rpb（rows/批，空行早退）
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer F32 { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+shared vec2 red[256]; // (max 值, 持有者最小下标——位型存 float)
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint rows = params[P + 2], cols = params[P + 3], cpad = params[P + 4];
+    uint rpb = params[P + 5]; // rows/批（rows=N_pad*T；批是外维）
+
+    uint row = gl_WorkGroupID.x;
+    if (row >= rows) return;
+    if (params[0] != 0u && row >= params[0] * rpb) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
+    uint base = in_off + row * cpad;
+    uint lid = gl_LocalInvocationID.x;
+
+    // 1) 线程内跨步扫描：首个严格最大（v > m 才换——平局留先者）
+    float m = -3.4e38;
+    uint mi = 0u;
+    for (uint j = lid; j < cols; j += 256u) {
+        float v = data[base + j];
+        if (v > m) {
+            m = v;
+            mi = j;
+        }
+    }
+    // 2) 子组归约：值取 max；等值线程里取最小下标
+    float wm = subgroupMax(m);
+    uint cand = (m == wm) ? mi : 0xFFFFFFFFu;
+    uint wmi = subgroupMin(cand);
+    if (subgroupElect()) red[gl_SubgroupID] = vec2(wm, uintBitsToFloat(wmi));
+    barrier();
+    // 3) 跨子组（softmax 同款尾归约）：值优先、平局最小下标
+    if (lid < gl_NumSubgroups && lid % 4u == 0u) {
+        float v = red[lid].x;
+        uint ix = floatBitsToUint(red[lid].y);
+        for (uint k = 1u; k < 4u && lid + k < gl_NumSubgroups; k++) {
+            float v2 = red[lid + k].x;
+            uint ix2 = floatBitsToUint(red[lid + k].y);
+            if (v2 > v || (v2 == v && ix2 < ix)) {
+                v = v2;
+                ix = ix2;
+            }
+        }
+        red[lid / 4u] = vec2(v, uintBitsToFloat(ix));
+    }
+    barrier();
+    float bv = red[0].x;
+    uint bi = floatBitsToUint(red[0].y);
+    for (uint g = 1u; g < (gl_NumSubgroups + 3u) / 4u; g++) {
+        float v2 = red[g].x;
+        uint ix2 = floatBitsToUint(red[g].y);
+        if (v2 > bv || (v2 == bv && ix2 < bi)) {
+            bv = v2;
+            bi = ix2;
+        }
+    }
+    if (lid == 0u) {
+        data[out_off + row * 2u] = bv;
+        data[out_off + row * 2u + 1u] = uintBitsToFloat(bi);
+    }
+}

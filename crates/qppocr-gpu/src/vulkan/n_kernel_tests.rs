@@ -20,7 +20,10 @@ fn lcg(seed: &mut u64) -> f32 {
 
 fn open_or_skip() -> Option<VulkanContext> {
     match VulkanContext::open(None) {
-        Ok(c) => Some(c),
+        Ok(c) => {
+            eprintln!("[gpu] 设备: {}", c.inner.name);
+            Some(c)
+        }
         Err(e) => {
             eprintln!("[gpu] 跳过（无满足基线的设备）: {e}");
             None
@@ -459,7 +462,170 @@ fn n_family_smoke() {
 
 /// 真实数据定位：用 CPU 引擎 dump 的 det 输入（QPPOCR_DUMP_DIR 产物，
 /// s0_000000.f32）同输入对拍 GPU vs CPU 的概率图统计——随机数据的
-/// 容差测试通过了但真实图片 0 框，用真实分布找分歧。
+///容差测试通过了但真实图片 0 框，用真实分布找分歧。
+#[test]
+fn det_shift_bisect() {
+    let dir = std::path::PathBuf::from(
+        std::env::var("QPPOCR_REAL_DET_INPUT").unwrap_or_else(|_| "/tmp/det-dump".into()),
+    );
+    let bytes = match std::fs::read(dir.join("s0_000000.f32")) {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("[bisect] 无真实 det 输入 dump，跳过");
+            return;
+        }
+    };
+    let Some(ctx) = open_or_skip() else { return };
+    let rank = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let shape: Vec<i64> = bytes[4..4 + 8 * rank]
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let data: Vec<f32> = bytes[4 + 8 * rank..]
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let model = std::path::Path::new("../../models/tiny/det.onnx");
+    if !model.is_file() {
+        eprintln!("[bisect] 无模型，跳过");
+        return;
+    }
+    let mbytes = std::fs::read(model).unwrap();
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+    let mk = || {
+        let mut b = F32Buf::with_zeroed(data.len());
+        b.as_mut_slice().copy_from_slice(&data);
+        Tensor {
+            name: String::new(),
+            shape: shape.clone(),
+            dtype: DType::F32,
+            f32: b,
+            i64: Vec::new(),
+        }
+    };
+    // CPU 逐节点 dump
+    let dump_dir = std::env::temp_dir().join("qppocr-det-bisect");
+    let _ = std::fs::remove_dir_all(&dump_dir);
+    std::fs::create_dir_all(&dump_dir).unwrap();
+    let mut cpu = Session::from_memory(&mbytes, "bisect.cpu").unwrap();
+    cpu.set_dump_dir(dump_dir.to_str().unwrap());
+    let in_name = cpu
+        .graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let _ = cpu.run(vec![(in_name.clone(), mk())]).unwrap();
+    let sid: u32 = {
+        let mut mx = 0u32;
+        for e in std::fs::read_dir(&dump_dir).unwrap().flatten() {
+            let nm = e.file_name().into_string().unwrap_or_default();
+            if let Some(stem) = nm.strip_suffix(".f32") {
+                if let Some((s, _)) = stem.split_once('_') {
+                    if let Ok(v) = s.strip_prefix('s').unwrap_or_default().parse::<u32>() {
+                        mx = mx.max(v);
+                    }
+                }
+            }
+        }
+        mx
+    };
+    // GPU：禁区域回收（事后读区保真），逐 rec 对拍 + 小平移搜索
+    unsafe { std::env::set_var("QPPOCR_GPU_NO_FREE", "1") };
+    let (graph, _init) = {
+        let s = Session::from_memory(&mbytes, "bisect.gpu").unwrap();
+        s.into_parts()
+    };
+    let gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, _init).unwrap();
+    let _ = qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name, mk())]).unwrap();
+    unsafe { std::env::remove_var("QPPOCR_GPU_NO_FREE") };
+    let (base, recs) = gpu.debug_recs(&shape).expect("无计划");
+    let mut first_shift: Option<String> = None;
+    for (i, (kernel, node, nidx, off, n, _, osh, _)) in recs.iter().enumerate() {
+        if *n == 0 || *nidx == usize::MAX || kernel == "n_entry" || kernel.starts_with("n_exit") {
+            continue;
+        }
+        let Ok(bb) = std::fs::read(dump_dir.join(format!("s{sid}_{nidx:06}.f32"))) else {
+            continue;
+        };
+        let r = i32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]) as usize;
+        let sh: Vec<i64> = bb[4..4 + 8 * r]
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let dv: Vec<f32> = bb[4 + 8 * r..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        if sh.len() != 4 || sh[0] != 1 || sh != *osh {
+            continue; // 只比 rank-4 单批、形状一致者
+        }
+        let (c, h, w) = (sh[1] as usize, sh[2] as usize, sh[3] as usize);
+        let cp = c.div_ceil(4) * 4;
+        if cp != c {
+            continue; // 区域含 pad 列，比较略
+        }
+        // SAFETY: base 持久映射；off+n 在区内（NO_FREE 下计划即布局）。
+        let gv: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
+        }
+        .to_vec();
+        let (mut b0, mut bbest, mut bdx, mut bdy) = (f32::INFINITY, f32::INFINITY, 0i32, 0i32);
+        for dy in -3i32..=3 {
+            for dx in -2i32..=2 {
+                let (mut s, mut cnt) = (0f32, 0usize);
+                for y in 0..h {
+                    let yy = y as i32 + dy;
+                    if yy < 0 || yy as usize >= h {
+                        continue;
+                    }
+                    let row = yy as usize * w;
+                    let crow = y * w;
+                    for x in (0..w).step_by(4) {
+                        let xx = x as i32 + dx;
+                        if xx < 0 || xx as usize >= w {
+                            continue;
+                        }
+                        // NHWC vs NCHW：ch 步长 cp（=c）
+                        for ch in (0..c).step_by(4) {
+                            s += (gv[(row + xx as usize) * c + ch]
+                                - dv[ch * h * w + crow + x])
+                                .abs();
+                            cnt += 1;
+                        }
+                    }
+                }
+                if cnt == 0 {
+                    continue;
+                }
+                let m = s / cnt as f32;
+                if dx == 0 && dy == 0 {
+                    b0 = m;
+                }
+                if m < bbest {
+                    (bbest, bdx, bdy) = (m, dx, dy);
+                }
+            }
+        }
+        let shifted = bdy.abs() >= 2 && bbest < b0 * 0.7;
+        if shifted && first_shift.is_none() {
+            first_shift = Some(format!(
+                "#{i} {kernel} {node} osh={osh:?} best=({bdx},{bdy}) r={b0:.3e}->{bbest:.3e}"
+            ));
+        }
+        eprintln!(
+            "[bisect] #{i} {kernel} {node} [{c},{h},{w}] ({bdx},{bdy}) {b0:.3e}->{bbest:.3e}"
+        );
+    }
+    match first_shift {
+        Some(s) => eprintln!("[bisect] 首个垂直错位节点: {s}"),
+        None => eprintln!("[bisect] 无 ≥2px 错位节点"),
+    }
+}
+
 #[test]
 fn det_real_input_cmp() {
     let dir = std::path::PathBuf::from(
@@ -514,9 +680,8 @@ fn det_real_input_cmp() {
     let dump_dir = std::env::temp_dir().join("qppocr-real-cmp");
     let _ = std::fs::remove_dir_all(&dump_dir);
     std::fs::create_dir_all(&dump_dir).unwrap();
-    // SAFETY: 测试独占该环境变量（仅 executor 读）。
-    unsafe { std::env::set_var("QPPOCR_DUMP_DIR", &dump_dir) };
-    let cpu = Session::from_memory(&mbytes, "cmp.cpu").unwrap();
+    let mut cpu = Session::from_memory(&mbytes, "cmp.cpu").unwrap();
+    cpu.set_dump_dir(dump_dir.to_str().unwrap());
     let in_name = cpu
         .graph
         .inputs
@@ -525,8 +690,6 @@ fn det_real_input_cmp() {
         .cloned()
         .unwrap();
     let out_cpu = cpu.run(vec![(in_name.clone(), mk())]).unwrap();
-    // SAFETY: CPU 前向完成，撤销 dump 环境。
-    unsafe { std::env::remove_var("QPPOCR_DUMP_DIR") };
     // GPU
     let (graph, init) = {
         let s = Session::from_memory(&mbytes, "cmp.gpu").unwrap();
@@ -589,6 +752,73 @@ fn det_real_input_cmp() {
     eprintln!(
         "[gpu] 概率图 mean|d|={mean_abs:.3e} max|d|={max_abs:.3e} >0.3: gpu={hi_g} cpu={hi_c}"
     );
+    // 形态学：平移搜索——mean|d| 最小的 (dx,dy) 揭示系统性空间错位
+    //（mean|d|~5e-2 且 GPU 多 ~1000 个 >0.3 像素 = 桥接合并行的指纹）。
+    if shape == [1, 3, 960, 864] {
+        let (hm, wm) = (960usize, 864usize);
+        let mut best = (f32::INFINITY, 0i32, 0i32);
+        for dy in -4i32..=4 {
+            for dx in -4i32..=4 {
+                let (x0, x1) = ((-dx).max(0) as usize, (wm as i32 - dx.max(0)) as usize);
+                let (y0, y1) = ((-dy).max(0) as usize, (hm as i32 - dy.max(0)) as usize);
+                let (mut s, mut n) = (0f32, 0usize);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let ga = a[((y as i32 + dy) as usize) * wm + (x as i32 + dx) as usize];
+                        s += (ga - b[y * wm + x]).abs();
+                        n += 1;
+                    }
+                }
+                let m = s / n as f32;
+                if m < best.0 {
+                    best = (m, dx, dy);
+                }
+            }
+        }
+        eprintln!(
+            "[gpu] 平移搜索: 最优 mean|d|={:.3e} @ (dx,dy)=({},{})",
+            best.0, best.1, best.2
+        );
+        // 渐进 vs 常数：条带分别搜——最优 dy 随条带下移而增大 = 尺度拉伸。
+        for qi in 0..4usize {
+            let ys = qi * 240..(qi + 1) * 240;
+            let mut best_h = (f32::INFINITY, 0i32);
+            for dy in -4i32..=24 {
+                let (y0, y1) = (ys.start.saturating_sub((-dy).max(0) as usize),
+                                (ys.end as i32 - dy.max(0)) as usize);
+                let (mut s, mut n) = (0f32, 0usize);
+                for y in y0..y1 {
+                    let yi = y as i32 + dy;
+                    if yi < 0 || yi as usize >= hm { continue; }
+                    for x in 0..wm {
+                        s += (a[yi as usize * wm + x] - b[y * wm + x]).abs();
+                        n += 1;
+                    }
+                }
+                let m = s / n as f32;
+                if m < best_h.0 {
+                    best_h = (m, dy);
+                }
+            }
+            eprintln!("[gpu] 条带{} (y {}..{}) 最优 dy={} mean|d|={:.3e}", qi, ys.start, ys.end, best_h.1, best_h.0);
+        }
+        // 逐行精测：单行最优 dy（内容行取有信号的行）——偏移结构定位。
+        for y in [60usize, 150, 300, 500, 700, 900] {
+            let mut best_r = (f32::INFINITY, 0i32);
+            for dy in -4i32..=24i32 {
+                let yi = y as i32 + dy;
+                if yi < 0 || yi as usize >= hm { continue; }
+                let mut s = 0f32;
+                for x in 0..wm {
+                    s += (a[yi as usize * wm + x] - b[y * wm + x]).abs();
+                }
+                if s < best_r.0 {
+                    best_r = (s, dy);
+                }
+            }
+            eprintln!("[gpu] 行 {y}: 最优 dy={}", best_r.1);
+        }
+    }
     // 双路径对拍：老 NCHW-f32 路径（已验证）vs n_ 路径，按节点名配对
     //（两会话共用同一 planner 图——节点名与形状一致）。
     let mut n_vs_old_mean = f32::INFINITY;
@@ -1100,9 +1330,8 @@ fn rec_session_end_to_end() {
     let dump_dir = std::env::temp_dir().join("qppocr-rec-cmp");
     let _ = std::fs::remove_dir_all(&dump_dir);
     std::fs::create_dir_all(&dump_dir).unwrap();
-    // SAFETY: 测试独占该环境变量（仅 executor 读）。
-    unsafe { std::env::set_var("QPPOCR_DUMP_DIR", &dump_dir) };
-    let cpu = Session::from_memory(&bytes, "rec.cpu").unwrap();
+    let mut cpu = Session::from_memory(&bytes, "rec.cpu").unwrap();
+    cpu.set_dump_dir(dump_dir.to_str().unwrap());
     let in_name = cpu
         .graph
         .inputs
@@ -1116,9 +1345,6 @@ fn rec_session_end_to_end() {
         "[rec] CPU 前向 {:.1} ms",
         t_cpu.elapsed().as_secs_f64() * 1000.0
     );
-    // SAFETY: CPU 前向完成，撤销 dump 环境。
-    unsafe { std::env::remove_var("QPPOCR_DUMP_DIR") };
-
     let (graph, init) = {
         let s = Session::from_memory(&bytes, "rec.gpu").unwrap();
         s.into_parts()
@@ -1370,6 +1596,268 @@ fn rec_session_end_to_end() {
     );
 }
 
+/// rec 批维补齐 + real_n 早退的回归：batch_grain=8 会话喂 3 行，
+/// 计划按 (8,…) 建但空行零算力——真实行输出必须与 grain=1 会话跑
+/// 同 3 行**逐位一致**（批内行独立、无跨行归约；布局偏移不同但算术
+/// 序相同）。这是「补齐不改变实行结果」的直接断言，早退守卫错杀
+/// 实行（写偏移/漏算）会立刻现形。
+#[test]
+fn rec_batch_pad_early_exit() {
+    let p = std::path::Path::new("../../models/tiny/rec.onnx");
+    if !p.is_file() {
+        eprintln!("[gpu] 无 rec 模型，跳过");
+        return;
+    }
+    let Some(ctx) = open_or_skip() else { return };
+    let bytes = std::fs::read(p).unwrap();
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    let (b, hh, ww) = (3usize, 48usize, 185usize);
+    let mut seed = 0x1234_5678_9abc_def0_u64;
+    let mut buf = F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    let mk_input = |buf: F32Buf| Tensor {
+        name: String::new(),
+        shape: vec![b as i64, 3, hh as i64, ww as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    let (graph, init) = {
+        let s = Session::from_memory(&bytes, "rec.gpu-pad").unwrap();
+        s.into_parts()
+    };
+    let in_name = graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+
+    // grain=1 基线（现网 det-only 的逐行形态）
+    let gpu_plain = super::session::VulkanSession::new(
+        ctx.inner.clone(),
+        graph.clone(),
+        init.clone(),
+    )
+    .unwrap();
+    let out_plain = qppocr_core::device::DeviceSession::run(
+        &gpu_plain,
+        vec![(in_name.clone(), mk_input(buf.clone()))],
+    )
+    .unwrap();
+
+    // grain=8 补齐：3 行 → 计划 (8,…) + 5 空行早退
+    let mut gpu_pad = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
+    gpu_pad.batch_grain = 8;
+    let out_pad =
+        qppocr_core::device::DeviceSession::run(&gpu_pad, vec![(in_name, mk_input(buf))]).unwrap();
+
+    assert_eq!(out_pad[0].shape, out_plain[0].shape, "补齐后输出形状应为真实行数");
+    assert_eq!(out_pad[0].f32.len(), out_plain[0].f32.len());
+    let max_d = out_pad[0]
+        .f32
+        .iter()
+        .zip(out_plain[0].f32.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    assert_eq!(max_d, 0.0, "补齐空行不得改变真实行输出: max|diff|={max_d}");
+    // softmax 行和（守卫错位会让整行变 0/垃圾）
+    let vocab = *out_pad[0].shape.last().unwrap() as usize;
+    let rows = out_pad[0].f32.len() / vocab;
+    for r in 0..rows {
+        let s: f32 = out_pad[0].f32[r * vocab..(r + 1) * vocab].iter().sum();
+        assert!((s - 1.0).abs() <= 1e-3, "行 {r} softmax 和={s}");
+    }
+    eprintln!("[rec][pad] {b} 行 @grain8 vs 逐行：逐位一致（{rows}×{vocab}）");
+
+    // ---- argmax 出口：[B,T,2] 对解码 == 概率路径解码（逐字 + 置信度）----
+    let (graph2, init2) = {
+        let s = Session::from_memory(&bytes, "rec.gpu-argmax").unwrap();
+        s.into_parts()
+    };
+    let in2 = graph2
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let mut gpu_am =
+        super::session::VulkanSession::new(ctx.inner.clone(), graph2, init2).unwrap();
+    gpu_am.batch_grain = 8;
+    gpu_am.argmax_exit = true;
+    let mut seed2 = 0x1234_5678_9abc_def0_u64;
+    let mut buf2 = qppocr_kernels::buf::F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf2.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed2);
+    }
+    let t2 = Tensor {
+        name: String::new(),
+        shape: vec![b as i64, 3, hh as i64, ww as i64],
+        dtype: DType::F32,
+        f32: buf2,
+        i64: Vec::new(),
+    };
+    let out_am = qppocr_core::device::DeviceSession::run(&gpu_am, vec![(in2, t2)]).unwrap();
+    assert_eq!(out_am[0].shape[2], 2, "argmax 出口末维应为 2");
+    let t = out_am[0].shape[1] as usize;
+    // 同输入的概率基线（grain=1 概率会话）
+    let (graph3, init3) = {
+        let s = Session::from_memory(&bytes, "rec.gpu-am-base").unwrap();
+        s.into_parts()
+    };
+    let in3 = graph3
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let gpu_p = super::session::VulkanSession::new(ctx.inner.clone(), graph3, init3).unwrap();
+    let mut seed3 = 0x1234_5678_9abc_def0_u64;
+    let mut buf3 = qppocr_kernels::buf::F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf3.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed3);
+    }
+    let out_p = qppocr_core::device::DeviceSession::run(
+        &gpu_p,
+        vec![(
+            in3,
+            Tensor {
+                name: String::new(),
+                shape: vec![b as i64, 3, hh as i64, ww as i64],
+                dtype: DType::F32,
+                f32: buf3,
+                i64: Vec::new(),
+            },
+        )],
+    )
+    .unwrap();
+    let charset: Vec<String> = (0..*out_p[0].shape.last().unwrap())
+        .map(|i| String::from_utf8_lossy(&[(i % 97 + 33) as u8]).into_owned())
+        .collect();
+    for k in 0..b {
+        let (tx_am, cf_am, _) = qppocr_core::pipeline::rec::ctc_decode_pairs(
+            &out_am[0].f32[k * t * 2..],
+            t,
+            &charset,
+        );
+        let (tx_p, cf_p, _) = qppocr_core::pipeline::rec::ctc_decode(
+            &out_p[0].f32[k * t * charset.len()..],
+            t,
+            charset.len(),
+            &charset,
+        );
+        assert_eq!(tx_am, tx_p, "行 {k} argmax 解码文本与概率路径不一致");
+        assert!(
+            (cf_am - cf_p).abs() < 1e-6,
+            "行 {k} 置信度不一致: {cf_am} vs {cf_p}"
+        );
+    }
+    eprintln!("[rec][argmax] {b} 行 (val,idx) 对解码 == 概率路径（逐字+置信度）");
+}
+
+/// 批间流水（run_deferred/complete）的回归：两条**不同计划**同时在飞
+/// 必须互不干扰；**同计划**连发必须先收账（inflight 断言兜底）。结果
+/// 与同步 run 逐位一致。
+#[test]
+fn rec_deferred_pipeline() {
+    let p = std::path::Path::new("../../models/tiny/rec.onnx");
+    if !p.is_file() {
+        eprintln!("[gpu] 无 rec 模型，跳过");
+        return;
+    }
+    let Some(ctx) = open_or_skip() else { return };
+    let bytes = std::fs::read(p).unwrap();
+    use qppocr_core::device::{DeferredRun, DeviceSession};
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    let (graph, init) = {
+        let s = Session::from_memory(&bytes, "rec.defer").unwrap();
+        s.into_parts()
+    };
+    let in_name = graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let mk_input = |seed: &mut u64, w: usize| -> Tensor {
+        let mut buf = F32Buf::with_zeroed(3 * 48 * w);
+        for v in buf.as_mut_slice().iter_mut() {
+            *v = lcg(seed);
+        }
+        Tensor {
+            name: String::new(),
+            shape: vec![1, 3, 48, w as i64],
+            dtype: DType::F32,
+            f32: buf,
+            i64: Vec::new(),
+        }
+    };
+    let mut seed = 0x0f0f_aaaa_5555_1234_u64;
+    let (t_a, t_b) = (mk_input(&mut seed, 320), mk_input(&mut seed, 704));
+
+    let mut gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
+    gpu.batch_grain = 8;
+
+    // 同步基线
+    let out_a_sync = gpu.run(vec![(in_name.clone(), t_a.clone())]).unwrap();
+    let out_b_sync = gpu.run(vec![(in_name.clone(), t_b.clone())]).unwrap();
+
+    // 流水：两条不同计划同时在飞 → 依次收账；再同计划连发两次
+    //（第二条必须等第一条收账后才提交——session 的 inflight 断言）。
+    let d1 = gpu
+        .run_deferred(vec![(in_name.clone(), t_a.clone())])
+        .unwrap();
+    let d2 = gpu
+        .run_deferred(vec![(in_name.clone(), t_b.clone())])
+        .unwrap();
+    let out_a = d1.complete().unwrap();
+    let out_b = d2.complete().unwrap();
+    for (am, sm) in [(&out_a, &out_a_sync), (&out_b, &out_b_sync)] {
+        assert_eq!(am[0].shape, sm[0].shape);
+        let max_d = am[0]
+            .f32
+            .iter()
+            .zip(sm[0].f32.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert_eq!(max_d, 0.0, "流水结果与同步不一致: max|diff|={max_d}");
+    }
+
+    // 同计划连发（同宽两次）：第一条在飞时提交第二条 = 写穿，引擎靠
+    // 先收账规避；这里验证「收完再发」结果正确。
+    let d3 = gpu
+        .run_deferred(vec![(in_name.clone(), t_a.clone())])
+        .unwrap();
+    let out_c1 = d3.complete().unwrap();
+    let d4 = gpu
+        .run_deferred(vec![(in_name.clone(), t_a.clone())])
+        .unwrap();
+    let out_c2 = d4.complete().unwrap();
+    let m1 = out_c1[0]
+        .f32
+        .iter()
+        .zip(out_a_sync[0].f32.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    let m2 = out_c2[0]
+        .f32
+        .iter()
+        .zip(out_a_sync[0].f32.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    assert_eq!(m1, 0.0, "同计划收后重发(1) 不一致");
+    assert_eq!(m2, 0.0, "同计划收后重发(2) 不一致");
+    eprintln!("[rec][defer] 双计划在飞 + 同计划连发：与同步逐位一致");
+}
+
 /// cls 端到端：GPU vs CPU executor 同输入对拍（B>1 批 + 尾部 rank-3）。
 #[test]
 fn cls_session_end_to_end() {
@@ -1487,9 +1975,8 @@ fn cls_forensics() {
     let dump_dir = std::env::temp_dir().join("qppocr-cls-cmp");
     let _ = std::fs::remove_dir_all(&dump_dir);
     std::fs::create_dir_all(&dump_dir).unwrap();
-    // SAFETY: 测试独占该环境变量。
-    unsafe { std::env::set_var("QPPOCR_DUMP_DIR", &dump_dir) };
-    let cpu = Session::from_memory(&bytes, "cls.cpu2").unwrap();
+    let mut cpu = Session::from_memory(&bytes, "cls.cpu2").unwrap();
+    cpu.set_dump_dir(dump_dir.to_str().unwrap());
     let in_name = cpu
         .graph
         .inputs
@@ -1498,8 +1985,6 @@ fn cls_forensics() {
         .cloned()
         .unwrap();
     let _ = cpu.run(vec![(in_name.clone(), t0.clone())]).unwrap();
-    // SAFETY: 同上。
-    unsafe { std::env::remove_var("QPPOCR_DUMP_DIR") };
     let (graph, init) = {
         let s = Session::from_memory(&bytes, "cls.gpu2").unwrap();
         s.into_parts()
@@ -2060,6 +2545,9 @@ fn dw_h3_repro() {
             unsafe { record_dispatch(d, cb, &ks, "n_conv_dw", pc.bytes(), grid) }
         })
         .unwrap();
+    // 读回屏障（见 memory::readback_clean）：本机驱动对 coherent 映射的
+    // 设备写不做主机缓存一致，不逐出则 ~30% 概率随机批部分行读到零。
+    super::memory::readback_clean(p_of(out_off) as *const u8, nb3 * m * cp * 4);
     // SAFETY: 已等信号。
     let got: Vec<f32> =
         unsafe { std::slice::from_raw_parts(p_of(out_off) as *const f32, 8) }.to_vec();
@@ -2068,6 +2556,34 @@ fn dw_h3_repro() {
         // SAFETY: 已等信号；批 3 偏移在输出区内。
         unsafe { std::slice::from_raw_parts(p_of(out_off + (3 * m * cp) as u32) as *const f32, 8) }
             .to_vec();
+    // 竞态诊断：全批 × 8 行采样，零值地图（固定工作组 vs 随机子集；
+    // 整批 vs 个别行）——间歇性 B3 全零的形态学。
+    let zero_scan = |tag: &str| {
+        let mut zero_map: Vec<(u32, usize)> = vec![];
+        for bb in 0..nb3 as u32 {
+            let zeros = (0..8usize)
+                .filter(|s| {
+                    // SAFETY: 已等信号；行偏移在批区内。
+                    let v: f32 = unsafe {
+                        *(p_of(out_off + (bb as usize * m + s * 30) as u32 * cp as u32)
+                            as *const f32)
+                    };
+                    v == 0.0
+                })
+                .count();
+            if zeros > 0 {
+                zero_map.push((bb, zeros));
+            }
+        }
+        eprintln!("[dw3] 零值地图{tag} (批,零行数/8): {zero_map:?}");
+        zero_map.is_empty()
+    };
+    let clean1 = zero_scan("");
+    if !clean1 {
+        // 可见性延迟假设：睡 200ms 再扫——零值消失=传播延迟；不消失=真零。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        zero_scan("(睡后)");
+    }
     // CPU 参考
     use qppocr_kernels::activation::Activation;
     use qppocr_kernels::buf::F32Buf;
@@ -2117,4 +2633,318 @@ fn dw_h3_repro() {
         .filter(|(a, b)| (**a - **b).abs() > 1e-4)
         .count();
     assert!(bad3 == 0, "dw 批 3 错 {bad3}/8");
+}
+
+/// 图内 Conv.27 精确对拍：CPU executor dump 的同名节点输出 vs GPU 输出区，
+/// 以及 Conv.27 输入区 vs CPU 的输入张量（上游是否已分歧）。
+#[test]
+fn cls_dw_precise() {
+    let p = std::path::Path::new("../../models/cls.onnx");
+    if !p.is_file() {
+        eprintln!("[dwp] 无模型，跳过");
+        return;
+    }
+    let Some(ctx) = open_or_skip() else { return };
+    let bytes = std::fs::read(p).unwrap();
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+    let (b, hh, ww) = (17usize, 80usize, 160usize);
+    let mut seed = 0x1234_5678_abcd_ef01_u64;
+    let mut buf = F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    let t0 = Tensor {
+        name: String::new(),
+        shape: vec![b as i64, 3, hh as i64, ww as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    // CPU 参考（dump 到内存目录）
+    let dump_dir = std::env::temp_dir().join("qppocr-cls-precise");
+    let _ = std::fs::remove_dir_all(&dump_dir);
+    std::fs::create_dir_all(&dump_dir).unwrap();
+    let mut cpu = Session::from_memory(&bytes, "cls.precise").unwrap();
+    cpu.set_dump_dir(dump_dir.to_str().unwrap());
+    let in_name = cpu
+        .graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let _out_cpu = cpu.run(vec![(in_name.clone(), t0.clone())]).unwrap();
+
+    // Conv.27 与其输入生产者的节点序号
+    let graph_probe = {
+        let s = Session::from_memory(&bytes, "cls.probe").unwrap();
+        s.into_parts().0
+    };
+    let idx27 = graph_probe
+        .nodes
+        .iter()
+        .position(|m| m.name == "Conv.27")
+        .unwrap();
+    let producer = graph_probe.nodes[idx27].inputs[0].clone();
+    let idx_prod = graph_probe
+        .nodes
+        .iter()
+        .position(|m| m.outputs.first() == Some(&producer))
+        .unwrap();
+    eprintln!(
+        "[dwp] Conv.27 = 节点#{idx27}；输入 {producer} 由 #{idx_prod} ({}) 产出",
+        graph_probe.nodes[idx_prod].op_type
+    );
+
+    let (graph, init) = {
+        let s = Session::from_memory(&bytes, "cls.gpu3").unwrap();
+        s.into_parts()
+    };
+    let gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
+    let _ = qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name, t0.clone())]).unwrap();
+
+    let (base, recs) = gpu
+        .debug_recs(&[b as i64, 3, hh as i64, ww as i64])
+        .expect("无计划");
+    let ri = recs
+        .iter()
+        .position(|(_, node, _, _, _, _, _, _)| node == "Conv.27")
+        .unwrap();
+    let (_, _, _, out_off, _, pc, _, _) = &recs[ri];
+    let p_off = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
+    // SAFETY: base 持久映射。
+    let pw: Vec<u32> =
+        unsafe { std::slice::from_raw_parts(base.add(p_off * 4) as *const u32, 20) }.to_vec();
+    let in_off = pw[0] as usize;
+
+    // CPU dump：节点序号 → f32 平铺（NCHW）。目录独占本会话
+    //（set_dump_dir），sid 从文件名解析——全套并行时本会话不是进程里
+    // 第一个 dumper，硬编码 s0_ 会静默跳过全部比较。
+    let sid: u32 = {
+        let mut mx = 0u32;
+        for e in std::fs::read_dir(&dump_dir).unwrap().flatten() {
+            let nm = e.file_name().into_string().unwrap_or_default();
+            if let Some(stem) = nm.strip_suffix(".f32") {
+                if let Some((s, _)) = stem.split_once('_') {
+                    if let Ok(v) = s.strip_prefix('s').unwrap_or_default().parse::<u32>() {
+                        mx = mx.max(v);
+                    }
+                }
+            }
+        }
+        mx
+    };
+    let dump_of = |node_idx: usize| -> Option<Vec<f32>> {
+        let bb = std::fs::read(dump_dir.join(format!("s{sid}_{node_idx:06}.f32"))).ok()?;
+        let r = i32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]) as usize;
+        Some(
+            bb[4 + 8 * r..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect(),
+        )
+    };
+    // NHWC 采样比较（rows = b*240, cols=128）
+    let cmp_region = |region: &[f32], dv: &[f32], tag: &str| {
+        let (rows, cols) = (b * 240usize, 128usize);
+        let step = (rows * cols / 64).max(1);
+        let mut bad = 0usize;
+        for smp in (0..rows * cols).step_by(step).take(64) {
+            let row = smp / cols;
+            let ch = smp % cols;
+            let bb = row / 240;
+            let l = row % 240;
+            let want = dv[bb * 128 * 240 + ch * 240 + l];
+            if (region[smp] - want).abs() > 5e-3 * (1.0 + want.abs()) {
+                bad += 1;
+            }
+        }
+        eprintln!("[dwp] {tag}: 64 点采样 {bad} 不符");
+    };
+    // SAFETY: base 持久映射。
+    let in_region: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(base.add(in_off * 4) as *const f32, b * 240 * 128) }
+            .to_vec();
+    // SAFETY: 同上。
+    let out_region: Vec<f32> = unsafe {
+        std::slice::from_raw_parts(
+            base.add(*out_off as usize * 4) as *const f32,
+            b * 240 * 128,
+        )
+    }
+    .to_vec();
+    // Conv.27 区级探针：其 off 若被更晚的 rec 复用，跑完读区看到的是
+    // 最后写者的数据——打印跳过而非误报（全图扫描同此约定）。
+    let recycled27 = |off: u32| recs.iter().skip(ri + 1).any(|r| r.3 == off);
+    if recycled27(*out_off) {
+        eprintln!("[dwp] Conv.27 输出区被复用，跳过（读区=最后写者）");
+    } else if let Some(dv) = dump_of(idx27) {
+        cmp_region(&out_region, &dv, "Conv.27 输出区 vs CPU Conv.27");
+    }
+    if recycled27(in_off as u32) {
+        eprintln!("[dwp] Conv.27 输入区被复用，跳过（读区=最后写者）");
+    } else if let Some(dv) = dump_of(idx_prod) {
+        cmp_region(&in_region, &dv, "Conv.27 输入区 vs CPU 上游输出");
+    }
+    // ---- entry 打包对拍：Conv.0 的输入区（n_entry 输出）vs CPU 输入 ----
+    // 二分定位首个分歧：entry 区就错 → 打包/布局问题；entry 区对 →
+    // n_conv8 内核（其批路径无内核级测试覆盖）。
+    {
+        let entry = recs
+            .iter()
+            .find(|(k, ..)| k == "n_entry")
+            .expect("计划里没有 n_entry");
+        let (_, _, _, e_off, _, _, _, _) = entry;
+        let (c_in, hw_in, cp_in) = (3usize, hh * ww, 4usize); // [B,3,H,W] → cpad4=4
+        // rec 的 out_n 是逻辑 numel（不含 pad）；真实区按 NHWC 全长读
+        //（与上方 NaN 扫描同约定：f32-per-word + cpad4）。
+        let total = b * hw_in * cp_in;
+        // SAFETY: base 持久映射；total 为 entry 输出区全长。
+        let ev: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(*e_off as usize * 4) as *const f32, total)
+        }
+        .to_vec();
+        let step = (total / 64).max(1);
+        let (mut bad, mut n_ok) = (0usize, 0usize);
+        for smp in (0..total).step_by(step).take(64) {
+            let row = smp / cp_in;
+            let ch = smp % cp_in;
+            let (l, bi) = (row % hw_in, row / hw_in);
+            if ch >= c_in {
+                continue; // 填充列，无 CPU 对应
+            }
+            n_ok += 1;
+            let want = t0.f32.as_slice()[bi * c_in * hw_in + ch * hw_in + l];
+            if !ev[smp].is_finite() || (ev[smp] - want).abs() > 5e-3 * (1.0 + want.abs()) {
+                bad += 1;
+            }
+        }
+        eprintln!("[dwp] entry 打包区 vs CPU 输入: {bad}/{n_ok} 不符");
+    }
+    // ---- 全图精确扫描：每个 rec 输出区 vs 同节点序号的 CPU dump ----
+    let mut first_bad: Option<(usize, String)> = None;
+    let (mut n_cmp, mut bad_kernels): (usize, Vec<&str>) = (0, Vec::new());
+    for (i, (kernel, node, nidx, off, n, _, osh, _)) in recs.iter().enumerate() {
+        if *n == 0 || *nidx == usize::MAX || kernel == "n_entry" || kernel.starts_with("n_exit") {
+            continue;
+        }
+        // region 复用：之后还有 rec 写同一 off → 跑完读区看到的是最后
+        // 写者的数据，比较无意义（曾在 Conv.0 上误报 48/48——后写的
+        // HardSigmoid 把值域压进 [0,1]）。只比本 rec 是该 off 最终值者。
+        let recycled = recs.iter().skip(i + 1).any(|r| r.3 == *off);
+        if recycled {
+            continue;
+        }
+        let Some(dv) = dump_of(*nidx) else { continue };
+        // 存储约定：rank-4 用 rc（rows,cols)；直接用形状换算两版都试
+        // SAFETY: base 持久映射。
+        let gv: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
+        }
+        .to_vec();
+        let numel: i64 = osh.iter().product();
+        if (numel as usize) != dv.len() {
+            continue; // 常量折叠/别名等
+        }
+        // 解析失败用模糊标记（不是断言依据，供打印）
+        let mut bad_cnt = usize::MAX;
+        if osh.len() == 4 && osh[0] == b as i64 {
+            // [B,C,H,W] NHWC 存储 vs NCHW dump
+            let (nb, c, h, w) = (
+                osh[0] as usize,
+                osh[1] as usize,
+                osh[2] as usize,
+                osh[3] as usize,
+            );
+            let hw = h * w;
+            let cp = c.div_ceil(4) * 4;
+            let mut bad = 0;
+            let step = (nb * hw * cp / 48).max(1);
+            for smp in (0..nb * hw * cp).step_by(step).take(48) {
+                let row = smp / cp;
+                let ch = smp % cp;
+                let l = row % hw;
+                let bi = row / hw;
+                let want = dv[bi * c * hw + ch * hw + l];
+                if !gv[smp].is_finite() || (gv[smp] - want).abs() > 5e-3 * (1.0 + want.abs()) {
+                    bad += 1;
+                }
+            }
+            bad_cnt = bad;
+        }
+        if bad_cnt != usize::MAX {
+            n_cmp += 1;
+            if bad_cnt > 0 {
+                bad_kernels.push(kernel);
+            }
+        }
+        if bad_cnt != usize::MAX && bad_cnt > 0 && first_bad.is_none() {
+            first_bad = Some((i, format!("{kernel} {node} osh={osh:?} bad={bad_cnt}/48")));
+        }
+    }
+    let fb_msg = first_bad.as_ref().map(|(i, d)| format!("#{i} {d}"));
+    if let Some((i, d)) = first_bad {
+        eprintln!("[dwp] 全图首个精确分歧：#{i} {d}");
+        // region 复用检测：off 相同的其它 rec（arena 回收后改写 → 事后读区
+        // 看到的是后来者的数据，分歧是读法 artifact 而非内核错）。
+        if let Some((_, _, _, off8, _, _, _, _)) = recs.get(i) {
+            let sharers: Vec<String> = recs
+                .iter()
+                .enumerate()
+                .filter(|(j, r)| *j != i && r.3 == *off8)
+                .map(|(j, r)| format!("#{j} {} {}", r.0, r.1))
+                .collect();
+            eprintln!("[dwp]   region 复用: off={off8} 另有 {} 个 rec 共用: {:?}", sharers.len(), sharers);
+        }
+        // 数值形态：首 8 对（GPU 区 NHWC 序 vs CPU dump NCHW 序的对应位）
+        if let Some((_, _, nidx8, off8, _, _, osh8, _)) = recs.get(i) {
+            if let Some(dv8) = dump_of(*nidx8) {
+                // SAFETY: base 持久映射。
+                let gv8: Vec<f32> = unsafe {
+                    std::slice::from_raw_parts(base.add(*off8 as usize * 4) as *const f32, 64)
+                }
+                .to_vec();
+                // NCHW 前 8 = (b0, c0, h0, w0..7)；NHWC 对应 = 每行 w 步进 cp
+                let cp8 = osh8.get(1).map(|c| (*c as usize).div_ceil(4) * 4).unwrap_or(1);
+                let pairs: Vec<String> = (0..8)
+                    .map(|k| {
+                        let want = dv8.get(k).copied().unwrap_or(f32::NAN);
+                        let got = gv8.get(k * cp8).copied().unwrap_or(f32::NAN);
+                        format!("{got:.4}|{want:.4}")
+                    })
+                    .collect();
+                eprintln!("[dwp]   首8值 gpu|cpu: {}", pairs.join("  "));
+            }
+        }
+        for (j, (k2, n2, nidx2, _, _, _, osh2, ins2)) in recs.iter().enumerate().skip(i - 3).take(5)
+        {
+            eprintln!("[dwp]   #{j} {k2} {n2} node#{nidx2} osh={osh2:?} ins={ins2:?}");
+        }
+        if let Some((k97, _, _, _, _, pc97, _, ins97)) = recs.get(i) {
+            let p97 = u32::from_le_bytes([pc97[0], pc97[1], pc97[2], pc97[3]]) as usize;
+            // SAFETY: base 持久映射。
+            let pw97: Vec<u32> =
+                unsafe { std::slice::from_raw_parts(base.add(p97 * 4) as *const u32, 21) }.to_vec();
+            eprintln!("[dwp] {k97} 参数(0..21)={pw97:?} ins={ins97:?}");
+        }
+    } else {
+        eprintln!("[dwp] 全图 rank-4 批张量无分歧（分歧在 rank-3 尾部或输出）");
+    }
+    eprintln!("[dwp] 精确扫描: {}/{} 个 rec 不符，内核分布={:?}", bad_kernels.len(), n_cmp, {
+        let mut h = std::collections::BTreeMap::new();
+        for k in &bad_kernels { *h.entry(k).or_insert(0usize) += 1; }
+        h
+    });
+    // 断言（声明=断言）：可比 rec（区未被复用、rank-4 批张量）须全对。
+    // 曾以 48/48 误报 Conv.0——实为事后读已回收 region 的假阳性。
+    assert!(
+        bad_kernels.is_empty(),
+        "cls f16 路径全图对拍 {}/{} 个可比 rec 不符：{:?}（首个：{:?}）",
+        bad_kernels.len(),
+        n_cmp,
+        bad_kernels,
+        fb_msg
+    );
 }

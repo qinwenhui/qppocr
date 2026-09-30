@@ -13,6 +13,56 @@ use ash::vk;
 use ash::{Device, Instance};
 use qppocr_core::error::{Error, Result};
 
+/// 读回屏障：主机读设备写入的映射内存前，逐出 `[ptr, ptr+bytes)` 的
+/// CPU 缓存行（x86_64 用 clflush；其它架构 no-op，依赖驱动一致性）。
+///
+/// 实证（2026-09-29，Intel Arc Pro + Windows 驱动）：HOST_COHERENT 映射
+/// 在 timeline 信号量主机等待后仍间歇读到设备写之前的旧值——dw 批式
+/// 内核测试 ~30% 概率「随机批子集部分行全零」，睡 200ms 后自愈（缓存
+/// 行自然逐出），vkInvalidateMappedMemoryRanges 与 device_wait_idle 均
+/// 无效（驱动 no-op）。clflush 逐出后 10/10 全清。生产读回路径（run 的
+/// 输出拷出）必须先过这道屏障，否则结果间歇含零。
+#[allow(dead_code)]
+pub(crate) fn readback_clean(_ptr: *const u8, _bytes: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::_mm_clflush;
+        let mut off = 0usize;
+        while off < _bytes {
+            // SAFETY: ptr 来自持久映射，ptr+off 在映射区内；clflush 对
+            // 任意有效地址安全（含未驻留行）。
+            unsafe { _mm_clflush(_ptr.add(off)) };
+            off += 64;
+        }
+    }
+}
+
+/// 发布屏障：主机写完映射内存后，把 `[ptr, ptr+bytes)` 的脏行**写回并
+/// 逐出**，使设备立即可见——readback_clean 的镜像方向。
+///
+/// 与 CB 头部内存屏障（session.rs build_plan）**配对使用、缺一不可**
+/// （img-003 间歇整行空文本的 A/B 实证，2026-09-30）：主机侧小写
+/// （rn=real_n 单元，4 字节）无容量压力、永不自我逐出，需 SFENCE +
+/// clflush 写回逐出；GPU 侧缓存的旧行另由 CB 屏障失效。
+///
+/// ★ 必须先 SFENCE 再 clflush：CLFLUSH 与前置 store **弱有序**
+/// （Intel SDM：CLFLUSH 不与 stores 排序，除非插入 SFENCE）——漏了
+/// fence 时逐出的是旧行、store 随后才落缓存，实测竞态照旧。
+pub(crate) fn publish_clean(_ptr: *const u8, _bytes: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::x86_64::{_mm_clflush, _mm_sfence};
+        // SAFETY: 无内存操作；序列化本线程的 store buffer。
+        unsafe { _mm_sfence() };
+        let mut off = 0usize;
+        while off < _bytes {
+            // SAFETY: 同 readback_clean。
+            unsafe { _mm_clflush(_ptr.add(off)) };
+            off += 64;
+        }
+    }
+}
+
 /// 选定的两个 memory type 与 UMA 判定。
 pub(crate) struct MemoryTypes {
     /// HOST_VISIBLE | HOST_COHERENT（可映射，上传/回读用）。
@@ -171,6 +221,28 @@ impl Arena {
     /// 计划保证全部区域落在一块里（按计划总量一次开块）。
     pub(crate) fn chunk_range(&self) -> Option<(vk::Buffer, vk::DeviceSize)> {
         self.chunks.last().map(|c| (c.buffer, c.size))
+    }
+
+    /// 显式失效所有已映射块的主机视图（vkInvalidateMappedMemoryRanges）。
+    ///
+    /// 规范上 HOST_COHERENT 内存无需 invalidate；本机（Arc Pro +
+    /// Windows 驱动）实测无效（见 [`readback_clean`]——真正的修复）。
+    /// 保留给非 coherent 类型的未来路径，当前无调用方。
+    #[allow(dead_code)]
+    pub(crate) fn invalidate_mapped(&self) -> Result<()> {
+        for c in &self.chunks {
+            if c.mapped.is_null() {
+                continue;
+            }
+            let range = vk::MappedMemoryRange::default()
+                .memory(c.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            // SAFETY: memory 属本设备且处于映射态；range 覆盖整块映射。
+            unsafe { self.device.invalidate_mapped_memory_ranges(&[range]) }
+                .map_err(|e| Error::Device(format!("invalidate_mapped_memory_ranges: {e}")))?;
+        }
+        Ok(())
     }
 
     fn push_chunk(&mut self, size: vk::DeviceSize) -> Result<()> {

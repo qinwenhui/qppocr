@@ -74,6 +74,46 @@ pub fn ctc_decode(
     (text, conf, marks)
 }
 
+/// [`ctc_decode`] 的 (val, idx) 对版：GPU 的 CTC argmax 出口
+/// （`DeviceSession::rec_argmax_pairs`）每时间步只回读首个严格最大
+/// （平局取最小下标——与上文的逐元素 `>` 首胜逐字等价）的值与下标，
+/// 免掉全量 T×V 概率矩阵的主机读回。对格式：pairs[t*2] = val、
+/// pairs[t*2+1] = idx（f32 位型）。
+pub fn ctc_decode_pairs(
+    pairs: &[f32],
+    t_len: usize,
+    charset: &[String],
+) -> (String, f32, Vec<DecodeMark>) {
+    let mut text = String::new();
+    let mut conf_sum = 0f64;
+    let mut conf_n = 0usize;
+    let mut prev: i64 = -1;
+    let mut marks = Vec::new();
+    for t in 0..t_len {
+        let bestv = pairs[t * 2];
+        let best = pairs[t * 2 + 1].to_bits() as usize;
+        let b = best as i64;
+        if b != 0 && b != prev {
+            if best < charset.len() {
+                marks.push(DecodeMark {
+                    step: t,
+                    off: text.len(),
+                });
+                text.push_str(&charset[best]);
+            }
+            conf_sum += bestv as f64;
+            conf_n += 1;
+        }
+        prev = b;
+    }
+    let conf = if conf_n > 0 {
+        (conf_sum / conf_n as f64) as f32
+    } else {
+        0.0
+    };
+    (text, conf, marks)
+}
+
 // ---------------------------------------------------------------- 像素空格
 
 /// 每列墨迹：该列最极端像素离背景多远（0..1）。**极性无关**——语料里

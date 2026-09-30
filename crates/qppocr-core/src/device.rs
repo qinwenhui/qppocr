@@ -92,6 +92,24 @@ pub trait DeviceContext: Send + Sync {
     ) -> Result<Arc<dyn DeviceSession>>;
 }
 
+/// 异步执行的收尾句柄：`run_deferred` 提交后由调用方择机 complete
+/// （等设备信号 + 读回输出）。
+pub trait DeferredRun: Send {
+    /// 等待设备完成并读回输出（CPU 占位实现 = 返回已算好的结果）。
+    fn complete(self: Box<Self>) -> Result<Vec<Tensor>>;
+}
+
+/// CPU 会话的 deferred 占位：run_deferred 默认实现里已同步算完。
+struct SyncDone {
+    outs: Vec<Tensor>,
+}
+
+impl DeferredRun for SyncDone {
+    fn complete(self: Box<Self>) -> Result<Vec<Tensor>> {
+        Ok(self.outs)
+    }
+}
+
 /// 设备会话：一次装载、多次 run。
 ///
 /// `Send + Sync` 且 `&self` 并发安全——rec 分片 / cls 批的现实调用形态
@@ -106,6 +124,39 @@ pub trait DeviceSession: Send + Sync {
     /// false 时 pipeline 的 cls / rec 批退化为串行提交（省线程 spawn
     /// 与提交争抢）。
     fn prefers_host_parallelism(&self) -> bool;
+    /// 动态宽输入（rec）的形状分桶粒度：>1 时引擎把批宽向上取整到其
+    /// 倍数。CPU 每形状零成本 → 1（关）；GPU 每个新形状付一次计划
+    /// 重建（实测 ~10ms），取桶后宽度塌缩成少数几个、计划全命中。
+    /// 代价是右侧零填充的少量额外计算。
+    fn bucket_grain(&self) -> i32 {
+        1
+    }
+    /// rec 批维补齐/合批粒度：>1 时引擎把行排序后每该数量行合成一批
+    /// （宽填充到批内最大桶宽），会话侧把批维补齐到该值——空行由
+    /// 设备侧早退守卫零算力，(bsz,W) 形状塌缩成 (grain,W桶)。
+    /// CPU 逐行线程扇出更优 → 1（关）。
+    fn batch_grain(&self) -> i32 {
+        1
+    }
+    /// rec 会话是否以 (val, idx) 对替代全量概率矩阵输出（GPU 的 CTC
+    /// argmax 出口）。true 时 run 返回 [B, T, 2]（idx 为 f32 位型），
+    /// 引擎用 `ctc_decode_pairs` 解码——argmax 语义与概率路径逐字相同。
+    fn rec_argmax_pairs(&self) -> bool {
+        false
+    }
+    /// 异步执行：提交后立即返回，[`DeferredRun::complete`] 等待并读回。
+    ///
+    /// 批间流水用（rec 同图多批）：批 k+1 的 pack/提交与批 k 的 GPU
+    /// 执行重叠。**同形状两条在飞 = 数据竞态**（输入/输出区同址）——
+    /// 调用方必须先 complete 同形状的在飞批再 run_deferred。CPU 会话
+    /// 的默认实现 = 同步 run（无重叠语义，结果等价）。
+    fn run_deferred(
+        &self,
+        inputs: Vec<(String, Tensor)>,
+    ) -> Result<Box<dyn DeferredRun + Send>> {
+        let outs = self.run(inputs)?;
+        Ok(Box::new(SyncDone { outs }))
+    }
 }
 
 impl DeviceSession for crate::executor::Session {
