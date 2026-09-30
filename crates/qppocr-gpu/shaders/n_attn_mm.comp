@@ -27,7 +27,10 @@ void main() {
     uint a_base = a_off + (b * m + mi) * k;
     uint o_base = out_off + (b * m + mi) * n;
     for (uint j = lid; j < n; j += 256u) {
-        float acc = 0.0;
+        // precise：禁 FMA 收缩/重结合——CPU MatMul 是标量 mul+add 不收缩，
+        // glslc 默认把 a*b+= 收缩成 fma（~1e-4 概率差，近阈值 CTC 候选
+        // 翻转单字）。整链唯一非逐位环节即此。
+        precise float acc = 0.0;
         uint b_base = b_off + (b * k) * n + j; // B[b, ki, j] 行主序
         for (uint ki = 0u; ki < k; ki++) {
             acc += data[a_base + ki] * data[b_base + ki * n];
