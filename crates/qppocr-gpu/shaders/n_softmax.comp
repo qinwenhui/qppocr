@@ -11,6 +11,28 @@ layout(push_constant) uniform PC { uint p_off; } pc;
 
 shared float red[256];
 
+// exp1：conv.comp 的逐字拷贝（与 CPU softmax.rs 位级一致的多项式）。
+// 曾用硬件 exp：概率差 ~1e-5 在近阈值候选（0/l/I、空格边界）上翻转
+// CTC argmax——small 100 图 12 行文本差（GT 975 vs CPU 978）。
+float exp1(float x) {
+    const float LN2_HI = 0.6931472;
+    const float LN2_LO = -2.9802322e-8;
+    const float INV_LN2 = 1.442695;
+    x = clamp(x, -88.0, 88.0);
+    float kf = roundEven(x * INV_LN2);
+    float r = fma(-kf, LN2_HI, x);
+    r = fma(-kf, LN2_LO, r);
+    float p = 1.0 / 720.0;
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    int ki = int(kf) + 127;
+    return uintBitsToFloat(uint(ki) << 23) * p;
+}
+
 void main() {
     uint P = pc.p_off;
     uint in_off = params[P + 0], out_off = params[P + 1];
@@ -44,33 +66,48 @@ void main() {
     for (uint g = 1u; g < (gl_NumSubgroups + 3u) / 4u; g++) {
         rowmax = max(rowmax, red[g]);
     }
+    // red[] 复用边界：所有线程读完 max，才允许 phase 2 的 elect 写改写
+    // red。缺此屏障时快线程的 sum 写会覆盖慢线程尚未读的 max（本机
+    // T=120 实测整行级非确定：13-51 行随运行变，max 读到 sum 值 →
+    // exp 溢出 → 整行概率错）。
+    barrier();
 
-    // 2) exp(x - max) 求和（CPU 镜像：softmax.rs 用 exp 多项式；这里
-    // 硬件 exp——rec 的输出是概率，容差在 verify.py 逐字符层兜底）
-    float s = 0.0;
+    // 2) exp(x - max)（并行；exp1 与 CPU exp256_ps 逐位同构——硬件 exp
+    // 会差 ~1e-5，剃刀薄时间步翻 CTC 单字）
     for (uint j = lid; j < cols; j += 256u) {
-        float e = exp(data[base + j] - rowmax);
-        data[obase + j] = e;
-        s += e;
-    }
-    float ws = subgroupAdd(s);
-    if (subgroupElect()) red[gl_SubgroupID] = ws;
-    barrier();
-    if (lid < gl_NumSubgroups && lid % 4u == 0u) {
-        float v = red[lid];
-        if (lid + 1u < gl_NumSubgroups) v += red[lid + 1u];
-        if (lid + 2u < gl_NumSubgroups) v += red[lid + 2u];
-        if (lid + 3u < gl_NumSubgroups) v += red[lid + 3u];
-        red[lid / 4u] = v;
+        data[obase + j] = exp1(data[base + j] - rowmax);
     }
     barrier();
-    float rowsum = red[0];
-    for (uint g = 1u; g < (gl_NumSubgroups + 3u) / 4u; g++) {
-        rowsum += red[g];
+    // 2b) 求和：单线程按 CPU x86 softmax_row_vec 的 lane 序（树归约序差
+    // ~1e-6 同样翻 CTC）——lane k = 元素 k+8t 的顺序和；水平树
+    // ((l0+l4)+(l1+l5))+((l2+l6)+(l3+l7))（=hadd 序）；标量尾顺序并入；
+    // 归一用 ×(1/sum)（CPU 是 inv 乘，不是除）。
+    if (lid == 0u) {
+        float l0 = 0.0, l1 = 0.0, l2 = 0.0, l3 = 0.0;
+        float l4 = 0.0, l5 = 0.0, l6 = 0.0, l7 = 0.0;
+        uint q = cols >> 3;
+        for (uint t = 0u; t < q; t++) {
+            uint b8 = obase + t * 8u;
+            l0 += data[b8];
+            l1 += data[b8 + 1u];
+            l2 += data[b8 + 2u];
+            l3 += data[b8 + 3u];
+            l4 += data[b8 + 4u];
+            l5 += data[b8 + 5u];
+            l6 += data[b8 + 6u];
+            l7 += data[b8 + 7u];
+        }
+        float s = ((l0 + l4) + (l1 + l5)) + ((l2 + l6) + (l3 + l7));
+        for (uint j = q * 8u; j < cols; j++) {
+            s += data[obase + j];
+        }
+        red[0] = 1.0 / s;
     }
+    barrier();
+    float inv = red[0];
 
-    // 3) 归一；pad 列写 0
+    // 3) 归一（×inv）；pad 列写 0
     for (uint j = lid; j < cpad; j += 256u) {
-        data[obase + j] = j < cols ? data[obase + j] / rowsum : 0.0;
+        data[obase + j] = j < cols ? data[obase + j] * inv : 0.0;
     }
 }

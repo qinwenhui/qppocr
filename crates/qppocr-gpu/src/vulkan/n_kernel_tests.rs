@@ -2948,3 +2948,854 @@ fn cls_dw_precise() {
         fb_msg
     );
 }
+
+/// small rec 对右零填充的**模型不变性**（纯 CPU，与 GPU 无关）：
+/// 自然宽 w 的输出 vs 桶宽 W（右侧补零）的重叠时间步。引擎 GPU 小 rec 走
+/// 桶宽填充、CPU 走自然宽——不变性不成立则两侧文本必然分叉（无注意力
+/// mask 的 SVTR 混合填充步；竞品 small GPU 丢 47 行同症）。
+#[test]
+fn small_rec_padding_invariance() {
+    let model = std::env::var("SMALL_CMP_MODEL").unwrap_or_else(|_| "small".into());
+    let mpath = format!("../../models/{model}/rec.onnx");
+    if !std::path::Path::new(&mpath).is_file() {
+        eprintln!("[gpu] 无 {model} rec 模型，跳过");
+        return;
+    }
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    let (hh, w_nat, w_pad) = (48usize, 192usize, 256usize);
+    let bytes = std::fs::read(&mpath).unwrap();
+    let mut seed = 0x1234_5678_9abc_def0_u64;
+    let mut buf = F32Buf::with_zeroed(3 * hh * w_nat);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed) * 2.0 - 1.0;
+    }
+    let mk = |buf: F32Buf, w: usize| Tensor {
+        name: String::new(),
+        shape: vec![1, 3, hh as i64, w as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    let in_name = {
+        let s = Session::from_memory(&bytes, "small.rec.pad.a").unwrap();
+        s.graph
+            .inputs
+            .iter()
+            .find(|s| !s.is_empty())
+            .cloned()
+            .unwrap()
+    };
+    let mut sa = Session::from_memory(&bytes, "small.rec.pad.a").unwrap();
+    let out_a = sa.run(vec![(in_name.clone(), mk(buf.clone(), w_nat))]).unwrap();
+    let mut padded = F32Buf::with_zeroed(3 * hh * w_pad);
+    for c in 0..3 {
+        for y in 0..hh {
+            let src = (c * hh + y) * w_nat;
+            let dst = (c * hh + y) * w_pad;
+            padded.as_mut_slice()[dst..dst + w_nat]
+                .copy_from_slice(&buf.as_slice()[src..src + w_nat]);
+        }
+    }
+    let mut sb = Session::from_memory(&bytes, "small.rec.pad.b").unwrap();
+    let out_b = sb.run(vec![(in_name, mk(padded, w_pad))]).unwrap();
+    // 重叠时间步：T = w/8，自然宽 24 步、桶宽 32 步。
+    let (va, vb) = (out_a[0].f32.as_slice(), out_b[0].f32.as_slice());
+    let (t_nat, t_pad, vocab) = (24usize, 32usize, va.len() / 24);
+    let mut worst = 0.0f64;
+    let mut nbad = 0usize;
+    let mut first = None;
+    for t in 0..t_nat {
+        for v in 0..vocab {
+            let (a, b) = (va[t * vocab + v], vb[t * vocab + v]);
+            let e = ((a - b).abs() / (1.0 + a.abs())) as f64;
+            if e > 0.02 {
+                nbad += 1;
+                if first.is_none() {
+                    first = Some((t, v, a, b));
+                }
+            }
+            worst = worst.max(e);
+        }
+    }
+    let argmax = |base: &[f32], t: usize| -> i32 {
+        let s = &base[t * vocab..(t + 1) * vocab];
+        s.iter()
+            .enumerate()
+            .max_by(|x, y| x.1.partial_cmp(y.1).unwrap())
+            .map(|(i, _)| i as i32)
+            .unwrap_or(-1)
+    };
+    let am_diff = (0..t_nat)
+        .filter(|&t| argmax(va, t) != argmax(vb, t))
+        .count();
+    eprintln!(
+        "[pad] 重叠 {t_nat} 步：worst={worst:.4} 不符(>0.02)={}/{} argmax 异步数={am_diff}/{t_nat} 首坏={:?}",
+        nbad,
+        t_nat * vocab,
+        first
+    );
+    // 断言（声明=断言）：**不不变性是预期行为**——动态 B MatMul 的注意力
+    // rec 桶宽右零填充会改真步输出（引擎因此对这类模型启用 exact_width/
+    // bucket_grain=1，见 mod.rs open_bytes_with）。若某日此断言失败
+    // （填充变成无害），可重新评估 exact_width 的形状税是否可退。
+    assert!(
+        nbad > 0,
+        "small rec 已对右零填充不变——exact_width（精确宽）的形状税可能可退役"
+    );
+}
+
+/// small rec 注意力头的 GPU↔CPU 逐节点对拍：找首个分歧节点（调试用，
+/// 非回归闸门——注意力值正确后本测试应全绿，可留作守卫）。
+#[test]
+fn small_rec_gpu_vs_cpu() {
+    let model = std::env::var("SMALL_CMP_MODEL").unwrap_or_else(|_| "small".into());
+    let mpath = format!("../../models/{model}/rec.onnx");
+    let p = std::path::Path::new(&mpath);
+    if !p.is_file() {
+        eprintln!("[gpu] 无 {model} rec 模型，跳过");
+        return;
+    }
+    let Some(ctx) = open_or_skip() else { return };
+    let bytes = std::fs::read(p).unwrap();
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    // 形状可由环境变量覆写（宽行对拍：QPPOCR_CMP_W=640 复现长行乱码）。
+    let (b, hh, ww) = (
+        std::env::var("QPPOCR_CMP_B")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8usize),
+        48usize,
+        std::env::var("QPPOCR_CMP_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(192usize),
+    );
+    let mut seed = 0x5566_7788_99aa_bbcc_u64;
+    let mut buf = F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed) * 2.0 - 1.0;
+    }
+    // 零尾巴（复现引擎桶宽右填充：内容左对齐、右侧 grain 内补零）。
+    if let Ok(zt) = std::env::var("QPPOCR_CMP_ZEROTAIL") {
+        let zt: usize = zt.parse().unwrap();
+        for bi in 0..b {
+            for c in 0..3 {
+                for y in 0..hh {
+                    let row = ((bi * 3 + c) * hh + y) * ww;
+                    for x in (ww - zt)..ww {
+                        buf.as_mut_slice()[row + x] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+    let mk = |buf: F32Buf| Tensor {
+        name: String::new(),
+        shape: vec![b as i64, 3, hh as i64, ww as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    // CPU dump
+    let dump_dir = std::env::temp_dir().join("qppocr-small-rec-cmp");
+    let _ = std::fs::remove_dir_all(&dump_dir);
+    std::fs::create_dir_all(&dump_dir).unwrap();
+    let mut cpu = Session::from_memory(&bytes, "small.rec.cpu").unwrap();
+    cpu.set_dump_dir(dump_dir.to_str().unwrap());
+    let in_name = cpu
+        .graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let _out_cpu = cpu.run(vec![(in_name.clone(), mk(buf.clone()))]).unwrap();
+    let mut dumps: Vec<(Vec<i64>, Vec<f32>)> = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(&dump_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "f32"))
+        .collect();
+    files.sort();
+    for f in files {
+        let Ok(bb) = std::fs::read(&f) else {
+            break;
+        };
+        let r = i32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]) as usize;
+        let sh: Vec<i64> = bb[4..4 + 8 * r]
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let v: Vec<f32> = bb[4 + 8 * r..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        dumps.push((sh, v));
+    }
+    eprintln!("[small][cmp] 读到 {} 个 dump", dumps.len());
+
+    let (graph, init) = {
+        let s = Session::from_memory(&bytes, "small.rec.gpu").unwrap();
+        s.into_parts()
+    };
+    let in2 = graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let mut gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
+    gpu.batch_grain = 8;
+    // 禁区域回收：run 后读区=最后写者（曾以此假阳性坑过一整轮——见
+    // qppocr-gpu-region-recycle-artifact 记忆）
+    unsafe { std::env::set_var("QPPOCR_GPU_NO_FREE", "1") };
+    let out = qppocr_core::device::DeviceSession::run(&gpu, vec![(in2, mk(buf))]).unwrap();
+    unsafe { std::env::remove_var("QPPOCR_GPU_NO_FREE") };
+    // 计划键按批维补齐（grain 8）——real_n<8 的部分批也查得到计划。
+    let b_pad = b.div_ceil(8) * 8;
+    let (base, recs) = gpu
+        .debug_recs(&[b_pad as i64, 3, hh as i64, ww as i64])
+        .expect("无计划");
+
+    // === 关键链精确探针：rec（按节点名）↔ dump（按 manifest 节点索引），
+    // 全量对比（不用形状猜——numel 碰撞曾拿错张量、浅采样曾漏深处分歧）。
+    // dump 索引 = CPU 节点索引：87 transpose 出（=LN 输入）、88 mean、
+    // 89 Sub.1、90 Pow.1、93 Sqrt.1、94 Div.27、102-115 attention 头链、
+    // 189 transpose.7（尾段真转置）。
+    {
+        // 文件名前缀 s{sid}_ 的 sid 是进程级会话计数（全套跑时非 0）——
+        // 按 `_{idx:06}.f32` 后缀匹配，勿硬编码 s0_。
+        let read_dump = |idx: usize| -> Option<(Vec<i64>, Vec<f32>)> {
+            let suffix = format!("_{idx:06}.f32");
+            let path = std::fs::read_dir(&dump_dir)
+                .ok()?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(&suffix))
+                })?;
+            let bb = std::fs::read(path).ok()?;
+            let r = i32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]) as usize;
+            let sh: Vec<i64> = bb[4..4 + 8 * r]
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let v: Vec<f32> = bb[4 + 8 * r..]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            Some((sh, v))
+        };
+        // (rec 节点名, op 判别（None=唯一）, dump 索引, lane0?)——op 取参数块
+        // 首 word（n_elem：5=mul 4=add；行广播 8=sub 11=div）。
+        // 尾段 MatMul.12/Add.204/Softmax.2（cpad 行填充布局）与
+        // fused:Add.202（NHWC 出 vs NCHW dump）不在此直读——由末尾输出
+        // 全量对拍断言覆盖。
+        let probes: &[(&str, Option<u32>, usize, bool)] = &[
+            ("fused:Add.156", Some(4), 87, false),
+            ("ReduceMean.10", None, 88, true),
+            ("Sub.0", None, 89, false),
+            ("Pow.0", None, 90, false),
+            ("Sqrt.0", None, 93, true),
+            ("Div.26", None, 94, false),
+            // attention 头链（rec↔dump 直读；Transpose.1 rank-5 已验直读存储）
+            ("Mul.54", None, 102, false),
+            ("Transpose.2", None, 109, false),
+            ("MatMul.1", None, 110, false),
+            ("Softmax.0", None, 111, false),
+            ("MatMul.2", None, 112, false),
+            ("Transpose.3", None, 113, false),
+            ("MatMul.3", None, 115, false),
+            // 第二 attention 头链（同构第二块）
+            ("MatMul.6", None, 141, false),
+            ("Transpose.4", None, 144, false),
+            ("Mul.61", None, 147, false),
+            ("Transpose.5", None, 154, false),
+            ("MatMul.7", None, 155, false),
+            ("Softmax.1", None, 156, false),
+            ("MatMul.8", None, 157, false),
+            ("Transpose.6", None, 158, false),
+            ("MatMul.9", None, 160, false),
+            ("Transpose.7", None, 189, false),
+        ];
+        for (want, want_op, di, lane0) in probes {
+            let Some(rec_i) = recs.iter().position(|(k, node, _, _, _, pc, _, _)| {
+                if !node.starts_with(want) || k == "n_entry" {
+                    return false;
+                }
+                match want_op {
+                    None => true,
+                    Some(op) => {
+                        let p = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
+                        let w0 = unsafe { *(base.add(p * 4) as *const u32) };
+                        w0 == *op
+                    }
+                }
+            }) else {
+                eprintln!("[probe] {want} rec 未找到");
+                continue;
+            };
+            let (_, node, _, off, n, _, _, _) = &recs[rec_i];
+            let Some((sh, dv)) = read_dump(*di) else {
+                eprintln!("[probe] dump {di} 未找到");
+                continue;
+            };
+            // lane0（[rows,4] 存储）：区宽 dv.len()*4 字，比 lane0；rec.n 只
+            // 记逻辑元素数（192），按分配宽读。
+            let gv: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(
+                    base.add(*off as usize * 4) as *const f32,
+                    if *lane0 { dv.len() * 4 } else { *n as usize },
+                )
+            }
+            .to_vec();
+            let (mut worst, mut nbad, mut first_bad_i) = (0.0f64, 0usize, None);
+            let (mut n1e3, mut n1e5) = (0usize, 0usize);
+            let mut bad_rows: Vec<usize> = Vec::new();
+            let lane0 = *lane0;
+            let rows = if lane0 { dv.len() } else { dv.len().min(gv.len()) };
+            for j in 0..rows {
+                let g = if lane0 { gv[j * 4] } else { gv[j] };
+                let d = dv[j];
+                let e = ((g - d).abs() / (1.0 + d.abs())) as f64;
+                if e > 0.05 {
+                    nbad += 1;
+                    if first_bad_i.is_none() {
+                        first_bad_i = Some(j);
+                    }
+                }
+                if e > 1e-3 {
+                    n1e3 += 1;
+                    let row_w = (*sh.last().unwrap_or(&1)).max(1) as usize;
+                    if !lane0 && bad_rows.len() < 64 && !bad_rows.contains(&(j / row_w)) {
+                        bad_rows.push(j / row_w);
+                    }
+                }
+                if e > 1e-5 {
+                    n1e5 += 1;
+                }
+                worst = worst.max(e);
+            }
+            let e1k = if worst > 1e-3 {
+                if !bad_rows.is_empty() {
+                    format!(" >1e-3:{n1e3} >1e-5:{n1e5} 坏行(≤64)={bad_rows:?}")
+                } else {
+                    format!(" >1e-3:{n1e3} >1e-5:{n1e5}")
+                }
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "[probe] #{rec_i} {node} ↔ dump{di} {sh:?} lane0={lane0} n={}：worst={worst:.4} 不符={nbad}/{}{e1k} 首坏idx={:?}",
+                gv.len(),
+                rows,
+                first_bad_i
+            );
+            if let Some(j) = first_bad_i {
+                let g = if lane0 { gv[j * 4] } else { gv[j] };
+                eprintln!("        首坏 j={j}（行{} 列{}）gpu={g:.6} cpu={:.6}", j / 120, j % 120, dv[j]);
+            }
+        }
+    }
+    // rec 名册（QPPOCR_CMP_RECS=1 时打印——现场取证用）。
+    if std::env::var_os("QPPOCR_CMP_RECS").is_some() {
+        for (i, (kernel, node, _, off, n, _, osh, _)) in recs.iter().enumerate() {
+            eprintln!("[rec] #{i} {kernel} {node} osh={osh:?} off={off} n={n}");
+        }
+    }
+
+    // 全图对拍（诊断性，无断言）：形状精确优先、numel 回退，rank-4 双解释
+    //（NHWC↔NCHW 与直读取优——头维张量是直读存储）。
+    let mut first_bad: Option<(usize, String)> = None;
+    let mut n_bad = 0;
+    for (i, (kernel, node, _idx, off, n, _pc, osh, _ins)) in recs.iter().enumerate() {
+        if *n == 0 || kernel == "n_entry" || kernel.starts_with("n_exit") {
+            continue;
+        }
+        let gv: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
+        }
+        .to_vec();
+        let numel: i64 = osh.iter().product();
+        let mut matched = false;
+        let mut rel = 0.0f64;
+        // 先试形状完全一致的 dump（消除 numel 碰撞的假阴/假阳）
+        let osh_full: Vec<i64> = osh.clone();
+        let exact: Vec<&(Vec<i64>, Vec<f32>)> = dumps
+            .iter()
+            .filter(|(sh, dv)| *sh == osh_full && dv.len() >= 8)
+            .collect();
+        let cand: Vec<&(Vec<i64>, Vec<f32>)> = if exact.is_empty() {
+            dumps
+                .iter()
+                .filter(|(sh, dv)| sh.iter().product::<i64>() == numel && dv.len() >= 8)
+                .collect()
+        } else {
+            exact
+        };
+        for (sh, dv) in cand {
+            let numel = sh.iter().product::<i64>();
+            let mut e = 0.0f64;
+            let step = (dv.len() / 16).max(1);
+            for (s_i, g) in gv.iter().enumerate().step_by(step) {
+                // 两种解释：直读（行主序，cols=末维）与 NHWC（cols=shape[1]）
+                let direct = dv[s_i];
+                let _ = direct;
+                e = e.max(0.0); // 占位——用下方统一比较
+            }
+            // rank-4 双解释取优：backbone 卷积量是 NHWC 存储（↔dump NCHW），
+            // attention 头维量（[B,H,T,D] 等）是朴素直读——曾只按 NHWC 解释
+            // 把 Mul.54 [8,8,24,15] 误报 rel=0.97。
+            let e2 = if sh.len() == 4 {
+                let (nn, c3, h3, w3) = (sh[0] as usize, sh[1] as usize, sh[2] as usize, sh[3] as usize);
+                let hw = h3 * w3;
+                let c4 = (c3 + 3) / 4 * 4;
+                let rows = nn * hw;
+                // NHWC 解释：gv[row*NHWC 列 c] ↔ dump NCHW
+                let mut e_nhwc = 0.0f64;
+                let ns = 96.min(rows);
+                for k in 0..ns {
+                    let row = k * rows / ns.max(1);
+                    let (n, hwr) = (row / hw, row % hw);
+                    let (h, w) = (hwr / w3, hwr % w3);
+                    for c in [0usize, 1, c3 / 2, c3 - 1] {
+                        let g = gv.get(row * c4 + c).copied().unwrap_or(f32::NAN);
+                        let d = dv[(n * c3 + c) * hw + h * w3 + w];
+                        e_nhwc = e_nhwc.max(((g - d).abs() / (1.0 + d.abs())) as f64);
+                    }
+                }
+                // 直读解释：同一线性下标逐位对（attention 头维量是行主序无 cpad）
+                let mut e_direct = 0.0f64;
+                let n_tot = dv.len().min(gv.len());
+                let ns2 = 64.min(n_tot);
+                for k in 0..ns2 {
+                    let idx = k * n_tot / ns2.max(1);
+                    e_direct = e_direct.max(((gv[idx] - dv[idx]).abs() / (1.0 + dv[idx].abs())) as f64);
+                }
+                e_nhwc.min(e_direct)
+            } else {
+                // [rows,4] lane0 存储（末维=1 的归约出）：gv[r*4] ↔ dv[r]
+                let lane0 = sh.last() == Some(&1) && sh.len() == 3;
+                let mut e = 0.0f64;
+                let nr = dv.len();
+                let ns = 64.min(nr);
+                for k in 0..ns {
+                    let r = k * nr / ns.max(1);
+                    let d = dv[r];
+                    let g = if lane0 {
+                        gv.get(r * 4).copied().unwrap_or(f32::NAN)
+                    } else {
+                        gv.get(r).copied().unwrap_or(f32::NAN)
+                    };
+                    e = e.max(((g - d).abs() / (1.0 + d.abs())) as f64);
+                }
+                e
+            };
+            if e2 < 0.05 {
+                matched = true;
+            } else {
+                rel = rel.max(e2);
+            }
+        }
+        if !matched && n_bad < 3 {
+            if (85..=95).contains(&i) {
+                let nan = gv.iter().filter(|v| !v.is_finite()).count();
+                eprintln!("  [#{i}] {kernel} {node} osh={osh:?} 非有限={}/{}", nan, gv.len());
+            }
+            if node.starts_with("Transpose.1") && osh.len() == 5 {
+                let (sh, dv) = dumps
+                    .iter()
+                    .find(|(sh, _)| *sh == *osh)
+                    .unwrap();
+                let probes: [usize; 8] = [0, 14, 15, 119, 120, 359, 360, 8640];
+                for &q in &probes {
+                    if q < gv.len() && q < dv.len() {
+                        eprintln!(
+                            "  [#{i}] idx={q}: gpu={:.6} cpu={:.6} {}",
+                            gv[q], dv[q],
+                            if (gv[q] - dv[q]).abs() < 1e-3 { "✓" } else { "✗" }
+                        );
+                    }
+                }
+            }
+            for (sh, dv) in dumps.iter().filter(|(sh, _)| sh.iter().product::<i64>() == numel).take(2) {
+                eprintln!("  候补 dump shape={sh:?} dv 前6={:?}", &dv[..6.min(dv.len())]);
+            }
+            // 取 numel 匹配的首个 dump 对拍采样值
+            for (sh, dv) in &dumps {
+                if sh.iter().product::<i64>() == numel {
+                    let c3 = if sh.len() == 4 { sh[1] as usize } else { 0 };
+                    eprintln!(
+                        "[small][dbg] {kernel} {node}: shape {sh:?} | gpu[0..6]={:?} | cpu[0..6]={:?} | C={c3}",
+                        &gv[..6.min(gv.len())],
+                        &dv[..6.min(dv.len())]
+                    );
+                    break;
+                }
+            }
+        }
+        if !matched {
+            n_bad += 1;
+            if first_bad.is_none() {
+                // 解码参数块：pc（PcParams）前 4 字节 = p_off，再读 arena 参数
+                let pcb: &[u8] = &recs[i].5;
+                let p_off = u32::from_le_bytes([pcb[0], pcb[1], pcb[2], pcb[3]]) as usize;
+                let pw: Vec<u32> = unsafe {
+                    std::slice::from_raw_parts(base.add(p_off * 4) as *const u32, 12)
+                }
+                .to_vec();
+                eprintln!("[small][dbg] 首分歧参数 words = {pw:?}");
+                first_bad = Some((i, format!("{kernel} {node} osh={osh:?} rel={rel:.3}")));
+            }
+        }
+    }
+    eprintln!(
+        "[small][cmp] 可比节点中分歧 {n_bad} 个；首个：{:?}",
+        first_bad
+    );
+    // 最终闸门：GPU 输出 vs CPU 输出全量对拍（注意力头全链正确的判据——
+    // 中间对拍循环有 rank-4 NHWC 解释假警报，以此断言为准）。
+    let o = &out[0];
+    eprintln!(
+        "[small][cmp] 输出 shape={:?} 头4={:?}",
+        o.shape,
+        &o.f32.as_slice()[..4.min(o.f32.len())]
+    );
+    let oc = &_out_cpu[0];
+    assert_eq!(o.shape, oc.shape, "GPU/CPU 输出形状不符");
+    let g = o.f32.as_slice();
+    let c = oc.f32.as_slice();
+    let mut worst = 0.0f64;
+    let mut nbad = 0usize;
+    let mut nbit = 0usize; // 逐位（含 <0.02 的微差）不相等数
+    let mut first_bad_j = None;
+    for j in 0..g.len() {
+        let e = ((g[j] - c[j]).abs() / (1.0 + c[j].abs())) as f64;
+        if g[j].to_bits() != c[j].to_bits() {
+            nbit += 1;
+        }
+        worst = worst.max(e);
+        if e > 0.02 {
+            nbad += 1;
+            if first_bad_j.is_none() {
+                first_bad_j = Some(j);
+            }
+        }
+    }
+    eprintln!(
+        "[small][cmp] 输出对拍：worst={worst:.5} 不符(>0.02)={}/{} 逐位不等={} 首坏idx={:?}",
+        nbad,
+        g.len(),
+        nbit,
+        first_bad_j
+    );
+    // 坏点分布：按图（b）与时间步（t）聚合——集中某图=批错位、某步=时间步错位。
+    {
+        let (t_steps, vocab) = (o.shape[1] as usize, o.shape[2] as usize);
+        let mut per_b = [0usize; 8];
+        let mut per_t_acc: Vec<(usize, usize, f32, f32)> = Vec::new(); // (t, n, gpu, cpu)
+        for j in 0..g.len() {
+            let e = ((g[j] - c[j]).abs() / (1.0 + c[j].abs())) as f64;
+            if e > 0.02 {
+                let (b, t) = (j / (t_steps * vocab), (j / vocab) % t_steps);
+                per_b[b.min(7)] += 1;
+                if per_t_acc.len() < 12 && per_t_acc.iter().all(|x| x.0 != t) {
+                    per_t_acc.push((t, 0, g[j], c[j]));
+                }
+                per_t_acc.iter_mut().for_each(|x| {
+                    if x.0 == t {
+                        x.1 += 1
+                    }
+                });
+            }
+        }
+        eprintln!("[small][cmp] 坏点按图分布 {per_b:?}；按时间步（前若干）：{per_t_acc:?}");
+        // 按词表列 v 聚合：集中单列 = GEMM 列错位/权重错读
+        let mut per_v: Vec<(usize, usize)> = Vec::new();
+        for j in 0..g.len() {
+            let e = ((g[j] - c[j]).abs() / (1.0 + c[j].abs())) as f64;
+            if e > 0.02 {
+                let v = j % vocab;
+                match per_v.iter_mut().find(|x| x.0 == v) {
+                    Some(x) => x.1 += 1,
+                    None => per_v.push((v, 1)),
+                }
+            }
+        }
+        per_v.sort_by_key(|x| std::cmp::Reverse(x.1));
+        eprintln!("[small][cmp] 坏点按词表列 top：{:?}", &per_v[..12.min(per_v.len())]);
+    }
+    if let Some(j) = first_bad_j {
+        eprintln!("        首坏 j={j} gpu={:.6} cpu={:.6}", g[j], c[j]);
+    }
+    assert!(
+        nbad == 0,
+        "small rec GPU↔CPU 输出对拍 {nbad}/{} 超 0.02（worst={worst:.4}，首坏 j={:?} gpu={:?} cpu={:?}）",
+        g.len(),
+        first_bad_j,
+        first_bad_j.map(|j| g[j]),
+        first_bad_j.map(|j| c[j]),
+    );
+}
+
+/// n_softmax 裸内核抗扰测试：T=120 注意力分数 [7680,120] 固定输入，单
+/// dispatch ×30 次提交，跨次比较自身一致性——图级曾观测到整行级非确定
+/// （同输入 16/51/13 行随运行变，T≤80 恒稳），在此隔离：裸形态仍抖 =
+/// 内核内竞态；稳定 = 图上下文（大 CB/驱动屏障）问题。
+#[test]
+fn n_softmax_flaky_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+
+    let (rows, cols) = (7680usize, 120usize);
+    let mut seed = 0xabcd_ef01_2345_6789_u64;
+    let mut src = vec![0f32; rows * cols];
+    for v in src.iter_mut() {
+        *v = lcg(&mut seed) * 20.0 - 10.0;
+    }
+    let seg = |n: usize| n.div_ceil(4) * 4;
+    let in_w = seg(rows * cols);
+    let out_w = seg(rows * cols);
+    let p_w = 64;
+    let big = arena.alloc(((in_w + out_w + p_w) * 4) as vk::DeviceSize).unwrap();
+    let base_word = big.offset as u32 / 4;
+    let (in_off, out_off) = (base_word, base_word + in_w as u32);
+    let p_off = base_word + (in_w + out_w) as u32;
+    let p_of = |w: u32| unsafe { big.ptr.add(w as usize * 4) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), p_of(in_off) as *mut f32, rows * cols);
+        let mut pb = ParamBlock::new();
+        pb.u(in_off)
+            .u(out_off)
+            .u(rows as u32)
+            .u(cols as u32)
+            .u(cols as u32)
+            .u((rows / 8) as u32); // rpb
+        std::ptr::copy_nonoverlapping(
+            pb.words().as_ptr(),
+            p_of(p_off) as *mut u32,
+            pb.words().len(),
+        );
+    }
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+    let mut ref_out: Option<Vec<f32>> = None;
+    let mut n_flaky = 0usize;
+    for run in 0..30 {
+        ctx.inner
+            .device
+            .submit_one_shot(|d, cb| {
+                unsafe {
+                    record_dispatch(
+                        d,
+                        cb,
+                        &ks,
+                        "n_softmax",
+                        PcParams { p_off }.bytes(),
+                        [rows as u32, 1, 1],
+                    );
+                }
+            })
+            .unwrap();
+        let got: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(p_of(out_off) as *const f32, rows * cols)
+        }
+        .to_vec();
+        // clflush 读回（本机驱动 HOST_COHERENT 陷阱，生产路径同款）
+        super::memory::readback_clean(p_of(out_off) as *const u8, rows * cols * 4);
+        match &ref_out {
+            None => ref_out = Some(got),
+            Some(r) => {
+                let d = r
+                    .iter()
+                    .zip(got.iter())
+                    .filter(|(a, b)| (**a - **b).abs() > 1e-6)
+                    .count();
+                if d > 0 {
+                    n_flaky += 1;
+                    eprintln!("[sm-flaky] run {run}: 与首跑分歧 {d}/{}", rows * cols);
+                }
+            }
+        }
+        // 复位输入区（softmax 非原位，输入不动；无需复位）
+    }
+    eprintln!("[sm-flaky] 30 次提交，跨次分歧运行数 {n_flaky}");
+    assert_eq!(n_flaky, 0, "n_softmax 裸形态自身不一致——内核内竞态");
+}
+
+/// n_transpose_nd 裸内核：rank-5 [2,0,3,1,4] 与 rank-4 [0,2,1,3] 对拍
+/// CPU 参考值（逐元素精确）。
+#[test]
+fn n_transpose_nd_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+
+    // dims=[4,3,2,8,15]（B,T,3,8,15 的同构）、perm=[2,0,3,1,4]
+    let dims: [u32; 5] = [4, 3, 2, 8, 15];
+    let perm: [u32; 5] = [2, 0, 3, 1, 4];
+    let total: u32 = dims.iter().product();
+    let mut seed = 0x1234_0000_5555_aaaa_u64;
+    let mut src = vec![0f32; total as usize];
+    for v in src.iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    // CPU 参考：out[o] where oc 分解按输出维 dims[perm[d]]
+    let odims: Vec<u32> = (0..5).map(|d| dims[perm[d] as usize]).collect();
+    let mut want = vec![0f32; total as usize];
+    for i in 0..total as usize {
+        let mut oc = [0u32; 5];
+        let mut rem = i as u32;
+        for d in (0..5).rev() {
+            oc[d] = rem % odims[d];
+            rem /= odims[d];
+        }
+        let mut ic = [0u32; 5];
+        for d in 0..5 {
+            ic[perm[d] as usize] = oc[d];
+        }
+        let mut s = 0usize;
+        for k in 0..5 {
+            s = s * dims[k] as usize + ic[k] as usize;
+        }
+        want[i] = src[s];
+    }
+
+    let seg = |n: usize| n.div_ceil(4) * 4;
+    let in_w = seg(total as usize);
+    let out_w = seg(total as usize);
+    let p_w = 256;
+    let big = arena.alloc(((in_w + out_w + p_w) * 4) as vk::DeviceSize).unwrap();
+    let base_word = big.offset as u32 / 4;
+    let in_off = base_word;
+    let out_off = base_word + in_w as u32;
+    let p_off = base_word + (in_w + out_w) as u32;
+    let p_of = |w: u32| unsafe { big.ptr.add(w as usize * 4) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), p_of(in_off) as *mut f32, total as usize);
+        let mut pb = ParamBlock::new();
+        pb.u(in_off).u(out_off).u(total).u(5);
+        for &d in &dims {
+            pb.u(d);
+        }
+        for &p in &perm {
+            pb.u(p);
+        }
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), p_of(p_off) as *mut u32, pb.words().len());
+    }
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+    ctx.inner
+        .device
+        .submit_one_shot(|d, cb| {
+            unsafe {
+                record_dispatch(
+                    d,
+                    cb,
+                    &ks,
+                    "n_transpose_nd",
+                    PcParams { p_off }.bytes(),
+                    [total.div_ceil(256), 1, 1],
+                );
+            }
+        })
+        .unwrap();
+    let got: Vec<f32> = unsafe {
+        std::slice::from_raw_parts(p_of(out_off) as *const f32, total as usize)
+    }
+    .to_vec();
+    let bad = got
+        .iter()
+        .zip(want.iter())
+        .filter(|(a, b)| (**a - **b).abs() > 1e-6)
+        .count();
+    eprintln!("[tpose][nd] 分歧 {bad}/{total}");
+    assert_eq!(bad, 0, "n_transpose_nd rank-5 对拍失败");
+}
+
+/// n_attn_mm 裸内核：batched [b,M,K]×[b,K,N] 对拍 CPU 参考。
+#[test]
+fn n_attn_mm_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+
+    let (batch, heads, m, k, n) = (6u32, 3u32, 5u32, 4u32, 7u32);
+    let mut seed = 0xabcd_ef01_2345_6789_u64;
+    let a: Vec<f32> = (0..batch * m * k).map(|_| lcg(&mut seed)).collect();
+    let b: Vec<f32> = (0..batch * k * n).map(|_| lcg(&mut seed)).collect();
+    let mut want = vec![0f32; (batch * m * n) as usize];
+    for bi in 0..batch {
+        for mi in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for ki in 0..k {
+                    acc += a[(bi * m + mi) as usize * k as usize + ki as usize]
+                        * b[(bi * k) as usize * n as usize + ki as usize * n as usize + j as usize];
+                }
+                want[(bi * m + mi) as usize * n as usize + j as usize] = acc;
+            }
+        }
+    }
+
+    let seg = |x: u32| x.div_ceil(4) * 4;
+    let a_w = seg(batch * m * k) as usize;
+    let b_w = seg(batch * k * n) as usize;
+    let o_w = seg(batch * m * n) as usize;
+    let p_w = 256usize;
+    let big = arena
+        .alloc(((a_w + b_w + o_w + p_w) * 4) as vk::DeviceSize)
+        .unwrap();
+    let base_word = big.offset as u32 / 4;
+    let (a_off, b_off, o_off, p_off) = (
+        base_word,
+        base_word + a_w as u32,
+        base_word + (a_w + b_w) as u32,
+        base_word + (a_w + b_w + o_w) as u32,
+    );
+    let p_of = |w: u32| unsafe { big.ptr.add(w as usize * 4) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(a.as_ptr(), p_of(a_off) as *mut f32, a.len());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), p_of(b_off) as *mut f32, b.len());
+        let mut pb = ParamBlock::new();
+        pb.u(a_off).u(b_off).u(o_off).u(m).u(k).u(n).u(batch).u(heads);
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), p_of(p_off) as *mut u32, pb.words().len());
+    }
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+    ctx.inner
+        .device
+        .submit_one_shot(|d, cb| {
+            unsafe {
+                record_dispatch(
+                    d,
+                    cb,
+                    &ks,
+                    "n_attn_mm",
+                    PcParams { p_off }.bytes(),
+                    [1, batch * m, 1],
+                );
+            }
+        })
+        .unwrap();
+    let got: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(p_of(o_off) as *const f32, want.len()) }.to_vec();
+    let bad = got
+        .iter()
+        .zip(want.iter())
+        .filter(|(x, y)| (**x - **y).abs() > 1e-5)
+        .count();
+    eprintln!("[attnmm] 分歧 {bad}/{}", want.len());
+    assert_eq!(bad, 0, "n_attn_mm 对拍失败");
+}
