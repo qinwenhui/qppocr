@@ -187,7 +187,10 @@ mod tests {
     /// 三个输入尺寸（方形/小方形/长宽比≠1）压满 padding/池化/插值的公式。
     #[test]
     fn det_shapes_match_executor() {
-        for &(h, w) in &[(960i64, 960i64), (640, 640), (960, 512)] {
+        // 960×864：曾在此尺寸漏测——planner 把 FPN 的 Add.159 推成
+        // [64,30,27]（P5）而 executor 实际 [64,60,54]（P4），GPU 全图
+        // 因此错位（Resize 族源坐标按错误输入形状计算）。
+        for &(h, w) in &[(960i64, 960i64), (640, 640), (960, 512), (960, 864)] {
             det_oracle(h, w);
         }
     }
@@ -201,14 +204,12 @@ mod tests {
             std::env::temp_dir().join(format!("qppocr-plan-oracle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dump_dir);
         std::fs::create_dir_all(&dump_dir).unwrap();
-        unsafe {
-            // SAFETY: edition 2024 的 set_var 是 unsafe；本测试独占该环境
-            // 变量（只有 Session::run 读它），本文件仅此一测。
-            std::env::set_var("QPPOCR_DUMP_DIR", &dump_dir);
-        }
-
         let bytes = std::fs::read(&det).unwrap();
-        let session = Session::from_memory(&bytes, "tiny.det").expect("加载 det");
+        let mut session = Session::from_memory(&bytes, "tiny.det").expect("加载 det");
+        // 会话级 dump 目录（不用 QPPOCR_DUMP_DIR 环境变量：并行测试线程
+        // 共享进程环境，不带锁的其它 Session::run 会读着同一变量把节点
+        // dump 进本目录，sid 更大——「目录里最大 sid」就会选中入侵会话）。
+        session.set_dump_dir(dump_dir.to_str().unwrap());
         let input_name = session
             .graph
             .inputs
@@ -350,10 +351,6 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dump_dir);
-        unsafe {
-            // SAFETY: 同上——本测试独占该环境变量。
-            std::env::remove_var("QPPOCR_DUMP_DIR");
-        }
         if let Some(msg) = first_bad {
             panic!("首个分歧：\n{msg}");
         }
