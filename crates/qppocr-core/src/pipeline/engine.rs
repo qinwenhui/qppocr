@@ -1239,6 +1239,7 @@ impl Engine {
             // (bsz≤grain, W桶) 形状多样性由桶宽分组 + 补齐塌缩掉。
             // CPU 会话批维即行数，不补。
             let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (img_h as usize) * (img_w as usize));
+            let t_pack = std::time::Instant::now();
             for (k, &i) in order[beg..end].iter().enumerate() {
                 let c = &line_crop[i];
                 pack_crop(
@@ -1247,6 +1248,12 @@ impl Engine {
                     img_w,
                     &mut batch_f32[k * 3 * (img_h as usize) * (img_w as usize)..],
                     crop_pads(c, img_h, self.cfg.rec_pad_min_h),
+                );
+            }
+            if std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some() {
+                eprintln!(
+                    "[pack] {bsz} 行 → {img_w} 宽：{} ms",
+                    t_pack.elapsed().as_secs_f64() * 1000.0
                 );
             }
 
