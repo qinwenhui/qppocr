@@ -137,6 +137,11 @@ const SHADERS: &[(&str, &[u8])] = &[
         "n_reduce_last",
         include_bytes!("../../shaders/spirv/n_reduce_last.spv"),
     ),
+    (
+        "n_transpose_nd",
+        include_bytes!("../../shaders/spirv/n_transpose_nd.spv"),
+    ),
+    ("n_attn_mm", include_bytes!("../../shaders/spirv/n_attn_mm.spv")),
 ];
 
 /// push constant 块（与各 .comp 的 PC 布局一一对应；float 元素偏移）。
