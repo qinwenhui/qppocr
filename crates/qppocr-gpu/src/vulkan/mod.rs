@@ -337,13 +337,18 @@ impl DeviceContext for VulkanContext {
         initializers: HashMap<String, Tensor>,
         opts: &SessionOptions,
     ) -> Result<Arc<dyn DeviceSession>> {
-        // bring-up 旋钮：QPPOCR_GPU_STAGES=det（默认）→ 仅 det 上 GPU；
-        // =detrec → det+rec 上 GPU、cls 留 CPU（cls-GPU 的 argmax 在真实
-        // 图上与 CPU 有 ~14% 边界翻转分歧——翻转错一行毁一行文本，且
-        // GPU cls 5.3ms 还慢于 CPU 4.2ms，无收益纯风险）；
-        // =all → 三模型全 GPU（cls 分歧仍在，仅作对照）。委托 CPU 时
+        // 部署分级（QPPOCR_GPU_STAGES，默认 **detrec**）：det+rec 上 GPU、
+        // cls 留 CPU。=det 可退回仅-det（rec 走 CPU——一次性单图冷进程
+        // 避付 rec 计划构建税 ~13ms×桶数，冷机单图实测 85 vs 158ms）。
+        // 转正依据（bench/COMPARISON.md 2026-09-30 各节）：持续/批量
+        // detrec 全链反超纯 CPU 26% 且 CPU 线程全释放、机器热态下
+        // det-only 的 CPU rec 劣化 37→60ms 而 detrec 恒稳；冷机语料
+        // 1.028 平手；精度逐位同（GT 860/1036）。
+        // cls 恒 CPU（=all 才上 GPU）：GPU cls argmax 真实图 ~14% 行边界
+        // 翻转分歧（翻转错=毁整行）且更慢（5.3 vs 4.2ms）。委托 CPU 时
         // **stderr 声明**，不是静默降级。
-        let stages = std::env::var("QPPOCR_GPU_STAGES").unwrap_or_else(|_| "det".into());
+        let stages =
+            std::env::var("QPPOCR_GPU_STAGES").unwrap_or_else(|_| "detrec".into());
         let gpu_ok = match opts.model {
             qppocr_core::device::ModelRole::Det => true,
             qppocr_core::device::ModelRole::Rec => stages == "detrec" || stages == "all",
