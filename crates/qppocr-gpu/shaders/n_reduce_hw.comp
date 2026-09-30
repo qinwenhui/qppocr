@@ -4,7 +4,11 @@
 // 访存：256 线程 = (256/cp4) 个位置组 × cp4 个通道组——每步 16 个
 // 连续位置 × 连续通道 vec4 = 2KB 连续读（曾按 C 步长逐线程扫，
 // 128B 间隔带宽放大 64×、单次归约 3.4ms）。
-// mDim 每块 1024 位置；Cpad ≤ 256（det 的 SE 通道全满足）。
+// mDim 每块 1024 位置；Cpad ≤ 1024（cp4 ≤ 256）。cp4 不整除 256 时
+//（如 small 的 SE 通道 384 → cp4=96、npg=2）尾线程 pg≥npg：**必须
+// 跳过 m 循环**——它们的页序列与 pg=0 重叠会双计（这正是旧版
+// Cpad ≤ 256 上限的根源）；red[t] 写 0 参与 barrier（不能提前 return，
+// 屏障发散是 UB）。
 // scratch 用 f32（binding 0 视图）写——同为 f32 区（不相交）。
 #version 450
 layout(local_size_x = 256) in;
@@ -33,8 +37,10 @@ void main() {
     uint mEnd = min(m0 + 1024u, mDim);
 
     vec4 acc = vec4(0.0);
-    for (uint m = m0 + pg; m < mEnd; m += npg) {
-        acc += vec4(d[in_base + m * cp4 + c4]);
+    if (pg < npg) {
+        for (uint m = m0 + pg; m < mEnd; m += npg) {
+            acc += vec4(d[in_base + m * cp4 + c4]);
+        }
     }
     red[t] = acc;
     barrier();

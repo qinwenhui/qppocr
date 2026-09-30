@@ -365,6 +365,30 @@ impl DeviceContext for VulkanContext {
                 initializers,
             )));
         }
+        // rec：**覆盖面探针**——一次性探针会话小形状试建计划（克隆图/
+        // 权重，探完即弃）。不支持的算子（如 small 的 rank-5 注意力
+        // Transpose 族）与形状无关，探针必现；失败则 stderr 声明后原图
+        // 退回 CPU 会话（非静默降级；cls 同款分级纪律）——补齐内核后
+        // 探针自动放行。
+        if opts.model == qppocr_core::device::ModelRole::Rec {
+            let probe_err = session::VulkanSession::new(
+                self.inner.clone(),
+                graph.clone(),
+                initializers.clone(),
+            )?
+            .probe(&[1, 3, 48, 64])
+            .err();
+            if let Some(e) = probe_err {
+                eprintln!(
+                    "[gpu] rec 会话探测失败（{e}）：rec 走 CPU 会话（分级部署，\
+                     补齐 n_ 覆盖面后自动上 GPU）"
+                );
+                return Ok(Arc::new(qppocr_core::executor::Session::from_parts(
+                    graph,
+                    initializers,
+                )));
+            }
+        }
         let mut session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
         // rec 会话批维补齐粒度 8：引擎按此合批（宽填充到批内最大桶），
         // 会话补齐空行 + 内核 real_n 早退——实测每行提交往返 ~0.85ms、

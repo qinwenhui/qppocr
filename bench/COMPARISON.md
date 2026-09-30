@@ -469,3 +469,29 @@ build_plan 本体，列为后续优化项。
 一次性 CLI 冷进程的 73ms 代价以 `QPPOCR_GPU_STAGES=det` 作为显式退路
 并在此记录。验证：翻默认后无环境变量跑 100 图 1096 行对 detrec 基线
 IDENTICAL；34 测试绿。
+
+## 2026-09-30（六）small 档 GPU 通车：SE 384 + LayerNorm 链 + 探针分级
+
+`--tier small --device gpu` 从干净报错 → **可用**（GT 978/1036 与 CPU
+逐位全同，所有指标同数字）。三件事：
+
+1. **SE 归约通道 384 > 256 解禁**：n_reduce_hw 的线程平铺要求 cp4 整除
+   256——cp4=96 时尾线程 pg≥npg 的页序列与 pg=0 **重叠双计**（这才是
+   旧上限的根源）。修法：m 循环挂 `pg < npg` 条件（尾线程空转但照常
+   写 red/过 barrier——屏障发散是 UB）。n_reduce_fin 改通道按 256 分组
+   跨步（组数 WG 一致、组内双 barrier）。上限放宽到 Cpad ≤ 1024
+   （cp4 ≤ 256；超出静默算零，必须显式拒绝）。
+2. **LayerNorm 分解链上 GPU**（small rec 的 SVTR 头，tiny 没有）：
+   `ReduceMean(-1)` 新内核 n_reduce_last（softmax 同款行归约骨架，出
+   [rows,4] lane0）；n_elem 扩 8=减行向量/9=square/10=sqrt/11=除行向量/
+   12=sub/13=div（行向量广播 p1 携带 c4 位型）；rank-0 标量 Add（LN 的
+   +eps，paddle2onnx 导出无维 helper.constant）；rank-3 MulAddScale
+   （LN 的 ×scale+shift）复用 n_channel op5（bn 的双 [C] 广播，单
+   dispatch 无临时区）。
+3. **rank-5 注意力转置族（[2,0,3,1,4] 等 7 种排列 + MatMul ×13）不支持
+   → 探针分级**：create_session 用一次性探针会话（克隆图/权重）小形状
+   试建计划，失败则 stderr 声明后 rec 退回 CPU（非静默，cls 同款纪律）；
+   补齐内核后探针自动放行。det 全 GPU 不受影响。
+
+small 分账（img-001 单图）：det GPU 43.8ms（CPU ~70）；rec 140ms CPU
+（注意力头是 small rec 上 GPU 的下一步）。34 测试绿。
