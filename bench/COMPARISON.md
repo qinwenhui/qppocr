@@ -727,3 +727,21 @@ small GT 978/1036＋cls 1006/1032——**两档与 cls-CPU 逐位全同**；100 
 至此 `--device gpu` = 有啥给 GPU（small rec 的 rank-5 注意力头除外，
 探针分级退 CPU）。34 测试绿、verify 1096 行 IDENTICAL。
 
+## 2026-09-30（十四）small rec 注意力头施工图（下会话用，已解剖未施工）
+
+3 个注意力块 ＋ MLP ＋ 输出头，全部围绕 [B,T,120]（C=120=8头×15维，
+T 动态）。已确认的施工要点：
+- **QKV 融合 MatMul [120,360]** → Reshape [B,T,3,8,15]（存储恒等✓现有
+  别名臂）→ **Transpose [2,0,3,1,4]**→[3,B,8,T,15]（需新内核：通用
+  ND 转置，精确存储）
+- **Slice dim0**（[3,...]→Q/K/V）＝连续存储的**偏移别名，零拷贝**
+- K^T：Transpose [0,1,3,2]（通用转置）；**QK^T 与 scores×V 是动态×
+  动态批量 GEMM**（[B8,T,15]×[B8,15,T]、K=15 极瘦——朴素内核即可，
+  张量小、launch 主导）
+- Softmax [B,8,T,T] 复用 n_softmax（cpad=cols 精确存储即可）
+- scale/dropout(eval=identity)/Mul/Add 走现有元素族
+- 存储定向陷阱：Transpose [0,2,1] 在 n_ 里常是**存储恒等**（rc 按生产者
+  记账），注意力区的 Transpose.0/7/8 哪些真要搬数据需按生产者逐一判——
+  这是最深的不确定点
+- 验收闸门：small GT 978/1036 必须不变（探针分级会在补齐后自动放行）
+
