@@ -71,10 +71,15 @@ struct Plan {
     /// 本计划是否有一条在飞的 deferred 提交（同形状两条在飞 = 输入/
     /// 输出区同址互踩；stage 置位、收账复位，debug 断言兜底）。
     inflight: std::sync::atomic::AtomicBool,
-    /// 计划存活期归本计划；逐出时 take 归还会话 arena 池（见
-    /// [`VulkanSession::arena_pool`]——免掉大块页提交）。
+    /// 计划存活期归本计划；**Drop 时**（最后引用释放 = 无在飞 CB）与
+    /// `ks` 成对归还会话池（见 [`VulkanSession::arena_pool`]——免掉大块
+    /// 页提交与内核套件重建；Arc 共享池句柄给本计划）。
     arena: Option<Arena>,
-    _ks: KernelSet,
+    /// 计划录制/执行要用；Drop 时与 arena 成对归池。None 仅出现在归池后
+    /// 的 Drop 中途或裸测试构造。
+    ks: Option<KernelSet>,
+    /// 会话池句柄（Drop 归还用）。
+    pool: std::sync::Arc<Mutex<Vec<(Arena, KernelSet)>>>,
     /// 查询池销毁用的设备句柄（drop 序：先于 ctx 释放）。
     _dev: ash::Device,
 }
@@ -85,6 +90,25 @@ impl Drop for Plan {
             // SAFETY: 池由本计划独占；drop 时设备上无未完成工作（run
             // 等完信号才返回）；_dev/ctx 仍存活（本体在字段 drop 前执行）。
             unsafe { self._dev.destroy_query_pool(p, None) };
+        }
+        // 归还 (arena, KernelSet) 对：此刻无任何 CB 引用（最后引用释放，
+        // deferred 已收账/同步 run 已等完），reset 后可安全复用。锁中毒
+        // （会话级灾难）也照常归还——into_inner 取数据继续。
+        if let (Some(a), Some(ks)) = (self.arena.take(), self.ks.take()) {
+            let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.push((a, ks));
+            if pool.len() > 2 {
+                // 淘汰容量最小的（封顶 2 对：引擎 deferred 流水把计划
+                // Arc 存活拉到下一图之后——池深 1 在 img k+1 建计划时
+                // img k 的对还没归池，结构性 miss；深 2 吃住流水）
+                let mut min_i = 0;
+                for i in 1..pool.len() {
+                    if pool[i].0.chunk_bytes() < pool[min_i].0.chunk_bytes() {
+                        min_i = i;
+                    }
+                }
+                pool.swap_remove(min_i);
+            }
         }
     }
 }
@@ -275,10 +299,15 @@ pub(crate) struct VulkanSession {
     /// 会话级权重重排缓存：重排算术（83 层 conv 的 k-major 循环 ~9ms）
     /// 与形状无关——按名缓存，重建只付 memcpy（~1ms）。
     repack_cache: Mutex<HashMap<String, std::sync::Arc<Vec<u32>>>>,
-    /// 会话级 arena 池：逐出计划归还整块，新形状 reset 复用（容量够时）。
-    /// 137MB 新块页提交 ~7ms vs 复用 ~0——形状多样性 × LRU 驱逐下每帧
-    /// 重建曾把它当固定税。池封顶 1 块（按容量优先留大）。
-    arena_pool: Mutex<Vec<Arena>>,
+    /// 会话级 **(arena, KernelSet) 成对池**：计划 Drop（最后引用释放 =
+    /// 无在飞 CB）时归还两件套，新形状 reset 复用（容量够时）。137MB 新
+    /// 块页提交 ~7ms vs 复用 ~0；KernelSet 绑定 arena 的块缓冲（reset 不
+    /// 改缓冲句柄/尺寸，绑定恒有效），成对复用把重建从「arena 免页提交 +
+    /// KernelSet 全套重建（DSL/描述符池/管线 2-10ms）」压到 ~0。
+    /// Arc 共享给 Plan：**归池在 Drop 而非驱逐时**——deferred 流水下驱逐
+    /// 刻旧计划 Arc 常在飞（get_mut 失败），驱逐路径归池曾大量失效
+    /// （实测每图仍 17ms 新建）。池封顶 2 对（按容量留大——deferred 流水深度 2，见 Drop 归池注释）。
+    arena_pool: std::sync::Arc<Mutex<Vec<(Arena, KernelSet)>>>,
     /// 批维补齐粒度（rec 会话=8，其余 1）：run() 把输入批维向上取整到
     /// 该值建计划，空行由内核 real_n 早退守卫零算力——(bsz,W) 形状塌缩
     /// 成 (grain,W桶)，计划全命中。与 `DeviceSession::batch_grain` 同源
@@ -343,7 +372,7 @@ impl VulkanSession {
             plans: Mutex::new(Vec::new()),
             pipeline_cache,
             repack_cache: Mutex::new(HashMap::new()),
-            arena_pool: Mutex::new(Vec::new()),
+            arena_pool: std::sync::Arc::new(Mutex::new(Vec::new())),
             batch_grain: 1,
             exact_width: false,
             argmax_exit: false,
@@ -416,35 +445,11 @@ impl VulkanSession {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(self.plan_budget_mb);
             let mut total: u64 = plans.iter().map(|(_, p)| p.block_bytes).sum();
-            let mut evicted_arenas: Vec<Arena> = Vec::new();
             while total > budget * (1 << 20) && plans.len() > 1 {
-                let (_, mut evicted) = plans.remove(0);
+                let (_, evicted) = plans.remove(0);
                 total -= evicted.block_bytes;
-                // get_mut 失败 = deferred 在飞引用该计划：不能归池
-                //（整块随最后一个 Arc drop 释放，池少一块可接受）。
-                if let Some(p) = std::sync::Arc::get_mut(&mut evicted) {
-                    if let Some(a) = p.arena.take() {
-                        evicted_arenas.push(a);
-                    }
-                }
-            }
-            // 归还的块进池（封顶 2，按容量留大——下一形状 reset 复用）
-            if !evicted_arenas.is_empty() {
-                if let Ok(mut pool) = self.arena_pool.lock() {
-                    for a in evicted_arenas {
-                        pool.push(a);
-                        if pool.len() > 1 {
-                            // 淘汰容量最小的
-                            let mut min_i = 0;
-                            for i in 1..pool.len() {
-                                if pool[i].chunk_bytes() < pool[min_i].chunk_bytes() {
-                                    min_i = i;
-                                }
-                            }
-                            pool.swap_remove(min_i);
-                        }
-                    }
-                }
+                // 归池在 Plan::drop（最后引用释放时）：deferred 在飞持有
+                // Arc 的时刻此处不强取——drop 时自然归还池。
             }
         }
         let plan = plans
@@ -586,7 +591,7 @@ impl VulkanSession {
         }
         let (last_off, last_n) = (plan.recs[to].3, plan.recs[to].4);
         let base = plan.base;
-        let ks = &plan._ks;
+        let ks = plan.ks.as_ref().expect("计划无 KernelSet（已归池？）");
         let mut idx = from;
         self.ctx.device.submit_one_shot(|d, cb| {
             for (kernel, pc, groups) in &recs_out {
@@ -651,7 +656,7 @@ impl VulkanSession {
                     }
                 }
             }
-            let ks = &plan._ks;
+            let ks = plan.ks.as_ref().expect("计划无 KernelSet（已归池？）");
             let pc = pc.clone();
             let kernel = kernel.clone();
             let groups = *groups;
@@ -1015,7 +1020,7 @@ impl VulkanSession {
                     let outn = table.values.get(&out);
                     let ok = matches!(
                         (start, end, axis, step),
-                        (Some(s), Some(e), Some(0), Some(1) | None) if s >= 0
+                        (Some(s), Some(_e), Some(0), Some(1) | None) if s >= 0
                     );
                     if ok && inn.is_some() && outn.is_some() {
                         let inn = inn.unwrap();
@@ -1394,36 +1399,52 @@ impl VulkanSession {
         let t_alloc = std::time::Instant::now();
         let dbg_time = std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some();
         let need = layout.total as vk::DeviceSize * 4;
-        // 池里找容量够的块 reset 复用；没有再新建
-        let mut arena = {
+        // 池里找容量够的 (arena, KernelSet) 对 reset 复用；没有再新建。
+        // 复用对的 KernelSet 绑定即 arena 块缓冲（reset 不换缓冲），免整套
+        // DSL/描述符池/管线重建（实测 2-10ms → ~0）。
+        let (arena, ks, whole) = {
             let mut pool = self
                 .arena_pool
                 .lock()
                 .map_err(|_| Error::Device("arena 池锁中毒".into()))?;
+            let alloc_whole = |a: &mut Arena| -> Result<super::memory::Region> {
+                a.alloc(need).map_err(|e| {
+                    Error::Device(format!("计划整块分配失败（{} floats）: {e}", layout.total))
+                })
+            };
             let mut hit = None;
             for i in 0..pool.len() {
-                if pool[i].reset_if_fits(need) {
+                if pool[i].0.reset_if_fits(need) {
                     hit = Some(i);
                     break;
                 }
             }
             match hit {
-                Some(i) => pool.swap_remove(i),
-                None => Arena::new(
-                    self.ctx.device.raw().clone(),
-                    self.ctx.mem_types.staging,
-                    true,
-                ),
+                Some(i) => {
+                    let (mut a, ks) = pool.swap_remove(i);
+                    let whole = alloc_whole(&mut a)?;
+                    (a, ks, whole)
+                }
+                None => {
+                    let mut a = Arena::new(
+                        self.ctx.device.raw().clone(),
+                        self.ctx.mem_types.staging,
+                        true,
+                    );
+                    let whole = alloc_whole(&mut a)?;
+                    let (buf, buf_size) = a
+                        .chunk_range()
+                        .ok_or_else(|| Error::Device("arena 空".into()))?;
+                    let ks = KernelSet::new_with_cache(
+                        self.ctx.device.raw(),
+                        buf,
+                        buf_size,
+                        self.pipeline_cache,
+                    )?;
+                    (a, ks, whole)
+                }
             }
         };
-        let whole = arena.alloc(need).map_err(|e| {
-            Error::Device(format!("计划整块分配失败（{} floats）: {e}", layout.total))
-        })?;
-        let (buf, buf_size) = arena
-            .chunk_range()
-            .ok_or_else(|| Error::Device("arena 空".into()))?;
-        let ks =
-            KernelSet::new_with_cache(self.ctx.device.raw(), buf, buf_size, self.pipeline_cache)?;
 
         if dbg_time {
             eprintln!(
@@ -1618,7 +1639,8 @@ impl VulkanSession {
             out_shapes,
             cb,
             qpool,
-            _ks: ks,
+            ks: Some(ks),
+            pool: std::sync::Arc::clone(&self.arena_pool),
             _dev: dev.clone(),
         })
     }
@@ -3132,8 +3154,7 @@ fn orient4(
             "定向中转仅支持 rank-3/4，实得 {shape:?}"
         )));
     }
-    let (nn, cc, hh, ww) = (shape[0], shape[1], shape[2], shape[3]);
-    let nhwc_rc = ((nn * hh * ww) as u32, cc as u32);
+    let (_nn, cc, _hh, ww) = (shape[0], shape[1], shape[2], shape[3]);
     // 字节序比较（H==1 的 [N,C,1,W]）：真线性 (n,c,w) vs NHWC (n,w,c)
     // ——C==1 或 W==1 时两序坍缩相同，否则互为方阵转置、必须中转。
     let orders_equal = cc == 1 || ww == 1;
