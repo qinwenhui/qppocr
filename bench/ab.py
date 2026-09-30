@@ -24,7 +24,11 @@ from pathlib import Path
 DS = Path(r"D:\qinwh\code\myself\sku-manager\ocr-tool\bench\simdpaddleocr-dataset-v1\dataset")
 OURS = Path(r"D:\qinwh\code\myself\qppocr\target\release\qppocr.exe")
 OURS_CWD = Path(r"D:\qinwh\code\myself\qppocr")
-SIMD = Path(r"D:\qinwh\code\myself\SimdPaddleOCR\test\Sdcb.SimdPaddleOCR.Tests\bin\Release\net10.0\Sdcb.SimdPaddleOCR.Tests.exe")
+# AB_SIMD_EXE：对方跑器路径覆盖（默认主检出的 CPU 构建；GPU 对决指向
+# feature/2.0 worktree 的构建产物，配 AB_THEIR_ENGINE=vulkan）
+SIMD = Path(os.environ.get(
+    "AB_SIMD_EXE",
+    r"D:\qinwh\code\myself\SimdPaddleOCR\test\Sdcb.SimdPaddleOCR.Tests\bin\Release\net10.0\Sdcb.SimdPaddleOCR.Tests.exe"))
 SIMD_CWD = SIMD.parent
 ROUNDS = 4
 
@@ -56,8 +60,11 @@ def ours(tier, extra=(), quiet=True):
 
 
 def theirs(tier, tag):
+    # AB_THEIR_ENGINE：对方引擎（默认 sharp=CPU；vulkan=他们的 GPU 后端，
+    # 需先在竞品仓库 checkout feature/2.0 并把 SIMD 指到其构建产物）
+    engine = os.environ.get("AB_THEIR_ENGINE", "sharp")
     r = subprocess.run(
-        [str(SIMD), "--benchmark", "--benchmark-kind", "simd", "--engine", "sharp",
+        [str(SIMD), "--benchmark", "--benchmark-kind", "simd", "--engine", engine,
          "--workers", "8", "--model", tier, "--input", str(DS), "--count", "100",
          "--warmup", "1", "--case-id", tag,
          "--out", str(Path.home() / "AppData/Local/Temp" / f"ab-{tag}.json")],
@@ -67,7 +74,10 @@ def theirs(tier, tag):
             mean = float(ln.split("mean=")[1].split()[0])
             med = float(ln.split("median=")[1].split()[0])
             return mean, med
-    raise RuntimeError("对方没有输出 total_ms")
+    # 失败时带输出尾巴（偶发设备初始化失败/中途崩溃的现场）
+    out = r.stdout.decode("utf-8", "replace").splitlines()[-6:]
+    err = r.stderr.decode("utf-8", "replace").splitlines()[-6:]
+    raise RuntimeError(f"对方没有输出 total_ms（exit={r.returncode}）\nstdout 尾: {out}\nstderr 尾: {err}")
 
 
 def main():
