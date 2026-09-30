@@ -136,9 +136,12 @@ def theirs(tier, engine, tag, count=100, warmup=1, indir=None):
 
 
 # ---------------- 我们 ----------------
+OUR_EXTRA = os.environ.get("DUEL_OUR_EXTRA", "").split()
+
+
 def ours(tier, device, imgs, tag):
     cmd = [str(OURS), *[str(p) for p in imgs], "--tier", tier, "--json", "--quiet",
-           "--bench", "1", "--workers", "1", "--device", device]
+           "--bench", "1", "--workers", "1", "--device", device, *OUR_EXTRA]
     out, err, rc, ws, priv = run_sampled(cmd, OURS_CWD)
     if rc != 0:
         raise RuntimeError(f"我们 exit={rc}\n{err.decode('utf-8','replace')[-500:]}")
@@ -206,6 +209,35 @@ def run_concurrent(cmds_pairs, label):
             "priv_sum_hint": priv, "rcs": rcs, "label": label}
 
 
+def cold_battery(tier, their_engine, our_device, runs=5):
+    """单图冷进程：一次性 CLI 的真实体验。双方各起 `runs` 个全新进程跑
+    img-001，外部墙钟（含模型加载/计划构建/.NET 启动）+ 内存峰，取中位。"""
+    img = str(DS / "img-001.jpg")
+    theirs_walls, ours_walls = [], []
+    tpeak = opeak = (0, 0)
+    for _ in range(runs):
+        cmd = [str(THEIR), "--benchmark", "--engine", their_engine, "--workers", "8",
+               "--model", tier, "--input", str(DS), "--count", "1", "--warmup", "0",
+               "--case-id", "cold", "--out", str(Path(tempfile.gettempdir()) / "duel-cold.json")]
+        t0 = time.time()
+        out, err, rc, ws, priv = run_sampled(cmd, THEIR_CWD)
+        if rc != 0:
+            raise RuntimeError(f"对方冷启 exit={rc}: {err.decode('utf-8','replace')[-200:]}")
+        theirs_walls.append(time.time() - t0)
+        tpeak = max(tpeak, (ws, priv))
+        cmd = [str(OURS), img, "--tier", tier, "--json", "--quiet", "--bench", "1",
+               "--workers", "1", "--device", our_device, *OUR_EXTRA]
+        t0 = time.time()
+        out, err, rc, ws, priv = run_sampled(cmd, OURS_CWD)
+        if rc != 0:
+            raise RuntimeError(f"我们冷启 exit={rc}: {err.decode('utf-8','replace')[-200:]}")
+        ours_walls.append(time.time() - t0)
+        opeak = max(opeak, (ws, priv))
+    print(f"  冷进程单图（{runs} 次中位墙钟，含启动）: 对方 {statistics.median(theirs_walls):6.2f}s"
+          f" ws峰 {tpeak[0]:5.0f}MB   我们 {statistics.median(ours_walls):6.2f}s ws峰 {opeak[0]:5.0f}MB"
+          f"   比值 {statistics.median(ours_walls)/statistics.median(theirs_walls):.3f}", flush=True)
+
+
 def probe():
     r = subprocess.run(["cargo", "run", "-p", "qppocr-kernels", "--release",
                         "--example", "scaling_probe"], cwd=OURS_CWD,
@@ -217,12 +249,21 @@ def probe():
 def main():
     cpu_mode = "--cpu" in sys.argv
     conc_only = "--conc-only" in sys.argv
+    cold_only = "--cold" in sys.argv
     their_engine = "sharp" if cpu_mode else "vulkan"
     our_device = "cpu" if cpu_mode else "gpu"
     print(f"模式：他们 --engine {their_engine} vs 我们 --device {our_device}（工厂默认档）")
     print(f"探针(前)：{probe()}\n")
     scorer = load_scorer()
     imgs = [DS / f"img-{i:03d}.jpg" for i in range(1, 101)]
+
+    if cold_only:
+        for tier in TIERS:
+            print(f"=== {tier} 单图冷进程 ===")
+            cold_battery(tier, their_engine, our_device)
+        print()
+        print(f"探针(后)：{probe()}")
+        return
 
     if not conc_only:
       for tier in TIERS:
