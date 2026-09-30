@@ -364,11 +364,36 @@ impl DeviceContext for VulkanContext {
         }
         // rec：**覆盖面探针**——先建会话再用小形状试建计划（直接用真
         // 会话，探针通过则复用：曾克隆图/权重建一次性探针会话再丢掉重
-        // 建，rec 装载白付一整遍 ~13ms 计划构建）。不支持的算子（如
-        // small 的 rank-5 注意力 Transpose 族）与形状无关，探针必现；
-        // 失败则 stderr 声明后退回 CPU 会话（非静默降级；cls 同款分级
-        // 纪律）——补齐内核后探针自动放行。探针计划留在缓存里
-        //（(1,3,48,64) 约 20MB，真形状另建，可忽略）。
+        // 建，rec 装载白付一整遍 ~13ms 计划构建）。不支持的算子与形状
+        // 无关，探针必现；失败则 stderr 声明后退回 CPU 会话（非静默降
+        // 级；cls 同款分级纪律）。探针计划留在缓存里（(1,3,48,64) 约
+        // 20MB，真形状另建，可忽略）。
+        // 动态 B MatMul = 注意力头（QK^T/scores×V，B 是运行期张量）。
+        // 无注意力 mask 的模型对桶宽右零填充**不 invariant**（填充步经
+        // 注意力混入真步概率；CPU 实证 small GT 932/1036 掉 46 行，
+        // small_rec_padding_invariance 守卫）——退精确宽。纯卷积 rec
+        // （tiny）实证填充不变，维持 64 桶。
+        let exact_width = opts.model == qppocr_core::device::ModelRole::Rec
+            && graph.nodes.iter().any(|n| {
+                n.op_type == "MatMul"
+                    && n.inputs
+                        .get(1)
+                        .is_some_and(|b| !initializers.contains_key(b))
+            });
+        // 注意力 rec 虽然值正确（0 分歧对拍 + 输出闸门），但精确宽的形状
+        // 税 + 168 dispatch/批使其**无性能赢面**（本机实测 422 vs 227
+        // ms/图，1.9× 慢）——默认退 CPU 保住 GT 978 逐位与速度。
+        // QPPOCR_GPU_FORCE_REC=1 强制放行（内核资产为后续优化保留）。
+        if exact_width && std::env::var_os("QPPOCR_GPU_FORCE_REC").is_none() {
+            eprintln!(
+                "[gpu] 注意力 rec（exact_width）：GPU 无性能赢面（实测 1.9× 慢于 CPU），\
+                 rec 走 CPU 会话（QPPOCR_GPU_FORCE_REC=1 强制上 GPU）"
+            );
+            return Ok(Arc::new(qppocr_core::executor::Session::from_parts(
+                graph,
+                initializers,
+            )));
+        }
         let mut session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
         if opts.model == qppocr_core::device::ModelRole::Rec {
             if let Err(e) = session.probe(&[1, 3, 48, 64]) {
@@ -402,6 +427,7 @@ impl DeviceContext for VulkanContext {
             // CTC 头只吃每时间步 argmax：GPU 端归约成 (val, idx) 对再回读
             //（全量 T×V 概率回读实测 ~18 ms/图，clflush 读回带宽是大头）。
             session.argmax_exit = true;
+            session.exact_width = exact_width;
         }
         Ok(Arc::new(session))
     }

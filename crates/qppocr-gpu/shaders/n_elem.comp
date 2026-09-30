@@ -47,7 +47,10 @@ void main() {
         uint c4 = floatBitsToUint(p1);
         uint row = gid / c4;
         vec4 a = vec4(d[ib + gid]);
-        float s = d[(in2_off >> 2) + row * 4u].x; // [rows,4] 的 lane0
+        // [rows,4] 的 lane0：d 是 vec4 数组，行 r 的 lane0 在第 r 个 vec4
+        //（= word in2_off + r*4，与 n_reduce_last 的写侧对齐）。曾写
+        // `+ row * 4u`——vec4 索引下成 16 B 跨距、读到 row 4r 的均值。
+        float s = d[(in2_off >> 2) + row].x;
         d[(out_off >> 2) + gid] =
             vec4(op == 8u ? a - vec4(s) : a / vec4(s));
     } else {

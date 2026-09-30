@@ -197,19 +197,33 @@ fn node_out_rc(
     if n.op_type == "MatMul" {
         let a = sh(&n.inputs[0]);
         let b = sh(&n.inputs[1]);
-        if a.len() < 2 || b.len() != 2 {
+        if a.len() < 2 || b.len() < 2 {
             return Err(format!("MatMul 形状不支持：A={a:?} B={b:?}"));
         }
         let m: i64 = a[..a.len() - 1].iter().product();
         let k = a[a.len() - 1];
-        let nn = b[1];
-        if k != b[0] {
+        let nn = *b.last().unwrap();
+        if k != b[b.len() - 2] {
             return Err(format!("MatMul K 不符：A={a:?} B={b:?}"));
+        }
+        // 动态 B（注意力 QK^T / scores×V，b 为 rank-3/4 批量矩阵）：
+        // 精确存储不加 pad——下游 softmax/转置都以末维为步长。
+        if b.len() != 2 {
+            return Ok((m as u32, nn as u32));
         }
         if k % 4 != 0 {
             return Err(format!("MatMul K={k} 非 %4（A={a:?}）"));
         }
         return Ok((m as u32, super::nhwc::cpad4(nn)));
+    }
+    // 真转置（非 [0,2,1] 别名——注意力头的 [2,0,3,1,4] 等）与 dim0
+    // 切片：精确连续存储 (numel/末维, 末维)，无通道 pad。
+    if n.op_type == "Transpose" || n.op_type == "Slice" {
+        let o = sh(&n.outputs[0]);
+        if !o.is_empty() && *o.last().unwrap() > 0 {
+            let numel: i64 = o.iter().product();
+            return Ok(((numel / o[o.len() - 1]) as u32, *o.last().unwrap() as u32));
+        }
     }
     // 末轴均值（LN 分解链）：输出 [.., 1] → rc = (行数, 4)——不能继承
     // 输入的 rc（列数塌成 1，cpad4(1)=4）。
@@ -270,6 +284,12 @@ pub(crate) struct VulkanSession {
     /// 成 (grain,W桶)，计划全命中。与 `DeviceSession::batch_grain` 同源
     /// （mod.rs 按模型角色设置；引擎按 trait 值分批）。
     pub(crate) batch_grain: i32,
+    /// 宽度精确模式（无注意力 mask 的 rec——SVTR 注意力头）：桶宽右零
+    /// 填充经注意力混入真步概率，**模型本身对填充不 invariant**（CPU
+    /// 实证 small 932/1036 掉 46 行；small_rec_padding_invariance 守卫）
+    /// ——true 时 bucket_grain=1（精确宽，同宽行仍合批）。纯卷积 rec
+    /// （tiny）实证填充不变，维持 64 桶。
+    pub(crate) exact_width: bool,
     /// rec 会话的 CTC argmax 出口：rank-3 概率输出不走 n_exit3 全量
     /// 拷贝，改 n_exit3_argmax 每时间步写 (val, idx) 对——读回从
     /// T×V×4 B/行（~3 MB）降到 8 B/行。本机 clflush 读回 ~1 ms/MB，
@@ -325,6 +345,7 @@ impl VulkanSession {
             repack_cache: Mutex::new(HashMap::new()),
             arena_pool: Mutex::new(Vec::new()),
             batch_grain: 1,
+            exact_width: false,
             argmax_exit: false,
             plan_budget_mb: 2048,
             ctx,
@@ -967,10 +988,58 @@ impl VulkanSession {
 
         for (node_idx, n) in self.graph.nodes.iter().enumerate() {
             let out = n.outputs[0].clone();
-            // ---- 存储恒等节点（Squeeze/Unsqueeze/Transpose(0,2,1)）：
-            // 零分配零 dispatch，输出别名输入。输入不释放（存活期 =
-            // 别名的最后消费者——记 immortal，泄漏量 ~25KB/节点可忽略）。
+            // ---- 存储恒等节点（Squeeze/Unsqueeze/Transpose(0,2,1)/
+            // Slice(dim0)）：零分配零 dispatch，输出别名输入（Slice 带偏移）。
+            // 输入不释放（存活期 = 别名的最后消费者——记 immortal，泄漏量
+            // ~25KB/节点可忽略）。
             if !f32_mode {
+                // dim0 连续切片（注意力的 Q/K/V 拆分）：输出 = 输入的
+                // start 段——纯偏移别名。starts/ends/axes/steps 是
+                // initializer 常量（opset 13+）。
+                if n.op_type == "Slice" {
+                    let geti = |k: usize| -> Option<i64> {
+                        let nm = n.inputs.get(k + 1)?;
+                        self.initializers
+                            .get(nm)
+                            .and_then(|t| t.i64.first().copied())
+                            .or_else(|| {
+                                // 折叠链的值在 planner 表里
+                                table.values.get(nm).and_then(|v| {
+                                    v.konst.as_ref().and_then(|kv| kv.as_i64().first().copied())
+                                })
+                            })
+                    };
+                    let (start, end, axis, step) =
+                        (geti(0), geti(1), geti(2), geti(3));
+                    let inn = table.values.get(&n.inputs[0]);
+                    let outn = table.values.get(&out);
+                    let ok = matches!(
+                        (start, end, axis, step),
+                        (Some(s), Some(e), Some(0), Some(1) | None) if s >= 0
+                    );
+                    if ok && inn.is_some() && outn.is_some() {
+                        let inn = inn.unwrap();
+                        let dim0 = inn.shape.first().copied().unwrap_or(1).max(1);
+                        let row = inn.shape.iter().product::<i64>() / dim0;
+                        let off0 = offs.get(&n.inputs[0]).copied();
+                        if let Some(o) = off0 {
+                            let s = start.unwrap();
+                            offs.insert(out.clone(), o + (s * row) as u32);
+                            // rc 按输出形状重算（列=末维不变、行数去掉
+                            // dim0 ——照搬输入会把行数多算 3 倍）
+                            let outn = outn.unwrap();
+                            if let Some(&last) = outn.shape.last() {
+                                if last > 0 {
+                                    let rows =
+                                        outn.shape.iter().product::<i64>() / last;
+                                    rc.insert(out.clone(), (rows as u32, last as u32));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // 非 dim0/非连续：落到 map_node 报不支持（Slice 无臂）
+                }
                 let is_alias = match n.op_type.as_str() {
                     "Reshape" => {
                         // 存储恒等条件：元素数不变（纯形状重排）。
@@ -984,7 +1053,24 @@ impl VulkanSession {
                     "Squeeze" | "Unsqueeze" => true,
                     "Transpose" => {
                         let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
-                        perm == [0, 2, 1] || perm == [0, 2, 3, 1] && false
+                        // [0,2,1] 的存储恒等**条件**：输入存储 rc 与输出
+                        // 逻辑 rc 一致（rows=行数、cols=末维）。small rec 的
+                        // Transpose.8 输入是真转置产物（rc=[B*120,T]），
+                        // 输出逻辑要 [B*T,120]——盲别名曾把词表头 A 读成
+                        // 错误定向（输出全 NaN 的根源）。不满足即走通用
+                        // 转置内核。
+                        if perm == [0, 2, 1] {
+                            let outn = table.values.get(&out);
+                            if let (Some(&r), Some(o)) = (rc.get(&n.inputs[0]), outn) {
+                                let last = o.shape.last().copied().unwrap_or(1).max(1);
+                                let rows = o.shape.iter().product::<i64>() / last;
+                                r == (rows as u32, last as u32)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };
@@ -1932,6 +2018,42 @@ impl VulkanSession {
                 // 按 [Co=N, Ci=K, 1,1] k-major 重排。
                 let a = shape_of(&n.inputs[0]);
                 let b = shape_of(&n.inputs[1]);
+                // **动态 B**（注意力 QK^T / scores×V）：B 是运行期张量
+                // [..batch, K, N]——批量瘦 GEMM，K=15 或 T，朴素点积。
+                // A/B/出均精确连续存储（rc 行=末维，无 pad）。
+                if !self.initializers.contains_key(&n.inputs[1]) {
+                    if a.len() < 2 || b.len() < 2 {
+                        return Err(Error::Graph(format!(
+                            "动态 MatMul 形状不支持：A={a:?} B={b:?}"
+                        )));
+                    }
+                    let (m, k, nn) = (
+                        a[a.len() - 2] as u32,
+                        *a.last().unwrap() as u32,
+                        *b.last().unwrap() as u32,
+                    );
+                    if *a.last().unwrap() != b[b.len() - 2] {
+                        return Err(Error::Graph(format!(
+                            "动态 MatMul K 不符：A={a:?} B={b:?}"
+                        )));
+                    }
+                    let batch: i64 = a[..a.len() - 2].iter().product();
+                    let heads = ((batch / a[0].max(1)) as u32).max(1);
+                    let mut pb = ParamBlock::new();
+                    pb.u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(off_of(out)?)
+                        .u(m)
+                        .u(k)
+                        .u(nn)
+                        .u(batch as u32)
+                        .u(heads);
+                    return Ok(vec![(
+                        "n_attn_mm",
+                        pb,
+                        [1, (batch as u32 * m).max(1), 1],
+                    )]);
+                }
                 if b.len() != 2 {
                     return Err(Error::Graph(format!("MatMul B 需 2D [K,N]，实得 {b:?}")));
                 }
@@ -2135,15 +2257,38 @@ impl VulkanSession {
                         "Sub" => 12,
                         _ => 13,
                     };
+                    // 定向一致性（同 MulAddScale 门分支）：按生产者定向中转。
+                    let mut pre: Vec<(&'static str, ParamBlock, [u32; 3])> = Vec::new();
+                    let mut b_off = off_of(&n.inputs[1])?;
+                    if let Some(t) = rc.get(&n.inputs[0]).copied() {
+                        let s = rc.get(&n.inputs[1]).copied().unwrap_or(t);
+                        let lin = linear_by_producer(
+                            &self.graph,
+                            table,
+                            rc,
+                            &self.initializers,
+                            &n.inputs[1],
+                        );
+                        let lin0 = linear_by_producer(
+                            &self.graph,
+                            table,
+                            rc,
+                            &self.initializers,
+                            &n.inputs[0],
+                        );
+                        b_off = orient4(layout, &mut pre, b_off, &b, s, t, lin, lin0)?;
+                    }
                     let mut pb = ParamBlock::new();
                     pb.u(op)
                         .u(off_of(&n.inputs[0])?)
-                        .u(off_of(&n.inputs[1])?)
+                        .u(b_off)
                         .u(off_of(out)?)
                         .u(a_words)
                         .f(0.0)
                         .f(0.0);
-                    Ok(vec![("n_elem", pb, [div256(a_words / 4), 1, 1])])
+                    let mut ds = pre;
+                    ds.push(("n_elem", pb, [div256(a_words / 4), 1, 1]));
+                    Ok(ds)
                 } else if a.len() == 3
                     && b.len() == 3
                     && b[2] == 1
@@ -2324,6 +2469,70 @@ impl VulkanSession {
                 }
                 let a_words = super::nhwc::nhwc_words(&fs);
                 let cp = cpad4(fs[1]);
+                // **逐元素门检测**（swish：Add(Mul(x, Sigmoid(x)), res)——
+                // 门 shape == 特征 shape，op2 的 `g[gateRow*c4+rowC4]` 只读
+                // 每批的 w=0 列，对它会整个读错。拆回 mul + add 两个
+                // n_elem（镜像 CPU 慢路径），中间量用临时区。
+                let gate_shape = shape_of(&n.inputs[1]);
+                if gate_shape == fs {
+                    let tmp_off = layout.alloc(a_words);
+                    // 定向一致性：mul/add 三操作数的字节序必须一致；按生产者
+                    // 定向中转成 inputs[0]（NHWC 基准）的定向。
+                    let base_rc = rc.get(&n.inputs[0]).copied();
+                    let mut pre: Vec<(&'static str, ParamBlock, [u32; 3])> = Vec::new();
+                    let mut g_off = off_of(&n.inputs[1])?;
+                    let mut r_off = off_of(&n.inputs[2])?;
+                    if let Some(t) = base_rc {
+                        let lin0 = linear_by_producer(
+                            &self.graph,
+                            table,
+                            rc,
+                            &self.initializers,
+                            &n.inputs[0],
+                        );
+                        {
+                            let s = rc.get(&n.inputs[1]).copied().unwrap_or(t);
+                            let lin = linear_by_producer(
+                                &self.graph,
+                                table,
+                                rc,
+                                &self.initializers,
+                                &n.inputs[1],
+                            );
+                            g_off =
+                                orient4(layout, &mut pre, g_off, &gate_shape, s, t, lin, lin0)?;
+                        }
+                        let r_shape = shape_of(&n.inputs[2]);
+                        {
+                            let s = rc.get(&n.inputs[2]).copied().unwrap_or(t);
+                            let lin = linear_by_producer(
+                                &self.graph,
+                                table,
+                                rc,
+                                &self.initializers,
+                                &n.inputs[2],
+                            );
+                            r_off = orient4(layout, &mut pre, r_off, &r_shape, s, t, lin, lin0)?;
+                        }
+                    }
+                    let mk_pb = |op: u32, a: u32, b: u32, o: u32| -> ParamBlock {
+                        let mut p = ParamBlock::new();
+                        p.u(op).u(a).u(b).u(o).u(a_words).f(0.0).f(0.0);
+                        p
+                    };
+                    let mut ds = pre;
+                    ds.push((
+                        "n_elem",
+                        mk_pb(5, off_of(&n.inputs[0])?, g_off, tmp_off),
+                        [div256(a_words / 4), 1, 1],
+                    ));
+                    ds.push((
+                        "n_elem",
+                        mk_pb(4, tmp_off, r_off, off_of(out)?),
+                        [div256(a_words / 4), 1, 1],
+                    ));
+                    return Ok(ds);
+                }
                 let mut pb = ParamBlock::new();
                 pb.u(2u32) // muladd_scale
                     .u(off_of(&n.inputs[0])?)
@@ -2336,6 +2545,35 @@ impl VulkanSession {
                     .f(0.0)
                     .u((fs[2] * fs[3]) as u32); // 每门行的特征行数
                 Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
+            }
+            "Transpose" => {
+                // 通用真转置（别名之外的 perm——注意力的 [2,0,3,1,4] 等）。
+                // rank ≤ 5、精确存储；存储定向恒等的 [0,2,1] 已在上游别名
+                // 段短路，到达这里的都是要搬数据的。
+                let ish = shape_of(&n.inputs[0]);
+                let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
+                if ish.len() > 5 || perm.len() != ish.len() {
+                    return Err(Error::Graph(format!(
+                        "Transpose 仅支持 rank ≤ 5 且带 perm，实得 rank={} perm={perm:?}",
+                        ish.len()
+                    )));
+                }
+                let total: i64 = ish.iter().product();
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(&n.inputs[0])?)
+                    .u(off_of(out)?)
+                    .u(total as u32)
+                    .u(ish.len() as u32);
+                for &d in &ish {
+                    pb.u(d as u32);
+                }
+                for _ in ish.len()..5 {
+                    pb.u(1); // rank 补齐（内核按 rank 截断）
+                }
+                for &p in &perm {
+                    pb.u(p as u32);
+                }
+                Ok(vec![("n_transpose_nd", pb, [div256(total as u32), 1, 1])])
             }
             other => Err(Error::Graph(format!(
                 "n_ 路径不支持算子 {other}（节点 {}）",
@@ -2803,6 +3041,153 @@ impl VulkanSession {
 
 /// conv 族权重的惰性重排：首次引用时重排 + 静态占区 + 进上传列表。
 /// 名字键控（共享权重只重排一份）。
+/// 操作数字节定向推断：沿存储恒等别名链（Reshape/Squeeze/Unsqueeze 与
+/// 满足别名条件的 Transpose[0,2,1]）回溯到物质化生产者。真转置/动态 B
+/// MatMul/dim0 切片按**真线性**（逻辑形行主序）写字节；其余（conv/元素
+/// 族/reduce/softmax）按 NHWC 族（rc 记账）。Some(true)=真线性，
+/// Some(false)=NHWC 族，None=无生产者（图输入/权重）或不可判。
+/// 背景：C==W 时真线性 rc 与 NHWC rc **数值相同**（[N,C,1,W] 互为方阵
+/// 转置≠恒等），rc 对照无法消歧——必须按生产者判（small T=120=C 时
+/// 曾静默搅拌整图）。
+fn linear_by_producer(
+    graph: &Graph,
+    table: &planner::ShapeTable,
+    rc: &HashMap<String, (u32, u32)>,
+    initializers: &HashMap<String, Tensor>,
+    name: &str,
+) -> Option<bool> {
+    let mut cur = name.to_string();
+    for _ in 0..graph.nodes.len() {
+        let n = graph
+            .nodes
+            .iter()
+            .find(|m| m.outputs.first() == Some(&cur))?;
+        match n.op_type.as_str() {
+            "Reshape" | "Squeeze" | "Unsqueeze" => {
+                cur = n.inputs[0].clone();
+            }
+            "Transpose" => {
+                let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
+                if perm != [0, 2, 1] {
+                    return Some(true); // 真转置：真线性
+                }
+                // [0,2,1]：输入 rc 与输出逻辑一致时是别名——继续回溯
+                let outn = table.values.get(&n.outputs[0]);
+                if let (Some(&r), Some(o)) = (rc.get(&n.inputs[0]), outn) {
+                    let last = o.shape.last().copied().unwrap_or(1).max(1);
+                    let rows = o.shape.iter().product::<i64>() / last;
+                    if r == (rows as u32, last as u32) {
+                        cur = n.inputs[0].clone();
+                        continue;
+                    }
+                }
+                return Some(true);
+            }
+            "MatMul" => {
+                // 动态 B（注意力）= 真线性；静态 [K,N] = (M, cpad4(N)) 族
+                let b_const = n
+                    .inputs
+                    .get(1)
+                    .map(|b| initializers.contains_key(b))
+                    .unwrap_or(false);
+                return Some(!b_const);
+            }
+            "Slice" => return Some(true), // dim0 切片别名（偏移不转向）
+            _ => return Some(false),
+        }
+    }
+    None
+}
+
+/// 逐元素操作数的**存储定向中转**：操作数字节序与基准不一致时（长跳跃
+/// 相遇：NHWC 卷积链张量 × 真转置产物，small rec Add.203 的分类器全烂
+/// 根因），把真线性一方用 n_transpose_nd（perm [0,2,3,1]）转成基准的
+/// NHWC 族定向。判定按生产者定向（`linear_by_producer`）+ 形状序比较，
+/// **不看 rc 数值等价**（C==W 时两序 rc 相同但字节互为方阵转置≠恒等，
+/// small T=120=C 曾静默搅拌整图）。不可中转的组合显式报错（不静默
+/// 搅拌）。仅支持 C%4==0：pad 通道的零填充中转不覆盖，宁可拒绝。
+fn orient4(
+    layout: &mut Layout,
+    pre: &mut Vec<(&'static str, ParamBlock, [u32; 3])>,
+    off: u32,
+    shape: &[i64],
+    src_rc: (u32, u32),
+    tgt_rc: (u32, u32),
+    src_linear: Option<bool>,
+    tgt_linear: Option<bool>,
+) -> Result<u32> {
+    let prod = shape.iter().product::<i64>();
+    if shape.len() == 3 {
+        // rank-3 的 rc 即字节序（无 NHWC/线性二义）：rc 对照足够。
+        return if src_rc == tgt_rc {
+            Ok(off)
+        } else {
+            Err(Error::Graph(format!(
+                "rank-3 操作数 rc 不一致：{src_rc:?} vs {tgt_rc:?}（{shape:?}）"
+            )))
+        };
+    }
+    if shape.len() != 4 {
+        return Err(Error::Graph(format!(
+            "定向中转仅支持 rank-3/4，实得 {shape:?}"
+        )));
+    }
+    let (nn, cc, hh, ww) = (shape[0], shape[1], shape[2], shape[3]);
+    let nhwc_rc = ((nn * hh * ww) as u32, cc as u32);
+    // 字节序比较（H==1 的 [N,C,1,W]）：真线性 (n,c,w) vs NHWC (n,w,c)
+    // ——C==1 或 W==1 时两序坍缩相同，否则互为方阵转置、必须中转。
+    let orders_equal = cc == 1 || ww == 1;
+    match src_linear {
+        None => {
+            // 无生产者（initializer/图输入）：字节序按 rc 对照（旧语义）
+            if src_rc == tgt_rc {
+                Ok(off)
+            } else {
+                Err(Error::Graph(format!(
+                    "逐元素操作数（常量）定向不可判：rc={src_rc:?} vs {tgt_rc:?}（{shape:?}）"
+                )))
+            }
+        }
+        Some(true) => {
+            if orders_equal || tgt_linear == Some(true) {
+                // 序本相同，或基准也是真线性（两方一致）
+                Ok(off)
+            } else if cc % 4 == 0 && tgt_linear == Some(false) {
+                let total = (prod as u32).max(1);
+                let tmp = layout.alloc(total);
+                let mut pb = ParamBlock::new();
+                pb.u(off).u(tmp).u(total).u(shape.len() as u32);
+                for &d in shape {
+                    pb.u(d as u32);
+                }
+                for _ in shape.len()..5 {
+                    pb.u(1);
+                }
+                for &p in &[0i64, 2, 3, 1] {
+                    pb.u(p as u32);
+                }
+                pre.push(("n_transpose_nd", pb, [total.div_ceil(256), 1, 1]));
+                Ok(tmp)
+            } else {
+                Err(Error::Graph(format!(
+                    "定向基准不可判（tgt={tgt_rc:?}，lin={tgt_linear:?}，shape={shape:?}）"
+                )))
+            }
+        }
+        Some(false) => {
+            // NHWC 族操作数：与 NHWC 基准一致；基准若是真线性且序不同，
+            // 反向中转未实现——显式拒绝。
+            if tgt_linear == Some(false) || orders_equal || src_rc == tgt_rc {
+                Ok(off)
+            } else {
+                Err(Error::Graph(format!(
+                    "NHWC 操作数遇真线性基准（{src_rc:?} → {tgt_rc:?}）——反向中转未支持"
+                )))
+            }
+        }
+    }
+}
+
 fn n_weight_off(
     initializers: &HashMap<String, Tensor>,
     name: &str,
@@ -2896,7 +3281,13 @@ impl DeviceSession for VulkanSession {
         // rec 每行一个裸宽 → 每形状一次 ~10ms 计划重建（曾把全 GPU 的
         // rec 拖到 2× CPU）。64 桶把语料宽度塌缩到 ~20 个形状，重建
         // 只付一次；右侧零填充的额外计算远小于重建税。
-        64
+        // 例外：无注意力 mask 的模型（exact_width）填充会改真步输出
+        // （非「额外计算」而是「错值」）——退精确宽，重建税交给计划缓存。
+        if self.exact_width {
+            1
+        } else {
+            64
+        }
     }
 
     fn batch_grain(&self) -> i32 {
