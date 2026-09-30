@@ -197,19 +197,33 @@ fn node_out_rc(
     if n.op_type == "MatMul" {
         let a = sh(&n.inputs[0]);
         let b = sh(&n.inputs[1]);
-        if a.len() < 2 || b.len() != 2 {
+        if a.len() < 2 || b.len() < 2 {
             return Err(format!("MatMul 形状不支持：A={a:?} B={b:?}"));
         }
         let m: i64 = a[..a.len() - 1].iter().product();
         let k = a[a.len() - 1];
-        let nn = b[1];
-        if k != b[0] {
+        let nn = *b.last().unwrap();
+        if k != b[b.len() - 2] {
             return Err(format!("MatMul K 不符：A={a:?} B={b:?}"));
+        }
+        // 动态 B（注意力 QK^T / scores×V，b 为 rank-3/4 批量矩阵）：
+        // 精确存储不加 pad——下游 softmax/转置都以末维为步长。
+        if b.len() != 2 {
+            return Ok((m as u32, nn as u32));
         }
         if k % 4 != 0 {
             return Err(format!("MatMul K={k} 非 %4（A={a:?}）"));
         }
         return Ok((m as u32, super::nhwc::cpad4(nn)));
+    }
+    // 真转置（非 [0,2,1] 别名——注意力头的 [2,0,3,1,4] 等）与 dim0
+    // 切片：精确连续存储 (numel/末维, 末维)，无通道 pad。
+    if n.op_type == "Transpose" || n.op_type == "Slice" {
+        let o = sh(&n.outputs[0]);
+        if !o.is_empty() && *o.last().unwrap() > 0 {
+            let numel: i64 = o.iter().product();
+            return Ok(((numel / o[o.len() - 1]) as u32, *o.last().unwrap() as u32));
+        }
     }
     // 末轴均值（LN 分解链）：输出 [.., 1] → rc = (行数, 4)——不能继承
     // 输入的 rc（列数塌成 1，cpad4(1)=4）。
@@ -967,10 +981,58 @@ impl VulkanSession {
 
         for (node_idx, n) in self.graph.nodes.iter().enumerate() {
             let out = n.outputs[0].clone();
-            // ---- 存储恒等节点（Squeeze/Unsqueeze/Transpose(0,2,1)）：
-            // 零分配零 dispatch，输出别名输入。输入不释放（存活期 =
-            // 别名的最后消费者——记 immortal，泄漏量 ~25KB/节点可忽略）。
+            // ---- 存储恒等节点（Squeeze/Unsqueeze/Transpose(0,2,1)/
+            // Slice(dim0)）：零分配零 dispatch，输出别名输入（Slice 带偏移）。
+            // 输入不释放（存活期 = 别名的最后消费者——记 immortal，泄漏量
+            // ~25KB/节点可忽略）。
             if !f32_mode {
+                // dim0 连续切片（注意力的 Q/K/V 拆分）：输出 = 输入的
+                // start 段——纯偏移别名。starts/ends/axes/steps 是
+                // initializer 常量（opset 13+）。
+                if n.op_type == "Slice" {
+                    let geti = |k: usize| -> Option<i64> {
+                        let nm = n.inputs.get(k + 1)?;
+                        self.initializers
+                            .get(nm)
+                            .and_then(|t| t.i64.first().copied())
+                            .or_else(|| {
+                                // 折叠链的值在 planner 表里
+                                table.values.get(nm).and_then(|v| {
+                                    v.konst.as_ref().and_then(|kv| kv.as_i64().first().copied())
+                                })
+                            })
+                    };
+                    let (start, end, axis, step) =
+                        (geti(0), geti(1), geti(2), geti(3));
+                    let inn = table.values.get(&n.inputs[0]);
+                    let outn = table.values.get(&out);
+                    let ok = matches!(
+                        (start, end, axis, step),
+                        (Some(s), Some(e), Some(0), Some(1) | None) if s >= 0
+                    );
+                    if ok && inn.is_some() && outn.is_some() {
+                        let inn = inn.unwrap();
+                        let dim0 = inn.shape.first().copied().unwrap_or(1).max(1);
+                        let row = inn.shape.iter().product::<i64>() / dim0;
+                        let off0 = offs.get(&n.inputs[0]).copied();
+                        if let Some(o) = off0 {
+                            let s = start.unwrap();
+                            offs.insert(out.clone(), o + (s * row) as u32);
+                            // rc 按输出形状重算（列=末维不变、行数去掉
+                            // dim0 ——照搬输入会把行数多算 3 倍）
+                            let outn = outn.unwrap();
+                            if let Some(&last) = outn.shape.last() {
+                                if last > 0 {
+                                    let rows =
+                                        outn.shape.iter().product::<i64>() / last;
+                                    rc.insert(out.clone(), (rows as u32, last as u32));
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // 非 dim0/非连续：落到 map_node 报不支持（Slice 无臂）
+                }
                 let is_alias = match n.op_type.as_str() {
                     "Reshape" => {
                         // 存储恒等条件：元素数不变（纯形状重排）。
@@ -984,7 +1046,24 @@ impl VulkanSession {
                     "Squeeze" | "Unsqueeze" => true,
                     "Transpose" => {
                         let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
-                        perm == [0, 2, 1] || perm == [0, 2, 3, 1] && false
+                        // [0,2,1] 的存储恒等**条件**：输入存储 rc 与输出
+                        // 逻辑 rc 一致（rows=行数、cols=末维）。small rec 的
+                        // Transpose.8 输入是真转置产物（rc=[B*120,T]），
+                        // 输出逻辑要 [B*T,120]——盲别名曾把词表头 A 读成
+                        // 错误定向（输出全 NaN 的根源）。不满足即走通用
+                        // 转置内核。
+                        if perm == [0, 2, 1] {
+                            let outn = table.values.get(&out);
+                            if let (Some(&r), Some(o)) = (rc.get(&n.inputs[0]), outn) {
+                                let last = o.shape.last().copied().unwrap_or(1).max(1);
+                                let rows = o.shape.iter().product::<i64>() / last;
+                                r == (rows as u32, last as u32)
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
                     }
                     _ => false,
                 };
@@ -1932,6 +2011,42 @@ impl VulkanSession {
                 // 按 [Co=N, Ci=K, 1,1] k-major 重排。
                 let a = shape_of(&n.inputs[0]);
                 let b = shape_of(&n.inputs[1]);
+                // **动态 B**（注意力 QK^T / scores×V）：B 是运行期张量
+                // [..batch, K, N]——批量瘦 GEMM，K=15 或 T，朴素点积。
+                // A/B/出均精确连续存储（rc 行=末维，无 pad）。
+                if !self.initializers.contains_key(&n.inputs[1]) {
+                    if a.len() < 2 || b.len() < 2 {
+                        return Err(Error::Graph(format!(
+                            "动态 MatMul 形状不支持：A={a:?} B={b:?}"
+                        )));
+                    }
+                    let (m, k, nn) = (
+                        a[a.len() - 2] as u32,
+                        *a.last().unwrap() as u32,
+                        *b.last().unwrap() as u32,
+                    );
+                    if *a.last().unwrap() != b[b.len() - 2] {
+                        return Err(Error::Graph(format!(
+                            "动态 MatMul K 不符：A={a:?} B={b:?}"
+                        )));
+                    }
+                    let batch: i64 = a[..a.len() - 2].iter().product();
+                    let heads = ((batch / a[0].max(1)) as u32).max(1);
+                    let mut pb = ParamBlock::new();
+                    pb.u(off_of(&n.inputs[0])?)
+                        .u(off_of(&n.inputs[1])?)
+                        .u(off_of(out)?)
+                        .u(m)
+                        .u(k)
+                        .u(nn)
+                        .u(batch as u32)
+                        .u(heads);
+                    return Ok(vec![(
+                        "n_attn_mm",
+                        pb,
+                        [1, (batch as u32 * m).max(1), 1],
+                    )]);
+                }
                 if b.len() != 2 {
                     return Err(Error::Graph(format!("MatMul B 需 2D [K,N]，实得 {b:?}")));
                 }
@@ -2324,6 +2439,31 @@ impl VulkanSession {
                 }
                 let a_words = super::nhwc::nhwc_words(&fs);
                 let cp = cpad4(fs[1]);
+                // **逐元素门检测**（swish：Add(Mul(x, Sigmoid(x)), res)——
+                // 门 shape == 特征 shape，op2 的 `g[gateRow*c4+rowC4]` 只读
+                // 每批的 w=0 列，对它会整个读错。拆回 mul + add 两个
+                // n_elem（镜像 CPU 慢路径），中间量用临时区。
+                let gate_shape = shape_of(&n.inputs[1]);
+                if gate_shape == fs {
+                    let tmp_off = layout.alloc(a_words);
+                    let mk_pb = |op: u32, a: u32, b: u32, o: u32| -> ParamBlock {
+                        let mut p = ParamBlock::new();
+                        p.u(op).u(a).u(b).u(o).u(a_words).f(0.0).f(0.0);
+                        p
+                    };
+                    return Ok(vec![
+                        (
+                            "n_elem",
+                            mk_pb(5, off_of(&n.inputs[0])?, off_of(&n.inputs[1])?, tmp_off),
+                            [div256(a_words / 4), 1, 1],
+                        ),
+                        (
+                            "n_elem",
+                            mk_pb(4, tmp_off, off_of(&n.inputs[2])?, off_of(out)?),
+                            [div256(a_words / 4), 1, 1],
+                        ),
+                    ]);
+                }
                 let mut pb = ParamBlock::new();
                 pb.u(2u32) // muladd_scale
                     .u(off_of(&n.inputs[0])?)
@@ -2336,6 +2476,35 @@ impl VulkanSession {
                     .f(0.0)
                     .u((fs[2] * fs[3]) as u32); // 每门行的特征行数
                 Ok(vec![("n_channel", pb, [div256(a_words / 4), 1, 1])])
+            }
+            "Transpose" => {
+                // 通用真转置（别名之外的 perm——注意力的 [2,0,3,1,4] 等）。
+                // rank ≤ 5、精确存储；存储定向恒等的 [0,2,1] 已在上游别名
+                // 段短路，到达这里的都是要搬数据的。
+                let ish = shape_of(&n.inputs[0]);
+                let perm = n.attr("perm").map(|a| a.ints.clone()).unwrap_or_default();
+                if ish.len() > 5 || perm.len() != ish.len() {
+                    return Err(Error::Graph(format!(
+                        "Transpose 仅支持 rank ≤ 5 且带 perm，实得 rank={} perm={perm:?}",
+                        ish.len()
+                    )));
+                }
+                let total: i64 = ish.iter().product();
+                let mut pb = ParamBlock::new();
+                pb.u(off_of(&n.inputs[0])?)
+                    .u(off_of(out)?)
+                    .u(total as u32)
+                    .u(ish.len() as u32);
+                for &d in &ish {
+                    pb.u(d as u32);
+                }
+                for _ in ish.len()..5 {
+                    pb.u(1); // rank 补齐（内核按 rank 截断）
+                }
+                for &p in &perm {
+                    pb.u(p as u32);
+                }
+                Ok(vec![("n_transpose_nd", pb, [div256(total as u32), 1, 1])])
             }
             other => Err(Error::Graph(format!(
                 "n_ 路径不支持算子 {other}（节点 {}）",

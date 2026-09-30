@@ -2948,3 +2948,481 @@ fn cls_dw_precise() {
         fb_msg
     );
 }
+
+/// small rec 注意力头的 GPU↔CPU 逐节点对拍：找首个分歧节点（调试用，
+/// 非回归闸门——注意力值正确后本测试应全绿，可留作守卫）。
+#[test]
+fn small_rec_gpu_vs_cpu() {
+    let model = std::env::var("SMALL_CMP_MODEL").unwrap_or_else(|_| "small".into());
+    let mpath = format!("../../models/{model}/rec.onnx");
+    let p = std::path::Path::new(&mpath);
+    if !p.is_file() {
+        eprintln!("[gpu] 无 {model} rec 模型，跳过");
+        return;
+    }
+    let Some(ctx) = open_or_skip() else { return };
+    let bytes = std::fs::read(p).unwrap();
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    let (b, hh, ww) = (8usize, 48usize, 192usize);
+    let mut seed = 0x5566_7788_99aa_bbcc_u64;
+    let mut buf = F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed) * 2.0 - 1.0;
+    }
+    let mk = |buf: F32Buf| Tensor {
+        name: String::new(),
+        shape: vec![b as i64, 3, hh as i64, ww as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    // CPU dump
+    let dump_dir = std::env::temp_dir().join("qppocr-small-rec-cmp");
+    let _ = std::fs::remove_dir_all(&dump_dir);
+    std::fs::create_dir_all(&dump_dir).unwrap();
+    let mut cpu = Session::from_memory(&bytes, "small.rec.cpu").unwrap();
+    cpu.set_dump_dir(dump_dir.to_str().unwrap());
+    let in_name = cpu
+        .graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let _out_cpu = cpu.run(vec![(in_name.clone(), mk(buf.clone()))]).unwrap();
+    let mut dumps: Vec<(Vec<i64>, Vec<f32>)> = Vec::new();
+    let mut files: Vec<_> = std::fs::read_dir(&dump_dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "f32"))
+        .collect();
+    files.sort();
+    for f in files {
+        let Ok(bb) = std::fs::read(&f) else {
+            break;
+        };
+        let r = i32::from_le_bytes([bb[0], bb[1], bb[2], bb[3]]) as usize;
+        let sh: Vec<i64> = bb[4..4 + 8 * r]
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let v: Vec<f32> = bb[4 + 8 * r..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        dumps.push((sh, v));
+    }
+    eprintln!("[small][cmp] 读到 {} 个 dump", dumps.len());
+
+    let (graph, init) = {
+        let s = Session::from_memory(&bytes, "small.rec.gpu").unwrap();
+        s.into_parts()
+    };
+    let in2 = graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let mut gpu = super::session::VulkanSession::new(ctx.inner.clone(), graph, init).unwrap();
+    gpu.batch_grain = 8;
+    // 禁区域回收：run 后读区=最后写者（曾以此假阳性坑过一整轮——见
+    // qppocr-gpu-region-recycle-artifact 记忆）
+    unsafe { std::env::set_var("QPPOCR_GPU_NO_FREE", "1") };
+    let out = qppocr_core::device::DeviceSession::run(&gpu, vec![(in2, mk(buf))]).unwrap();
+    unsafe { std::env::remove_var("QPPOCR_GPU_NO_FREE") };
+    let (base, recs) = gpu.debug_recs(&[b as i64, 3, hh as i64, ww as i64]).expect("无计划");
+
+    // GPU 张量 vs 全部 CPU dump（形状乘积相同即比）：报首个大分歧
+    let mut first_bad: Option<(usize, String)> = None;
+    // 全量非有限扫描（无论匹配与否）：NaN/Inf 的首个生产者
+    for (i, (kernel, node, _idx, off, n, _pc, _osh, _ins2)) in recs.iter().enumerate() {
+        if *n == 0 || kernel == "n_entry" {
+            continue;
+        }
+        let gv2: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
+        }
+        .to_vec();
+        let nf = gv2.iter().filter(|v| !v.is_finite()).count();
+        if nf > 0 {
+            eprintln!("[small][nan] #{i} {kernel} {node} 非有限 {}/{}", nf, gv2.len());
+            let pcb: &[u8] = &recs[i].5;
+            let p_off2 = u32::from_le_bytes([pcb[0], pcb[1], pcb[2], pcb[3]]) as usize;
+            let pw2: Vec<u32> = unsafe {
+                std::slice::from_raw_parts(base.add(p_off2 * 4) as *const u32, 8)
+            }
+            .to_vec();
+            eprintln!("[small][nan] params={pw2:?}");
+            // b 区 lane0 采样（行 0/1/8/23/24/…）与 a 区对应首值
+            let b_off2 = pw2[2] as usize;
+            let a_off2 = pw2[1] as usize;
+            eprintln!("  std bits 行0={:#x} 行24={:#x}",
+                unsafe { *(base.add(b_off2) as *const u32) },
+                unsafe { *(base.add(b_off2 + 24 * 4) as *const u32) });
+            // LN 输入区：从 recs 找 ReduceMean.10 解码 in_off
+            let mut ln_in = 0usize;
+            let mut mean_off = 0usize;
+            for (kernel, node, _i, off, _n, pc, _osh, _ins2) in recs.iter() {
+                if node.starts_with("ReduceMean.10") && ln_in == 0 {
+                    let p3 = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
+                    let w3: Vec<u32> = unsafe {
+                        std::slice::from_raw_parts(base.add(p3 * 4) as *const u32, 6)
+                    }
+                    .to_vec();
+                    ln_in = w3[0] as usize;
+                    mean_off = w3[1] as usize;
+                    eprintln!("[small][nan] ReduceMean.10 params={w3:?}");
+            for (kernel, node, _i, _off, _n, pc, _osh, _ins2) in recs.iter() {
+                if node.starts_with("fused:Add.156") {
+                    let p4 = u32::from_le_bytes([pc[0], pc[1], pc[2], pc[3]]) as usize;
+                    let w4: Vec<u32> = unsafe {
+                        std::slice::from_raw_parts(base.add(p4 * 4) as *const u32, 6)
+                    }
+                    .to_vec();
+                    eprintln!("[small][sw] {kernel} {node} params={w4:?}");
+                    // 深采各输入
+                    for (lab, off) in [("a", w4[1]), ("b", w4[2]), ("out", w4[3])] {
+                        let v: Vec<f32> = (0..4)
+                            .map(|k| unsafe {
+                                *(base.add(off as usize + 5000 + k * 5000) as *const f32)
+                            })
+                            .collect();
+                        eprintln!("   {lab} off={} 深4={:?}", off, v);
+                    }
+                }
+            }
+                }
+            }
+            for &r in &[0usize, 1, 24, 25] {
+                let v0: f32 = unsafe { *(base.add(ln_in + r * 120) as *const f32) };
+                let v1: f32 = unsafe { *(base.add(ln_in + r * 120 + 1) as *const f32) };
+                eprintln!("  LN输入 行{r}: c0={v0:.4} c1={v1:.4}");
+            }
+            for &r in &[0usize, 1, 24] {
+                let mv: f32 = unsafe { *(base.add(mean_off + r * 4) as *const f32) };
+                eprintln!("  mean 行{r}: {mv:.6}");
+            }
+            for &r in &[0usize, 1, 24, 25, 100, 191] {
+                let sv: f32 = unsafe { *(base.add((b_off2 + r * 4)) as *const f32) };
+                let av: f32 = unsafe { *(base.add(a_off2 + r * 120) as *const f32) };
+                eprintln!("  行{r}: std={sv:.6} x首={av:.4} 商={:.4}", if sv != 0.0 { av / sv } else { f32::NAN });
+            }
+            break;
+        }
+    }
+    let mut n_bad = 0;
+    for (i, (kernel, node, _idx, off, n, _pc, osh, _ins)) in recs.iter().enumerate() {
+        if *n == 0 || kernel == "n_entry" || kernel.starts_with("n_exit") {
+            continue;
+        }
+        let gv: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
+        }
+        .to_vec();
+        let numel: i64 = osh.iter().product();
+        let mut matched = false;
+        let mut rel = 0.0f64;
+        // 先试形状完全一致的 dump（消除 numel 碰撞的假阴/假阳）
+        let osh_full: Vec<i64> = osh.clone();
+        let exact: Vec<&(Vec<i64>, Vec<f32>)> = dumps
+            .iter()
+            .filter(|(sh, dv)| *sh == osh_full && dv.len() >= 8)
+            .collect();
+        let cand: Vec<&(Vec<i64>, Vec<f32>)> = if exact.is_empty() {
+            dumps
+                .iter()
+                .filter(|(sh, dv)| sh.iter().product::<i64>() == numel && dv.len() >= 8)
+                .collect()
+        } else {
+            exact
+        };
+        for (sh, dv) in cand {
+            let numel = sh.iter().product::<i64>();
+            let mut e = 0.0f64;
+            let step = (dv.len() / 16).max(1);
+            for (s_i, g) in gv.iter().enumerate().step_by(step) {
+                // 两种解释：直读（行主序，cols=末维）与 NHWC（cols=shape[1]）
+                let direct = dv[s_i];
+                let _ = direct;
+                e = e.max(0.0); // 占位——用下方统一比较
+            }
+            // rank-4：NHWC(row=N*H*W,col=C) ↔ dump NCHW 直读；
+            // rank-3/2：直读（行主序）。
+            let e2 = if sh.len() == 4 {
+                let (nn, c3, h3, w3) = (sh[0] as usize, sh[1] as usize, sh[2] as usize, sh[3] as usize);
+                let hw = h3 * w3;
+                let c4 = (c3 + 3) / 4 * 4;
+                let rows = nn * hw;
+                let mut e = 0.0f64;
+                let ns = 96.min(rows);
+                for k in 0..ns {
+                    let row = k * rows / ns.max(1);
+                    let (n, hwr) = (row / hw, row % hw);
+                    let (h, w) = (hwr / w3, hwr % w3);
+                    for c in [0usize, 1, c3 / 2, c3 - 1] {
+                        let g = gv[row * c4 + c];
+                        let d = dv[(n * c3 + c) * hw + h * w3 + w];
+                        e = e.max(((g - d).abs() / (1.0 + d.abs())) as f64);
+                    }
+                }
+                e
+            } else {
+                // [rows,4] lane0 存储（末维=1 的归约出）：gv[r*4] ↔ dv[r]
+                let lane0 = sh.last() == Some(&1) && sh.len() == 3;
+                let mut e = 0.0f64;
+                let nr = dv.len();
+                let ns = 64.min(nr);
+                for k in 0..ns {
+                    let r = k * nr / ns.max(1);
+                    let d = dv[r];
+                    let g = if lane0 {
+                        gv.get(r * 4).copied().unwrap_or(f32::NAN)
+                    } else {
+                        gv.get(r).copied().unwrap_or(f32::NAN)
+                    };
+                    e = e.max(((g - d).abs() / (1.0 + d.abs())) as f64);
+                }
+                e
+            };
+            if e2 < 0.05 {
+                matched = true;
+            } else {
+                rel = rel.max(e2);
+            }
+        }
+        if !matched && n_bad < 3 {
+            if (85..=95).contains(&i) {
+                let nan = gv.iter().filter(|v| !v.is_finite()).count();
+                eprintln!("  [#{i}] {kernel} {node} osh={osh:?} 非有限={}/{}", nan, gv.len());
+            }
+            if node.starts_with("Transpose.1") && osh.len() == 5 {
+                let (sh, dv) = dumps
+                    .iter()
+                    .find(|(sh, _)| *sh == *osh)
+                    .unwrap();
+                let probes: [usize; 8] = [0, 14, 15, 119, 120, 359, 360, 8640];
+                for &q in &probes {
+                    if q < gv.len() && q < dv.len() {
+                        eprintln!(
+                            "  [#{i}] idx={q}: gpu={:.6} cpu={:.6} {}",
+                            gv[q], dv[q],
+                            if (gv[q] - dv[q]).abs() < 1e-3 { "✓" } else { "✗" }
+                        );
+                    }
+                }
+            }
+            for (sh, dv) in dumps.iter().filter(|(sh, _)| sh.iter().product::<i64>() == numel).take(2) {
+                eprintln!("  候补 dump shape={sh:?} dv 前6={:?}", &dv[..6.min(dv.len())]);
+            }
+            // 取 numel 匹配的首个 dump 对拍采样值
+            for (sh, dv) in &dumps {
+                if sh.iter().product::<i64>() == numel {
+                    let c3 = if sh.len() == 4 { sh[1] as usize } else { 0 };
+                    eprintln!(
+                        "[small][dbg] {kernel} {node}: shape {sh:?} | gpu[0..6]={:?} | cpu[0..6]={:?} | C={c3}",
+                        &gv[..6.min(gv.len())],
+                        &dv[..6.min(dv.len())]
+                    );
+                    break;
+                }
+            }
+        }
+        if !matched {
+            n_bad += 1;
+            if first_bad.is_none() {
+                // 解码参数块：pc（PcParams）前 4 字节 = p_off，再读 arena 参数
+                let pcb: &[u8] = &recs[i].5;
+                let p_off = u32::from_le_bytes([pcb[0], pcb[1], pcb[2], pcb[3]]) as usize;
+                let pw: Vec<u32> = unsafe {
+                    std::slice::from_raw_parts(base.add(p_off * 4) as *const u32, 12)
+                }
+                .to_vec();
+                eprintln!("[small][dbg] 首分歧参数 words = {pw:?}");
+                first_bad = Some((i, format!("{kernel} {node} osh={osh:?} rel={rel:.3}")));
+            }
+        }
+    }
+    eprintln!(
+        "[small][cmp] 可比节点中分歧 {n_bad} 个；首个：{:?}",
+        first_bad
+    );
+    // 输出层 top-1 抽查
+    let o = &out[0];
+    eprintln!(
+        "[small][cmp] 输出 shape={:?} 头4={:?}",
+        o.shape,
+        &o.f32.as_slice()[..4.min(o.f32.len())]
+    );
+}
+
+/// n_transpose_nd 裸内核：rank-5 [2,0,3,1,4] 与 rank-4 [0,2,1,3] 对拍
+/// CPU 参考值（逐元素精确）。
+#[test]
+fn n_transpose_nd_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+
+    // dims=[4,3,2,8,15]（B,T,3,8,15 的同构）、perm=[2,0,3,1,4]
+    let dims: [u32; 5] = [4, 3, 2, 8, 15];
+    let perm: [u32; 5] = [2, 0, 3, 1, 4];
+    let total: u32 = dims.iter().product();
+    let mut seed = 0x1234_0000_5555_aaaa_u64;
+    let mut src = vec![0f32; total as usize];
+    for v in src.iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    // CPU 参考：out[o] where oc 分解按输出维 dims[perm[d]]
+    let odims: Vec<u32> = (0..5).map(|d| dims[perm[d] as usize]).collect();
+    let mut want = vec![0f32; total as usize];
+    for i in 0..total as usize {
+        let mut oc = [0u32; 5];
+        let mut rem = i as u32;
+        for d in (0..5).rev() {
+            oc[d] = rem % odims[d];
+            rem /= odims[d];
+        }
+        let mut ic = [0u32; 5];
+        for d in 0..5 {
+            ic[perm[d] as usize] = oc[d];
+        }
+        let mut s = 0usize;
+        for k in 0..5 {
+            s = s * dims[k] as usize + ic[k] as usize;
+        }
+        want[i] = src[s];
+    }
+
+    let seg = |n: usize| n.div_ceil(4) * 4;
+    let in_w = seg(total as usize);
+    let out_w = seg(total as usize);
+    let p_w = 256;
+    let big = arena.alloc(((in_w + out_w + p_w) * 4) as vk::DeviceSize).unwrap();
+    let base_word = big.offset as u32 / 4;
+    let in_off = base_word;
+    let out_off = base_word + in_w as u32;
+    let p_off = base_word + (in_w + out_w) as u32;
+    let p_of = |w: u32| unsafe { big.ptr.add(w as usize * 4) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), p_of(in_off) as *mut f32, total as usize);
+        let mut pb = ParamBlock::new();
+        pb.u(in_off).u(out_off).u(total).u(5);
+        for &d in &dims {
+            pb.u(d);
+        }
+        for &p in &perm {
+            pb.u(p);
+        }
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), p_of(p_off) as *mut u32, pb.words().len());
+    }
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+    ctx.inner
+        .device
+        .submit_one_shot(|d, cb| {
+            unsafe {
+                record_dispatch(
+                    d,
+                    cb,
+                    &ks,
+                    "n_transpose_nd",
+                    PcParams { p_off }.bytes(),
+                    [total.div_ceil(256), 1, 1],
+                );
+            }
+        })
+        .unwrap();
+    let got: Vec<f32> = unsafe {
+        std::slice::from_raw_parts(p_of(out_off) as *const f32, total as usize)
+    }
+    .to_vec();
+    let bad = got
+        .iter()
+        .zip(want.iter())
+        .filter(|(a, b)| (**a - **b).abs() > 1e-6)
+        .count();
+    eprintln!("[tpose][nd] 分歧 {bad}/{total}");
+    assert_eq!(bad, 0, "n_transpose_nd rank-5 对拍失败");
+}
+
+/// n_attn_mm 裸内核：batched [b,M,K]×[b,K,N] 对拍 CPU 参考。
+#[test]
+fn n_attn_mm_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let dev = ctx.inner.device.raw().clone();
+    let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
+    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+
+    let (batch, heads, m, k, n) = (6u32, 3u32, 5u32, 4u32, 7u32);
+    let mut seed = 0xabcd_ef01_2345_6789_u64;
+    let a: Vec<f32> = (0..batch * m * k).map(|_| lcg(&mut seed)).collect();
+    let b: Vec<f32> = (0..batch * k * n).map(|_| lcg(&mut seed)).collect();
+    let mut want = vec![0f32; (batch * m * n) as usize];
+    for bi in 0..batch {
+        for mi in 0..m {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for ki in 0..k {
+                    acc += a[(bi * m + mi) as usize * k as usize + ki as usize]
+                        * b[(bi * k) as usize * n as usize + ki as usize * n as usize + j as usize];
+                }
+                want[(bi * m + mi) as usize * n as usize + j as usize] = acc;
+            }
+        }
+    }
+
+    let seg = |x: u32| x.div_ceil(4) * 4;
+    let a_w = seg(batch * m * k) as usize;
+    let b_w = seg(batch * k * n) as usize;
+    let o_w = seg(batch * m * n) as usize;
+    let p_w = 256usize;
+    let big = arena
+        .alloc(((a_w + b_w + o_w + p_w) * 4) as vk::DeviceSize)
+        .unwrap();
+    let base_word = big.offset as u32 / 4;
+    let (a_off, b_off, o_off, p_off) = (
+        base_word,
+        base_word + a_w as u32,
+        base_word + (a_w + b_w) as u32,
+        base_word + (a_w + b_w + o_w) as u32,
+    );
+    let p_of = |w: u32| unsafe { big.ptr.add(w as usize * 4) };
+    unsafe {
+        std::ptr::copy_nonoverlapping(a.as_ptr(), p_of(a_off) as *mut f32, a.len());
+        std::ptr::copy_nonoverlapping(b.as_ptr(), p_of(b_off) as *mut f32, b.len());
+        let mut pb = ParamBlock::new();
+        pb.u(a_off).u(b_off).u(o_off).u(m).u(k).u(n).u(batch).u(heads);
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), p_of(p_off) as *mut u32, pb.words().len());
+    }
+    let (buf, buf_size) = arena.chunk_range().unwrap();
+    let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
+    ctx.inner
+        .device
+        .submit_one_shot(|d, cb| {
+            unsafe {
+                record_dispatch(
+                    d,
+                    cb,
+                    &ks,
+                    "n_attn_mm",
+                    PcParams { p_off }.bytes(),
+                    [1, batch * m, 1],
+                );
+            }
+        })
+        .unwrap();
+    let got: Vec<f32> =
+        unsafe { std::slice::from_raw_parts(p_of(o_off) as *const f32, want.len()) }.to_vec();
+    let bad = got
+        .iter()
+        .zip(want.iter())
+        .filter(|(x, y)| (**x - **y).abs() > 1e-5)
+        .count();
+    eprintln!("[attnmm] 分歧 {bad}/{}", want.len());
+    assert_eq!(bad, 0, "n_attn_mm 对拍失败");
+}
