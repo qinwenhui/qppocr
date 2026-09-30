@@ -769,3 +769,40 @@ NaN 在 Div.26（std=0）→ 深采发现 Add.156 的 add dispatch **两输入
 取证方法论沉淀：对拍必须（a）NO_FREE 禁区域回收（b）全深度等距采样
 （≥96 点）——浅采样 + 回收区读取曾各漏报一轮。
 
+
+## 2026-09-30（十七）注意力头值链闭环与转正否决：内核资产合入主线
+
+**值正确性闭环**（attention-wip 合入 internal-main，85cefe9）：small
+rec GPU↔CPU 输出全量对拍 0/3592320 分歧（worst 2e-5），覆盖全部宽度
+（192/256/640/962/1213——含 C==W 歧形）、部分批（real_n=3）、零尾填充。
+全程挖出并修复 **七个图级/内核级 bug**（（十六）③④ + 本轮⑤⑥⑦）：
+
+- ③ n_elem op8/11 行向量广播 lane0 下标单位错位（vec4 索引 ×4 = 16B
+  跨距 vs 写侧 4B——行 r 读到行 4r 的均值；row0 对齐所以首行全对）
+- ④ 存储定向混用：长跳跃输入（NHWC 卷积链 × 真转置产物）在同形逐元素
+  处搅拌 → orient4 定向中转（perm [0,2,3,1] 前置 n_transpose_nd）
+- ⑤ n_softmax 两阶段 shared 复用竞态：rowmax 读与 sum 写之间缺
+  barrier，**跨运行非确定**（同输入 13-51 行随运行变；裸内核 30 连发
+  复现定位；T=120 高发、T≤80 恒稳——概率性 bug 裸测试 0/210 抓不住）
+- ⑥ C==W 定向歧义：真线性 rc 与 NHWC rc 在 C==W 时数值相同（方阵
+  转置≠恒等）——rc 对照失效，改 linear_by_producer 生产者回溯消歧
+- ⑦ n_attn_mm FMA 收缩（glslc 默认 vs CPU 标量不收缩）→ precise；
+  n_softmax 换 exp1 + CPU lane 序求和（8-lane 垂直累加 + hadd 树 +
+  ×1/s 归一）压 ulp 差
+
+**模型层发现**：无注意力 mask 的 rec（SVTR）对桶宽右零填充**不
+invariant**（CPU 实证：填充步经注意力混入真步概率）——桶化填充与自然
+宽不可对拍（竞品 small GPU 丢 47 行同症）。引擎侧 exact_width（动态 B
+MatMul 结构检测）退精确宽。
+
+**转正否决（性能）**：值虽对，精确宽形状税 + 168 dispatch/批 = **422
+vs 227 ms/图（1.9× 慢）**——默认退 CPU（stderr 声明），GT 978/1036
+逐位保持；`QPPOCR_GPU_FORCE_REC=1` 强制放行（975/1036、CER 1.13%，
+净 -3 行为 ulp 噪声在剃刀薄 CTC 步骤的翻转——GPU/CPU 归约序固有，
+98.5% 输出元素末位不同）。反超前置：会话级 KernelSet/arena 共享
+（每计划 1.8ms×形状数）与注意力 dispatch 合并。
+
+取证方法论（第三次踩实，已记忆沉淀）：探针自身会撒谎——word/byte
+单位混用（上轮「输出区全零」误判源头）、存储定向四种解释、概率容差
+假绿（0.02 绝对容差放行全部小概率差）、numel 碰撞拿错 CPU 张量；对拍
+一律 manifest 节点索引精确对号。
