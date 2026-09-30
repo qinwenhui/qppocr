@@ -362,31 +362,26 @@ impl DeviceContext for VulkanContext {
                 initializers,
             )));
         }
-        // rec：**覆盖面探针**——一次性探针会话小形状试建计划（克隆图/
-        // 权重，探完即弃）。不支持的算子（如 small 的 rank-5 注意力
-        // Transpose 族）与形状无关，探针必现；失败则 stderr 声明后原图
-        // 退回 CPU 会话（非静默降级；cls 同款分级纪律）——补齐内核后
-        // 探针自动放行。
+        // rec：**覆盖面探针**——先建会话再用小形状试建计划（直接用真
+        // 会话，探针通过则复用：曾克隆图/权重建一次性探针会话再丢掉重
+        // 建，rec 装载白付一整遍 ~13ms 计划构建）。不支持的算子（如
+        // small 的 rank-5 注意力 Transpose 族）与形状无关，探针必现；
+        // 失败则 stderr 声明后退回 CPU 会话（非静默降级；cls 同款分级
+        // 纪律）——补齐内核后探针自动放行。探针计划留在缓存里
+        //（(1,3,48,64) 约 20MB，真形状另建，可忽略）。
+        let mut session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
         if opts.model == qppocr_core::device::ModelRole::Rec {
-            let probe_err = session::VulkanSession::new(
-                self.inner.clone(),
-                graph.clone(),
-                initializers.clone(),
-            )?
-            .probe(&[1, 3, 48, 64])
-            .err();
-            if let Some(e) = probe_err {
+            if let Err(e) = session.probe(&[1, 3, 48, 64]) {
                 eprintln!(
                     "[gpu] rec 会话探测失败（{e}）：rec 走 CPU 会话（分级部署，\
                      补齐 n_ 覆盖面后自动上 GPU）"
                 );
-                return Ok(Arc::new(qppocr_core::executor::Session::from_parts(
-                    graph,
-                    initializers,
-                )));
+                // Drop 实现销毁 Vulkan 资源；掏空字段绕开「带 Drop 的结构
+                // 不能局部移动」——graph/initializers 已被会话吃掉，CPU
+                // 会话需要它们回来。
+                return Ok(Arc::new(session.into_cpu_parts()));
             }
         }
-        let mut session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
         // 计划预算按角色分配（预算是 per-session 的，见字段文档）：
         // det 形状逐图一次性、暖缓存重建仅 ~2.5-3ms → 384MB（~2-3 计划，
         // 漏中代价小）；rec 桶形状每图复用、重建 13ms → 1536MB（语料

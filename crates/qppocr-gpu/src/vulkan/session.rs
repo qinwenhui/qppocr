@@ -331,10 +331,21 @@ impl VulkanSession {
         })
     }
 
-    /// 覆盖面探针：小形状试建一次计划（不出执行、计划即弃）。装载期
-    /// 分级用——不支持的算子与形状无关，探针必现（见 mod.rs）。
+    /// 覆盖面探针：小形状试建一次计划（不出执行）。装载期分级用——
+    /// 不支持的算子与形状无关，探针必现（见 mod.rs）。
     pub(crate) fn probe(&self, in_shape: &[i64]) -> Result<()> {
         self.build_plan(in_shape).map(|_| ())
+    }
+
+    /// 探针失败后的退路：把吃进去的 (graph, initializers) 原样吐还，
+    /// 供 CPU 会话组装。Vulkan 资源（pipeline_cache）随 Drop 释放；
+    /// build_plan 失败不入缓存 → plans 恒空、无 arena 泄漏。
+    pub(crate) fn into_cpu_parts(self) -> qppocr_core::executor::Session {
+        let mut me = self;
+        let graph = std::mem::take(&mut me.graph);
+        let initializers = std::mem::take(&mut me.initializers);
+        drop(me);
+        qppocr_core::executor::Session::from_parts(graph, initializers)
     }
 
     /// 执行的前半段（run / run_deferred 共用）：计划建/查 → real_n 写入
