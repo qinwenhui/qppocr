@@ -745,3 +745,27 @@ T 动态）。已确认的施工要点：
   这是最深的不确定点
 - 验收闸门：small GT 978/1036 必须不变（探针分级会在补齐后自动放行）
 
+## 2026-09-30（十五）注意力头攻坚：半程战果与安全收口
+
+主线保底：`internal-gpu-all-20260930`（d586421）＋ 其后两刀（24db47b
+探针会话复用、868d736 n_channel 守卫升级）——**主线回退到 868d736**，
+small rec 恢复探针退 CPU，GT 978/1036 复验不变、34 测试绿。
+
+**注意力头 WIP 在 `attention-wip` 分支**（commit 见分支头）。已完成：
+n_transpose_nd（rank≤5 通用转置，裸内核 0/2880）、n_attn_mm（批量瘦
+GEMM，0/210）、Slice dim0 偏移别名、Transpose[0,2,1] 别名改存储定向
+校验（Transposed.8 盲别名曾错读词表头 A）、**swish 逐元素门分解**
+（fuse_mul_add 曾把 Sigmoid 全图当 [N,C,1,1] 广播门只读 w=0 列——
+small rec backbone 的系统性错读，已在 WIP 修复）、LN 链全套。small
+rec 探针放行、165 dispatch 计划可建。
+
+**未解的值错乱**（输出乱码）：取证链（small_rec_gpu_vs_cpu 测试：
+NO_FREE＋全深度等距采样，浅采样曾两次漏报——前 24 个采样点全对、
+深处 NaN）：backbone 0-79 全对 → swish 修复后推进到 Sub.0 → 首个
+NaN 在 Div.26（std=0）→ 深采发现 Add.156 的 add dispatch **两输入
+有值、输出区全零**。嫌疑集中区域生命周期/arena（多块？复用？），
+调试工具已全部就位在 WIP 分支。
+
+取证方法论沉淀：对拍必须（a）NO_FREE 禁区域回收（b）全深度等距采样
+（≥96 点）——浅采样 + 回收区读取曾各漏报一轮。
+
