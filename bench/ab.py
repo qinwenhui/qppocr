@@ -14,6 +14,7 @@
 输出每轮的原始值 + 比值，最后给比值的中位数与极差。
 """
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -84,7 +85,8 @@ def main():
                       f"   比值 {b/a:.3f}", flush=True)
             else:
                 mean, med = theirs(tier, f"{tier}{r}")
-                o = ours(tier)
+                # AB_OURS_EXTRA：我们一侧的附加参数（如 "--device gpu"）
+                o = ours(tier, os.environ.get("AB_OURS_EXTRA", "").split())
                 print(f"  r{r+1}: 对方 {mean:6.1f}(中位 {med:6.1f})   "
                       f"我们 {o[0]:6.1f}（det {o[1]:5.1f} 行 {o[2]:5.1f}, {o[3]:.2f} 张/s）"
                       f"   比值 {o[0]/mean:.3f}", flush=True)
