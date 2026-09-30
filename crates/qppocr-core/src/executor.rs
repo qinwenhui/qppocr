@@ -137,6 +137,10 @@ pub struct Session {
     pub graph: Graph,
     /// 权重 arena 的输入（run 时 clone 进运行 arena——后续缓冲池会接管）。
     initializers: HashMap<String, Tensor>,
+    /// 逐节点 dump 目录。显式指定优先；否则回退 `QPPOCR_DUMP_DIR`
+    /// 环境变量（CLI/示例用）。测试内必须显式指定——并行测试线程
+    /// 共享进程环境，靠环境变量会让同时段其它 `run` 读到同一目录互踩。
+    dump_dir: Option<String>,
 }
 
 impl Session {
@@ -191,7 +195,13 @@ impl Session {
         Self {
             graph,
             initializers,
+            dump_dir: None,
         }
+    }
+
+    /// 显式指定逐节点 dump 目录（优先于 `QPPOCR_DUMP_DIR` 环境变量）。
+    pub fn set_dump_dir(&mut self, dir: impl Into<String>) {
+        self.dump_dir = Some(dir.into());
     }
 
     /// 拆回 (图, 权重)，所有权移出（供设备工厂重组用）。
@@ -229,7 +239,11 @@ impl Session {
         // 0 起，共用目录会互相覆盖——对拍时无法区分归属。计数器在
         // device 模块全局共享：混合部署（det-GPU + rec-CPU）下各持一个
         // 会互相覆盖对拍目录。
-        let dump_dir = std::env::var("QPPOCR_DUMP_DIR").ok().map(|d| {
+        let dump_dir = self
+            .dump_dir
+            .clone()
+            .or_else(|| std::env::var("QPPOCR_DUMP_DIR").ok())
+            .map(|d| {
             let _ = std::fs::create_dir_all(&d);
             let id = crate::device::next_dump_session_id();
             (d, id)
