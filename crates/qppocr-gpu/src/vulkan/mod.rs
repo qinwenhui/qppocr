@@ -390,6 +390,17 @@ impl DeviceContext for VulkanContext {
             }
         }
         let mut session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
+        // 计划预算按角色分配（预算是 per-session 的，见字段文档）：
+        // det 形状逐图一次性、暖缓存重建仅 ~2.5-3ms → 384MB（~2-3 计划，
+        // 漏中代价小）；rec 桶形状每图复用、重建 13ms → 1536MB（语料
+        // 24 桶 ×~60MB 全进、零驱逐）。实测（100 图语料，外置采样）：
+        // tiny 5.5GB→3.4GB、small 3.9GB→1.4GB，速度在噪声内（对照旧
+        // 一刀切 2048×2 把单进程推到 5.5GB、6× 竞品，见 COMPARISON.md
+        // （九）（十）节）。QPPOCR_GPU_PLAN_MB 仍可覆写。
+        session.plan_budget_mb = match opts.model {
+            qppocr_core::device::ModelRole::Det => 384,
+            _ => 1536,
+        };
         // rec 会话批维补齐粒度 8：引擎按此合批（宽填充到批内最大桶），
         // 会话补齐空行 + 内核 real_n 早退——实测每行提交往返 ~0.85ms、
         // 11 行图 11 次提交吃 9.3ms；合批后 (8,W桶) 形状全命中。det/cls
