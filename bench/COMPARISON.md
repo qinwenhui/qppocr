@@ -515,3 +515,33 @@ small 分账（img-001 单图）：det GPU 43.8ms（CPU ~70）；rec 140ms CPU
 - CPU 参考轮同时量化 GPU 贡献：tiny 0.945→0.682（~28 点）；small CPU
   轮两边的 16 线程互相加热、极差 0.72-1.51 不可用——GPU 模式反而恒稳
   （0.79-0.81），复证（四）节的发热不对称。
+
+## 2026-09-30（八）★ 口径纠正：竞品有 GPU 后端（feature/2.0），GPU vs GPU 仍两档全胜 2.1-2.2×
+
+**（七）节的「竞品全 CPU」结论是错的**——只看了对方 main 检出。竞品仓库
+分支：`feature/2.0`（Vulkan+Metal 双 GPU 后端，DET/CLS/REC 全图上 GPU、
+sg32l/coopmat/SE/CTC 调优、880M 实测报告）与 `devin/...-vulkan-gpu-backend`
+开发分支。**cls 也上了 GPU**（PaddleOcrClassifier._gpuCapable + ClsGraph
+档）——回答了「竞品 cls 用没用 GPU」：2.0 分支用了，main 没有。
+
+对决设置：竞品 worktree（`../SimdPaddleOCR-gpu`，feature/2.0 @6298596）
+dotnet build 后 `--engine vulkan`；我们 `--device gpu`。跑器协议同（七）。
+机器 16T = 4.33x。工具：ab.py 增 `AB_SIMD_EXE`/`AB_THEIR_ENGINE` 透传。
+
+| 档 | 竞品 GPU(vulkan) | 我们 GPU | **比值中位** | 极差 |
+|---|---|---|---|---|
+| tiny | 133 ms | 62-70 ms | **0.472** | 0.47-0.52 |
+| small | 428-433 ms | 190-234 ms | **0.460** | 0.44-0.55 |
+
+他们 vulkan（30 图阶段分解）：det_graph 42.5 / **cls_graph 11.5** /
+rec_graph 76.4 / lines_wall 90.4——对照我们 det 22.6 / cls 4.2(CPU) /
+行阶段 30.5。精度：他们 GPU 740/1036（=其 CPU 水位 71.4%，GPU 无损）vs
+我们 860/1036。
+
+**关键事实：他们的 Vulkan 在本机（Intel Arc）比他们自己的 CPU 还慢**
+（tiny 133 vs ~104）——其调优全在 AMD RDNA（sg32l/coopmat/880M 报告），
+Intel 无 coopmat 档缺乏竞争力；cls 上 GPU 后 11.5ms 反而比 CPU 慢。
+我们的核显路径赢在每一段。small 侧我们的 rec 仍在 CPU（探针分级），
+即便如此 2.2×——注意力头上 GPU 是纯余量。
+
+（七）节数字保留作「vs 竞品 CPU」口径；对外对标应以本节为准。
