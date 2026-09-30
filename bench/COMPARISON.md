@@ -711,3 +711,19 @@ CPU 模式：内存 2-2.8× 占优、冷启 2.5-3.8× 占优、tiny 并发小胜
 164/127MB、small CPU 286/221MB、tiny GPU 394/662MB、small GPU
 499/376MB（他们/我们）。
 
+## 2026-09-30（十三）cls 上 GPU 转正（默认 =all）——两条旧否决双双翻案
+
+**旧否决 ①「~14% 行翻转分歧（翻转错=毁整行）」：bug 时代的产物，已作废。**
+现 `QPPOCR_GPU_STAGES=all` 实测：tiny GT 860/1036＋cls 1003/1026、
+small GT 978/1036＋cls 1006/1032——**两档与 cls-CPU 逐位全同**；100 图
+1096 行（含 rotation 字段）对基线 IDENTICAL。14% 分歧量于 2026-09-29
+批维 bug（bias/SE 门错位、mislabel 路由） era，修复后不复存在。
+
+**旧否决 ②「GPU cls 更慢 5.3 vs 4.2ms」：引擎 cls 批化（per=8）前的
+旧账。** 现 abx（tiny 2 轮）：=all 对 =detrec **0.987（0.986-0.988）**
+——cls 上 GPU 反快 1.3%。
+
+默认翻为 **all**（det+rec+cls 全 GPU）；=detrec/=det 退路保留。
+至此 `--device gpu` = 有啥给 GPU（small rec 的 rank-5 注意力头除外，
+探针分级退 CPU）。34 测试绿、verify 1096 行 IDENTICAL。
+
