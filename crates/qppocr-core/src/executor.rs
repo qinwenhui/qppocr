@@ -244,10 +244,10 @@ impl Session {
             .clone()
             .or_else(|| std::env::var("QPPOCR_DUMP_DIR").ok())
             .map(|d| {
-            let _ = std::fs::create_dir_all(&d);
-            let id = crate::device::next_dump_session_id();
-            (d, id)
-        });
+                let _ = std::fs::create_dir_all(&d);
+                let id = crate::device::next_dump_session_id();
+                (d, id)
+            });
 
         // per-op profile（QPPOCR_PROF=1）：按算子累计内核时间。
         let prof = std::env::var("QPPOCR_PROF").is_ok();

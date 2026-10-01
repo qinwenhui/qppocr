@@ -6,149 +6,72 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 每个版本写清**行为变化**，尤其是默认值变化。
 
-## [Unreleased]
+## [0.3.0] - 2026-10-01
+
+**GPU 版本**：新增可选的 Vulkan 计算后端（det/cls/rec 全图上 GPU），
+aarch64 升级为 NEON 向量执行，CLI 新增 `bench` 基准子命令。CPU 路径
+行为不变（100 图逐字符对拍与 0.2.1 一致）。
 
 ### 新增（Added）
 
-- **GPU Phase 1-G3 收官**：SE 融合模式匹配（HardSigmoid/Sigmoid 门
-  →Mul 合为 fused_*_mul，det 图实测融合 5 对——省 5 个独立门 dispatch
-  + 5 整趟 NCHW 读+一趟写）；计划缓存 LRU 封顶（4 个计划，防形状多样
-  性导致 arena 无界增长）；exp1（sigmoid/erf 的自研多项式）逐字镜像
-  进 GLSL（消除 GPU 硬件 exp 与 CPU 多项式的差异——实测对概率图
-  mean|diff| 影响不大，主因在 conv 累加序）。GPU det 端到端性能
-  （Intel Arc, 5 图 bench, det/img）：GPU 177 ms vs CPU 127 ms——
-  direct conv 比 CPU 的 implicit GEMM 慢 40%，P2 优化方向确认。
-  全语料 100 图逐字符对拍：GPU 路径字符级贪心匹配 52.5%（CPU 基线
-  自身 100%）——差异来源于 det 概率图 mean 2.7e-5 的累积漂移经
-  DB 后处理阈值/裁剪放大（非 bug；CPU implicit GEMM 面板累加序 ≠
-  GPU 逐像素直积累加序，fp32 下不可消除；简单版式 100% 匹配、复杂
-  版式差异大，分布合理）。
-
-- **GPU det 端到端跑通（Phase 1-G2）**：图计划生成器（planner 形状表
-  → op→内核映射 → 活性复用的区域布局 → 权重/参数块上传 → 整图 140
-  dispatch 录进一条可复用命令缓冲）+ VulkanSession（形状键计划缓存，
-  run = memcpy 输入 → 一次提交 → 读回输出）+ `QPPOCR_GPU_STAGES=det`
-  混合部署（det 走 GPU、rec/cls 明确告知走 CPU，非静默降级）。
-  Intel Arc 实测：128×128 二跑 6.1 ms；640×640 二跑 91.6 ms；CLI 端到端
-  （真实图片、det GPU + rec/cls CPU）文本输出与 CPU 路径**逐行一致**
-  （img-001~004 四图对比）。概率图 mean|diff| = 2.7e-5（逐层 fma/累加
-  序差异的正常传播；max 出现在 sigmoid 斜坡处，框归属翻转由字符级对拍
-  判定）。SessionOptions 新增 `model: ModelRole`（pipeline 按位置填
-  det/rec/cls）。开发中抓出并修复四个真 bug（全在提交信息留案底）：
-  ①`Layout` first-fit 分割后剩余区段未后移 → 同址重叠分配（深度卷积
-  in-place 别名的根因）；②静态区（权重/参数块）与激活共用空闲表 →
-  CB 重放时被激活写冲掉（conv 读到垃圾参数 → GPU 挂死设备丢失）；
-  ③单 CB 内连续 dispatch 缺内存屏障 → 长序列结果错乱（规范要求的
-  SSBO 写→读可见性）；④会话字段序 ctx 在前 → 先销毁设备再销毁管线
-  （CLI 路径 100% 退出段错误）。
-
-- **GPU 计算内核 G1（Phase 1-G 第一批，det 全算子覆盖）**：按 det 图
-  真实分布（83 Conv：61×1x1 + 16×3x3 + 4×5x5 + 17 分组/深度；Conv
-  ×2、池化/归约 14、Resize×6、通道 Concat×2）实现 conv（通用 group、
-  bias/relu/GELU/残差 epilogue——顺序镜像 CPU conv2d_res：acc+bias→
-  act→+residual；erf1 逐字镜像 A&S 7.1.26 fma 链）、convtranspose
-  （输出线程跨 ci 累加）、pool（max/avg 通用带 pad；avg 除满核面积）、
-  reduce_hw（GAP/ReduceMean 同核）、resize_nearest、concat_c。
-  参数块进 arena（binding 1 = 同缓冲 u32 视图，解 128 B push constant
-  上限，装载期写一次零每帧成本）。Intel Arc 对拍全绿：11 项中 8 项
-  **逐位一致**（1x1+relu / depthwise / 5x5s2+residual / convT / pool
-  max+avg / resize / concat），3x3+GELU 1.2e-7、reduce 1.4e-8。
-  开发中 oracle 抓出两个真 bug：conv 输出公式漏 +1（两侧）、convT
-  最初按输入线程写成了覆盖而非跨 ci 累加（对拍首元素吻合、整体 0.83
-  相对误差的典型形态）。
-
-- **GPU 计算管线与首批内核（Phase 1-F）**：单 SSBO + push constant
-  偏移寻址的绑定模型（一个会话一个描述符集，零描述符churn）；
-  **可复用命令缓冲**——整图 dispatch 序列装载期录一次、每帧只
-  submit+等信号（Intel Arc 实测 10-dispatch 序列重提交中位
-  0.355 ms，这是把每图固定开销压到 ~5ms 级的载体）。首批 10 个
-  compute 内核（sigmoid/hardsigmoid/relu/clip/add/mul/mul_c/
-  muladd_scale + 融合 SE 链 fused_sigmoid_mul/fused_hardsigmoid_mul
-  ——SE 门与特征图的 Mul 融成一个内核，省一整趟 NCHW 读写），全部
-  与 CPU 判据对拍：纯算术内核逐位一致，exp 族 ≤1.8e-7，fma 收缩
-  ≤1.9e-6。着色器工具链：naga（纯 Rust）的 GLSL→SPIR-V 编译工具
-  （`tools/shader-build`，独立于 workspace），SPIR-V 签入，仓库仍零
-  C++ 依赖。
-
-- **GPU planner（`qppocr-gpu::planner`，Phase 1-E）**：装载期静态形状
-  推理 + i64 常量折叠（Shape/Cast/Slice/Concat/Transpose/Unsqueeze 链
-  求值——Resize 的 sizes、Reshape 目标、各类 axes 的来源）。语义逐字
-  镜像 executor/内核（conv/pool/ConvTranspose 输出公式、auto_pad 的
-  SAME_UPPER/LOWER、右对齐广播、slice 钳位、0/-1 reshape、右对齐批次
-  matmul、keepdims 归约），判据是真实 det 模型的 oracle 对拍：三个输入
-  尺寸（960×960/640×640/960×512）下逐节点与 `QPPOCR_DUMP_DIR` 落盘的
-  运行期形状**全部一致**（各 140 节点）。该测试即 Phase F 内核规划的
-  准入门；缺模型环境自动跳过。
-- **GPU 后端 crate 落地（`qppocr-gpu`，Phase 1 第一步）**：Vulkan 设备
-  枚举与打开（ash；实例按 1.1 请求最大化枚举面，可用性按物理设备
-  `apiVersion` 判定 1.4 基线，低于基线的设备枚举可见并标注）+ CUDA
-  枚举级预留（dlopen 驱动，零编译期 SDK 依赖）。门面 feature `gpu` /
-  `gpu-cuda` 接线：`--device gpu`（Auto：Vulkan 优先、CUDA 兜底）、
-  `--device vulkan[:N]`、`--device cuda[:N]` 全部到达真实设备事实；
-  `--device cpu` 与默认构建零变化（不引 GPU 依赖）。计算内核尚未实现
-  ——显式要求 GPU 的会话构造给出明确说明，不静默回退。已在本机
-  Intel Arc（Vulkan 1.4.335）实测枚举/打开。CI feature 矩阵补
-  `gpu` 与 `gpu-cuda` 组合。
-- **设备接缝（GPU 地基）**：`qppocr-core` 新增 `device` 模块——
-  `DeviceContext`（装载期工厂，权重按值一次性移交设备）与
-  `DeviceSession`（与 CPU `Session::run` 同签名的执行入口）两个 trait
-  把设备边界定在 Session 层（kernels 层的 `Backend` 枚举保持纯 CPU 概念）；
-  pipeline 的 det/cls/rec 会话字段改为 `Arc<dyn DeviceSession>`，CPU
-  路径行为零变化（100 图逐字符对拍双基线 IDENTICAL、`--device cpu`
-  abx 比值 1.008）。会话不受益于宿主侧扇出时（`prefers_host_parallelism`
-  = false）cls/rec 批自动退化为串行提交、跳过分片池布局。门面新增
-  `DeviceChoice` / `EngineBuilder::device()` / `Engine::device()`；CLI
-  新增 `--device cpu|gpu|vulkan[:N]|cuda[:N]`（多进程 worker 回传，
-  bench `--sweep device=` 可用）。GPU 实现本体（`qppocr-gpu` crate，
-  Vulkan 计算后端）后续版本接入；显式要 GPU 而未编译支持时构造报错，
-  不静默回退 CPU。`Session` 新增 `from_parts` / `into_parts`；
-  `qppocr-core::Error` 新增 `Device` 变体（下游 exhaustive match 需跟进）。
-- **CLI `bench` 子命令**：测量纪律内建——同进程跑完整语料、1 轮 warmup
-  丢弃、多配置逐轮交错、中位数汇总，报告探测到的内核后端与生效配置；
-  `--sweep` 对自己的图集扫 preset / rec-height / threads / rec-shards。
-  `qppocr` 门面新增 `detect_backend` / `Backend` 再导出。
-- 新增 `RELEASING.md`：引用模型（internal-main 私有主线 / 公开孤儿
-  快照 / v tag）与发布 checklist、改动准入纪律（「声明 = 断言」、
-  verify.py 对拍、abx 性能口径）全部文档化；废止长命 release-prep
-  分支（0.3.0 的过期分支已删）。
-- CI 新增 aarch64-linux 测试 job（交叉编译 + QEMU 用户态执行）：
-  NEON↔标量逐位对拍在 linux-arm64 上持续验证，不依赖 Apple 硬件。
+- **GPU 后端（`qppocr-gpu` crate，feature `gpu`）**：纯 Rust（ash 绑定）
+  的 Vulkan 计算后端，不引入 C++ 工具链——GLSL 着色器编译为 SPIR-V 后
+  签入仓库（`tools/shader-build` 为独立编译工具），构建零着色器依赖。
+  - 执行模型：装载期完成形状推理与常量折叠、算子到内核的映射、显存
+    区域布局与权重重排，整图 dispatch 序列录进一条可复用命令缓冲；
+    运行时一次提交 + 等信号，无逐算子往返。
+  - 内核覆盖 conv 全家族（1x1/3x3/5x5、分组、深度、ConvTranspose，
+    bias/激活/残差收尾）、池化、resize、通道拼接、SE 门融合、
+    LayerNorm 分解链、softmax、注意力所需的批量矩阵乘与通用转置、
+    CTC argmax 出口（每时间步只读回 8 字节/行）。
+  - 批处理：同形状行合批 + 批维补齐，空行由内核按真实行数早退（零
+    算力）；识别行按宽度分桶复用计划；`run_deferred` 支持批间流水
+    （提交下一批与 GPU 执行当前批重叠）。
+  - 三级缓存控制重建开销：管线缓存（驱动复用编译产物）、权重重排
+    缓存、显存块池；计划缓存按字节预算 LRU。
+  - 精度：GPU 与 CPU 路径在评测语料上逐字符一致（100 图对拍）；算术
+    内核与 CPU 参考逐位对齐（exp/erf 多项式逐字镜像、FMA 链一致）。
+  - 分级部署 `QPPOCR_GPU_STAGES=all|detrec|det`；会话在装载期探测算子
+    覆盖面，不支持的模型显式声明并留在 CPU，不静默降级。**small 档
+    识别模型（SVTR 注意力结构）默认留在 CPU**：该结构对批处理的宽度
+    填充敏感，按自然宽度执行才保精度，而逐行形状的代价目前大于收益
+    （`QPPOCR_GPU_FORCE_REC=1` 可强制上 GPU）。
+  - 开发与验证在 Intel Arc 核显（Vulkan 1.4）完成；其它 GPU 未经测试。
+    发现并适配了一个驱动侧的缓存一致性问题（HOST_COHERENT 映射读回
+    需显式 clflush；已按架构 gate，不影响其它平台语义）。
+- **设备抽象（`qppocr-core::device`）**：`DeviceContext` / `DeviceSession`
+  trait 把设备边界定在 Session 层；门面新增 `DeviceChoice` 与
+  `EngineBuilder::device()`；CLI 新增 `--device cpu|gpu|vulkan[:N]|cuda[:N]`
+  （cuda 为枚举级预留，计算后端尚未实现）。`qppocr-core::Error` 新增
+  `Device` 变体（下游 exhaustive match 需跟进）。
 - **aarch64 NEON 后端**：sgemm 面板（含 implicit-GEMM 指针面板）、窄 N
   路径、深度卷积、ConvTranspose、激活（GELU/erf/exp/ReLU/clip/
   HardSigmoid/sigmoid）、softmax、二元算子、2x2 池化、双线性缩放、
-  2x2 膨胀——全部与标量判据逐位一致（`bitexact` 对拍在 aarch64 上自动
-  选 NEON 侧）。Apple Silicon（M 系列）与各家 ARM 服务器/手机 SoC 从
-  纯标量回退升级为向量执行。f32 NEON 是 aarch64 基线指令集，无需运行时
-  探测；`enable_flush_denormals` 在 aarch64 上经 FPCR 置 FZ 位。
-- `Backend` 枚举新增 `Neon` 档；`detect_backend()` 在 aarch64 上返回它。
+  2x2 膨胀——全部与标量判据逐位一致。ARM 设备从纯标量回退升级为向量
+  执行；f32 NEON 是 aarch64 基线指令集，无需运行时探测。`Backend` 枚举
+  新增 `Neon` 档。CI 新增 aarch64-linux 交叉编译 + QEMU 测试 job。
+- **CLI `bench` 子命令**：测量纪律内建——同进程跑完整语料、warmup
+  丢弃、多配置逐轮交错取中位，报告内核后端与生效配置；`--sweep` 对
+  自己的图集扫 preset / rec-height / threads / rec-shards / device。
 
 ### 修复（Fixed）
 
-- **区域重试自 0.2.0 起实际默认开启**（与 0.2.0 发布说明及 README 宣称
-  相反）：当时的「默认关闭」只改了门面（`Advanced::default` 与 Balanced
-  预设），漏改 core 的 `PipelineConfig::default()`——门面 `resolve_config`
-  以 core 默认值为起点、Balanced 预设不清零，于是默认配置仍在约 9/100
-  张图上隐式跑双倍 det（0.2.0/0.2.1 发布版均如此）。core 默认值现归零，
-  默认真正关闭；Accuracy 预设与显式 `Advanced::retry_conf` 的开启路径
-  不受影响。已补回归断言（门面预设契约 + core 默认值各一条测试），
-  「文档声明的默认值必须被测试锁住」，防同类脱节再犯。
-  逐行精度开关一致（0.2.0 发布说明的实测依据不变）；对拍基线已随
-  本行为修正重建（tiny 1099→1096 行、small 1042→1041 行）。
-- **池的嵌套 fork 结构性降级**：worker 线程内的 `fork_join` 改为就地
-  串行执行（切分决策不变，与并行路径逐位一致），消灭「并行区内再次
-  并行」争 `fork_mu` 的整类死锁。此前内核依赖「收尾激活的字节数低于
-  fork 阈值」这一形状巧合避开嵌套——大通道形状越过阈值即挂死，疑似即
-  medium 多进程批量（`--workers 4/8`）偶发停滞的根因；50ms 唤醒兜底
-  对它无效（卡的是互斥锁不是条件变量）。触发时每线程提示一次。
+- **区域重试自 0.2.0 起实际默认开启**（与 0.2.0 发布说明相反）：当时的
+  「默认关闭」只改了门面默认值，漏改 core 的 `PipelineConfig::default()`，
+  默认配置仍在约 9/100 张图上隐式跑双倍 det。现默认真正关闭；Accuracy
+  预设与显式 `Advanced::retry_conf` 的开启路径不受影响。已补回归断言
+  锁住「文档声明的默认值」。
+- **线程池嵌套并行死锁**：并行区内的 `fork_join` 改为就地串行执行，
+  消灭「并行区内再次并行」争锁的整类挂起（疑似即 0.2.0 已知问题中
+  medium 多进程批量偶发停滞的根因）。触发时每线程提示一次。
 
 ### 变更（Changed）
 
-- **内核分发层重构为单一入口**（`qppocr-kernels::arch`）：全部
-  `target_arch` 接线集中到一个模块，内核文件不再含架构条件；原先
-  「分发宏 + cfg-if」两套写法合一。标量参考实现从调用点内联代码抽成
-  命名函数（仍是逐位判据）。x86-64 输出逐位不变。
-- implicit-GEMM（卷积免 im2col 物化路径）不再限定特定架构：无向量后端
-  的目标同样走指针面板，省掉 patch 矩阵的内存搬运。
+- 内核分发层重构为单一入口（`qppocr-kernels::arch`）：架构接线集中到
+  一个模块，内核文件不再含架构条件；标量参考实现抽成命名函数。
+  x86-64 输出逐位不变。
+- implicit-GEMM（卷积免 im2col 物化）不再限定特定架构：无向量后端的
+  目标同样走指针面板。
 
 ## [0.2.0] - 2026-09-27
 

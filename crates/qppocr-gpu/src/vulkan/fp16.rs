@@ -13,7 +13,7 @@
 //!
 //! 计算精度：内核读 f16 → 解包为 f32 → FMA 累加（f32）→ 结果打包 f16。
 //! 权重精度：装载期一次性转换为 f16——det 模型对权重量化到 f16 的
-//! 精度损失在逐字符对拍里不构成差异（竞品全部用 fp16 推理）。
+//! 精度损失在逐字符对拍里不构成差异。
 
 use super::pipeline::{KernelSet, PcUnary, record_dispatch};
 use ash::vk;
@@ -56,6 +56,7 @@ pub(crate) fn record_from_f16(
 }
 
 /// f32 切片 → f16 packed words（装载期权重转换用）。
+#[allow(dead_code)] // f16 工具箱：随路径启用，非恒被调用
 pub fn f32_to_f16_words(src: &[f32]) -> Vec<u32> {
     let n = src.len().div_ceil(2) * 2;
     let mut out = Vec::with_capacity(n / 2);
@@ -82,6 +83,7 @@ pub fn f16_words_to_f32(src: &[u32]) -> Vec<f32> {
 
 /// f32 → f16 的位级转换（round-to-nearest-even，IEEE 754）。
 /// 精度：尾数 23→10 位截断 + 舍入；值域 [±65504]；denormal → 0。
+#[allow(dead_code)] // f16 工具箱：随路径启用，非恒被调用
 pub(crate) fn f32_to_f16_bits(x: f32) -> u16 {
     let bits = x.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -158,6 +160,7 @@ fn f16_to_f32_bits(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+#[allow(dead_code)] // f16 工具箱：随路径启用，非恒被调用
 fn pack_half2x16(a: f32, b: f32) -> u32 {
     (f32_to_f16_bits(a) as u32) | ((f32_to_f16_bits(b) as u32) << 16)
 }

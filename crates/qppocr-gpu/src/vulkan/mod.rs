@@ -137,8 +137,11 @@ pub(crate) struct Inner {
     /// 选定的 memory types 与 UMA 判定。
     pub(crate) mem_types: memory::MemoryTypes,
     /// 协作矩阵（XMX/DNA）形状：fp16 输入、f32 累加、Subgroup 域。
+    /// （coopmat 内核路径未启用；探测结果留作诊断/后续路径的排布前提。）
+    #[allow(dead_code)]
     pub(crate) coopmat: Option<CoopMat>,
     /// 计算队列族的 subgroup 大小（coopmat 内核的排布前提）。
+    #[allow(dead_code)]
     pub(crate) subgroup_size: u32,
     /// 实例句柄：`Drop::drop` 里显式 destroy（ash 0.38 无 Drop）。
     /// 字段从不读取——存在即销毁序职责（见 [`InstanceGuard`]）。
@@ -344,7 +347,7 @@ impl DeviceContext for VulkanContext {
         // 行翻转分歧」是批维 bug 时代的产物——现 GT 两档逐位全同、100 图
         // 1096 行（含 rotation）逐位同；②「GPU cls 更慢 5.3 vs 4.2ms」是
         // 引擎 cls 批化（per=8）前的旧账——现 =all 比 detrec 快 1.3%
-        // （abx 0.987 稳定）。委托 CPU 时 **stderr 声明**，不是静默降级。
+        // 稳定。委托 CPU 时 **stderr 声明**，不是静默降级。
         let stages = std::env::var("QPPOCR_GPU_STAGES").unwrap_or_else(|_| "all".into());
         let gpu_ok = match opts.model {
             qppocr_core::device::ModelRole::Det => true,
@@ -412,7 +415,7 @@ impl DeviceContext for VulkanContext {
         // 漏中代价小）；rec 桶形状每图复用、重建 13ms → 1536MB（语料
         // 24 桶 ×~60MB 全进、零驱逐）。实测（100 图语料，外置采样）：
         // tiny 5.5GB→3.4GB、small 3.9GB→1.4GB，速度在噪声内（对照旧
-        // 一刀切 2048×2 把单进程推到 5.5GB、6× 竞品，见 COMPARISON.md
+        // 一刀切 2048×2 曾把单进程推到 5.5GB
         // （九）（十）节）。QPPOCR_GPU_PLAN_MB 仍可覆写。
         session.plan_budget_mb = match opts.model {
             qppocr_core::device::ModelRole::Det => 384,

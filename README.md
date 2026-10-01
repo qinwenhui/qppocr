@@ -36,8 +36,11 @@ ONNX Runtime（一个 C 库：跨平台部署带工具链、有 CVE 跟随、行
 - **配置三档分层**：`Preset`（Speed/Balanced/Accuracy，整段基准验证）
   → `Config`（有 semver 承诺的公开项）→ `Advanced`（29 项调参常数，
   明确不承诺稳定）。
-- **`unsafe` 只有一个 crate**（`qppocr-kernels`），其余每行编译期安全；
-  内核 crate 零第三方依赖。
+- **`unsafe` 只有一个 crate**（`qppocr-kernels`，GPU 后端另有显式
+  标注的 Vulkan 调用层），其余每行编译期安全；内核 crate 零第三方依赖。
+- **可选 GPU 后端（feature `gpu`）**：纯 Rust 写的 Vulkan 计算后端，
+  装载期把整图编译成一条命令缓冲。与 CPU 路径逐字符一致；分级部署、
+  无静默降级（见下）。
 
 ## 模型
 
@@ -123,8 +126,27 @@ qppocr bench *.jpg --sweep preset=base,speed   # 用自己的图集扫一个轴
 （默认 small）· `--preset speed|balanced|accuracy` · `--threads <n>`
 （0=自动）· `--workers <n>`（批量并发进程数，0=自动）· `--bench <n>`
 （每图跑 n 次取最好）· `--det-only`（只要框）· `--boxes`（输出带坐标）
-· `--no-cls`（关方向分类）。环境变量 `QPPOCR_THREADS` 等价 `--threads`；
+· `--no-cls`（关方向分类）· `--device cpu|gpu`（默认 cpu；需要 `gpu`
+feature 编译）。环境变量 `QPPOCR_THREADS` 等价 `--threads`；
 `QPPOCR_PROF=1` 输出逐算子耗时剖析。
+
+## GPU 后端（Vulkan，feature `gpu`）
+
+`cargo add qppocr --features gpu` 后，`--device gpu` 或
+`EngineBuilder::device(DeviceChoice::gpu())` 启用。整图在装载期编译成
+一条可复用命令缓冲（形状推理、区域布局、权重重排全部预排），运行时
+一次提交；同形状的识别行自动合批。
+
+- **精度**：与 CPU 路径在评测语料上逐字符一致。算术内核与 CPU 参考
+  逐位对齐（同一个 exp/erf 多项式、同一 FMA 链）。
+- **部署分级**：`QPPOCR_GPU_STAGES=all|detrec|det`。**small 档识别模型
+  默认留在 CPU**——它的注意力结构对批处理的宽度填充敏感，按自然宽度
+  执行才保精度，逐行形状的代价目前大于收益（`QPPOCR_GPU_FORCE_REC=1`
+  可强制）。所有降级都有 stderr 声明，没有静默切换。
+- 缓存三级（管线 / 权重重排 / 显存块）+ 按字节预算的计划缓存，控制
+  形状多样场景的重建开销。
+- 开发与验证在 Intel Arc 核显（Vulkan 1.4）上完成；其它 GPU 未测试，
+  欢迎报告。
 
 `bench` 子命令把测量纪律内建：同进程跑完整语料（不逐图起进程）、
 1 轮 warmup 丢弃、多配置**逐轮交错**后取中位——配置间受同样的热态与
