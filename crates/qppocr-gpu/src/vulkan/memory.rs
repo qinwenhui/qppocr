@@ -41,7 +41,7 @@ pub(crate) fn readback_clean(_ptr: *const u8, _bytes: usize) {
 /// 逐出**，使设备立即可见——readback_clean 的镜像方向。
 ///
 /// 与 CB 头部内存屏障（session.rs build_plan）**配对使用、缺一不可**
-/// （img-003 间歇整行空文本的 A/B 实证，2026-09-30）：主机侧小写
+/// （间歇性整行空文本的 A/B 实证，2026-09-30）：主机侧小写
 /// （rn=real_n 单元，4 字节）无容量压力、永不自我逐出，需 SFENCE +
 /// clflush 写回逐出；GPU 侧缓存的旧行另由 CB 屏障失效。
 ///

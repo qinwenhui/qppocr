@@ -14,7 +14,7 @@
 
 公开快照 = 孤儿单提交（无父历史）：内容 = internal-main 指定提交
 **剔除内部文件**（`bench/` 全目录：COMPARISON.md、ab.py、abx.py、
-verify.py），提交信息为对外描述（发布快照固定为 `qppocr X.Y.Z`）。
+verify.py；`RELEASING.md` 本身——内部引用模型与发布流程，对外无意义），提交信息为对外描述（发布快照固定为 `qppocr X.Y.Z`）。
 内部历史（移植叙述、对拍数据、基准口径）因此永不出现在公开仓库。
 
 **不建长命 release-prep 分支**：发布准备（升版 + CHANGELOG 落段）做成
@@ -42,7 +42,7 @@ internal-main 上的普通提交，从它切快照。0.3.0 曾开 `release-prep/
    ```
    export GIT_INDEX_FILE=$PWD/.git/snap-index
    git read-tree C
-   git rm -r --cached bench
+   git rm -r --cached bench RELEASING.md
    TREE=$(git write-tree)
    rm $GIT_INDEX_FILE; unset GIT_INDEX_FILE
    COMMIT=$(git commit-tree $TREE -m "qppocr X.Y.Z")

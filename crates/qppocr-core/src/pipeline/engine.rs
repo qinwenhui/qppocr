@@ -1394,11 +1394,9 @@ impl Engine {
                 Option<(Box<dyn crate::device::DeferredRun + Send>, i32)>,
                 usize,
                 usize,
-                i32,
             );
             let mut pending: Option<Pending> = None;
             for &(b, e) in &batches {
-                let bucket = bucket_w(wh_ratio[order[b]]);
                 // 同桶连续批不再「先收账再提交」：GPU 会话对同形状双批在飞
                 // 自动分流影子计划（独立 arena/CB，零共享）——批 k+1 提交
                 // 与 GPU(k) 重叠，收账 k-1 与 GPU(k) 重叠（真正的批间流水；
@@ -1407,7 +1405,7 @@ impl Engine {
                 if let Some(p) = pending.take() {
                     outs.push(rec_collect(p.0.unwrap(), p.1, p.2)?);
                 }
-                pending = Some(Pending(Some(staged), b, e, bucket));
+                pending = Some(Pending(Some(staged), b, e));
             }
             if let Some(p) = pending.take() {
                 outs.push(rec_collect(p.0.unwrap(), p.1, p.2)?);

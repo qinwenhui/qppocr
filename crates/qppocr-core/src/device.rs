@@ -150,10 +150,7 @@ pub trait DeviceSession: Send + Sync {
     /// 执行重叠。**同形状两条在飞 = 数据竞态**（输入/输出区同址）——
     /// 调用方必须先 complete 同形状的在飞批再 run_deferred。CPU 会话
     /// 的默认实现 = 同步 run（无重叠语义，结果等价）。
-    fn run_deferred(
-        &self,
-        inputs: Vec<(String, Tensor)>,
-    ) -> Result<Box<dyn DeferredRun + Send>> {
+    fn run_deferred(&self, inputs: Vec<(String, Tensor)>) -> Result<Box<dyn DeferredRun + Send>> {
         let outs = self.run(inputs)?;
         Ok(Box::new(SyncDone { outs }))
     }

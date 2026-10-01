@@ -27,8 +27,8 @@ gpu-cuda = ["gpu", "qppocr-gpu/cuda"]
 serde = ["dep:serde", "qppocr-core/serde"]
 
 [dependencies]
-qppocr-core = { path = "../qppocr-core", version = "0.2.1" }
-qppocr-gpu = { path = "../qppocr-gpu", version = "0.2.1", optional = true }
+qppocr-core = { path = "../qppocr-core", version = "0.3.0" }
+qppocr-gpu = { path = "../qppocr-gpu", version = "0.3.0", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"], optional = true }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 

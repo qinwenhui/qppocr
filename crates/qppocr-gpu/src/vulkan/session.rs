@@ -255,7 +255,10 @@ fn node_out_rc(
         if let Ok(axes) = planner::axes_from(n, &table.values) {
             let ish = sh(&n.inputs[0]);
             let r = ish.len() as i64;
-            let norm: Vec<i64> = axes.iter().map(|&a| if a < 0 { a + r } else { a }).collect();
+            let norm: Vec<i64> = axes
+                .iter()
+                .map(|&a| if a < 0 { a + r } else { a })
+                .collect();
             if norm.len() == 1 && norm[0] == r - 1 {
                 let m: i64 = ish[..(r as usize - 1)].iter().product();
                 return Ok((m as u32, 4));
@@ -296,8 +299,7 @@ struct PlanSlot {
 
 impl PlanSlot {
     fn bytes(&self) -> u64 {
-        self.primary.block_bytes
-            + self.shadow.as_ref().map_or(0, |s| s.block_bytes)
+        self.primary.block_bytes + self.shadow.as_ref().map_or(0, |s| s.block_bytes)
     }
 }
 
@@ -348,8 +350,7 @@ pub(crate) struct VulkanSession {
     /// **预算 per-session**——det 与 rec 会话各一份，create_session 按
     /// 角色设定：det 形状逐图一次性、暖缓存重建仅 ~2.5-3ms → 小预算；
     /// rec 桶形状每图复用、重建 ~13ms → 大预算。旧的一刀切 2048/会话
-    /// 曾把单进程推到 5.5GB（对决实测 6× 竞品，见 COMPARISON.md（九）
-    /// 节）。直接构造（测试）默认 2048 不变。
+    /// 曾把单进程推到 5.5GB。直接构造（测试）默认 2048 不变。
     pub(crate) plan_budget_mb: u64,
     /// 持有整个上下文。**必须声明在最后**：字段按声明序 drop——plans
     /// 里的管线/缓冲销毁要用设备，而设备销毁发生在 ctx（Arc<Inner>）
@@ -465,9 +466,11 @@ impl VulkanSession {
             {
                 claim(&slot.primary);
                 slot.primary.clone()
-            } else if slot.shadow.as_ref().is_some_and(|s| {
-                !s.inflight.load(std::sync::atomic::Ordering::Acquire)
-            }) {
+            } else if slot
+                .shadow
+                .as_ref()
+                .is_some_and(|s| !s.inflight.load(std::sync::atomic::Ordering::Acquire))
+            {
                 let s = slot.shadow.clone().unwrap();
                 claim(&s);
                 s
@@ -484,7 +487,8 @@ impl VulkanSession {
             }
         } else {
             let plan = std::sync::Arc::new(self.build_plan(&plan_shape)?);
-            plan.inflight.store(true, std::sync::atomic::Ordering::Release);
+            plan.inflight
+                .store(true, std::sync::atomic::Ordering::Release);
             plans.push(PlanSlot {
                 shape: plan_shape.clone(),
                 primary: plan.clone(),
@@ -566,6 +570,7 @@ impl VulkanSession {
 
     /// 调试：给定形状返回 (整块基址, [(内核, 节点, 偏移, 元素数, PC, 形状, 输入明细)])。
     #[allow(clippy::type_complexity)]
+    #[cfg(test)]
     pub(crate) fn debug_recs(
         &self,
         in_shape: &[i64],
@@ -610,6 +615,7 @@ impl VulkanSession {
     /// 调试：重放 recs[from..=to]（之前可先 mutate 整块基址），
     /// 返回 (基址, 末 rec 的输出偏移/元素数)。现场取证用。
     /// （旧单 rec 形态等价 from==to。）
+    #[cfg(test)]
     pub(crate) fn debug_replay(
         &self,
         in_shape: &[i64],
@@ -619,6 +625,7 @@ impl VulkanSession {
         self.debug_replay_range(in_shape, rec_idx, rec_idx, mutate)
     }
 
+    #[cfg(test)]
     pub(crate) fn debug_replay_range(
         &self,
         in_shape: &[i64],
@@ -661,6 +668,7 @@ impl VulkanSession {
     }
 
     /// 调试：图输入名。
+    #[cfg(test)]
     pub(crate) fn input_name_for_test(&self) -> String {
         self.input_name.clone()
     }
@@ -1068,33 +1076,31 @@ impl VulkanSession {
                                 })
                             })
                     };
-                    let (start, end, axis, step) =
-                        (geti(0), geti(1), geti(2), geti(3));
+                    let (start, end, axis, step) = (geti(0), geti(1), geti(2), geti(3));
                     let inn = table.values.get(&n.inputs[0]);
                     let outn = table.values.get(&out);
                     let ok = matches!(
                         (start, end, axis, step),
                         (Some(s), Some(_e), Some(0), Some(1) | None) if s >= 0
                     );
-                    if ok && inn.is_some() && outn.is_some() {
-                        let inn = inn.unwrap();
-                        let dim0 = inn.shape.first().copied().unwrap_or(1).max(1);
-                        let row = inn.shape.iter().product::<i64>() / dim0;
-                        let off0 = offs.get(&n.inputs[0]).copied();
-                        if let Some(o) = off0 {
-                            let s = start.unwrap();
-                            offs.insert(out.clone(), o + (s * row) as u32);
-                            // rc 按输出形状重算（列=末维不变、行数去掉
-                            // dim0 ——照搬输入会把行数多算 3 倍）
-                            let outn = outn.unwrap();
-                            if let Some(&last) = outn.shape.last() {
-                                if last > 0 {
-                                    let rows =
-                                        outn.shape.iter().product::<i64>() / last;
-                                    rc.insert(out.clone(), (rows as u32, last as u32));
+                    if let (Some(inn), Some(outn)) = (inn, outn) {
+                        if ok {
+                            let dim0 = inn.shape.first().copied().unwrap_or(1).max(1);
+                            let row = inn.shape.iter().product::<i64>() / dim0;
+                            let off0 = offs.get(&n.inputs[0]).copied();
+                            if let Some(o) = off0 {
+                                let s = start.unwrap();
+                                offs.insert(out.clone(), o + (s * row) as u32);
+                                // rc 按输出形状重算（列=末维不变、行数去掉
+                                // dim0 ——照搬输入会把行数多算 3 倍）
+                                if let Some(&last) = outn.shape.last() {
+                                    if last > 0 {
+                                        let rows = outn.shape.iter().product::<i64>() / last;
+                                        rc.insert(out.clone(), (rows as u32, last as u32));
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
                         }
                     }
                     // 非 dim0/非连续：落到 map_node 报不支持（Slice 无臂）
@@ -1568,7 +1574,7 @@ impl VulkanSession {
             }
             // 头部全量内存屏障（每次重放都执行）：本机驱动的第三个
             // 一致性缺口——GPU 侧缓存会保留旧地址行，主机写穿到 DRAM
-            // 也被它遮住（img-003 间歇整行空文本的现场：批内稀疏行、
+            // 也被它遮住（间歇整行空文本的现场：批内稀疏行、
             // 主机侧 sfence+clflush 输入发布无效）。屏障强制设备缓存
             // 对本次重放前的全部写入（含主机写）失效。代价每次重放
             // 一道屏障（µs 级）。
@@ -1965,8 +1971,7 @@ impl VulkanSession {
                     if norm.len() == 1 && norm[0] == r - 1 {
                         // 末轴均值（small rec 的 LayerNorm 分解链）：一行 WG
                         // 归约，出 [rows,4]（lane0=均值）。rpb 供空行早退。
-                        let rows: u32 =
-                            xs[..xs.len() - 1].iter().product::<i64>() as u32;
+                        let rows: u32 = xs[..xs.len() - 1].iter().product::<i64>() as u32;
                         let cols = *xs.last().unwrap() as u32;
                         let (in_rows, cpad) = rc
                             .get(&n.inputs[0])
@@ -2109,9 +2114,7 @@ impl VulkanSession {
                         *b.last().unwrap() as u32,
                     );
                     if *a.last().unwrap() != b[b.len() - 2] {
-                        return Err(Error::Graph(format!(
-                            "动态 MatMul K 不符：A={a:?} B={b:?}"
-                        )));
+                        return Err(Error::Graph(format!("动态 MatMul K 不符：A={a:?} B={b:?}")));
                     }
                     let batch: i64 = a[..a.len() - 2].iter().product();
                     let heads = ((batch / a[0].max(1)) as u32).max(1);
@@ -2124,11 +2127,7 @@ impl VulkanSession {
                         .u(nn)
                         .u(batch as u32)
                         .u(heads);
-                    return Ok(vec![(
-                        "n_attn_mm",
-                        pb,
-                        [1, (batch as u32 * m).max(1), 1],
-                    )]);
+                    return Ok(vec![("n_attn_mm", pb, [1, (batch as u32 * m).max(1), 1])]);
                 }
                 if b.len() != 2 {
                     return Err(Error::Graph(format!("MatMul B 需 2D [K,N]，实得 {b:?}")));
@@ -2365,11 +2364,7 @@ impl VulkanSession {
                     let mut ds = pre;
                     ds.push(("n_elem", pb, [div256(a_words / 4), 1, 1]));
                     Ok(ds)
-                } else if a.len() == 3
-                    && b.len() == 3
-                    && b[2] == 1
-                    && b[0] == a[0]
-                    && b[1] == a[1]
+                } else if a.len() == 3 && b.len() == 3 && b[2] == 1 && b[0] == a[0] && b[1] == a[1]
                 {
                     // rank-3 行向量广播（LN 链的 x-mean、x/std）：b 是
                     // [B,T,1] → 存储 [rows,4]（lane0 有效），行内 4 通道
@@ -2537,11 +2532,7 @@ impl VulkanSession {
                         .f(0.0)
                         .f(0.0)
                         .u(rows); // 门单行
-                    return Ok(vec![(
-                        "n_channel",
-                        pb,
-                        [div256(rows * cpad / 4), 1, 1],
-                    )]);
+                    return Ok(vec![("n_channel", pb, [div256(rows * cpad / 4), 1, 1])]);
                 }
                 let a_words = super::nhwc::nhwc_words(&fs);
                 let cp = cpad4(fs[1]);
@@ -2575,8 +2566,7 @@ impl VulkanSession {
                                 &self.initializers,
                                 &n.inputs[1],
                             );
-                            g_off =
-                                orient4(layout, &mut pre, g_off, &gate_shape, s, t, lin, lin0)?;
+                            g_off = orient4(layout, &mut pre, g_off, &gate_shape, s, t, lin, lin0)?;
                         }
                         let r_shape = shape_of(&n.inputs[2]);
                         {
@@ -3182,6 +3172,7 @@ fn linear_by_producer(
 /// **不看 rc 数值等价**（C==W 时两序 rc 相同但字节互为方阵转置≠恒等，
 /// small T=120=C 曾静默搅拌整图）。不可中转的组合显式报错（不静默
 /// 搅拌）。仅支持 C%4==0：pad 通道的零填充中转不覆盖，宁可拒绝。
+#[allow(clippy::too_many_arguments)]
 fn orient4(
     layout: &mut Layout,
     pre: &mut Vec<(&'static str, ParamBlock, [u32; 3])>,
@@ -3358,11 +3349,7 @@ impl DeviceSession for VulkanSession {
         // 只付一次；右侧零填充的额外计算远小于重建税。
         // 例外：无注意力 mask 的模型（exact_width）填充会改真步输出
         // （非「额外计算」而是「错值」）——退精确宽，重建税交给计划缓存。
-        if self.exact_width {
-            1
-        } else {
-            64
-        }
+        if self.exact_width { 1 } else { 64 }
     }
 
     fn batch_grain(&self) -> i32 {
@@ -3412,10 +3399,9 @@ fn prof_print_with(ctx: &Arc<super::Inner>, plan: &Plan, pool: vk::QueryPool, wa
     let n = plan.recs.len();
     let mut stamps = vec![0u64; n + 1];
     // SAFETY: pool 归本计划且提交已等完信号；data 切片长度即查询数。
-    let ok = unsafe {
-        dev.get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64)
-    }
-    .is_ok();
+    let ok =
+        unsafe { dev.get_query_pool_results(pool, 0, &mut stamps, vk::QueryResultFlags::TYPE_64) }
+            .is_ok();
     if !ok {
         eprintln!("[gpu][prof] 时间戳查询不可用（查询未完成？）");
         return;
@@ -3472,8 +3458,7 @@ fn prof_print_with(ctx: &Arc<super::Inner>, plan: &Plan, pool: vk::QueryPool, wa
             sh.join(" × "),
         );
     }
-    }
-
+}
 
 /// 执行的后半段（run / deferred::complete 共用）：等信号后按真实行数
 /// 拷出图输出（含 clflush 读回屏障与补齐缩行）。
@@ -3738,7 +3723,7 @@ mod tests {
         eprintln!("[gpu] CPU 值域 [{cpu_min:.4},{cpu_max:.4}] mean={cpu_mean:.4} >0.2: {cpu_hi}");
         // 验收口径：mean 反映整体数值健康（逐层 fma/累加序差异的传播），
         // max 允许 sigmoid 斜坡处的极值放大（det_thresh=0.2 附近的框边界
-        // 翻转由 verify.py 的字符级对拍判定，不在这里卡死）。
+        // 翻转由端到端字符级对拍判定，不在这里卡死）。
         assert!(mean_abs < 1e-3, "概率图均值偏差超容差: {mean_abs}");
         assert!(max_abs < 5e-2, "概率图极值偏差超容差: {max_abs}");
     }
