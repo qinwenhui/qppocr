@@ -75,9 +75,10 @@ models/
 重导出模型用 `EngineBuilder::verify_sha256(false)` 跳过。字典查找顺序：
 `{tier}/dict.txt` → `dict.txt` → `ppocr_keys.txt` → rec 内嵌。
 
-## 性能与精度（16 逻辑核桌面机实测，多轮交错取中位）
+## 性能与精度（CPU 路径，16 逻辑核桌面机实测，多轮交错取中位）
 
-单机实测（16 逻辑核、100 图语料、同进程热态、多轮取中位）：
+单机实测（CPU 路径；16 逻辑核、100 图语料、同进程热态、多轮取中位。
+GPU 后端见下文，不在本表）：
 
 | | tiny | small |
 |---|---|---|
@@ -114,7 +115,8 @@ models/
 ## CLI
 
 ```bash
-cargo install --path crates/qppocr-cli
+cargo install --path crates/qppocr-cli                      # CPU（默认）
+cargo install --path crates/qppocr-cli --features qppocr/gpu # + Vulkan GPU
 qppocr img.png --tier small --json        # 单图（--json 含九项分阶段耗时）
 qppocr *.jpg --workers 8                  # 批量：进程扇出，自动分图
 qppocr bench *.jpg --tier small           # 基准：同进程全语料、交错取中位，
@@ -130,11 +132,18 @@ qppocr bench *.jpg --sweep preset=base,speed   # 用自己的图集扫一个轴
 feature 编译）。环境变量 `QPPOCR_THREADS` 等价 `--threads`；
 `QPPOCR_PROF=1` 输出逐算子耗时剖析。
 
+`bench` 子命令把测量纪律内建：同进程跑完整语料（不逐图起进程）、
+1 轮 warmup 丢弃、多配置**逐轮交错**后取中位——配置间受同样的热态与
+频率影响，比值才是配置差异。`--sweep` 支持 `preset / rec-height /
+threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给的
+基准配置。默认值只是我们的参考环境（x86 桌面机、商品图语料）上的
+折中，建议拿自己的机器和图源量一量再定。
+
 ## GPU 后端（Vulkan，feature `gpu`）
 
-`cargo add qppocr --features gpu` 后，`--device gpu` 或
-`EngineBuilder::device(DeviceChoice::gpu())` 启用。整图在装载期编译成
-一条可复用命令缓冲（形状推理、区域布局、权重重排全部预排），运行时
+`cargo add qppocr --features gpu` 后，`--device gpu`（多卡可选
+`--device vulkan:N`）或 `EngineBuilder::device(DeviceChoice::gpu())`
+启用。整图在装载期编译成一条可复用命令缓冲（形状推理、区域布局、权重重排全部预排），运行时
 一次提交；同形状的识别行自动合批。
 
 - **精度**：与 CPU 路径在评测语料上逐字符一致。算术内核与 CPU 参考
@@ -148,13 +157,6 @@ feature 编译）。环境变量 `QPPOCR_THREADS` 等价 `--threads`；
 - 开发与验证在 Intel Arc 核显（Vulkan 1.4）上完成；其它 GPU 未测试，
   欢迎报告。
 
-`bench` 子命令把测量纪律内建：同进程跑完整语料（不逐图起进程）、
-1 轮 warmup 丢弃、多配置**逐轮交错**后取中位——配置间受同样的热态与
-频率影响，比值才是配置差异。`--sweep` 支持 `preset / rec-height /
-threads / rec-shards` 四个轴，值可用 `base` 引用命令行给的基准配置。
-默认值只是我们的参考环境（x86 桌面机、商品图语料）上的折中，建议拿
-自己的机器和图源量一量再定。
-
 ## 已知限制（如实）
 
 - `medium` 档**未跑过精度基准**（能跑通，单图约 1.7 s）；预设值系从
@@ -163,6 +165,8 @@ threads / rec-shards` 四个轴，值可用 `base` 引用命令行给的基准�
   约 1/100 概率出现 ≤1 ulp 级的 box 微差（聚合指标不变）。同会话固定
   线程数即稳定。
 - `Advanced` 的 29 项常数**无稳定性承诺**，小版本可能变。
+- GPU 路径：首次遇到新形状要一次性构建执行计划——形状多样的冷进程
+  首图会比 CPU 慢（后续同形状零构建）；识别行按宽度分桶复用计划。
 - WASM/嵌入式：`--no-default-features` 单线程构建可用；七组 feature
   组合在 CI 矩阵内。
 
