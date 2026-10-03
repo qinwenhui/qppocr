@@ -1,0 +1,19 @@
+// 融合 SE（sigmoid 型）：out = a * sigmoid(g[C])。
+// 原图是 Sigmoid(gate[1,C,1,1]) → Mul(feature) 两个节点 + 一整趟
+// NCHW 读写；融合后 sigmoid 只算 C 个门、特征图读一次写一次。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(push_constant) uniform PC {
+    uint a_off; uint g_off; uint out_off;
+    uint hw; uint c;
+} pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint ch = gl_GlobalInvocationID.y;
+    uint n = gl_GlobalInvocationID.z;
+    if (j >= pc.hw) return;
+    uint base = n * pc.c * pc.hw + ch * pc.hw + j;
+    float g = data[pc.g_off + ch];
+    data[pc.out_off + base] = data[pc.a_off + base] * (1.0 / (1.0 + exp(-g)));
+}

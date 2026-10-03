@@ -1,0 +1,73 @@
+// 1x1 conv 的 GEMM：C[M,HW] = A[M,Ci] × B[Ci,HW]。
+// NCHW 输入在 N=1 时天然 [Ci,HW]——零重排直做 GEMM。
+// 朴素版（每线程 1 输出）：实测在此 GPU 上最优。
+//
+// 实验记录（Intel Arc）：
+// - 共享内存 16×16 tile：单 WG 5/5 稳定、多 WG 随机失败（Intel 驱动
+//   OpControlBarrier 并发 workgroup bug；barrier patch 经单 WG 验证正确）
+// - 2×2 寄存器分块：与朴素等速（瓶颈不在带宽）
+// - 4×4 寄存器分块：更慢（16 累加器寄存器压力 → occupancy 降）
+// - NHWC：与 NCHW 完全等速（L2 预取已处理步长）
+// - fp16：1.65x（另见 conv_gemm_f16.comp）
+//
+// 适用：kh=kw=1, sh=sw=1, ph=pw=0, group=1, N=1。
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+float erf1(float x) {
+    float ax = abs(x);
+    float t = 1.0 / fma(0.3275911, ax, 1.0);
+    float p = 1.0614054;
+    p = fma(p, t, -1.453152027);
+    p = fma(p, t, 1.421413741);
+    p = fma(p, t, -0.284496736);
+    p = fma(p, t, 0.2548296);
+    p *= t;
+    float xx = clamp(-ax * ax, -88.0, 88.0);
+    float kf = roundEven(xx * 1.44695);
+    float r = fma(-kf, 0.6931472, xx);
+    r = fma(-kf, -2.9802322e-8, r);
+    float q = 1.0 / 720.0;
+    q = fma(q, r, 1.0 / 120.0);
+    q = fma(q, r, 1.0 / 24.0);
+    q = fma(q, r, 1.0 / 6.0);
+    q = fma(q, r, 0.5);
+    q = fma(q, r, 1.0);
+    q = fma(q, r, 1.0);
+    float e = uintBitsToFloat(uint(int(kf) + 127) << 23) * q;
+    float res = fma(-p, e, 1.0);
+    return uintBitsToFloat(floatBitsToUint(res) | (floatBitsToUint(x) & 0x80000000u));
+}
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1];
+    uint b_off = params[P + 2], r_off = params[P + 3], out_off = params[P + 4];
+    uint Ci = params[P + 6];
+    uint M = params[P + 9];
+    uint HW = params[P + 21];
+    uint act = params[P + 17];
+    float c1 = uintBitsToFloat(params[P + 18]);
+    float c2 = uintBitsToFloat(params[P + 19]);
+    float c3 = uintBitsToFloat(params[P + 20]);
+
+    uint gm = gl_GlobalInvocationID.y;
+    uint gn = gl_GlobalInvocationID.x;
+    if (gm >= M || gn >= HW) return;
+
+    float acc = 0.0;
+    for (uint k = 0; k < Ci; k++) {
+        acc = fma(data[w_off + gm * Ci + k], data[in_off + k * HW + gn], acc);
+    }
+
+    if (b_off != NONE) acc += data[b_off + gm];
+    if (act == 2) acc = max(acc, 0.0);
+    else if (act == 1) { float inv = 1.0/c1; acc = c3 * acc * (erf1(acc * inv) + c2); }
+    if (r_off != NONE) acc += data[r_off + gm * HW + gn];
+    data[out_off + gm * HW + gn] = acc;
+}

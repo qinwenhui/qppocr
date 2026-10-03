@@ -1,0 +1,37 @@
+// 通道拼接（axis=1，NCHW）：det FPN neck 的两处 Concat。
+// params：[out_off, n, h, w, n_in, c_total, 0, 0, 然后每输入 {src_off, c_len}]
+// 输入 k 的布局是 [n, c_len_k, h, w]（各自的通道维，不是 c_total）。
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+void main() {
+    uint P = pc.p_off;
+    uint out_off = params[P + 0];
+    uint n = params[P + 1], h = params[P + 2], w = params[P + 3];
+    uint n_in = params[P + 4], c_total = params[P + 5];
+    uint hw = h * w;
+
+    uint j = gl_GlobalInvocationID.x;   // w 内
+    uint y = gl_GlobalInvocationID.y;   // h 内
+    uint nc = gl_GlobalInvocationID.z;  // n * c_total
+    if (j >= w || y >= h) return;
+    uint bn = nc / c_total;
+    uint cout = nc % c_total;
+
+    uint acc_c = 0u, src = 0u, c_in = 0u, clen = 0u;
+    for (uint k = 0; k < n_in; k++) {
+        uint len = params[P + 8 + k * 2 + 1];
+        if (cout < acc_c + len) {
+            src = params[P + 8 + k * 2];
+            c_in = cout - acc_c;
+            clen = len;
+            break;
+        }
+        acc_c += len;
+    }
+    data[out_off + nc * hw + y * w + j] =
+        data[src + (bn * clen + c_in) * hw + y * w + j];
+}

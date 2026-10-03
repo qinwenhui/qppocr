@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # 内核单元测试是自包含的：不需要模型、不需要语料。
+      - run: cargo build --workspace --all-targets
+      - run: cargo test --workspace
+      - run: cargo clippy --workspace --all-targets
+
+  aarch64-qemu:
+    # linux-arm64 的持续验证：交叉编译 + QEMU 用户态执行。bitexact 在
+    # aarch64 上自动选 NEON 侧，NEON↔标量逐位对拍不依赖 Apple 硬件。
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: qemu-aarch64 -L /usr/aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml 钉的是具体版本：target 必须装进「文件选中的
+      # 那条」工具链——action 的 targets: 输入只装到 stable，二者不一致
+      # 就是 E0463。裸 rustup target add 遵守工具链文件的目录覆盖。
+      - run: rustup target add aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user gcc-aarch64-linux-gnu
+      # 模拟执行比原生慢一个数量级：只跑内核测试（bitexact 是 NEON 的
+      # 关键验证）；全 workspace 测试留给三平台原生 job。
+      - run: cargo test -p qppocr-kernels --target aarch64-unknown-linux-gnu
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace --lib
+
+  feature-matrix:
+    # 公开门面的 feature 组合矩阵（v0.1.0 前的教训：无门控 re-export 让
+    # default-features=false 编不过，CI 没覆盖到就带了出去）
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "std"
+          - "std,parallel"
+          - "image-decode"
+          - "std,parallel,image-decode"
+          - "serde,std"
+          - "serde,std,parallel,image-decode"
+          # GPU 后端：ash 用 loaded 加载器，无 Vulkan SDK 的 runner 可编译；
+          # 运行时枚举为空 → 测试自动 skip（真机验证在开发机的 Arc 上）。
+          - "gpu"
+          - "std,parallel,image-decode,gpu-cuda"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p qppocr --no-default-features ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
+      - run: cargo build -p qppocr-kernels --no-default-features
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

@@ -1,0 +1,41 @@
+// 2D 转置（rec 的 Transpose perm=(0,2,1)：存储 [R,C] → [C,R]）。
+// 每 WG 处理 32×32 tile：协作装 shared 再转置写出——两端合并访存。
+//   params: in_off, out_off, r, c（in = r 行 × c 列，out = c × r）
+#version 450
+layout(local_size_x = 32, local_size_y = 8) in;
+layout(std430, binding = 0) buffer F32 { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+shared float tile[32][33]; // +1 列防共享内存银行冲突
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint r = params[P + 2], c = params[P + 3];
+
+    uint tx = gl_LocalInvocationID.x; // 列方向（每线程 4 列）
+    uint ty = gl_LocalInvocationID.y; // 行方向（每线程 4 行）
+    uint x0 = gl_WorkGroupID.x * 32u + tx * 4u;
+    uint y0 = gl_WorkGroupID.y * 32u + ty * 4u;
+
+    for (uint dy = 0u; dy < 4u; dy++) {
+        uint y = y0 + dy;
+        for (uint dx = 0u; dx < 4u; dx++) {
+            uint x = x0 + dx;
+            tile[ty * 4u + dy][tx * 4u + dx] =
+                (y < r && x < c) ? data[in_off + y * c + x] : 0.0;
+        }
+    }
+    barrier();
+    // out[x][y] = in[y][x]
+    for (uint dy = 0u; dy < 4u; dy++) {
+        uint y = y0 + dy;
+        for (uint dx = 0u; dx < 4u; dx++) {
+            uint x = x0 + dx;
+            if (x < c && y < r) {
+                data[out_off + x * r + y] = tile[tx * 4u + dx][ty * 4u + dy];
+            }
+        }
+    }
+}
