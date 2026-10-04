@@ -17,9 +17,9 @@ vulkan = ["dep:ash"]
 cuda = ["dep:libloading"]
 
 [dependencies]
-qppocr-core = { path = "../qppocr-core", version = "0.3.0" }
+qppocr-core = { path = "../qppocr-core", version = "0.3.1" }
 # session 的输出张量构造（F32Buf）——运行时依赖，非仅测试
-qppocr-kernels = { path = "../qppocr-kernels", version = "0.3.0" }
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.3.1" }
 # 锁 minor：ash 升级走独立 PR（raw 指针面全封在本 crate 的 vulkan 模块内）
 ash = { version = "~0.38", optional = true, features = ["loaded", "debug"] }
 libloading = { version = "0.8", optional = true }
@@ -29,4 +29,4 @@ workspace = true
 
 [dev-dependencies]
 # tests/plan.rs 构造 Tensor 输入用（F32Buf）
-qppocr-kernels = { path = "../qppocr-kernels", version = "0.3.0" }
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.3.1" }

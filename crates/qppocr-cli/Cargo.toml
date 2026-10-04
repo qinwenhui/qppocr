@@ -14,7 +14,7 @@ name = "qppocr"
 path = "src/main.rs"
 
 [dependencies]
-qppocr = { path = "../qppocr", version = "0.3.0" }
+qppocr = { path = "../qppocr", version = "0.3.1" }
 
 [lints]
 workspace = true
