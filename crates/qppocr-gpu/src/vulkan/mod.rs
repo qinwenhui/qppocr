@@ -374,8 +374,11 @@ impl DeviceContext for VulkanContext {
         // 动态 B MatMul = 注意力头（QK^T/scores×V，B 是运行期张量）。
         // 无注意力 mask 的模型对桶宽右零填充**不 invariant**（填充步经
         // 注意力混入真步概率；CPU 实证 small GT 932/1036 掉 46 行，
-        // small_rec_padding_invariance 守卫）——退精确宽。纯卷积 rec
-        // （tiny）实证填充不变，维持 64 桶。
+        // small_rec_padding_invariance 守卫）——退精确宽（bucket_grain=1）。
+        // 纯卷积 rec（tiny）实证填充不变，维持 64 桶。
+        // 显式选择 GPU 即全 GPU：不做基于单机性能数据的默认降级——
+        // 什么设备上跑得快慢由使用者自己判断（曾按本机 1.9× 慢的实测
+        // 默认退 CPU，已撤：本机结论不该变成全局行为）。
         let exact_width = opts.model == qppocr_core::device::ModelRole::Rec
             && graph.nodes.iter().any(|n| {
                 n.op_type == "MatMul"
@@ -383,20 +386,6 @@ impl DeviceContext for VulkanContext {
                         .get(1)
                         .is_some_and(|b| !initializers.contains_key(b))
             });
-        // 注意力 rec 虽然值正确（0 分歧对拍 + 输出闸门），但精确宽的形状
-        // 税 + 168 dispatch/批使其**无性能赢面**（本机实测 422 vs 227
-        // ms/图，1.9× 慢）——默认退 CPU 保住 GT 978 逐位与速度。
-        // QPPOCR_GPU_FORCE_REC=1 强制放行（内核资产为后续优化保留）。
-        if exact_width && std::env::var_os("QPPOCR_GPU_FORCE_REC").is_none() {
-            eprintln!(
-                "[gpu] 注意力 rec（exact_width）：GPU 无性能赢面（实测 1.9× 慢于 CPU），\
-                 rec 走 CPU 会话（QPPOCR_GPU_FORCE_REC=1 强制上 GPU）"
-            );
-            return Ok(Arc::new(qppocr_core::executor::Session::from_parts(
-                graph,
-                initializers,
-            )));
-        }
         let mut session = session::VulkanSession::new(self.inner.clone(), graph, initializers)?;
         if opts.model == qppocr_core::device::ModelRole::Rec {
             if let Err(e) = session.probe(&[1, 3, 48, 64]) {
