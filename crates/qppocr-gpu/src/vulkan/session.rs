@@ -916,9 +916,7 @@ impl VulkanSession {
                         .lock()
                         .map_err(|_| Error::Device("重排缓存锁中毒".into()))?
                         .entry(format!("init:{name}"))
-                        .or_insert_with(|| {
-                            std::sync::Arc::new(super::nhwc::init_to_nhwc(t))
-                        }),
+                        .or_insert_with(|| std::sync::Arc::new(super::nhwc::init_to_nhwc(t))),
                 )
             };
             let off = layout.alloc_static(words.len() as u32);

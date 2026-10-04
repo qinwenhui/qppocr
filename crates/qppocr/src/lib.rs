@@ -127,6 +127,17 @@ pub enum DeviceChoice {
     },
 }
 
+impl DeviceChoice {
+    /// GPU（自动选 API、第一个可用设备）——等价
+    /// `Gpu { api: GpuApi::Auto, index: None }`，与 CLI `--device gpu` 同义。
+    pub fn gpu() -> Self {
+        DeviceChoice::Gpu {
+            api: GpuApi::Auto,
+            index: None,
+        }
+    }
+}
+
 /// GPU API 选择。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GpuApi {
@@ -746,6 +757,20 @@ mod tests {
     /// 0.2.0 宣称「默认关闭」，但 core 默认值是 0.85、Balanced 预设又
     /// 不清零——发布版实际默认开启，两个版本后才被发现。声明过的
     /// 默认行为一律进这条测试（「声明 = 断言」）。
+    /// README「`DeviceChoice::gpu()` 与 CLI `--device gpu` 同义」的
+    /// 声明锚点：便捷构造必须展开为 Auto + 第一个设备。
+    #[test]
+    fn device_choice_gpu_matches_cli() {
+        assert_eq!(
+            DeviceChoice::gpu(),
+            DeviceChoice::Gpu {
+                api: GpuApi::Auto,
+                index: None,
+            }
+        );
+        assert_eq!(DeviceChoice::default(), DeviceChoice::Cpu);
+    }
+
     #[test]
     fn preset_contract_matches_docs() {
         let cases = [
