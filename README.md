@@ -184,7 +184,7 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
 
 ## 相关项目
 
-- **[qpp-ocr](https://github.com/qinwenhui/qpp-ocr)** —— 基于本引擎的
+- **[qpp-studio](https://github.com/qinwenhui/qpp-studio)** —— 基于本引擎的
   桌面门面软件（开箱即用的图形界面）。
 
 ## License
