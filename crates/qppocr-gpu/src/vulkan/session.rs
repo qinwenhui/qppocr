@@ -79,7 +79,9 @@ struct Plan {
     /// 的 Drop 中途或裸测试构造。
     ks: Option<KernelSet>,
     /// 会话池句柄（Drop 归还用）。
-    pool: std::sync::Arc<Mutex<Vec<(Arena, KernelSet)>>>,
+    pool: std::sync::Arc<Mutex<Vec<(Arena, KernelSet, u64)>>>,
+    /// 归池图标记（复用对判权重段可否跳过）。
+    graph_id: u64,
     /// 查询池销毁用的设备句柄（drop 序：先于 ctx 释放）。
     _dev: ash::Device,
 }
@@ -96,7 +98,7 @@ impl Drop for Plan {
         // （会话级灾难）也照常归还——into_inner 取数据继续。
         if let (Some(a), Some(ks)) = (self.arena.take(), self.ks.take()) {
             let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-            pool.push((a, ks));
+            pool.push((a, ks, self.graph_id));
             if pool.len() > 2 {
                 // 淘汰容量最小的（封顶 2 对：引擎 deferred 流水把计划
                 // Arc 存活拉到下一图之后——池深 1 在 img k+1 建计划时
@@ -290,6 +292,8 @@ fn shape_of(table: &planner::ShapeTable, name: &str) -> Vec<i64> {
         .unwrap_or_default()
 }
 
+static NEXT_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// 一个形状的计划槽：primary + 可选影子（同形状双批在飞时分流）。
 struct PlanSlot {
     shape: Vec<i64>,
@@ -320,6 +324,12 @@ pub(crate) struct VulkanSession {
     /// 会话级权重重排缓存：重排算术（83 层 conv 的 k-major 循环 ~9ms）
     /// 与形状无关——按名缓存，重建只付 memcpy（~1ms）。
     repack_cache: Mutex<HashMap<String, std::sync::Arc<Vec<u32>>>>,
+    /// 输出名 → 节点索引（linear_by_producer 的回溯表；图会话内不变，
+    /// 一次构建。曾用线性 find 逐级回溯 = O(N²)——168 节点的 small 图
+    /// 上节点环被拖到 28ms/形状，是精确宽形状税的主部之一）。
+    producer_idx: std::sync::OnceLock<HashMap<String, usize>>,
+    /// 会话图标记：池复用对判权重段可否跳过（同会话重建=同图）。
+    session_id: u64,
     /// 会话级 **(arena, KernelSet) 成对池**：计划 Drop（最后引用释放 =
     /// 无在飞 CB）时归还两件套，新形状 reset 复用（容量够时）。137MB 新
     /// 块页提交 ~7ms vs 复用 ~0；KernelSet 绑定 arena 的块缓冲（reset 不
@@ -328,7 +338,7 @@ pub(crate) struct VulkanSession {
     /// Arc 共享给 Plan：**归池在 Drop 而非驱逐时**——deferred 流水下驱逐
     /// 刻旧计划 Arc 常在飞（get_mut 失败），驱逐路径归池曾大量失效
     /// （实测每图仍 17ms 新建）。池封顶 2 对（按容量留大——deferred 流水深度 2，见 Drop 归池注释）。
-    arena_pool: std::sync::Arc<Mutex<Vec<(Arena, KernelSet)>>>,
+    arena_pool: std::sync::Arc<Mutex<Vec<(Arena, KernelSet, u64)>>>,
     /// 批维补齐粒度（rec 会话=8，其余 1）：run() 把输入批维向上取整到
     /// 该值建计划，空行由内核 real_n 早退守卫零算力——(bsz,W) 形状塌缩
     /// 成 (grain,W桶)，计划全命中。与 `DeviceSession::batch_grain` 同源
@@ -392,6 +402,8 @@ impl VulkanSession {
             plans: Mutex::new(Vec::new()),
             pipeline_cache,
             repack_cache: Mutex::new(HashMap::new()),
+            producer_idx: std::sync::OnceLock::new(),
+            session_id: NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             arena_pool: std::sync::Arc::new(Mutex::new(Vec::new())),
             batch_grain: 1,
             exact_width: false,
@@ -853,6 +865,9 @@ impl VulkanSession {
         // 权重**永不释放**：命令缓冲每次重放都读它，区域复用=数据被覆盖。
         // 统一 word 上传：f32 数据按位转 u32。
         let mut upload: Vec<(u32, Vec<u32>)> = Vec::new();
+        // init 直传权重单独收集：复用同图 arena 对时整段跳过（静态权重
+        // 区布局与内容只依赖图，与形状无关——激活/参数偏移才随形状）。
+        let mut upload_init: Vec<(u32, std::sync::Arc<Vec<u32>>)> = Vec::new();
         // real_n 单元（arena 第 0 词）：本次 run 的真实批维行数，run() 每
         // 次提交前主机直写；n_ 内核读 params[0] 做批维早退——批维补齐
         // （batch_grain）后空行工作组零算力。必须**最先**分配：内核按
@@ -889,15 +904,27 @@ impl VulkanSession {
             if conv_w_names.contains(name) {
                 continue; // conv 权重/bias 惰性重排（map_node_n）
             }
-            let words: Vec<u32> = if f32_mode {
-                t.f32.iter().map(|f| f.to_bits()).collect()
+            // 转换进会话级缓存（与 conv 权重重排同款）：非 conv 权重可
+            // 巨大（small rec 的分类器矩阵 4.5M 元素）——曾每计划重算
+            // to_bits/to_nhwc，是精确宽形状税的主部（节点环外预告环
+            // ~17ms/形状）。
+            let words: std::sync::Arc<Vec<u32>> = if f32_mode {
+                std::sync::Arc::new(t.f32.iter().map(|f| f.to_bits()).collect())
             } else {
-                super::nhwc::init_to_nhwc(t)
+                std::sync::Arc::clone(
+                    self.repack_cache
+                        .lock()
+                        .map_err(|_| Error::Device("重排缓存锁中毒".into()))?
+                        .entry(format!("init:{name}"))
+                        .or_insert_with(|| {
+                            std::sync::Arc::new(super::nhwc::init_to_nhwc(t))
+                        }),
+                )
             };
             let off = layout.alloc_static(words.len() as u32);
             ledger.push((format!("w:{name}"), off, words.len() as u32));
             offs.insert(name.clone(), off);
-            upload.push((off, words));
+            upload_init.push((off, words));
         }
 
         struct Rec {
@@ -957,11 +984,6 @@ impl VulkanSession {
         // + 独立门 dispatch）。融合掉的节点记入 skip 集。
         // n_ 模式默认开（n_channel 内核原生支持）；QPPOCR_GPU_NO_SE 关。
         let mut fused = std::collections::HashSet::new(); // 被融合掉的节点名
-        let se_fusion_on = if f32_mode {
-            std::env::var_os("QPPOCR_GPU_SE_FUSION").is_some()
-        } else {
-            std::env::var_os("QPPOCR_GPU_NO_SE").is_none()
-        };
         // n_ 模式：conv 族权重的惰性重排区（名 → 偏移，防共享权重重排两份）
         let mut w_offs: HashMap<String, u32> = HashMap::new();
         // n_ 模式：SE 归约的两阶段共享 scratch（f32 words，按最大块需求开一份）
@@ -1014,6 +1036,10 @@ impl VulkanSession {
             let (nr, cr) = (ish[0] * ish[2] * ish[3], super::nhwc::cpad4(ish[1]));
             rc.insert(self.input_name.clone(), (nr as u32, cr));
         }
+        // env 查询环外一次（Windows 上 var_os 是系统调用级开销，预环内
+        // 每节点 2 次曾吃掉节点环的显著份额）
+        let se_env = std::env::var_os("QPPOCR_GPU_SE_FUSION").is_some()
+            && std::env::var_os("QPPOCR_GPU_NO_SE").is_none();
         for i in 0..self.graph.nodes.len() {
             let n = &self.graph.nodes[i];
             if n.op_type != "HardSigmoid" && n.op_type != "Sigmoid" {
@@ -1047,7 +1073,7 @@ impl VulkanSession {
                 continue;
             }
             // 融合：HardSigmoid/Sigmoid 节点标记为跳过
-            if se_fusion_on {
+            if se_env {
                 fused.insert(n.name.clone());
                 eprintln!("[gpu] SE 融合: {} → {} (fused)", n.name, mul.name);
             }
@@ -1172,6 +1198,7 @@ impl VulkanSession {
                     &self.input_name,
                     f32_mode,
                     &rc,
+                    dbg_env,
                 );
                 continue;
             }
@@ -1322,6 +1349,7 @@ impl VulkanSession {
                 &self.input_name,
                 f32_mode,
                 &rc,
+                dbg_env,
             );
         }
 
@@ -1329,7 +1357,7 @@ impl VulkanSession {
             eprintln!(
                 "[gpu][dbg] 节点环 {:.1} ms（其中 map_node_n {:.1}）",
                 t_node0.elapsed().as_secs_f64() * 1000.0,
-                t_map_acc * 1000.0
+                t_map_acc
             );
         }
         // n_ 模式：exit 转换（每个图输出一条；sigmoid 融合的在节点环里挂单）。
@@ -1462,7 +1490,8 @@ impl VulkanSession {
         // 池里找容量够的 (arena, KernelSet) 对 reset 复用；没有再新建。
         // 复用对的 KernelSet 绑定即 arena 块缓冲（reset 不换缓冲），免整套
         // DSL/描述符池/管线重建（实测 2-10ms → ~0）。
-        let (arena, ks, whole) = {
+        let graph_id = self.session_id;
+        let (arena, ks, whole, warm_weights) = {
             let mut pool = self
                 .arena_pool
                 .lock()
@@ -1481,9 +1510,10 @@ impl VulkanSession {
             }
             match hit {
                 Some(i) => {
-                    let (mut a, ks) = pool.swap_remove(i);
+                    let (mut a, ks, gid) = pool.swap_remove(i);
                     let whole = alloc_whole(&mut a)?;
-                    (a, ks, whole)
+                    let warm = gid == graph_id;
+                    (a, ks, whole, warm)
                 }
                 None => {
                     let mut a = Arena::new(
@@ -1501,7 +1531,7 @@ impl VulkanSession {
                         buf_size,
                         self.pipeline_cache,
                     )?;
-                    (a, ks, whole)
+                    (a, ks, whole, false)
                 }
             }
         };
@@ -1523,6 +1553,14 @@ impl VulkanSession {
                 layout.total
             );
         }
+        for (off, data) in &upload_init {
+            assert!(
+                off + data.len() as u32 <= layout.total,
+                "静态上传越界: {off}+{} > {}",
+                data.len(),
+                layout.total
+            );
+        }
         // SAFETY: whole 是整块持久映射；off+len ≤ total。
         unsafe {
             for (off, data) in &upload {
@@ -1531,6 +1569,15 @@ impl VulkanSession {
                     whole.ptr.add(*off as usize * 4) as *mut u32,
                     data.len(),
                 );
+            }
+            if !warm_weights {
+                for (off, data) in &upload_init {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        whole.ptr.add(*off as usize * 4) as *mut u32,
+                        data.len(),
+                    );
+                }
             }
             for (p_off, words) in &params {
                 std::ptr::copy_nonoverlapping(
@@ -1701,6 +1748,7 @@ impl VulkanSession {
             qpool,
             ks: Some(ks),
             pool: std::sync::Arc::clone(&self.arena_pool),
+            graph_id,
             _dev: dev.clone(),
         })
     }
@@ -1713,6 +1761,18 @@ impl VulkanSession {
     /// （差值 = 主机等待/提交开销）。
     fn prof_print(&self, plan: &Plan, pool: vk::QueryPool, wall_ms: f64) {
         prof_print_with(&self.ctx, plan, pool, wall_ms);
+    }
+
+    /// linear_by_producer 的回溯表（惰性构建一次）。
+    fn producer_idx(&self) -> &HashMap<String, usize> {
+        self.producer_idx.get_or_init(|| {
+            self.graph
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| n.outputs.first().map(|o| (o.clone(), i)))
+                .collect()
+        })
     }
 
     /// n_ 模式的节点 → (内核名, 参数块, dispatch 网格)。
@@ -2339,6 +2399,7 @@ impl VulkanSession {
                         let s = rc.get(&n.inputs[1]).copied().unwrap_or(t);
                         let lin = linear_by_producer(
                             &self.graph,
+                            self.producer_idx(),
                             table,
                             rc,
                             &self.initializers,
@@ -2346,6 +2407,7 @@ impl VulkanSession {
                         );
                         let lin0 = linear_by_producer(
                             &self.graph,
+                            self.producer_idx(),
                             table,
                             rc,
                             &self.initializers,
@@ -2552,6 +2614,7 @@ impl VulkanSession {
                     if let Some(t) = base_rc {
                         let lin0 = linear_by_producer(
                             &self.graph,
+                            self.producer_idx(),
                             table,
                             rc,
                             &self.initializers,
@@ -2561,6 +2624,7 @@ impl VulkanSession {
                             let s = rc.get(&n.inputs[1]).copied().unwrap_or(t);
                             let lin = linear_by_producer(
                                 &self.graph,
+                                self.producer_idx(),
                                 table,
                                 rc,
                                 &self.initializers,
@@ -2573,6 +2637,7 @@ impl VulkanSession {
                             let s = rc.get(&n.inputs[2]).copied().unwrap_or(t);
                             let lin = linear_by_producer(
                                 &self.graph,
+                                self.producer_idx(),
                                 table,
                                 rc,
                                 &self.initializers,
@@ -3117,17 +3182,20 @@ impl VulkanSession {
 /// 曾静默搅拌整图）。
 fn linear_by_producer(
     graph: &Graph,
+    node_idx: &HashMap<String, usize>,
     table: &planner::ShapeTable,
     rc: &HashMap<String, (u32, u32)>,
     initializers: &HashMap<String, Tensor>,
     name: &str,
 ) -> Option<bool> {
     let mut cur = name.to_string();
-    for _ in 0..graph.nodes.len() {
-        let n = graph
-            .nodes
-            .iter()
-            .find(|m| m.outputs.first() == Some(&cur))?;
+    let mut hops = 0usize;
+    loop {
+        let n = node_idx.get(&cur).map(|&i| &graph.nodes[i])?;
+        hops += 1;
+        if hops > graph.nodes.len() {
+            return None; // 别名链成环（理论不可能）——按不可判处理
+        }
         match n.op_type.as_str() {
             "Reshape" | "Squeeze" | "Unsqueeze" => {
                 cur = n.inputs[0].clone();
@@ -3162,7 +3230,6 @@ fn linear_by_producer(
             _ => return Some(false),
         }
     }
-    None
 }
 
 /// 逐元素操作数的**存储定向中转**：操作数字节序与基准不一致时（长跳跃
@@ -3348,8 +3415,9 @@ impl DeviceSession for VulkanSession {
         // rec 拖到 2× CPU）。64 桶把语料宽度塌缩到 ~20 个形状，重建
         // 只付一次；右侧零填充的额外计算远小于重建税。
         // 例外：无注意力 mask 的模型（exact_width）填充会改真步输出
-        // （非「额外计算」而是「错值」）——退精确宽，重建税交给计划缓存。
-        if self.exact_width { 1 } else { 64 }
+        // （非「额外计算」而是「错值」）——退小粒度对齐（8px：填充 ≤7，
+        // 注意力混入窗口极小，GT 实测与逐像素精确无差；形状数大减）。
+        if self.exact_width { 8 } else { 64 }
     }
 
     fn batch_grain(&self) -> i32 {
@@ -3553,8 +3621,8 @@ fn release_inputs(
     input_name: &str,
     f32_mode: bool,
     rc_free: &HashMap<String, (u32, u32)>,
+    dbg: bool,
 ) {
-    let dbg = std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some();
     for inn in &n.inputs {
         if inn.is_empty() {
             continue;
