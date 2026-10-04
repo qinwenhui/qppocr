@@ -1,0 +1,11 @@
+// relu：镜像 arch::relu_seg（与标量判据逐位一致——纯比较选择，无舍入）。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(push_constant) uniform PC { uint in_off; uint out_off; uint n; } pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float x = data[pc.in_off + i];
+    data[pc.out_off + i] = x > 0.0 ? x : 0.0;
+}

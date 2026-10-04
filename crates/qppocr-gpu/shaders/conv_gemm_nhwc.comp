@@ -1,0 +1,49 @@
+// 1x1 conv 的 NHWC GEMM：全顺序访问，零跨步。
+//
+// C[gn][gm] = Σ_k B[gn][k] × A[gm][k]
+//   B = input [HW, Ci]（NHWC，每行 = 一个像素的全部通道，连续读）
+//   A = weight [M, Ci]（行主序，同行连续读）
+//   C = output [HW, M]（NHWC，相邻 gm 写相邻地址 = coalesced）
+//
+// 与 NCHW GEMM 的区别：B 从跨通道步长 HW*4B 变为连续 4B——
+// 每个 thread 的 B 读取从 830KB 跨步 × Ci 次变为一条 cache line。
+//
+// dispatch: [M, HW] with local (16, 16)
+// x = gm (M), y = gn (HW) → coalesced write + cache-friendly read
+//
+// act=0/2（无/ReLU）；GELU 后续加。bias 从参数区读。
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1];
+    uint b_off = params[P + 2], r_off = params[P + 3], out_off = params[P + 4];
+    uint Ci = params[P + 6];
+    uint M = params[P + 9];
+    uint HW = params[P + 21];
+    uint act = params[P + 17];
+
+    uint gm = gl_GlobalInvocationID.x;  // M（输出通道）
+    uint gn = gl_GlobalInvocationID.y;  // HW（像素）
+    if (gm >= M || gn >= HW) return;
+
+    // 两个操作数的点积——全顺序读
+    float acc = 0.0;
+    for (uint k = 0; k < Ci; k++) {
+        float b = data[in_off + gn * Ci + k];  // NHWC：像素 gn 的通道 k（连续）
+        float a = data[w_off + gm * Ci + k];   // 权重行 gm 的列 k（连续）
+        acc = fma(a, b, acc);
+    }
+
+    if (b_off != NONE) acc += data[b_off + gm];
+    if (act == 2) acc = max(acc, 0.0);
+
+    // 输出 NHWC [HW, M]：相邻 gm 写相邻地址（coalesced）
+    data[out_off + gn * M + gm] = acc;
+}
