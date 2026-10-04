@@ -182,6 +182,11 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
   `monitor_preset`（监控截图场景完整配方）——目录内另有若干开发用
   诊断脚本（批大小扫描、口径对齐 dump 等）
 
+## 相关项目
+
+- **[qpp-ocr](https://github.com/qinwenhui/qpp-ocr)** —— 基于本引擎的
+  桌面门面软件（开箱即用的图形界面）。
+
 ## License
 
 MIT OR Apache-2.0（下游任选其一遵守即可）。模型权重归 PaddleOCR 上游
