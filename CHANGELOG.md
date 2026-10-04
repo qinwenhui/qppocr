@@ -8,6 +8,11 @@
 
 ## [Unreleased]
 
+### 新增（Added）
+
+- `DeviceChoice::gpu()` 便捷构造（等价 `Gpu { api: Auto, index: None }`，
+  与 CLI `--device gpu` 同义）。
+
 ### 变更（Changed）
 
 - **GPU 路径不再按单机性能数据默认降级**：0.3.0 曾把注意力结构的识别

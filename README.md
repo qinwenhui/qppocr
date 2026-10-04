@@ -34,12 +34,12 @@ ONNX Runtime（一个 C 库：跨平台部署带工具链、有 CVE 跟随、行
 - **透明计时。** 每次结果自带九项分阶段毫秒（det/cls/rec 的前后向与
   后处理）——慢在哪一段，数据说话。
 - **配置三档分层**：`Preset`（Speed/Balanced/Accuracy，整段基准验证）
-  → `Config`（有 semver 承诺的公开项）→ `Advanced`（29 项调参常数，
+  → `Config`（有 semver 承诺的公开项）→ `Advanced`（31 项调参常数，
   明确不承诺稳定）。
 - **`unsafe` 只有一个 crate**（`qppocr-kernels`，GPU 后端另有显式
   标注的 Vulkan 调用层），其余每行编译期安全；内核 crate 零第三方依赖。
 - **可选 GPU 后端（feature `gpu`）**：纯 Rust 写的 Vulkan 计算后端，
-  装载期把整图编译成一条命令缓冲。与 CPU 路径逐字符一致；分级部署、
+  装载期把整图编译成一条命令缓冲。选择 GPU 即 det/cls/rec 全上设备，
   无静默降级（见下）。
 
 ## 模型
@@ -146,15 +146,15 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
 启用。整图在装载期编译成一条可复用命令缓冲（形状推理、区域布局、权重重排全部预排），运行时
 一次提交；同形状的识别行自动合批。
 
-- **精度**：与 CPU 路径在评测语料上逐字符一致。算术内核与 CPU 参考
-  逐位对齐（同一个 exp/erf 多项式、同一 FMA 链）。
+- **精度**：算术内核与 CPU 参考逐位对齐（同一个 exp/erf 多项式、同一
+  FMA 链）；tiny 档在评测语料上与 CPU 逐字符一致。small 档的识别模型
+  含注意力结构，GPU 并行归约与 CPU 顺序求和的浮点末位噪声在近阈值
+  行上可能产生个别字符差异（评测语料 100 图约 12 行）——需要与 CPU
+  完全一致输出的场景请用 CPU 路径。
 - **选择 GPU 即全 GPU**：det/cls/rec 三段全上设备，不做基于性能
   采样的默认降级——在什么硬件上更快，由使用者自己判断。分级开关
   `QPPOCR_GPU_STAGES=all|detrec|det` 供显式混合部署。仅当模型的算子
   超出后端覆盖面时才退回 CPU（stderr 声明，无静默切换）。
-- **精度**：GPU 与 CPU 的差异限于浮点求和顺序带来的末位噪声，在近
-  阈值的识别行上可能产生个别字符级差异（评测语料 100 图约 12 行）。
-  需要与 CPU 完全一致输出的场景请用 CPU 路径。
 - 缓存三级（管线 / 权重重排 / 显存块）+ 按字节预算的计划缓存，控制
   形状多样场景的重建开销。
 - 开发与验证在 Intel Arc 核显（Vulkan 1.4）上完成；其它 GPU 未测试，
@@ -167,7 +167,7 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
 - 位级输出依赖线程数（gemm 分轴规则）：同一图在不同 `--threads` 下
   约 1/100 概率出现 ≤1 ulp 级的 box 微差（聚合指标不变）。同会话固定
   线程数即稳定。
-- `Advanced` 的 29 项常数**无稳定性承诺**，小版本可能变。
+- `Advanced` 的 31 项常数**无稳定性承诺**，小版本可能变。
 - GPU 路径：首次遇到新形状要一次性构建执行计划——形状多样的冷进程
   首图会比 CPU 慢（后续同形状零构建）；识别行按宽度分桶复用计划。
 - WASM/嵌入式：`--no-default-features` 单线程构建可用；七组 feature
@@ -179,7 +179,8 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
 - 可运行示例（`crates/qppocr/examples/`）：`api_smoke`（三行上手）、
   `api_verify`（serde/并发语义断言）、`char_boxes`（逐字坐标几何验证）、
   `retry_flags`（区域重试标记）、`phase_breakdown`（分阶段计时）、
-  `monitor_preset`（监控截图场景完整配方）
+  `monitor_preset`（监控截图场景完整配方）——目录内另有若干开发用
+  诊断脚本（批大小扫描、口径对齐 dump 等）
 
 ## License
 
