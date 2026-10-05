@@ -54,9 +54,27 @@ mod models;
 mod sha256;
 
 pub use qppocr_core::Error as CoreError;
+pub use qppocr_core::device::{DeviceInfo, DeviceKind};
 pub use qppocr_core::pipeline::{Dictionary, OcrResult, TextLine, Timings};
 /// CPU 内核后端探测（AVX2 / NEON / 标量），诊断与基准报告用。
 pub use qppocr_core::{Backend, detect_backend};
+
+/// 枚举本机可用计算设备（GUI 选设备/诊断用）。
+///
+/// 恒含一个 CPU 条目（`DeviceKind::Cpu`，名如 `host (x86_64)`）；
+/// `gpu` feature 编译时再追加检测到的 GPU（Vulkan 在前）。无 GPU
+/// 不是错误——显式 [`DeviceChoice::Gpu`] 才是。
+pub fn list_devices() -> Vec<DeviceInfo> {
+    #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+    let mut out = vec![DeviceInfo {
+        kind: qppocr_core::device::DeviceKind::Cpu,
+        name: format!("host ({})", std::env::consts::ARCH),
+        api: format!("cpu {:?}", detect_backend()).to_lowercase(),
+    }];
+    #[cfg(feature = "gpu")]
+    out.extend(qppocr_gpu::list_devices());
+    out
+}
 
 pub use image::{Image, rgb_from_bytes};
 // 解码 trio 只在 image-decode feature 下存在——不门控这行时，

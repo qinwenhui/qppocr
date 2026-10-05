@@ -1886,6 +1886,38 @@ fn rec_deferred_pipeline() {
     assert_eq!(s1, 0.0, "影子路径 primary 侧不一致");
     assert_eq!(s2, 0.0, "影子路径 shadow 侧不一致");
     eprintln!("[rec][defer] 双计划在飞 + 同计划连发 + 影子并发：与同步逐位一致");
+
+    // **排队**：同形状三条并发在飞（多线程共享 Engine 的官方用法）——
+    // 曾是硬错误（深度 ≤2），现应排队等影子收账后自动放行，三条结果
+    // 都与同步逐位一致。
+    let t_c = mk_input(&mut seed, 704);
+    let out_c_sync =
+        qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name.clone(), t_c.clone())])
+            .unwrap();
+    let gpu_arc = std::sync::Arc::new(gpu);
+    let hs: Vec<_> = [t_c.clone(), t_c.clone(), t_c.clone()]
+        .into_iter()
+        .map(|t| {
+            let g = std::sync::Arc::clone(&gpu_arc);
+            let in_name = in_name.clone();
+            std::thread::spawn(move || {
+                let d = qppocr_core::device::DeviceSession::run_deferred(&*g, vec![(in_name, t)])
+                    .unwrap();
+                d.complete().unwrap()
+            })
+        })
+        .collect();
+    for h in hs {
+        let out = h.join().unwrap();
+        let m = out[0]
+            .f32
+            .iter()
+            .zip(out_c_sync[0].f32.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert_eq!(m, 0.0, "排队路径结果与同步不一致");
+    }
+    eprintln!("[rec][defer] 三条并发排队：全部与同步逐位一致");
 }
 
 /// cls 端到端：GPU vs CPU executor 同输入对拍（B>1 批 + 尾部 rank-3）。

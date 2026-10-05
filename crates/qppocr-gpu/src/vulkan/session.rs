@@ -466,49 +466,72 @@ impl VulkanSession {
         };
         // 选计划：primary 空闲用 primary；同形状在飞（引擎同桶批 k+1 而
         // k 未收账）分流影子——惰性建，独立 arena/CB/rn_word 零共享。
+        // primary+shadow 均忙 = 并发调用方多于流水深度：**排队重试**
+        //（曾是硬错误；Engine 多线程共享 run 是官方用法，GUI 并发识别
+        // 极易触发。等待在锁外自旋——complete() 只复位原子不取锁，无
+        // 死锁环；30 秒仍忙才报错，防对端泄漏 deferred 卡死调用方）。
         let mut just_built = false;
-        let plan = if let Some(slot) = plans.iter_mut().find(|s| s.shape == plan_shape) {
-            let claim = |p: &Plan| {
-                p.inflight.store(true, std::sync::atomic::Ordering::Release);
-            };
-            if !slot
-                .primary
-                .inflight
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                claim(&slot.primary);
-                slot.primary.clone()
-            } else if slot
-                .shadow
-                .as_ref()
-                .is_some_and(|s| !s.inflight.load(std::sync::atomic::Ordering::Acquire))
-            {
-                let s = slot.shadow.clone().unwrap();
-                claim(&s);
-                s
-            } else if slot.shadow.is_some() {
-                return Err(Error::Device(
-                    "同形状三条在飞：引擎流水深度应 ≤2（primary+shadow 均忙）".into(),
-                ));
-            } else {
-                let shadow = std::sync::Arc::new(self.build_plan(&plan_shape)?);
-                claim(&shadow);
-                slot.shadow = Some(shadow.clone());
-                just_built = true;
-                shadow
+        let mut plan: Option<std::sync::Arc<Plan>> = None;
+        for attempt in 0u32.. {
+            if attempt > 0 {
+                if attempt > 300_000 {
+                    return Err(Error::Device(
+                        "同形状排队超时（>30s）：在飞批未收账——疑似 deferred 泄漏".into(),
+                    ));
+                }
+                drop(plans);
+                std::thread::sleep(std::time::Duration::from_micros(100));
+                plans = self
+                    .plans
+                    .lock()
+                    .map_err(|_| Error::Device("计划缓存锁中毒".into()))?;
             }
-        } else {
-            let plan = std::sync::Arc::new(self.build_plan(&plan_shape)?);
-            plan.inflight
-                .store(true, std::sync::atomic::Ordering::Release);
-            plans.push(PlanSlot {
-                shape: plan_shape.clone(),
-                primary: plan.clone(),
-                shadow: None,
-            });
-            just_built = true;
-            plan
-        };
+            let picked = if let Some(slot) = plans.iter_mut().find(|s| s.shape == plan_shape) {
+                let claim = |p: &Plan| {
+                    p.inflight.store(true, std::sync::atomic::Ordering::Release);
+                };
+                if !slot
+                    .primary
+                    .inflight
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    claim(&slot.primary);
+                    Some(slot.primary.clone())
+                } else if slot
+                    .shadow
+                    .as_ref()
+                    .is_some_and(|s| !s.inflight.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    let s = slot.shadow.clone().unwrap();
+                    claim(&s);
+                    Some(s)
+                } else if slot.shadow.is_some() {
+                    None // 均忙：锁外等待后重试
+                } else {
+                    let shadow = std::sync::Arc::new(self.build_plan(&plan_shape)?);
+                    claim(&shadow);
+                    slot.shadow = Some(shadow.clone());
+                    just_built = true;
+                    Some(shadow)
+                }
+            } else {
+                let plan = std::sync::Arc::new(self.build_plan(&plan_shape)?);
+                plan.inflight
+                    .store(true, std::sync::atomic::Ordering::Release);
+                plans.push(PlanSlot {
+                    shape: plan_shape.clone(),
+                    primary: plan.clone(),
+                    shadow: None,
+                });
+                just_built = true;
+                Some(plan)
+            };
+            if picked.is_some() {
+                plan = picked;
+                break;
+            }
+        }
+        let plan = plan.expect("排队循环退出必有计划");
         if just_built {
             // 字节预算封顶（per-session，角色分配见字段文档；env 覆写）：
             // det ~137MB/计划、逐图一次性（~41 个形状装不下任何预算，靠
