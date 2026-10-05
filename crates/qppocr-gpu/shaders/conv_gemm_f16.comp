@@ -1,0 +1,70 @@
+// 1x1 conv 的 fp16 GEMM（最小可行版）：全 f16 存储，f32 累加。
+// 每线程 2 相邻 N 值（偶对齐）；B 同行相邻列偶对齐时一个 word 读 2 值。
+// 内联 pack/unpack（naga 不支持在用户函数里调它们）。
+// act=0/2（无/ReLU）；GELU 待后续加（宏在 naga 里有 bug）。
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) buffer Buf { uint data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint NONE = 0xFFFFFFFFu;
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1];
+    uint b_off = params[P + 2], out_off = params[P + 4];
+    uint Ci = params[P + 6];
+    uint M = params[P + 9];
+    uint HW = params[P + 21];
+    uint act = params[P + 17];
+
+    uint gm = gl_GlobalInvocationID.y;
+    uint gn = gl_GlobalInvocationID.x * 2;
+    if (gm >= M || gn >= HW) return;
+
+    float acc0 = 0.0, acc1 = 0.0;
+    for (uint k = 0; k < Ci; k++) {
+        // A[gm][k] — f16
+        uint a_idx = w_off + gm * Ci + k;
+        vec2 a_p = unpackHalf2x16(data[a_idx / 2]);
+        float a = (a_idx % 2 == 0) ? a_p.x : a_p.y;
+
+        // B[k][gn] 和 B[k][gn+1] — f16，同行相邻列
+        uint b_idx = in_off + k * HW + gn;
+        if (b_idx % 2 == 0 && gn + 1 < HW) {
+            // 偶对齐：一个 word 两个值
+            vec2 b_p = unpackHalf2x16(data[b_idx / 2]);
+            acc0 += a * b_p.x;
+            acc1 += a * b_p.y;
+        } else {
+            // 非对齐：两个 word
+            vec2 bp0 = unpackHalf2x16(data[b_idx / 2]);
+            acc0 += a * ((b_idx % 2 == 0) ? bp0.x : bp0.y);
+            if (gn + 1 < HW) {
+                vec2 bp1 = unpackHalf2x16(data[(b_idx + 1) / 2]);
+                acc1 += a * ((b_idx + 1) % 2 == 0 ? bp1.x : bp1.y);
+            }
+        }
+    }
+
+    // bias（f16 存储）
+    if (b_off != NONE) {
+        vec2 b_p = unpackHalf2x16(data[b_off / 2 + gm / 2]);
+        float bv = (b_off + gm) % 2 == 0 ? b_p.x : b_p.y;
+        acc0 += bv; acc1 += bv;
+    }
+    if (act == 2) { acc0 = max(acc0, 0.0); acc1 = max(acc1, 0.0); }
+
+    // 写 f16 packed：gn 偶对齐 → 一个 word
+    uint out_idx = out_off + gm * HW + gn;
+    if (gn + 1 < HW) {
+        data[out_idx / 2] = packHalf2x16(vec2(acc0, acc1));
+    } else if (gn < HW) {
+        uint old = data[out_idx / 2];
+        vec2 op = unpackHalf2x16(old);
+        data[out_idx / 2] = (out_idx % 2 == 0)
+            ? packHalf2x16(vec2(acc0, op.y))
+            : packHalf2x16(vec2(op.x, acc0));
+    }
+}

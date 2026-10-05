@@ -1,0 +1,54 @@
+// 末轴均值（rank-3 [B,T,C] 的 LayerNorm 分解链，ReduceMean axes 归一化
+// 到最后一维）：每行 sum(cols) → mean，写出 [rows,4]（lane0=均值、旁 lane
+// 写 0——下游行向量广播 8/11 只读 lane0）。
+// 一 WG（256 线程）一行：block 归约 sum（softmax 同款骨架）。
+//   params: in_off, out_off, rows, cols, cpad（存储列数）, rpb（rows/批）
+// 求和序 = 子组树归约（CPU 的逐元素序不同——GPU↔CPU 浮点序差异类）。
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer F32 { float data[]; };
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+shared float red[256];
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], out_off = params[P + 1];
+    uint rows = params[P + 2], cols = params[P + 3], cpad = params[P + 4];
+    uint rpb = params[P + 5]; // rows/批（rows=N_pad*T；批是外维）
+
+    uint row = gl_WorkGroupID.x;
+    if (row >= rows) return;
+    if (params[0] != 0u && row >= params[0] * rpb) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
+    uint base = in_off + row * cpad;
+    uint lid = gl_LocalInvocationID.x;
+
+    float s = 0.0;
+    for (uint j = lid; j < cols; j += 256u) {
+        s += data[base + j];
+    }
+    float ws = subgroupAdd(s);
+    if (subgroupElect()) red[gl_SubgroupID] = ws;
+    barrier();
+    if (lid < gl_NumSubgroups && lid % 4u == 0u) {
+        float v = red[lid];
+        if (lid + 1u < gl_NumSubgroups) v += red[lid + 1u];
+        if (lid + 2u < gl_NumSubgroups) v += red[lid + 2u];
+        if (lid + 3u < gl_NumSubgroups) v += red[lid + 3u];
+        red[lid / 4u] = v;
+    }
+    barrier();
+    float rowsum = red[0];
+    for (uint g = 1u; g < (gl_NumSubgroups + 3u) / 4u; g++) {
+        rowsum += red[g];
+    }
+    if (lid == 0u) {
+        data[out_off + row * 4u] = rowsum / float(cols);
+        data[out_off + row * 4u + 1u] = 0.0;
+        data[out_off + row * 4u + 2u] = 0.0;
+        data[out_off + row * 4u + 3u] = 0.0;
+    }
+}

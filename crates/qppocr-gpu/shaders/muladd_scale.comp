@@ -1,0 +1,20 @@
+// 融合 SE 门控：out = f * gate[C] + r。
+// CPU 侧刻意两次舍入（不 FMA）——GPU 编译器可能融合（≤1 ulp，
+// naga 不支持 precise 限定符阻融合；主要误差源在 sigmoid/gelu 的
+// exp 多项式，已逐字镜像）。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(push_constant) uniform PC {
+    uint f_off; uint gate_off; uint r_off; uint out_off;
+    uint hw; uint c;
+} pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint ch = gl_GlobalInvocationID.y;
+    uint n = gl_GlobalInvocationID.z;
+    if (j >= pc.hw) return;
+    uint base = n * pc.c * pc.hw + ch * pc.hw + j;
+    float g = data[pc.gate_off + ch];
+    data[pc.out_off + base] = data[pc.f_off + base] * g + data[pc.r_off + base];
+}
