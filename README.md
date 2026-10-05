@@ -182,6 +182,14 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
   `monitor_preset`（监控截图场景完整配方）——目录内另有若干开发用
   诊断脚本（批大小扫描、口径对齐 dump 等）
 
+## 交流
+
+QQ 群（扫码加入，问题反馈 / 使用讨论 / 参与开发都欢迎）：
+
+<p align="center">
+  <img src="qq.jpg" width="280" alt="QQ 交流群二维码">
+</p>
+
 ## 相关项目
 
 - **[qpp-studio](https://github.com/qinwenhui/qpp-studio)** —— 基于本引擎的
