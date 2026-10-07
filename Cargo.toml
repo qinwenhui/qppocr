@@ -4,6 +4,7 @@ members = [
     "crates/qppocr",
     "crates/qppocr-core",
     "crates/qppocr-gpu",
+    "crates/qppocr-metal",
     "crates/qppocr-kernels",
     "crates/qppocr-cli",
 ]

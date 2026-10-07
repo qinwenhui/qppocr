@@ -1,0 +1,33 @@
+[package]
+name = "qppocr-metal"
+description = "qppocr 的 Metal 设备后端（Apple GPU 原生直连，仅 macOS）"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[features]
+default = ["metal"]
+# Metal 计算后端（gfx-rs 的 metal 绑定）。依赖挂 macOS target 门下：
+# 其他平台开了本 feature 也只是空枚举——「有没有 Metal」是平台事实。
+metal = ["dep:metal"]
+
+[dependencies]
+qppocr-core = { path = "../qppocr-core", version = "0.3.1" }
+# 共享计划模型（qppocr_gpu::plan/nhwc）：整图 dispatch 编排与权重重排。
+# default-features = false——不拉 Vulkan 依赖（ash），只取后端无关层。
+qppocr-gpu = { path = "../qppocr-gpu", version = "0.3.1", default-features = false }
+# session 的输出张量构造（F32Buf）——运行时依赖，非仅测试
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.3.1" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 锁 minor：metal 升级走独立 PR（objc 系 raw 指针面全封在本 crate 的
+# backend 模块内）。默认 feature "link"——直接链系统 Metal.framework，
+# 与 ash 链 Vulkan loader 同级的系统依赖，无第三方原生库。
+metal = { version = "~0.33", optional = true }
+
+[lints]
+workspace = true
