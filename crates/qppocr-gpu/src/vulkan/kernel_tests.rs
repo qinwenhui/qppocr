@@ -9,7 +9,8 @@
 
 use super::VulkanContext;
 use super::memory::{Arena, Region};
-use super::pipeline::{KernelSet, OFF_NONE, ParamBlock, PcUnaryF, record_dispatch};
+use super::pipeline::{KernelSet, PcUnaryF, record_dispatch};
+use crate::plan::{OFF_NONE, ParamBlock};
 use ash::vk;
 use qppocr_kernels::activation::Activation;
 use qppocr_kernels::buf::F32Buf;
@@ -228,7 +229,18 @@ fn conv_vs_cpu() {
             .f(0.5)
             .u(oh * ow)
             .u(ow);
-        let pc = pb.finish(&pp);
+        // plan::ParamBlock 无 finish（Vulkan Region 专属被抽走）：就地写入
+        // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+        let pc = unsafe {
+            std::ptr::copy_nonoverlapping(
+                pb.words().as_ptr(),
+                pp.ptr as *mut u32,
+                pb.words().len(),
+            );
+            crate::plan::PcParams {
+                p_off: pp.offset as u32 / 4,
+            }
+        };
         // SAFETY: cb 录制态；PC 与 conv.comp 参数块逐字段对应。
         unsafe {
             record_dispatch(
@@ -324,7 +336,14 @@ fn convtranspose_vs_cpu() {
         .u(h)
         .u(w)
         .u(m);
-    let pc = pb.finish(&pp);
+    // plan::ParamBlock 无 finish（Vulkan Region 专属被抽走）：就地写入
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // 输出网格 [2w, 2h, n*m]（新内核是输出线程累加版）
     // SAFETY: 同 conv。
     unsafe {
@@ -408,7 +427,13 @@ fn pool_vs_cpu() {
         .u(1)
         .u(oh_max)
         .u(ow_max);
-    let pc1 = pb.finish(&pp1);
+    // SAFETY: pp1 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc1 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp1.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp1.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同 conv。
     unsafe {
         record_dispatch(
@@ -436,7 +461,13 @@ fn pool_vs_cpu() {
         .u(0)
         .u(oh_avg)
         .u(oh_avg);
-    let pc2 = pb.finish(&pp2);
+    // SAFETY: pp2 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc2 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp2.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp2.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同上。
     unsafe {
         record_dispatch(
@@ -524,7 +555,13 @@ fn reduce_resize_concat_vs_cpu() {
     // reduce_hw.comp：in,out,n,c,h,w
     let mut pb = ParamBlock::new();
     pb.u(el(&x)).u(el(&red)).u(n).u(c).u(h).u(w);
-    let pc1 = pb.finish(&p1);
+    // SAFETY: p1 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc1 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), p1.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: p1.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同 conv。
     unsafe {
         record_dispatch(&dev, cb, &ks, "reduce_hw", pc1.bytes(), [n * c, 1, 1]);
@@ -532,7 +569,13 @@ fn reduce_resize_concat_vs_cpu() {
     // resize_nearest.comp：in,out,n,c,h,w,oh,ow
     let mut pb = ParamBlock::new();
     pb.u(el(&x)).u(el(&up)).u(n).u(c).u(h).u(w).u(oh).u(ow);
-    let pc2 = pb.finish(&p2);
+    // SAFETY: p2 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc2 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), p2.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: p2.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同上。
     unsafe {
         record_dispatch(
@@ -558,7 +601,13 @@ fn reduce_resize_concat_vs_cpu() {
         .u(4)
         .u(el(&cb_in))
         .u(6);
-    let pc3 = pb.finish(&p3);
+    // SAFETY: p3 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc3 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), p3.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: p3.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同上。
     unsafe {
         record_dispatch(
@@ -696,7 +745,13 @@ fn hardsigmoid_then_conv_min_repro() {
         .f(0.5)
         .u(h * w)
         .u(w);
-    let pc2 = pb.finish(&pp);
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc2 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同上。
     unsafe {
         record_dispatch(
@@ -767,7 +822,14 @@ fn conv_gemm_vs_cpu() {
         .f(0.5)
         .u(h * w) // hw = N 维
         .u(0); // ow（不用）
-    let pc = pb.finish(&pp);
+    // plan::ParamBlock 无 finish（Vulkan Region 专属被抽走）：就地写入
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // SAFETY: cb 录制态；PC 与 conv_gemm.comp 参数块对应。
     unsafe {
         record_dispatch(
@@ -914,7 +976,14 @@ fn conv_gemm_f16_vs_cpu() {
         .f(0.0)
         .u(hw)
         .u(w);
-    let pc = pb.finish(&pp);
+    // plan::ParamBlock 无 finish（Vulkan Region 专属被抽走）：就地写入
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // SAFETY: cb 录制态；PC 与 conv_gemm_f16.comp 参数对应。
     unsafe {
         record_dispatch(
@@ -1024,7 +1093,13 @@ fn gemm_f16_vs_f32_perf() {
         .f(0.0)
         .u(hw)
         .u(1);
-    let pc32 = pb.finish(&pp);
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc32 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // SAFETY: cb 录制态。
     unsafe {
         record_dispatch(
@@ -1064,7 +1139,13 @@ fn gemm_f16_vs_f32_perf() {
         .f(0.0)
         .u(hw)
         .u(1);
-    let pc16 = pb.finish(&pp);
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc16 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同上。
     unsafe {
         record_dispatch(
@@ -1177,7 +1258,17 @@ fn conv_gemm_nhwc_vs_cpu() {
         .f(0.0)
         .u(hw)
         .u(w);
-    let pc_gemm = pb.finish(&pp_gemm);
+    // SAFETY: pp_gemm 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc_gemm = unsafe {
+        std::ptr::copy_nonoverlapping(
+            pb.words().as_ptr(),
+            pp_gemm.ptr as *mut u32,
+            pb.words().len(),
+        );
+        crate::plan::PcParams {
+            p_off: pp_gemm.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同上。dispatch [M, HW]（x=M, y=HW——与 NCHW 版相反！）
     unsafe {
         record_dispatch(
@@ -1272,7 +1363,13 @@ fn gemm_nhwc_vs_nchw_perf() {
         .f(0.0)
         .u(hw)
         .u(1);
-    let pc1 = pb.finish(&pp);
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc1 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // SAFETY: cb 录制态。
     unsafe {
         record_dispatch(
@@ -1312,7 +1409,13 @@ fn gemm_nhwc_vs_nchw_perf() {
         .f(0.0)
         .u(hw)
         .u(1);
-    let pc2 = pb.finish(&pp);
+    // SAFETY: pp 是测试分配的持久映射区域；words.len() ≤ 分配长度。
+    let pc2 = unsafe {
+        std::ptr::copy_nonoverlapping(pb.words().as_ptr(), pp.ptr as *mut u32, pb.words().len());
+        crate::plan::PcParams {
+            p_off: pp.offset as u32 / 4,
+        }
+    };
     // SAFETY: 同上。
     unsafe {
         record_dispatch(

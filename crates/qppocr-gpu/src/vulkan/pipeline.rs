@@ -205,14 +205,6 @@ pub(crate) struct PcLayout {
     pub w: u32,
 }
 
-/// 参数块内核（conv/pool/resize/convT/reduce/concat）：全部形状参数
-/// 放 arena（128 B 的 push constant 装不下），PC 只带参数块偏移。
-#[repr(C)]
-pub(crate) struct PcParams {
-    /// 参数块在 SSBO 里的 **u32 下标**（binding 1 的 uint 视图同源）。
-    pub p_off: u32,
-}
-
 /// fused_hardsigmoid_mul。
 #[repr(C)]
 pub(crate) struct PcChannelF {
@@ -246,62 +238,8 @@ pc_bytes!(
     PcBinary,
     PcChannel,
     PcMulAddScale,
-    PcChannelF,
-    PcParams
+    PcChannelF
 );
-
-/// 参数块写入器：形状参数太多（conv 20+ 项）装不进 128 B 的 push
-/// constant，写进 arena 一小块，内核经 binding 1（同一缓冲的 u32
-/// 视图）读取。装载期写一次、随 CB 复用——零每帧成本。
-pub(crate) struct ParamBlock {
-    words: Vec<u32>,
-}
-
-/// 「无此输入」的哨兵偏移（conv 的 bias/residual 等）。
-pub(crate) const OFF_NONE: u32 = u32::MAX;
-
-impl ParamBlock {
-    pub(crate) fn new() -> Self {
-        Self { words: Vec::new() }
-    }
-
-    pub(crate) fn u(&mut self, v: u32) -> &mut Self {
-        self.words.push(v);
-        self
-    }
-
-    /// 字数（布局分配用）。
-    pub(crate) fn len_words(&self) -> u32 {
-        self.words.len() as u32
-    }
-
-    /// 只读视图（session 直接写进整块布局）。
-    pub(crate) fn words(&self) -> &[u32] {
-        &self.words
-    }
-
-    /// f32 按位写入（内核侧 uintBitsToFloat 读回）。
-    pub(crate) fn f(&mut self, v: f32) -> &mut Self {
-        self.words.push(v.to_bits());
-        self
-    }
-
-    /// 写入 arena 区域（u32 视图），返回 push constant。
-    /// `region` 必须按 words.len()*4 分配（调用方保证）。
-    pub(crate) fn finish(self, region: &super::memory::Region) -> PcParams {
-        // SAFETY: 持久映射可写内存；写入长度 ≤ 分配长度，无越界。
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.words.as_ptr(),
-                region.ptr as *mut u32,
-                self.words.len(),
-            );
-        }
-        PcParams {
-            p_off: region.offset as u32 / 4,
-        }
-    }
-}
 
 /// 一套内核：共享的管线布局/描述符集 + 名字 → 管线。
 pub(crate) struct KernelSet {

@@ -18,7 +18,6 @@ pub(crate) mod device;
 pub(crate) mod fp16;
 #[allow(dead_code)]
 pub(crate) mod memory;
-pub(crate) mod nhwc;
 #[allow(dead_code)]
 pub(crate) mod pipeline;
 pub(crate) mod session;

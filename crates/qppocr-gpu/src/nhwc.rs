@@ -9,12 +9,12 @@
 use qppocr_core::tensor::Tensor;
 
 /// 通道数补到 %4。
-pub(crate) fn cpad4(c: i64) -> u32 {
+pub fn cpad4(c: i64) -> u32 {
     ((c + 3) / 4) as u32 * 4
 }
 
 /// NHWC f32 张量 [N,C,H,W] 的 word 数（= 元素数，含 Cpad4）。
-pub(crate) fn nhwc_words(shape: &[i64]) -> u32 {
+pub fn nhwc_words(shape: &[i64]) -> u32 {
     if shape.len() != 4 {
         panic!("n_ 路径只收 rank-4：{shape:?}");
     }
@@ -23,7 +23,7 @@ pub(crate) fn nhwc_words(shape: &[i64]) -> u32 {
 
 /// 稠密 conv 权重 [Co,Ci,kh,kw] → k-major（n_conv.comp 的布局）：
 /// f16vec4 下标 (t*cin4v + ci4)*4*nv + i*nv + n4，元素 = 4 个输出通道。
-pub(crate) fn repack_conv_w(w: &[f32], co: usize, cin: usize, kh: usize, kw: usize) -> Vec<u32> {
+pub fn repack_conv_w(w: &[f32], co: usize, cin: usize, kh: usize, kw: usize) -> Vec<u32> {
     let (cop, cip) = (cpad4(co as i64) as usize, cpad4(cin as i64) as usize);
     let (cin4v, nv, taps) = (cip / 4, cop / 4, kh * kw);
     let mut v = vec![0f32; taps * cin4v * 4 * nv * 4];
@@ -48,7 +48,7 @@ pub(crate) fn repack_conv_w(w: &[f32], co: usize, cin: usize, kh: usize, kw: usi
 }
 
 /// depthwise 权重 [Co,1,kh,kw] → [t][c4]（n_conv_dw.comp 的布局）。
-pub(crate) fn repack_dw_w(w: &[f32], c: usize, kh: usize, kw: usize) -> Vec<u32> {
+pub fn repack_dw_w(w: &[f32], c: usize, kh: usize, kw: usize) -> Vec<u32> {
     let cp = cpad4(c as i64) as usize;
     let cv4 = cp / 4;
     let mut v = vec![0f32; kh * kw * cv4 * 4];
@@ -68,7 +68,7 @@ pub(crate) fn repack_dw_w(w: &[f32], c: usize, kh: usize, kw: usize) -> Vec<u32>
 }
 
 /// ConvTranspose 权重 [Ci,Co,kh,kw] → 每 tap 一张 [Ci][nv]（n_convt.comp）。
-pub(crate) fn repack_convt_w(w: &[f32], ci: usize, co: usize, kh: usize, kw: usize) -> Vec<u32> {
+pub fn repack_convt_w(w: &[f32], ci: usize, co: usize, kh: usize, kw: usize) -> Vec<u32> {
     let (cip, cop) = (cpad4(ci as i64) as usize, cpad4(co as i64) as usize);
     let nv = cop / 4;
     let mut v = vec![0f32; kh * kw * cip * nv * 4];
@@ -91,7 +91,7 @@ pub(crate) fn repack_convt_w(w: &[f32], ci: usize, co: usize, kh: usize, kw: usi
 }
 
 /// conv bias [Co] f32 → [CoPad4] words。
-pub(crate) fn conv_bias(bias: &[f32], co: i64) -> Vec<u32> {
+pub fn conv_bias(bias: &[f32], co: i64) -> Vec<u32> {
     let cop = cpad4(co) as usize;
     let mut v = vec![0f32; cop];
     let n = bias.len().min(cop);
@@ -102,7 +102,7 @@ pub(crate) fn conv_bias(bias: &[f32], co: i64) -> Vec<u32> {
 /// 任意 f32 initializer → NHWC f32 words（Cpad4 补 0）。
 /// gate 形 [N,C,1,1] 走同一路径（HW=1 退化成通道平铺）；rank<4
 ///（如 Resize 的 f32 scales [4]）按前置 1 补齐到 [1,C,1,1]。
-pub(crate) fn init_to_nhwc(t: &Tensor) -> Vec<u32> {
+pub fn init_to_nhwc(t: &Tensor) -> Vec<u32> {
     let mut s: Vec<i64> = t.shape.clone();
     if s.len() == 1 {
         // rank-1 = 通道向量：补成 [1, V, 1, 1]（NHWC 展开为平铺 V）。
