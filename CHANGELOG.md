@@ -8,6 +8,26 @@
 
 ## [Unreleased]
 
+### 新增（Added）
+
+- **Metal 后端（Apple GPU 原生直连，det/rec/cls 整图执行）**（新 crate
+  `qppocr-metal`，随 feature `gpu` 在 macOS 上启用；其他平台编译为
+  空枚举，构建面不变）：设备枚举/打开、MSL 源码内嵌运行时编译（显式
+  禁 fast-math 保逐位可比）、n_ 内核族全量 19 个 MSL 移植（与
+  GLSL 逐行对应）、整图会话（批维补齐/real_n 早退/CTC argmax 出口/
+  精确宽与 Vulkan 侧同款语义）。统一内存零 staging：输入写入/输出读回
+  直接经 `StorageModeShared`。部署分级 `QPPOCR_GPU_STAGES=all|detrec|det`
+  与 Vulkan 侧同款（委托 CPU 时 stderr 声明）；`GpuApi::Auto` 在
+  macOS 优先 Metal（原生直连），Vulkan/MoltenVK 兜底。新增
+  `DeviceKind::Metal`、`GpuApi::Metal` 与 CLI `--device metal[:N]`。
+  内核位级对拍与 det/rec/cls 端到端测试（无 Metal 设备的环境自动跳过）。
+- **共享计划模型**（`qppocr-gpu` 新公开模块 `plan` + `nhwc` 上移）：
+  n_ 路径的整图计划构建（图 + 输入形状 → dispatch 列表 + arena 布局 +
+  上传清单）从 VulkanSession 抽出为后端无关层，Vulkan 与 Metal 会话
+  共同消费——两后端的算子覆盖与参数编码同源。Vulkan 侧行为等价经
+  全测试套验证（det 端到端 max|diff| 与抽取前一致）；`QPPOCR_GPU_F32=1`
+  的旧 NCHW 路径保留为会话内联实现（A/B 与兜底）。
+
 ## [0.3.1] - 2026-10-04
 
 ### 新增（Added）
