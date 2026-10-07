@@ -41,7 +41,7 @@ struct Options {
     sweep: Option<(String, Vec<String>)>,
 }
 
-/// `--device` 值解析：`cpu | gpu | vulkan[:N] | cuda[:N]`。
+/// `--device` 值解析：`cpu | gpu | vulkan[:N] | metal[:N] | cuda[:N]`。
 fn parse_device(s: &str) -> Option<DeviceChoice> {
     let (api, idx) = match s.split_once(':') {
         Some((a, i)) => (a, Some(i.parse().ok()?)),
@@ -55,6 +55,10 @@ fn parse_device(s: &str) -> Option<DeviceChoice> {
         }),
         "vulkan" => Some(DeviceChoice::Gpu {
             api: GpuApi::Vulkan,
+            index: idx,
+        }),
+        "metal" => Some(DeviceChoice::Gpu {
+            api: GpuApi::Metal,
             index: idx,
         }),
         "cuda" => Some(DeviceChoice::Gpu {
@@ -75,6 +79,7 @@ fn device_name(d: &DeviceChoice) -> String {
             let a = match api {
                 GpuApi::Auto => "gpu",
                 GpuApi::Vulkan => "vulkan",
+                GpuApi::Metal => "metal",
                 GpuApi::Cuda => "cuda",
             };
             match index {
@@ -107,7 +112,7 @@ options:
   --rec-shards <n>  rec 两级并行的外层分片数（0 = 关，不传 = 按档位自动）
   --det-thresh <f>  DB 二值化阈值（默认 0.2；低阈值多保细笔/小字，多进杂块）
   --det-max-side <n> 检测输入长边上限（默认 960；大图上适当调高保弱缘笔画）
-  --device <d>      cpu | gpu | vulkan[:N] | cuda[:N]   (default: cpu)
+  --device <d>      cpu | gpu | vulkan[:N] | metal[:N] | cuda[:N]   (default: cpu)
   --quiet           suppress the per-line listing
   -h, --help        this help
 
@@ -226,7 +231,7 @@ fn parse_args() -> Option<Options> {
                 i += 1;
                 let s = args.get(i)?;
                 o.device = parse_device(s).or_else(|| {
-                    eprintln!("--device: cpu | gpu | vulkan[:N] | cuda[:N]");
+                    eprintln!("--device: cpu | gpu | vulkan[:N] | metal[:N] | cuda[:N]");
                     None
                 })?;
             }

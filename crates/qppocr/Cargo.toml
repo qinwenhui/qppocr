@@ -20,7 +20,8 @@ parallel = ["qppocr-core/parallel"]
 # 图像解码（JPEG/PNG/BMP；BMP 无损、无 rayon 依赖）。关掉 = 只吃已解码像素
 image-decode = ["dep:image"]
 # GPU 设备后端（Vulkan 计算先行）。不进 default：默认构建保持零 GPU 依赖。
-gpu = ["dep:qppocr-gpu"]
+# metal 的重依赖只挂 macOS target——Windows/Linux 构建面不变。
+gpu = ["dep:qppocr-gpu", "dep:qppocr-metal"]
 # GPU + CUDA 枚举（dlopen，无编译期 CUDA SDK 依赖）
 gpu-cuda = ["gpu", "qppocr-gpu/cuda"]
 # 结果/配置的 serde 序列化（结果类型在 core，feature 透传过去）
@@ -29,6 +30,7 @@ serde = ["dep:serde", "qppocr-core/serde"]
 [dependencies]
 qppocr-core = { path = "../qppocr-core", version = "0.3.1" }
 qppocr-gpu = { path = "../qppocr-gpu", version = "0.3.1", optional = true }
+qppocr-metal = { path = "../qppocr-metal", version = "0.3.1", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"], optional = true }
 serde = { version = "1", default-features = false, optional = true, features = ["derive", "std"] }
 

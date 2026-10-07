@@ -30,6 +30,8 @@ pub enum DeviceKind {
     Cpu,
     /// Vulkan 计算设备。
     Vulkan,
+    /// Metal 计算设备（Apple GPU 原生直连，仅 macOS）。
+    Metal,
     /// CUDA 计算设备。
     Cuda,
 }

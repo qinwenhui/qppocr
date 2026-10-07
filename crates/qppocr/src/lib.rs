@@ -62,7 +62,8 @@ pub use qppocr_core::{Backend, detect_backend};
 /// 枚举本机可用计算设备（GUI 选设备/诊断用）。
 ///
 /// 恒含一个 CPU 条目（`DeviceKind::Cpu`，名如 `host (x86_64)`）；
-/// `gpu` feature 编译时再追加检测到的 GPU（Vulkan 在前）。无 GPU
+/// `gpu` feature 编译时再追加检测到的 GPU（Metal 在前、Vulkan/CUDA
+/// 其后——顺序即 [`GpuApi::Auto`] 的选择优先级）。无 GPU
 /// 不是错误——显式 [`DeviceChoice::Gpu`] 才是。
 pub fn list_devices() -> Vec<DeviceInfo> {
     #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
@@ -72,7 +73,11 @@ pub fn list_devices() -> Vec<DeviceInfo> {
         api: format!("cpu {:?}", detect_backend()).to_lowercase(),
     }];
     #[cfg(feature = "gpu")]
-    out.extend(qppocr_gpu::list_devices());
+    {
+        // 顺序 = Auto 的选择优先级：Metal（原生）在前，Vulkan/CUDA 其后。
+        out.extend(qppocr_metal::list_devices());
+        out.extend(qppocr_gpu::list_devices());
+    }
     out
 }
 
@@ -159,11 +164,14 @@ impl DeviceChoice {
 /// GPU API 选择。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum GpuApi {
-    /// 有什么用什么（当前即 Vulkan）。
+    /// 有什么用什么：macOS 上 Metal 优先（原生直连；整图执行就绪前
+    /// 自动让位 Vulkan/MoltenVK），其后 Vulkan、CUDA。
     #[default]
     Auto,
-    /// Vulkan 计算后端。
+    /// Vulkan 计算后端（macOS 上经 MoltenVK 翻译层）。
     Vulkan,
+    /// Metal 计算后端（Apple GPU 原生直连，仅 macOS）。
+    Metal,
     /// CUDA 计算后端。
     Cuda,
 }
@@ -600,25 +608,38 @@ fn resolve_device(
                     GpuApi::Vulkan => Ok(std::sync::Arc::new(
                         VulkanContext::open(*index).map_err(gpu_err)?,
                     )),
-                    // Auto = 有什么用什么：Vulkan 优先（验收线在 Vulkan），
-                    // CUDA 兜底（仅 gpu-cuda 编译时）；两者皆败报主因
-                    // （Vulkan 的报错带设备清单，信息量最大）。
-                    GpuApi::Auto => match VulkanContext::open(*index) {
-                        Ok(ctx) => Ok(std::sync::Arc::new(ctx)),
-                        Err(ve) => {
-                            #[cfg(feature = "gpu-cuda")]
-                            {
-                                match qppocr_gpu::CudaContext::open(*index) {
-                                    Ok(c) => Ok(std::sync::Arc::new(c)),
-                                    Err(_) => Err(gpu_err(ve)),
-                                }
-                            }
-                            #[cfg(not(feature = "gpu-cuda"))]
-                            {
-                                Err(gpu_err(ve))
+                    GpuApi::Metal => Ok(std::sync::Arc::new(
+                        qppocr_metal::MetalContext::open(*index).map_err(gpu_err)?,
+                    )),
+                    // Auto = 有什么用什么：macOS 上 Metal 优先（原生直连，
+                    // 无 MoltenVK 翻译层）——但仅当其整图执行就绪；其后
+                    // Vulkan（验收线在 Vulkan）、CUDA 兜底（仅 gpu-cuda
+                    // 编译时）；皆败报主因（Vulkan 的报错带设备清单，
+                    // 信息量最大）。
+                    GpuApi::Auto => {
+                        #[cfg(target_os = "macos")]
+                        if let Ok(ctx) = qppocr_metal::MetalContext::open(*index) {
+                            if ctx.sessions_ready() {
+                                return Ok(std::sync::Arc::new(ctx));
                             }
                         }
-                    },
+                        match VulkanContext::open(*index) {
+                            Ok(ctx) => Ok(std::sync::Arc::new(ctx)),
+                            Err(ve) => {
+                                #[cfg(feature = "gpu-cuda")]
+                                {
+                                    match qppocr_gpu::CudaContext::open(*index) {
+                                        Ok(c) => Ok(std::sync::Arc::new(c)),
+                                        Err(_) => Err(gpu_err(ve)),
+                                    }
+                                }
+                                #[cfg(not(feature = "gpu-cuda"))]
+                                {
+                                    Err(gpu_err(ve))
+                                }
+                            }
+                        }
+                    }
                     GpuApi::Cuda => {
                         #[cfg(feature = "gpu-cuda")]
                         {
