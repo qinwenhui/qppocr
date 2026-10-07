@@ -22,15 +22,23 @@
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
+/// NHWC-f32 计划路径的纯数据变换（n_ 内核族的 Rust 侧配套：权重重排
+/// 与布局 word 数；后端无关）。
+pub mod nhwc;
+/// 整图计划模型（图 + 输入形状 → dispatch 列表 + arena 布局；后端无关，
+/// Vulkan 与 Metal 会话共同消费）。
+pub mod plan;
 /// 装载期图分析（静态形状推理 + 常量折叠；后端无关，无 GPU 也能用——
 /// tests/plan.rs 用它对真实模型做 oracle 对拍）。
 pub mod planner;
+#[cfg(feature = "vulkan")]
 pub mod vulkan;
 
 use qppocr_core::device::DeviceInfo;
 
 #[cfg(feature = "cuda")]
 pub use cuda::CudaContext;
+#[cfg(feature = "vulkan")]
 pub use vulkan::VulkanContext;
 
 /// 枚举本机全部 GPU（跨已编译的后端，Vulkan 在前、CUDA 其后）。
@@ -38,6 +46,7 @@ pub use vulkan::VulkanContext;
 /// 失败（无 loader / 无 ICD / 驱动异常）= 空列表，绝不当错误——
 /// 「有没有 GPU」是环境事实，只有显式要求 GPU 时才构成错误。
 pub fn list_devices() -> Vec<DeviceInfo> {
+    #[cfg_attr(not(any(feature = "vulkan", feature = "cuda")), allow(unused_mut))]
     let mut out = Vec::new();
     #[cfg(feature = "vulkan")]
     out.extend(vulkan::enumerate());

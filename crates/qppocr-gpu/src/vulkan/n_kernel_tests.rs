@@ -9,7 +9,8 @@
 
 use super::VulkanContext;
 use super::memory::Arena;
-use super::pipeline::{KernelSet, OFF_NONE, ParamBlock, PcParams, record_dispatch};
+use super::pipeline::{KernelSet, record_dispatch};
+use crate::plan::{OFF_NONE, ParamBlock, PcParams};
 use ash::vk;
 
 fn lcg(seed: &mut u64) -> f32 {
@@ -43,9 +44,9 @@ fn n_family_smoke() {
     let hw = h * w;
     let (oh, ow) = (8usize, 6usize); // 3x3 s2 p1 的输出
     let ohw = oh * ow;
-    let cip = super::nhwc::cpad4(ci as i64) as usize;
-    let co1p = super::nhwc::cpad4(co1 as i64) as usize;
-    let co2p = super::nhwc::cpad4(co2 as i64) as usize;
+    let cip = crate::nhwc::cpad4(ci as i64) as usize;
+    let co1p = crate::nhwc::cpad4(co1 as i64) as usize;
+    let co2p = crate::nhwc::cpad4(co2 as i64) as usize;
 
     let mut seed = 0x1234_5678_9abc_def0_u64;
     let x: Vec<f32> = (0..ci * hw).map(|_| lcg(&mut seed)).collect();
@@ -55,11 +56,11 @@ fn n_family_smoke() {
     let dwv: Vec<f32> = (0..co2 * 25).map(|_| lcg(&mut seed) * 0.1).collect();
     let ctw: Vec<f32> = (0..co2 * co2 * 4).map(|_| lcg(&mut seed) * 0.1).collect();
 
-    let w1_16 = super::nhwc::repack_conv_w(&w1, co1, ci, 3, 3);
-    let b1_16 = super::nhwc::conv_bias(&b1, co1 as i64);
-    let w2_16 = super::nhwc::repack_conv_w(&w2, co2, co1, 3, 3);
-    let dw_16 = super::nhwc::repack_dw_w(&dwv, co2, 5, 5);
-    let ct_16 = super::nhwc::repack_convt_w(&ctw, co2, co2, 2, 2);
+    let w1_16 = crate::nhwc::repack_conv_w(&w1, co1, ci, 3, 3);
+    let b1_16 = crate::nhwc::conv_bias(&b1, co1 as i64);
+    let w2_16 = crate::nhwc::repack_conv_w(&w2, co2, co1, 3, 3);
+    let dw_16 = crate::nhwc::repack_dw_w(&dwv, co2, 5, 5);
+    let ct_16 = crate::nhwc::repack_convt_w(&ctw, co2, co2, 2, 2);
 
     // 各段 word 数（16B 对齐）——真实规模段 + 参数段一起算总量
     let seg = |n: usize| n.div_ceil(4) * 4;
@@ -885,7 +886,7 @@ fn det_real_input_cmp() {
                 osh[2] as usize,
                 osh[3] as usize,
             );
-            let cp = super::nhwc::cpad4(osh[1]) as usize;
+            let cp = crate::nhwc::cpad4(osh[1]) as usize;
             // SAFETY: base 持久映射；off+n ≤ total。
             let gv: Vec<f32> = unsafe {
                 std::slice::from_raw_parts(base.add(*off as usize * 4) as *const f32, *n as usize)
@@ -1159,8 +1160,8 @@ fn n_conv_gelu_zero_repro() {
     let mut seed = 0xdead_beef_u64;
     let w: Vec<f32> = (0..co * ci).map(|_| lcg(&mut seed) * 0.5).collect();
     let bias: Vec<f32> = (0..co).map(|_| lcg(&mut seed)).collect();
-    let w16 = super::nhwc::repack_conv_w(&w, co, ci, 1, 1);
-    let b16 = super::nhwc::conv_bias(&bias, co as i64);
+    let w16 = crate::nhwc::repack_conv_w(&w, co, ci, 1, 1);
+    let b16 = crate::nhwc::conv_bias(&bias, co as i64);
 
     let seg = |n: usize| n.div_ceil(4) * 4;
     let in_w = seg(m_dim * ci);
@@ -1230,7 +1231,7 @@ fn n_conv_gelu_zero_repro() {
                 pb2.words().len(),
             );
         }
-        let pc2 = super::pipeline::PcParams { p_off: p_off + 32 };
+        let pc2 = crate::plan::PcParams { p_off: p_off + 32 };
         let grid = [(m_dim as u32).div_ceil(4) * (co as u32 / 4) / 256 + 1, 1, 1];
         ctx.inner
             .device
@@ -2528,11 +2529,11 @@ fn dw_h3_repro() {
     let (nb3, ci, oh, ow, ih, iw) = (17usize, 128usize, 3usize, 80usize, 3usize, 80usize);
     let hw = ih * iw;
     let m = oh * ow;
-    let cp = super::nhwc::cpad4(ci as i64) as usize;
+    let cp = crate::nhwc::cpad4(ci as i64) as usize;
     let mut seed = 0xbeef_cafe_1234_5678_u64;
     let x: Vec<f32> = (0..nb3 * ci * hw).map(|_| lcg(&mut seed)).collect();
     let wt: Vec<f32> = (0..ci * 25).map(|_| lcg(&mut seed) * 0.3).collect();
-    let w16 = super::nhwc::repack_dw_w(&wt, ci, 5, 5);
+    let w16 = crate::nhwc::repack_dw_w(&wt, ci, 5, 5);
 
     let seg = |nn: usize| nn.div_ceil(4) * 4;
     let in_w = seg(nb3 * hw * cp);
@@ -3650,7 +3651,8 @@ fn n_softmax_flaky_raw() {
     let Some(ctx) = open_or_skip() else { return };
     let dev = ctx.inner.device.raw().clone();
     let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
-    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+    use super::pipeline::{KernelSet, record_dispatch};
+    use crate::plan::{ParamBlock, PcParams};
 
     let (rows, cols) = (7680usize, 120usize);
     let mut seed = 0xabcd_ef01_2345_6789_u64;
@@ -3734,7 +3736,8 @@ fn n_transpose_nd_raw() {
     let Some(ctx) = open_or_skip() else { return };
     let dev = ctx.inner.device.raw().clone();
     let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
-    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+    use super::pipeline::{KernelSet, record_dispatch};
+    use crate::plan::{ParamBlock, PcParams};
 
     // dims=[4,3,2,8,15]（B,T,3,8,15 的同构）、perm=[2,0,3,1,4]
     let dims: [u32; 5] = [4, 3, 2, 8, 15];
@@ -3826,7 +3829,8 @@ fn n_attn_mm_raw() {
     let Some(ctx) = open_or_skip() else { return };
     let dev = ctx.inner.device.raw().clone();
     let mut arena = Arena::new(dev.clone(), ctx.inner.mem_types.staging, true);
-    use super::pipeline::{KernelSet, ParamBlock, PcParams, record_dispatch};
+    use super::pipeline::{KernelSet, record_dispatch};
+    use crate::plan::{ParamBlock, PcParams};
 
     let (batch, heads, m, k, n) = (6u32, 3u32, 5u32, 4u32, 7u32);
     let mut seed = 0xabcd_ef01_2345_6789_u64;
