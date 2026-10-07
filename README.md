@@ -159,6 +159,11 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
   形状多样场景的重建开销。
 - 开发与验证在 Intel Arc 核显（Vulkan 1.4）上完成；其它 GPU 未测试，
   欢迎报告。
+- **Metal（macOS）**：`qppocr-metal` crate（Apple GPU 原生直连，不经
+  MoltenVK 翻译层）。det/rec/cls 整图会话与 Vulkan 共用同一后端无关
+  计划模型（参数编码同源）；批维补齐/CTC argmax 出口/部署分级
+  （`QPPOCR_GPU_STAGES`）与 Vulkan 侧同款语义。macOS 上 `--device gpu`
+  优先 Metal，MoltenVK 兜底。
 
 ## 已知限制（如实）
 
