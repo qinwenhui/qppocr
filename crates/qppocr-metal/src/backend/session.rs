@@ -960,6 +960,36 @@ impl DeviceSession for MetalSession {
         // 顺序）；这个开关只用来量「154 个串行点」本身值多少毫秒——数值
         // 会错（后一条读到前一条未完成的结果），纯粹是计时实验。
         let no_barrier = std::env::var_os("QPPOCR_METAL_NO_BARRIER").is_some();
+        // 诊断开关：对 **rec 计划**（`argmax_exit`）跳过指定内核的派发，
+        // 逗号分隔（`QPPOCR_METAL_STUB_REC=n_conv8,n_conv`；`@名字` 按
+        // 节点名精确匹配，例 `@MatMul.12`——用来把「同一内核、两个映射」
+        // 的两档（≥1 MB 走窗口序 / <1 MB 走列主序）分开量）。
+        //
+        // 为什么这个消融**有效**，而「把 n_conv8 整体置空」无效：rec 在 det
+        // 下游，切出多少行完全由 det 的输出决定，rec 的输出只是文本、不回馈
+        // 给任何调度决策——所以跳过后 rec 仍然跑同样的次数，量到的就是内核
+        // 本身的成本。整体置空会让 det 输出为空 ⇒ 一行都切不出来 ⇒ rec 一次
+        // 也不跑，量到的是 0 而不是成本（真发生过：读数 83.5 ms/img 看着像
+        // -45%，其实整个 rec 阶段没跑）。
+        //
+        // 数值必然错（下游读到上一轮的陈旧数据），纯粹是计时实验。屏障照旧
+        // 发射：这样量到的是内核的算力/访存成本，屏障本身另由 NO_BARRIER 量。
+        let stub_rec: Vec<String> = std::env::var("QPPOCR_METAL_STUB_REC")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let skip_rec = |k: &str, node: &str| {
+            self.argmax_exit
+                && stub_rec.iter().any(|s| match s.strip_prefix('@') {
+                    Some(n) => n == node,
+                    None => s == k,
+                })
+        };
         // 诊断开关：把这一整条命令缓冲区按 N 条 dispatch 切块，每块单独
         // commit+wait，并把每块墙钟**立刻**刷到 stderr（`QPPOCR_METAL_CHUNK`）。
         //
@@ -987,6 +1017,13 @@ impl DeviceSession for MetalSession {
         let run_seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
         // 并发（--workers 0）时多个线程的日志会交错，带线程号才能归属。
         let tid = std::thread::current().id();
+        // 消融模式下数字一定是错的，每次 run 都喊一声，免得忘了自己在量什么。
+        if self.argmax_exit && !stub_rec.is_empty() {
+            eprintln!(
+                "[metal] ⚠ 消融模式：rec 计划（run#{run_seq}）跳过 {stub_rec:?} 的派发，\
+                 **本次读数只作计时用、数值无效**"
+            );
+        }
         let t0 = std::time::Instant::now();
         let (encode_ms, wait_ms) = if let Some(n) = chunk {
             let ds = &plan.dispatches;
@@ -1001,9 +1038,11 @@ impl DeviceSession for MetalSession {
                 let lo = i * n;
                 let (e, w) = submit_compute_timed(&self.ctx.queue, |enc| {
                     for d in blk {
-                        self.ks
-                            .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
-                            .expect("dispatch（内核名来自计划，必在套件内）");
+                        if !skip_rec(d.kernel, &d.node) {
+                            self.ks
+                                .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
+                                .expect("dispatch（内核名来自计划，必在套件内）");
+                        }
                         if !no_barrier {
                             let resources: [&metal::ResourceRef; 1] = [&plan.buf];
                             enc.memory_barrier_with_resources(&resources);
@@ -1038,9 +1077,11 @@ impl DeviceSession for MetalSession {
         } else {
             submit_compute_timed(&self.ctx.queue, |enc| {
                 for d in &plan.dispatches {
-                    self.ks
-                        .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
-                        .expect("dispatch（内核名来自计划，必在套件内）");
+                    if !skip_rec(d.kernel, &d.node) {
+                        self.ks
+                            .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
+                            .expect("dispatch（内核名来自计划，必在套件内）");
+                    }
                     if !no_barrier {
                         let resources: [&metal::ResourceRef; 1] = [&plan.buf];
                         enc.memory_barrier_with_resources(&resources);
