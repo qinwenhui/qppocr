@@ -1,0 +1,8 @@
+# 编译产物：重启后 ./build.sh 三秒重建，不入库
+gpuhealth
+gpulat
+gpuaxes
+gpualu2
+stress
+membw
+cpumin
