@@ -9,6 +9,13 @@
 // GLSL 的 `precise` 由本 crate 的禁 fast-math 编译选项承担（不收缩
 // a*b+= 成 fma——CPU MatMul 是标量 mul+add 不收缩；收缩曾以 ~1e-4
 // 概率在近阈值 CTC 候选翻转单字）。
+//
+// **坐标类型是 uint2 而不是 uint**（也不是 uint3 + uint 混用）：MSL 要求
+// 同一内核里所有 `thread_*` 位置属性「要么全标量、要么同元数向量」，
+// 混用直接编译失败。而本内核是**唯一**把行号放在网格第二维的内核
+//（grid = [1, batch*M, 1]，grid.x 只有 1 组）——这里若退成标量，
+// 拿到的就不是行号，而是线程组在网格里的第 0 维（恒 0）或线程线性
+// 下标，整块注意力输出随之全错。见 `attn_mm_raw` 用例。
 #include <metal_stdlib>
 using namespace metal;
 
@@ -16,9 +23,10 @@ kernel void n_attn_mm(
     device float* data [[buffer(0)]],
     device const uint* params [[buffer(1)]],
     constant uint& p_off [[buffer(3)]],
-    uint3 wg [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]])
+    uint2 wg [[threadgroup_position_in_grid]],
+    uint2 lid2 [[thread_position_in_threadgroup]])
 {
+    uint lid = lid2.x;
     uint P = p_off;
     uint a_off = params[P + 0], b_off = params[P + 1], out_off = params[P + 2];
     uint m = params[P + 3], k = params[P + 4], n = params[P + 5];

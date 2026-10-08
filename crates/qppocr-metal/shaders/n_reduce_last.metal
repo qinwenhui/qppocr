@@ -12,8 +12,9 @@ kernel void n_reduce_last(
     device float* data [[buffer(0)]],
     device const uint* params [[buffer(1)]],
     constant uint& p_off [[buffer(3)]],
-    uint3 wg [[threadgroup_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]])
+    uint wg [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sgw [[threads_per_simdgroup]])
 {
     threadgroup float red[256];
 
@@ -22,11 +23,11 @@ kernel void n_reduce_last(
     uint rows = params[P + 2], cols = params[P + 3], cpad = params[P + 4];
     uint rpb = params[P + 5]; // rows/批（rows=N_pad*T；批是外维）
 
-    uint row = wg.x;
+    // `wg` 标量：MSL 禁同内核混用标量/向量位置属性；grid 恒 [rows,1,1]
+    uint row = wg;
     if (row >= rows) return;
     if (params[0] != 0u && row >= params[0] * rpb) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
     uint base = in_off + row * cpad;
-    uint sgw = threads_per_simdgroup;
     uint nsg = 256u / sgw;
     uint sg = lid / sgw;
 

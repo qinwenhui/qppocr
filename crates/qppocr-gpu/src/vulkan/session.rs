@@ -699,6 +699,9 @@ impl VulkanSession {
             repack_cache: &self.repack_cache,
             producer_idx: self.producer_idx(),
             argmax_exit: self.argmax_exit,
+            // Vulkan 侧的 n_conv8 是 GLSL 版本、**没有** grid-stride 循环
+            //（夹了就是少算），故不夹；上限是 Metal 内核的形状特性。
+            grid_cap: 0,
         }
         .build(&self.input_name, in_shape)?;
 

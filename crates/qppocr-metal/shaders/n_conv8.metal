@@ -8,6 +8,39 @@
 //
 // 存储/重排/act/残差语义与 n_conv 完全一致（见其头注释）。
 // 与 qppocr-gpu/shaders/n_conv8.comp 逐行对应——改语义必须两边同步。
+//
+// **瓦片到线程的映射有两套**（见内核里 `taps == 1u && ...` 那一段的
+// 注释）：通道最快变化的默认序，与「窗口序」（1×1 且权重段 ≥ 256 KB
+// 时启用，把同一片权重的所有行组铺在一起，复用距离 9 MB → 123 KB）。
+// 两套的 tile 数与网格公式**完全相同**（`ceil(m/4)*nh`），所以计划层
+// 零改动、覆盖无风险；热循环与寄存器瓦片也完全相同。
+//
+// # grid-stride：保留机制，但实测无收益
+//
+// 曾每线程恰好吃一个 tile（网格 = `ceil(tiles/256)`）。一度认为「线程组
+// 周转本身极贵」，据此在这个内核里加了 stride 循环、计划侧加了网格上限，
+// 好让计划把网格夹小。**结论不成立，机制保留、默认关闭**：
+//
+// - det 前向 5 次取最小：cap=0（不夹）**1474.7 ms**、64 组 1506.1、
+//   256 组 1559.4、32 组 1596.2、16 组 1875.3。只有 16 组明显变差，
+//   其余都在噪声里，而不夹名义最好。`GROUP_CAP_DEFAULT` 因此回到 0。
+// - 原因：真实内核是**短突发**（det 154 条 / 1475 ms ≈ 9.6 ms 一条），
+//   吃的是每条 dispatch 的固定开销与访存停顿，不是长跑稳态带宽。
+// - 旧记录里「空转内核 0.7~2.7 µs/组、与内核算什么无关」来自一个有缺陷
+//   的探针；用取自 det 真实网格的 v1 探针重测是 **0.15~3.4 ms/条，且与
+//   组数不同向**（9720 组 0.15 ms、288 组 2.7 ms）——斜率法在这个粒度上
+//   的噪声地板就有 ~1 ms/条，比信号还大。
+//
+// 长跑带宽曲线本身是真的（256 MB 合并访存 + 手工展开 + **逐字节校验**
+// 的内核实测）：8K 线程 **24 GB/s** → 32K 13 → 262K 8.8 → 2M 3.9 GB/s；
+// 同机 CPU memcpy 是 **136 GB/s**。这条曲线的用途是解释「这块 GPU 为什么
+// 跑不赢自己的 CPU」，不是拿来夹网格。
+//
+// stride 循环留着是为了让计划侧的上限机制仍能工作（`PlanBuilder::grid_cap`，
+// 默认 0 = 不夹），也便于以后扫参。**数值逐位不变**：每个 tile 仍由一个
+// 线程用同一套累加顺序算完，stride 只改变「哪个线程算哪个 tile」，不改变
+// 任何输出的加法次序。`grid_cap = 0` 时 `stride >= tiles`，循环恰好跑一趟，
+// 与改写前逐字等价。
 #include <metal_stdlib>
 using namespace metal;
 
@@ -62,6 +95,7 @@ kernel void n_conv8(
     device const uint* params [[buffer(1)]],
     constant uint& p_off [[buffer(3)]],
     uint3 gid3 [[thread_position_in_grid]],
+    uint3 tpg [[threads_per_grid]],
     uint3 wg [[threadgroup_position_in_grid]])
 {
     uint P = p_off;
@@ -82,76 +116,167 @@ kernel void n_conv8(
     if (params[0] != 0u && b >= params[0]) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
     uint nv = nDim >> 2;
     uint nh = nv >> 1; // 列组数（每组 2 个 float4 列）
-    uint gid = gid3.x;
-    uint tiles = ((mDim + 3u) >> 2) * nh;
-    if (gid >= tiles) return;
-    uint n4 = (gid % nh) * 2u; // 第一列的 float4 下标（第二列 = n4+1）
-    uint m0 = (gid / nh) * 4u;
+    uint rows_g = (mDim + 3u) >> 2; // 行组数
+    uint tiles = rows_g * nh;
+
+    // 整块不随 tile 变的基址（本来就在映射之后算，纯外提）。
     uint ib = (in_off >> 2) + b * inH * inW * cin4v;
     uint wb = w_off >> 2;
     uint ob = (out_off >> 2) + b * mDim * nv;
 
-    // 8 个累加器：行 × 2 列
-    float4 a0c0 = float4(0.0), a1c0 = float4(0.0), a2c0 = float4(0.0), a3c0 = float4(0.0);
-    float4 a0c1 = float4(0.0), a1c1 = float4(0.0), a2c1 = float4(0.0), a3c1 = float4(0.0);
-    uint oh[4], ow[4];
-    bool ok[4];
-    for (uint i = 0u; i < 4u; i++) {
-        uint m = m0 + i;
-        ok[i] = m < mDim;
-        oh[i] = m / outW;
-        ow[i] = m - oh[i] * outW;
-    }
+    // stride = 本网格实际铺开的线程数（计划侧可能夹过）。不夹时
+    // `stride >= tiles`，循环恰好跑一趟，与改前逐字等价。
+    uint stride = tpg.x;
 
-    for (uint t = 0u; t < taps; t++) {
-        uint ky = t / kW, kx = t - ky * kW;
-        for (uint ci4 = 0u; ci4 < cin4v; ci4++) {
-            float4 g0 = float4(0.0), g1 = float4(0.0), g2 = float4(0.0), g3 = float4(0.0);
-            for (uint i = 0u; i < 4u; i++) {
-                if (!ok[i]) continue;
-                int ih = int(oh[i] * sH + ky) - int(padT);
-                int iw = int(ow[i] * sW + kx) - int(padL);
-                if (ih < 0 || ih >= int(inH) || iw < 0 || iw >= int(inW)) continue;
-                uint px = uint(ih) * inW + uint(iw);
-                float4 v = d[ib + px * cin4v + ci4];
-                if (i == 0u) g0 = v; else if (i == 1u) g1 = v;
-                else if (i == 2u) g2 = v; else g3 = v;
+    for (uint gid = gid3.x; gid < tiles; gid += stride) {
+        // `n4b` = 第二个通道块（float4 列）的下标。**它不再恒等于 `n4+1`**
+        // ——列主序把第二列放到 `n4 + nh`（见下面 else-if 分支）。所有用到
+        // 第二列的地方（权重、bias、残差、写回）都必须用 `n4b`，用错就是
+        // 静默写坏一半通道。
+        uint n4, m0, n4b;
+        if (taps == 1u && cin4v * nv >= 65536u) {
+            // ── 窗口序（**只换瓦片到线程的映射，热循环一字不动**）──
+            //
+            // 病根：权重段（本例 9 MB）被每个行组各读一遍 = 485 MB，而原
+            // 映射是**通道最快变化**——同一片权重要等全部 54 个行组走完
+            // （整整 9 MB 流量）才被再读一次，远超 L2，于是卡在 DRAM 上
+            // （实测：同形状 p_base 2.92 ms vs 权重钉进 1 KB 的 p_wsmall
+            // 0.78 ms，条数地址算术全同）。
+            //
+            // 处方：把「32 列组的窗」提到行组外面——先让同一片窗口的**所
+            // 有行组**背靠背走完，再推进下一片。复用距离 9 MB → 一片窗口
+            // 的权重（120×256×4 ≈ 123 KB，L2 内）。网格不变（`tiles` 与
+            // 原式同为 `ceil(m/4)*nh`），一个 warp 的 32 个 lane 仍是 32 个
+            // 连续列组 ⇒ 输入仍是广播、权重的行数与跨度也不变，变的**只是
+            // 这片权重多久之后还会被用到**。实测分类层 2.92 → 1.20 ms。
+            //
+            // 尾部：`nh` 不一定是 32 的倍数（本层 2339 = 73*32 + 3）。前
+            // `full` 个 tile 铺满 73 个整窗，剩下的 3 个通道 × 54 行组
+            // = 162 个 tile 正好是尾数，用下面 else 分支单独铺掉。对任意
+            // (m, n) 都成立（`tiles - full == (nh%32)*rows_g` 恒等）。
+            //
+            // 门：仅 1×1（taps>1 时相邻输出共享输入像素，换序会砸掉输入的
+            // 局部性——实测 3×3 上反而慢一倍）且权重段 ≥ 4 MB（低于这档的
+            // 权重本来就躺在 L2 里，缩复用距离无益——2026-10-08 在 288 KB /
+            // 576 KB / 1152 KB 三档上实测窗口序只值 1.05 / 1.00 / 0.97，而
+            // 那三档改用列主序值 1.25 / 1.17 / 1.04；门的旧值是 256 KB，
+            // 把这三档一起误判进了窗口序。生产里 1152 KB 与 8771 KB 之间
+            // **没有别的权重档**（见 bench/gpuhealth/logs/bottleneck_map_*.md
+            // 的尺寸分布），所以阈值落在这段区间里任何位置都等价）。
+            // 另：本分支的窗内排布也已改为列主序（CTC 头 8771 KB 上
+            // 1.51× → **2.00×**）。旧注释保留的"≥ 256 KB"已作废。
+            //
+            // 映射仍是 `gid → tile` 的函数，与 stride 无关（stride 循环
+            // 只是换一批 gid 来算），故夹网格不影响这里的全覆盖。
+            uint full = (tiles / (32u * rows_g)) * (32u * rows_g);
+            if (gid < full) {
+                uint w = gid / (32u * rows_g);
+                uint rem = gid - w * (32u * rows_g);
+                // 窗内**列主序**（见 else-if 分支的解释）：窗宽 32 块 =
+                // 64 个 float4，lane q 取第 q 与第 q+32 个，两条装载各是
+                // 4 条满载 line。双射仍在（q ∈ [0,32) 两列合起来覆盖本窗）。
+                n4 = (w << 6u) + (rem & 31u);
+                n4b = n4 + 32u;
+                m0 = (rem >> 5u) * 4u;
+            } else {
+                // 尾数：一个 warp 的 lane 跨行组、同通道 ⇒ 权重装载本就是
+                // 广播（1 条事务），列主序无从下手，保持相邻的 +1。
+                uint rem = gid - full;
+                uint wb2 = full / (32u * rows_g) << 5u;
+                n4 = (wb2 + rem / rows_g) * 2u;
+                n4b = n4 + 1u;
+                m0 = (rem % rows_g) * 4u;
             }
-            uint wRow = wb + (t * cin4v + ci4) * 4u * nv + n4;
-            for (uint i = 0u; i < 4u; i++) {
-                float4 wv0 = d[wRow + i * nv];
-                float4 wv1 = d[wRow + i * nv + 1u];
-                float s0 = g0[i], s1 = g1[i], s2 = g2[i], s3 = g3[i];
-                a0c0 += s0 * wv0; a1c0 += s1 * wv0; a2c0 += s2 * wv0; a3c0 += s3 * wv0;
-                a0c1 += s0 * wv1; a1c1 += s1 * wv1; a2c1 += s2 * wv1; a3c1 += s3 * wv1;
+        } else if (taps == 1u) {
+            // ── 列主序（1×1 且权重 < 4 MB）──────────────────────────
+            //
+            // 上面那条窗口序的门从 256 KB 提到了 4 MB：实测 288 KB / 576 KB
+            // / 1152 KB 三档上窗口序分别只值 1.05 / 1.00 / 0.97，而列主序
+            // 值 1.25 / 1.17 / 1.04 —— 权重本来就躺在 L2 里时，缩短复用
+            // 距离没有意义，赚的是 **lane 排布**。
+            //
+            // 原映射 `n4 = (gid % nh) * 2` 让相邻 lane 的通道相距 2 个
+            // float4，一个 warp 的权重装载横跨 8 条 cache line 却各用一半。
+            // 改成相邻 lane 连续取列（第二列放到 +nh）后，一条装载 = 32 个
+            // 连续 float4 = 512 B = **4 条满载 line**。输入侧不受影响：输入
+            // 地址与列号无关，仍是组内广播。
+            //
+            // 双射：`n4 = gid % nh ∈ [0, nh)`、`n4b = n4 + nh ∈ [nh, nv)`，
+            // 两列合起来恰好覆盖 `[0, nv)`（要求 `nv` 为偶，内核既有契约）。
+            // **每个输出元素的累加顺序一字未变**（仍按 ci4 递增），所以结果
+            // 与 base 映射位级一致——探针里误差 2.24e-8 与 `p_base` 完全相同。
+            n4 = gid % nh;
+            n4b = n4 + nh;
+            m0 = (gid / nh) * 4u;
+        } else {
+            n4 = (gid % nh) * 2u; // 第一列的 float4 下标（第二列 = n4+1）
+            n4b = n4 + 1u;
+            m0 = (gid / nh) * 4u;
+        }
+        uint dcol = n4b - n4; // 第二列相对第一列的偏移（循环外算一次）
+
+        // 8 个累加器：行 × 2 列
+        float4 a0c0 = float4(0.0), a1c0 = float4(0.0), a2c0 = float4(0.0), a3c0 = float4(0.0);
+        float4 a0c1 = float4(0.0), a1c1 = float4(0.0), a2c1 = float4(0.0), a3c1 = float4(0.0);
+        uint oh[4], ow[4];
+        bool ok[4];
+        for (uint i = 0u; i < 4u; i++) {
+            uint m = m0 + i;
+            ok[i] = m < mDim;
+            oh[i] = m / outW;
+            ow[i] = m - oh[i] * outW;
+        }
+
+        for (uint t = 0u; t < taps; t++) {
+            uint ky = t / kW, kx = t - ky * kW;
+            for (uint ci4 = 0u; ci4 < cin4v; ci4++) {
+                float4 g0 = float4(0.0), g1 = float4(0.0), g2 = float4(0.0), g3 = float4(0.0);
+                for (uint i = 0u; i < 4u; i++) {
+                    if (!ok[i]) continue;
+                    int ih = int(oh[i] * sH + ky) - int(padT);
+                    int iw = int(ow[i] * sW + kx) - int(padL);
+                    if (ih < 0 || ih >= int(inH) || iw < 0 || iw >= int(inW)) continue;
+                    uint px = uint(ih) * inW + uint(iw);
+                    float4 v = d[ib + px * cin4v + ci4];
+                    if (i == 0u) g0 = v; else if (i == 1u) g1 = v;
+                    else if (i == 2u) g2 = v; else g3 = v;
+                }
+                uint wRow = wb + (t * cin4v + ci4) * 4u * nv + n4;
+                for (uint i = 0u; i < 4u; i++) {
+                    float4 wv0 = d[wRow + i * nv];
+                    float4 wv1 = d[wRow + i * nv + dcol];
+                    float s0 = g0[i], s1 = g1[i], s2 = g2[i], s3 = g3[i];
+                    a0c0 += s0 * wv0; a1c0 += s1 * wv0; a2c0 += s2 * wv0; a3c0 += s3 * wv0;
+                    a0c1 += s0 * wv1; a1c1 += s1 * wv1; a2c1 += s2 * wv1; a3c1 += s3 * wv1;
+                }
             }
         }
+        if (b_off != OFF_NONE) {
+            float4 bv0 = d[(b_off >> 2) + n4]; // bias 全批共享（曾有 b*nv 越界）
+            float4 bv1 = d[(b_off >> 2) + n4b];
+            a0c0 += bv0; a1c0 += bv0; a2c0 += bv0; a3c0 += bv0;
+            a0c1 += bv1; a1c1 += bv1; a2c1 += bv1; a3c1 += bv1;
+        }
+        if (act != 0u) {
+            a0c0 = apply_act(a0c0, act, c1, c2, c3);
+            a1c0 = apply_act(a1c0, act, c1, c2, c3);
+            a2c0 = apply_act(a2c0, act, c1, c2, c3);
+            a3c0 = apply_act(a3c0, act, c1, c2, c3);
+            a0c1 = apply_act(a0c1, act, c1, c2, c3);
+            a1c1 = apply_act(a1c1, act, c1, c2, c3);
+            a2c1 = apply_act(a2c1, act, c1, c2, c3);
+            a3c1 = apply_act(a3c1, act, c1, c2, c3);
+        }
+        if (r_off != OFF_NONE) {
+            uint rb = (r_off >> 2) + b * mDim * nv;
+            if (ok[0]) { a0c0 += d[rb + m0 * nv + n4]; a0c1 += d[rb + m0 * nv + n4b]; }
+            if (ok[1]) { a1c0 += d[rb + (m0 + 1u) * nv + n4]; a1c1 += d[rb + (m0 + 1u) * nv + n4b]; }
+            if (ok[2]) { a2c0 += d[rb + (m0 + 2u) * nv + n4]; a2c1 += d[rb + (m0 + 2u) * nv + n4b]; }
+            if (ok[3]) { a3c0 += d[rb + (m0 + 3u) * nv + n4]; a3c1 += d[rb + (m0 + 3u) * nv + n4b]; }
+        }
+        if (ok[0]) { d[ob + m0 * nv + n4] = a0c0; d[ob + m0 * nv + n4b] = a0c1; }
+        if (ok[1]) { d[ob + (m0 + 1u) * nv + n4] = a1c0; d[ob + (m0 + 1u) * nv + n4b] = a1c1; }
+        if (ok[2]) { d[ob + (m0 + 2u) * nv + n4] = a2c0; d[ob + (m0 + 2u) * nv + n4b] = a2c1; }
+        if (ok[3]) { d[ob + (m0 + 3u) * nv + n4] = a3c0; d[ob + (m0 + 3u) * nv + n4b] = a3c1; }
     }
-    if (b_off != OFF_NONE) {
-        float4 bv0 = d[(b_off >> 2) + n4]; // bias 全批共享（曾有 b*nv 越界）
-        float4 bv1 = d[(b_off >> 2) + n4 + 1u];
-        a0c0 += bv0; a1c0 += bv0; a2c0 += bv0; a3c0 += bv0;
-        a0c1 += bv1; a1c1 += bv1; a2c1 += bv1; a3c1 += bv1;
-    }
-    if (act != 0u) {
-        a0c0 = apply_act(a0c0, act, c1, c2, c3);
-        a1c0 = apply_act(a1c0, act, c1, c2, c3);
-        a2c0 = apply_act(a2c0, act, c1, c2, c3);
-        a3c0 = apply_act(a3c0, act, c1, c2, c3);
-        a0c1 = apply_act(a0c1, act, c1, c2, c3);
-        a1c1 = apply_act(a1c1, act, c1, c2, c3);
-        a2c1 = apply_act(a2c1, act, c1, c2, c3);
-        a3c1 = apply_act(a3c1, act, c1, c2, c3);
-    }
-    if (r_off != OFF_NONE) {
-        uint rb = (r_off >> 2) + b * mDim * nv;
-        if (ok[0]) { a0c0 += d[rb + m0 * nv + n4]; a0c1 += d[rb + m0 * nv + n4 + 1u]; }
-        if (ok[1]) { a1c0 += d[rb + (m0 + 1u) * nv + n4]; a1c1 += d[rb + (m0 + 1u) * nv + n4 + 1u]; }
-        if (ok[2]) { a2c0 += d[rb + (m0 + 2u) * nv + n4]; a2c1 += d[rb + (m0 + 2u) * nv + n4 + 1u]; }
-        if (ok[3]) { a3c0 += d[rb + (m0 + 3u) * nv + n4]; a3c1 += d[rb + (m0 + 3u) * nv + n4 + 1u]; }
-    }
-    if (ok[0]) { d[ob + m0 * nv + n4] = a0c0; d[ob + m0 * nv + n4 + 1u] = a0c1; }
-    if (ok[1]) { d[ob + (m0 + 1u) * nv + n4] = a1c0; d[ob + (m0 + 1u) * nv + n4 + 1u] = a1c1; }
-    if (ok[2]) { d[ob + (m0 + 2u) * nv + n4] = a2c0; d[ob + (m0 + 2u) * nv + n4 + 1u] = a2c1; }
-    if (ok[3]) { d[ob + (m0 + 3u) * nv + n4] = a3c0; d[ob + (m0 + 3u) * nv + n4 + 1u] = a3c1; }
 }

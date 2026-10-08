@@ -16,8 +16,13 @@
 
 pub(crate) mod device;
 #[cfg(test)]
+mod conv_probe;
+#[cfg(test)]
 mod kernel_tests;
+#[cfg(test)]
+mod microbench;
 pub(crate) mod pipeline;
+pub(crate) mod prof;
 pub(crate) mod session;
 
 use metal::MTLGPUFamily;
@@ -189,7 +194,20 @@ impl DeviceContext for MetalContext {
         // 覆盖面探针：算子支持与形状无关，试建一次小计划——不支持时
         // stderr 声明后退回 CPU 会话（非静默降级）。探针留在缓存（真
         // 形状另建，可忽略）。
-        if let Err(e) = session.probe(&[1, 3, 48, 64]) {
+        //
+        // 探针形状必须落在**模型有定义**的输入域内：det（DB/FPN）在
+        // H=48 这类非 32 倍数上，下采样 3 会与 ×2 上采样对不齐，形状
+        // 推断直接报广播失败——那是探针形状的锅，不是算子缺覆盖。
+        // 用 64（32 的倍数、两级下采样都整除）作为通用探针形状。
+        let probe_shape: Vec<i64> = std::env::var("QPPOCR_METAL_PROBE")
+            .ok()
+            .and_then(|v| {
+                v.split(',')
+                    .map(|s| s.trim().parse::<i64>().ok())
+                    .collect::<Option<Vec<i64>>>()
+            })
+            .unwrap_or_else(|| vec![1, 3, 64, 64]);
+        if let Err(e) = session.probe(&probe_shape) {
             eprintln!(
                 "[metal] {:?} 会话探测失败（{e}）：走 CPU 会话（分级部署，\
                  补齐 n_ 覆盖面后自动上 GPU）",
@@ -204,13 +222,26 @@ impl DeviceContext for MetalContext {
             ModelRole::Det => 384,
             _ => 1536,
         };
-        // rec 会话批维补齐粒度 8：引擎按此合批（宽填充到批内最大桶宽），
-        // 会话补齐空行 + 内核 real_n 早退。
+        // rec 批维**补齐**默认关（=1）：计划按真实行数建。
+        //
+        // 「补齐换形状塌缩」的前提是所有内核都读 `params[0]` 早退，而批维
+        // 折进 x 网格的算子（分类头 conv/softmax/channel……）根本没得早退
+        // ——补齐 8 就是白算 8 倍。img-091 实测（交错 A/B 同窗）：
+        // rec 设备时间 189 → ~130 ms，整图 294–321 → 202–207 ms（1.45×，
+        // 机器降速窗内 1.59×）；且计划体积大 2.5–8 倍（每形状的静态段+
+        // 动态区）逼出预算淘汰，退真实行数后同图 11 个桶形状全命中。
+        // 合批仍留 8（`rec_chunk`）——合的是真实行，省每轮提交开销。
+        // `QPPOCR_METAL_BG=8` 可退回补齐（诊断/对照实验用）。
         if opts.model == ModelRole::Rec {
-            session.batch_grain = 8;
+            session.batch_grain = std::env::var("QPPOCR_METAL_BG")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
             // CTC 头只吃每时间步 argmax：GPU 端归约成 (val, idx) 对再回读
-            //（全量 T×V 概率回读纯属带宽浪费）。
-            session.argmax_exit = true;
+            //（全量 T×V 概率回读纯属带宽浪费）。诊断开关可退回宿主机 argmax
+            //（全量 T×V 回读）——用来把「GPU 归约选错」与「logits 本身不同」
+            // 分开定位。
+            session.argmax_exit = std::env::var_os("QPPOCR_METAL_NO_ARGMAX").is_none();
             session.exact_width = exact_width;
         }
         Ok(Arc::new(session))

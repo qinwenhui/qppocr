@@ -117,6 +117,9 @@ pub struct Dispatch {
 pub struct GraphPlan {
     /// arena 总 word 数（= 字节数 / 4）。
     pub total_words: u32,
+    /// 其中静态段（权重 + 参数块）的 word 数。**形状无关的权重**如果按
+    /// 形状各存一份，这里就是重复量的下界——诊断用。
+    pub static_words: u32,
     /// real_n 单元的 word 偏移（构造上恒 0；显式存字段防布局演算漂移）。
     pub rn_word: u32,
     /// 图输入的 f32 NCHW 区偏移（host 每次 memcpy 的目标——**不是**
@@ -125,7 +128,7 @@ pub struct GraphPlan {
     /// dispatch 序列（整图执行序）。
     pub dispatches: Vec<Dispatch>,
     /// 每次装载写一次的静态数据（rn 初值 + 参数块）。
-    pub uploads: Vec<(u32, Vec<u32>)>,
+    pub uploads: Vec<(u32, Arc<Vec<u32>>)>,
     /// init 直传权重（重排后）：复用同图 arena 时整段跳过（内容与形状
     /// 无关）。
     pub upload_init: Vec<(u32, Arc<Vec<u32>>)>,
@@ -152,6 +155,20 @@ pub struct PlanBuilder<'a> {
     pub producer_idx: &'a HashMap<String, usize>,
     /// rec 会话的 CTC argmax 出口（rank-3 输出改走 n_exit3_argmax）。
     pub argmax_exit: bool,
+    /// 网格上限（0 = 不夹）。
+    ///
+    /// M4 上**线程组周转本身**极贵，与内核算什么无关：独立探针（不经本
+    /// 仓库）测到空转内核 7200 组 6~25 ms = **0.7~2.7 µs/组**，而空命令
+    /// 缓冲往返只有 0.016 ms；同一份活的线程组越少越快——拷贝 16K 线程
+    /// 17.6 GB/s → 16.7M 线程 1.20 GB/s，纯 FMA 40 组 1696 GFLOPS →
+    /// 2560 组 450。det 计划里单条 dispatch 有 1200~9720 组，于是每条光
+    /// 铺线程组就几毫秒（CPU 侧同机 memcpy 64~82 GB/s，故 CPU 反快）。
+    ///
+    /// 夹过之后多出来的 tile 由**内核里的 grid-stride 循环**吃掉，所以
+    /// 只有写了 stride 的内核才能夹（当前 `n_conv8`）——没写的内核夹了
+    /// 就是少算。**数值不受影响**：stride 只改「哪个线程算哪个 tile」，
+    /// 每个输出的加法次序一字未动。
+    pub grid_cap: u32,
 }
 
 impl PlanBuilder<'_> {
@@ -176,7 +193,7 @@ impl PlanBuilder<'_> {
         let mut offs: HashMap<String, u32> = HashMap::new();
         // 权重占区（F32 且被引用；i64 常量链由 planner 折叠，不上传）。
         // 权重**永不释放**：dispatch 每次重放都读它，区域复用=数据被覆盖。
-        let mut upload: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut upload: Vec<(u32, Arc<Vec<u32>>)> = Vec::new();
         let mut upload_init: Vec<(u32, Arc<Vec<u32>>)> = Vec::new();
         // real_n 单元（arena 第 0 词）：本次 run 的真实批维行数，run() 每
         // 次提交前主机直写；n_ 内核读 params[0] 做批维早退。必须**最先**
@@ -184,7 +201,7 @@ impl PlanBuilder<'_> {
         // 让给权重/激活。初值 1 = 全通过（等 run() 覆写）。
         let rn_word = layout.alloc_static(1);
         debug_assert_eq!(rn_word, 0);
-        upload.push((rn_word, vec![1u32]));
+        upload.push((rn_word, Arc::new(vec![1u32])));
         // conv 族权重（重排目标）名单：预环跳过，节点处理时惰性重排。
         let mut conv_w_names: std::collections::HashSet<String> = Default::default();
         for n in &self.graph.nodes {
@@ -210,7 +227,7 @@ impl PlanBuilder<'_> {
                 continue;
             }
             if conv_w_names.contains(name) {
-                continue; // conv 权重/bias 惰性重排（map_node_n）
+                continue; // conv 权重/bias 惰性重排，同样落 upload_init（map_node_n）
             }
             // 转换进会话级缓存（与 conv 权重重排同款）：非 conv 权重可
             // 巨大（small rec 的分类器矩阵 4.5M 元素）——曾每计划重算
@@ -240,7 +257,7 @@ impl PlanBuilder<'_> {
             out_shape: Vec<i64>,
         }
         let mut recs: Vec<Rec> = Vec::new();
-        let mut params: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut params: Vec<(u32, Arc<Vec<u32>>)> = Vec::new();
 
         // 图输入占区：f32 区每 run 重写（host memcpy）；节点一律引用
         // entry 转换出的 NHWC 区。两区都不释放。
@@ -260,7 +277,7 @@ impl PlanBuilder<'_> {
                 .u(w as u32)
                 .u(nhwc::cpad4(c));
             let p_off = layout.alloc_static(pb.len_words());
-            params.push((p_off, pb.words().to_vec()));
+            params.push((p_off, Arc::new(pb.words().to_vec())));
             recs.push(Rec {
                 kernel: "n_entry",
                 node: "<entry>".into(),
@@ -524,6 +541,7 @@ impl PlanBuilder<'_> {
                 &fused,
                 &mut layout,
                 &mut upload,
+                &mut upload_init,
                 &mut w_offs,
                 reduce_scratch,
                 &mut rc,
@@ -531,7 +549,7 @@ impl PlanBuilder<'_> {
             for (kernel, pb, groups) in routes {
                 // 参数块与数据同块（u32 视图）；静态内容，装载期写一次
                 let p_off = layout.alloc_static(pb.len_words());
-                params.push((p_off, pb.words().to_vec()));
+                params.push((p_off, Arc::new(pb.words().to_vec())));
                 let ins: Vec<(String, u32, u32)> = n
                     .inputs
                     .iter()
@@ -622,7 +640,7 @@ impl PlanBuilder<'_> {
                     let mut pb = ParamBlock::new();
                     pb.u(src_off).u(out_off).u(rows).u(real_cols).u(cpad).u(rpb);
                     let p_off = layout.alloc_static(pb.len_words());
-                    params.push((p_off, pb.words().to_vec()));
+                    params.push((p_off, Arc::new(pb.words().to_vec())));
                     recs.push(Rec {
                         kernel: if argmax { "n_exit3_argmax" } else { "n_exit3" },
                         node: format!("<exit3:{name}>"),
@@ -657,7 +675,7 @@ impl PlanBuilder<'_> {
                     .u(nhwc::cpad4(c))
                     .u(act);
                 let p_off = layout.alloc_static(pb.len_words());
-                params.push((p_off, pb.words().to_vec()));
+                params.push((p_off, Arc::new(pb.words().to_vec())));
                 recs.push(Rec {
                     kernel: "n_exit",
                     node: format!("<exit:{name}>"),
@@ -728,6 +746,7 @@ impl PlanBuilder<'_> {
         }
         Ok(GraphPlan {
             total_words: layout.total,
+            static_words: layout.static_total,
             rn_word,
             in_f32_off,
             dispatches: recs
@@ -760,7 +779,10 @@ impl PlanBuilder<'_> {
     /// 两阶段、定向中转前置、逐元素门拆分）。
     ///
     /// 全图激活按 NHWC f32 语义路由；偏移一律 u32 word 单位。conv 族
-    /// 权重/偏置经 [`n_weight_off`] 惰性重排（k-major / tap-major）。
+    /// 权重/偏置经 [`n_weight_off`] 惰性重排（k-major / tap-major），落
+    /// `w_upload`（= `upload_init`，会话级 Arc 稳、可跳写），**不落
+    /// `uploads`**（每形状照写的动态块——混进去会把形状无关的权重也拖成
+    /// 每建必写）。
     #[allow(clippy::too_many_arguments)]
     fn map_node_n(
         &self,
@@ -769,7 +791,8 @@ impl PlanBuilder<'_> {
         offs: &HashMap<String, u32>,
         fused: &std::collections::HashSet<String>,
         layout: &mut Layout,
-        uploads: &mut Vec<(u32, Vec<u32>)>,
+        uploads: &mut Vec<(u32, Arc<Vec<u32>>)>,
+        w_upload: &mut Vec<(u32, Arc<Vec<u32>>)>,
         w_offs: &mut HashMap<String, u32>,
         reduce_scratch: u32,
         rc: &mut HashMap<String, (u32, u32)>,
@@ -791,6 +814,12 @@ impl PlanBuilder<'_> {
             })
         };
         let div256 = |t: u32| t.div_ceil(256);
+        // 夹过上限的网格——**只给写了 grid-stride 的内核用**（理由见
+        // `PlanBuilder::grid_cap`）。余下的 tile 由内核循环吃掉，数值不变。
+        let capped = |tiles: u32| -> u32 {
+            let g = tiles.div_ceil(256);
+            if self.grid_cap == 0 { g } else { g.min(self.grid_cap) }
+        };
         let out = &n.outputs[0];
         let out_shape = shape_of(out);
         // act 参数（conv 族：0=无 1=gelu 2=relu，镜像 Activation）
@@ -816,7 +845,7 @@ impl PlanBuilder<'_> {
                         self.initializers,
                         &n.inputs[1],
                         layout,
-                        uploads,
+                        w_upload,
                         w_offs,
                         self.repack_cache,
                         |t| repack_conv_w(&t.f32, co, ci, kh, kw),
@@ -853,12 +882,14 @@ impl PlanBuilder<'_> {
                         .u(r_off);
                     // 寄存器分块：Co%8==0 走 m4×n8（两列共享输入 gather，
                     // 输入流量减半）；奇数列回 m4×n4 基线。
+                    // `n_conv8` 有 grid-stride 循环 ⇒ 网格可夹到 grid_cap；
+                    // `n_conv` 没有 ⇒ 只能用 `div256`。
                     let nv = cpad4(ws[0]) / 4;
                     if nv % 2 == 0 {
                         Ok(vec![(
                             "n_conv8",
                             pb,
-                            [div256(m_dim.div_ceil(4) * (nv / 2)), nb, 1],
+                            [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1],
                         )])
                     } else {
                         Ok(vec![(
@@ -874,7 +905,7 @@ impl PlanBuilder<'_> {
                         self.initializers,
                         &n.inputs[1],
                         layout,
-                        uploads,
+                        w_upload,
                         w_offs,
                         self.repack_cache,
                         |t| repack_dw_w(&t.f32, cch, kh, kw),
@@ -931,7 +962,7 @@ impl PlanBuilder<'_> {
                     self.initializers,
                     &n.inputs[1],
                     layout,
-                    uploads,
+                    w_upload,
                     w_offs,
                     self.repack_cache,
                     |t| repack_convt_w(&t.f32, ci, co, kh, kw),
@@ -1186,7 +1217,7 @@ impl PlanBuilder<'_> {
                     self.initializers,
                     &n.inputs[1],
                     layout,
-                    uploads,
+                    w_upload,
                     w_offs,
                     self.repack_cache,
                     |_| nhwc::repack_conv_w(&w_t, nn, k, 1, 1),
@@ -1222,7 +1253,7 @@ impl PlanBuilder<'_> {
                     Ok(vec![(
                         "n_conv8",
                         pb,
-                        [div256(m_dim.div_ceil(4) * (nv / 2)), 1, 1],
+                        [capped(m_dim.div_ceil(4) * (nv / 2)), 1, 1],
                     )])
                 } else {
                     Ok(vec![("n_conv", pb, [div256(m_dim.div_ceil(4) * nv), 1, 1])])
@@ -1293,13 +1324,13 @@ impl PlanBuilder<'_> {
                 let g_off = {
                     let data = pack_c(&g);
                     let off = layout.alloc_static(data.len() as u32);
-                    uploads.push((off, data));
+                    uploads.push((off, Arc::new(data)));
                     off
                 };
                 let b_off2 = {
                     let data = pack_c(&bb);
                     let off = layout.alloc_static(data.len() as u32);
-                    uploads.push((off, data));
+                    uploads.push((off, Arc::new(data)));
                     off
                 };
                 let (rows, cpad) = rc
@@ -1689,14 +1720,14 @@ impl PlanBuilder<'_> {
         }
     }
 
-    /// conv 族 bias 的惰性 f16 重排区。
+    /// conv 族 bias 的惰性 f16 重排区（同 `w_upload`：形状无关、可跳写）。
     #[allow(clippy::too_many_arguments)]
     fn n_bias_off(
         &self,
         n: &Node,
         co: i64,
         layout: &mut Layout,
-        uploads: &mut Vec<(u32, Vec<u32>)>,
+        w_upload: &mut Vec<(u32, Arc<Vec<u32>>)>,
         w_offs: &mut HashMap<String, u32>,
     ) -> Result<u32> {
         if n.inputs.len() <= 2 || n.inputs[2].is_empty() {
@@ -1706,7 +1737,7 @@ impl PlanBuilder<'_> {
             self.initializers,
             &n.inputs[2],
             layout,
-            uploads,
+            w_upload,
             w_offs,
             self.repack_cache,
             |t| nhwc::conv_bias(&t.f32, co),
@@ -1720,6 +1751,9 @@ pub(crate) struct Layout {
     pub(crate) cursor: u32,
     /// 已触及的最大偏移（word）——arena 的总字数。
     pub(crate) total: u32,
+    /// `alloc_static` 累计申请量。静态段只增不复用，所以这是「与形状无关
+    /// 的部分占了总量多少」的直接读数。
+    pub(crate) static_total: u32,
 }
 
 impl Layout {
@@ -1728,6 +1762,7 @@ impl Layout {
             free: Vec::new(),
             cursor: 0,
             total: 0,
+            static_total: 0,
         }
     }
 
@@ -1771,8 +1806,10 @@ impl Layout {
     /// 巨循环 → GPU 挂死设备丢失）。
     pub(crate) fn alloc_static(&mut self, n: u32) -> u32 {
         let off = self.cursor;
-        self.cursor += n.div_ceil(4) * 4;
+        let n = n.div_ceil(4) * 4;
+        self.cursor += n;
         self.total = self.cursor;
+        self.static_total += n;
         off
     }
 }
@@ -1887,11 +1924,16 @@ fn node_out_rc(
 
 /// conv 族权重的惰性重排：首次引用时重排 + 静态占区 + 进上传列表。
 /// 名字键控（共享权重只重排一份）。
+///
+/// 落 `w_upload`（会话级 `upload_init`）：重排**与形状无关**且 Arc 出自
+/// [`Self::repack_cache`]，每次重建都是同一个 Arc × 同一份字节——可进
+/// 「跳写」集合。曾错落 `uploads`（每形状照写的动态块），导致小 rec 每建
+/// 一次计划就把 ~21 MB conv 权重主机侧重写一遍（11 形状/图 → ~230 MB）。
 fn n_weight_off(
     initializers: &HashMap<String, Tensor>,
     name: &str,
     layout: &mut Layout,
-    uploads: &mut Vec<(u32, Vec<u32>)>,
+    w_upload: &mut Vec<(u32, Arc<Vec<u32>>)>,
     w_offs: &mut HashMap<String, u32>,
     repack_cache: &Mutex<HashMap<String, Arc<Vec<u32>>>>,
     repack: impl FnOnce(&Tensor) -> Vec<u32>,
@@ -1916,7 +1958,7 @@ fn n_weight_off(
         )
     };
     let off = layout.alloc_static(data.len() as u32);
-    uploads.push((off, (*data).to_vec()));
+    w_upload.push((off, data));
     w_offs.insert(name.to_string(), off);
     Ok(off)
 }

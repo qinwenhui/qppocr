@@ -12,7 +12,7 @@ kernel void n_reduce_fin(
     device const uint* params [[buffer(1)]],
     device float4* d [[buffer(2)]],
     constant uint& p_off [[buffer(3)]],
-    uint3 gid3 [[thread_position_in_grid]],
+    uint gid [[thread_position_in_grid]],
     uint lid [[thread_position_in_threadgroup]])
 {
     threadgroup float accs[256];
@@ -21,7 +21,9 @@ kernel void n_reduce_fin(
     uint scratch_off = params[P + 0], out_off = params[P + 1];
     uint mBlocks = params[P + 2], cDim = params[P + 3], mDim = params[P + 4];
 
-    uint nb_idx = gid3.x / 256u; // grid.x=nb，每 WG 一批
+    // `gid` 标量 = 网格第 0 维（MSL 禁同内核混用标量/向量位置属性）；
+    // grid 恒 [nb,1,1]、线程组 256 线程，故 gid/256 = 线程组号 = 批号
+    uint nb_idx = gid / 256u; // grid.x=nb，每 WG 一批
     if (params[0] != 0u && nb_idx >= params[0]) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
     for (uint c0 = 0u; c0 < cDim; c0 += 256u) {
         uint c = c0 + lid;

@@ -107,10 +107,10 @@ fn elem_ref(op: u32, a: &[f32], b: &[f32], p1: f32, p2: f32, n: usize) -> Vec<f3
             5 => x * b[i],
             6 => x + b[0],
             7 => x * b[0],
-            8 => x - b[(i / 4) / c4 * 4],
+            8 => x - b[(i / 4) / c4],
             9 => x * x,
             10 => x.sqrt(),
-            11 => x / b[(i / 4) / c4 * 4],
+            11 => x / b[(i / 4) / c4],
             12 => x - b[i],
             13 => x / b[i],
             _ => unreachable!("op {op} 不在 n_elem 语义表内"),
@@ -323,7 +323,21 @@ fn elem_family_bitexact() {
 
         let src = if op == 10 { &a_pos } else { &a };
         let got: Vec<f32> = (0..n).map(|i| f32::from_bits(m[out_off + i])).collect();
-        let want = elem_ref(op, src, &b_elem, p1, p2, n);
+        // op 6/7 的 in2 是 scalar_off、op 8/11 是 rowv_off——两者都单独存在
+        // arena 另一段，不在 b_elem 里。以前这里一律传 &b_elem，等于让参考
+        // 实现去 b_elem 里捞标量/行向量：参考值本身是错的，却指着内核喊
+        // 「位级不符」（实测 op6 两侧 1.31 vs 0.64）。按内核语义把真正的
+        // 第二操作数交给参考实现。
+        let b_ref = match op {
+            6 | 7 => {
+                let mut v = b_elem.clone();
+                v[0] = scalar;
+                v
+            }
+            8 | 11 => rowv.clone(),
+            _ => b_elem.clone(),
+        };
+        let want = elem_ref(op, src, &b_ref, p1, p2, n);
         if bitexact {
             let gb: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
             let wb: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
@@ -440,6 +454,63 @@ fn det_session_end_to_end() {
 /// 端到端：真实 tiny rec，Metal 整图 vs CPU executor——概率图容差 +
 /// softmax 行和 + 每时间步 top-1 对齐（判据口径与 vulkan 侧
 /// rec_session_end_to_end 同源；直接构造会话 → 全量概率输出）。
+/// 零 GPU 风险的复用复现：连续 build 一串形状（**不派发任何 dispatch**），
+/// 然后逐份核对「该计划的静态区（权重 + 参数块）此刻还在不在位」。
+///
+/// 为什么这条判据是根因级的：会话级 arena 被所有计划共用，而静态区**每次
+/// build 都从偏移 0 重新分配**（`Layout::alloc_static` 与 `alloc` 共用一个
+/// cursor），于是 build j 的激活区会压在 build i 的参数块上。`plan_for` 命中
+/// 缓存时**一个字节都不重传**，被压掉的参数块就这么被拿去跑 → 垃圾参数 →
+/// 巨循环 → GPU 挂死设备丢失（`plan.rs:1804` 记的形态）。本测试给出**无派发**
+/// 的证据：哪些计划的静态区被这串 build 冲掉了；再走 `ensure_statics` 复核
+/// 修复后「派发前必然齐全」。
+///
+/// 形状/模型可由环境变量驱动，rec / cls 的序列不必重编译。**默认那两个 det 形状是弱例**
+/// （它们静态区恰好重合、0 份被冲），要跑**能真正冲掉**的强例用 rec：
+///
+///   QPPOCR_METAL_REPLAY_MODEL=../../models/tiny/rec.onnx \
+///   QPPOCR_METAL_REPLAY_SHAPES="1x3x48x384,1x3x48x1024,4x3x48x256,8x3x48x192,3x3x48x512,1x3x48x1088" \
+///   cargo test --release -p qppocr-metal arena_reuse_replay -- --nocapture
+///
+/// 2026-10-08 修后实测（重启后的健康机器，与修前一致）：`建完 6 份计划：4 份静态区被冲掉`，
+/// 最坏的 `[1,3,48,1024]` 只剩 **13/154 块**在位（9.08/13.47 MB）；逐份走 `ensure_statics`
+/// 之后 **6/6 全部在位**。默认形状则是 2026-10-08 22:22 那次「2 张图 / 1 进程」致瘸日志里的
+/// 两个 det 形状（`[1,3,960,864]` = 图 1，`[1,3,800,960]` = 图 2）。
+#[test]
+fn arena_reuse_replay_det() {
+    let Some(ctx) = open_or_skip() else { return };
+    let model = std::env::var("QPPOCR_METAL_REPLAY_MODEL")
+        .unwrap_or_else(|_| "../../models/tiny/det.onnx".into());
+    let p = std::path::Path::new(&model);
+    if !p.is_file() {
+        eprintln!("[metal] 无模型 {model}，跳过");
+        return;
+    }
+    let shapes: Vec<Vec<i64>> = match std::env::var("QPPOCR_METAL_REPLAY_SHAPES") {
+        Ok(s) => s
+            .split(',')
+            .filter(|t| !t.trim().is_empty())
+            .map(|t| {
+                t.trim()
+                    .split('x')
+                    .map(|v| v.trim().parse::<i64>().expect("形状形如 1x3x48x384"))
+                    .collect()
+            })
+            .collect(),
+        Err(_) => vec![
+            vec![1i64, 3, 960, 864], // 图 1 的 det
+            vec![1i64, 3, 800, 960], // 图 2 的 det
+        ],
+    };
+    let bytes = std::fs::read(p).unwrap();
+    use qppocr_core::executor::Session;
+    let (graph, init) = Session::from_memory(&bytes, "metal.replay")
+        .unwrap()
+        .into_parts();
+    let gpu = super::session::MetalSession::new(ctx.inner.clone(), graph, init).unwrap();
+    gpu.debug_replay_builds(&shapes).unwrap();
+}
+
 #[test]
 fn rec_session_end_to_end() {
     let Some(ctx) = open_or_skip() else { return };
@@ -499,8 +570,10 @@ fn rec_session_end_to_end() {
         .sum::<f32>()
         / a.len() as f32;
     eprintln!("[metal-rec] max|diff|={max_abs:.3e} mean|diff|={mean_abs:.3e}");
-    assert!(mean_abs < 1e-3, "概率均值偏差超容差: {mean_abs}");
-    assert!(max_abs < 5e-2, "概率极值偏差超容差: {max_abs}");
+    assert!(mean_abs < 1e-6, "概率均值偏差超容差: {mean_abs}");
+    // 极值容差按实测定格（曾放 5e-2——那是个能把整块注意力算错都盖住的
+    // 数字，见 `attn_mm_raw` 的 203/210：真正的错误在这里被放行了）
+    assert!(max_abs < 1e-4, "概率极值偏差超容差: {max_abs}");
     // softmax 行和 ≈ 1（全链数值健康的独立判据）
     let rows = a.len() / *out_cpu[0].shape.last().unwrap() as usize;
     let vocab = *out_cpu[0].shape.last().unwrap() as usize;
@@ -525,7 +598,141 @@ fn rec_session_end_to_end() {
         .filter(|r| pick(&a[r * vocab..(r + 1) * vocab]) != pick(&bw[r * vocab..(r + 1) * vocab]))
         .count();
     eprintln!("[metal-rec] top-1 不一致 {top_mis}/{rows}");
-    assert!(top_mis <= rows / 3, "top-1 不一致超 1/3: {top_mis}/{rows}");
+    // 逐位要求：CTC 的每步 top-1 就是最终字符，差一个就是**错字**。
+    // 这里曾写 `top_mis <= rows/3`——一个允许 1/3 时间步选错字的断言，
+    // 等于把「精度与 CPU 一致」这条硬约束换成了「大致像」。
+    assert_eq!(top_mis, 0, "top-1 不一致 {top_mis}/{rows}");
+}
+
+/// 端到端：**small 档 rec（transformer 主干）**的逐元素对拍。
+///
+/// `rec_session_end_to_end` 只覆盖 `models/tiny`（纯卷积 rec，63 条
+/// dispatch），而 small 档的 rec 是 173 条 dispatch 的 transformer
+/// （LayerNorm + 多头注意力 + CTC 头）——窗口、掩码、softmax 语义都不同。
+/// 实测端到端 12 图的**逐字符**对拍里 small 档 rec 有 33% 的行与 CPU 不同
+/// （tiny 档与 cls/det 均逐位一致），所以这里把它单拉出来量。
+///
+/// 形状取真实语料桶宽（48×216），批维 1（引擎 exact_width 下的常态）。
+#[test]
+fn rec_small_end_to_end() {
+    let Some(ctx) = open_or_skip() else { return };
+    if !rec_small_bytes().is_some() {
+        return;
+    }
+    let (max_abs, mean_abs, shape) = rec_small_case(&ctx, 1, 216, 0x1357_9bdf_0246_8ace);
+    eprintln!(
+        "[metal-rec-small] 输出0 {shape:?} max|diff|={max_abs:.3e} mean|diff|={mean_abs:.3e}"
+    );
+    // 判据：注意力块算错时这里是 4.6e-1（见 `attn_mm_raw`），修好后
+    // 是 2.5e-6（FMA 收缩的余量）。1e-4 两边都夹得住——不允许退回。
+    assert!(max_abs < 1e-4, "极值偏差超容差: {max_abs:.3e}");
+    assert!(mean_abs < 1e-6, "均值偏差超容差: {mean_abs:.3e}");
+}
+
+/// small 档 rec 的**形状扫描**：单点对拍（上面那个用例）只证明了一个
+/// 宽度，而引擎真实的桶宽是一整套（grain=8 下 96…1008 都可能出现）、
+/// 批维也从 1 到 8。先前「单点绿、整图红」就是栽在这个缝里：注意力块
+/// 一错，216 恰好因为某种巧合过关（或反之）。
+///
+/// 所以这里把「一算子一算子地测」落到形状维上：逐形状打印偏差，任何
+/// 一个形状炸掉都直接点名。
+#[test]
+fn rec_small_shape_sweep() {
+    let Some(ctx) = open_or_skip() else { return };
+    if !rec_small_bytes().is_some() {
+        return;
+    }
+    // 宽度取语料里真实出现过的桶宽（grain 8）+ 极端窄/宽
+    let widths = [
+        96usize, 128, 160, 192, 216, 240, 264, 288, 336, 408, 480, 552, 720, 1008,
+    ];
+    let mut worst = (0f32, 0usize);
+    for (i, &w) in widths.iter().enumerate() {
+        let (max_abs, mean_abs, _) =
+            rec_small_case(&ctx, 1, w, 0x51ed_2701_dead_0001 + i as u64 * 0x9e37);
+        eprintln!("[sweep] B=1 W={w:<5} max|diff|={max_abs:.3e} mean|diff|={mean_abs:.3e}");
+        if max_abs > worst.0 {
+            worst = (max_abs, w);
+        }
+        assert!(max_abs < 1e-4, "B=1 W={w} 极值偏差超容差: {max_abs:.3e}");
+    }
+    // 批维：引擎 per_batch=8，实跑多为 3/5/8 行一批（其余行零填充，
+    // real_n 早退）。批维一错，整批行文本一起错。
+    for &b in &[2usize, 3, 5, 8] {
+        let (max_abs, mean_abs, _) = rec_small_case(&ctx, b, 216, 0x0b_a7_0003 + b as u64);
+        eprintln!("[sweep] B={b} W=216  max|diff|={max_abs:.3e} mean|diff|={mean_abs:.3e}");
+        assert!(max_abs < 1e-4, "B={b} W=216 极值偏差超容差: {max_abs:.3e}");
+    }
+    eprintln!("[sweep] 最差形状 W={}", worst.1);
+}
+
+fn rec_small_bytes() -> Option<Vec<u8>> {
+    let p = std::path::Path::new("../../models/small/rec.onnx");
+    if !p.is_file() {
+        eprintln!("[metal] 无 small rec 模型，跳过");
+        return None;
+    }
+    Some(std::fs::read(p).unwrap())
+}
+
+/// 跑一组 small rec 对拍：CPU `Session` vs Metal 会话（批维按引擎语义
+/// 补齐到 8），返回 (max|diff|, mean|diff|, 输出形状)。
+///
+/// `seed` 必须按形状给不同的值：同一份随机输入喂给不同宽度，会掩盖
+/// 「某些宽度才触发的寻址错误」。
+fn rec_small_case(
+    ctx: &MetalContext,
+    b: usize,
+    ww: usize,
+    seed0: u64,
+) -> (f32, f32, Vec<i64>) {
+    let bytes = rec_small_bytes().expect("已确认模型存在");
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    let hh = 48usize;
+    let mut seed = seed0;
+    let mut buf = F32Buf::with_zeroed(b * 3 * hh * ww);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    let t0 = Tensor {
+        name: String::new(),
+        shape: vec![b as i64, 3, hh as i64, ww as i64],
+        dtype: DType::F32,
+        f32: buf,
+        i64: Vec::new(),
+    };
+    let cpu = Session::from_memory(&bytes, "metal.rec_small.cpu").unwrap();
+    let in_name = cpu
+        .graph
+        .inputs
+        .iter()
+        .find(|s| !s.is_empty())
+        .cloned()
+        .unwrap();
+    let out_cpu = cpu.run(vec![(in_name.clone(), t0.clone())]).unwrap();
+    let (graph, init) = {
+        let s = Session::from_memory(&bytes, "metal.rec_small.gpu").unwrap();
+        s.into_parts()
+    };
+    let mut gpu = super::session::MetalSession::new(ctx.inner.clone(), graph, init).unwrap();
+    gpu.batch_grain = 8; // 引擎合批语义（create_session 的 rec 配置）
+    let out_gpu =
+        qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name.clone(), t0)]).unwrap();
+
+    assert_eq!(out_gpu.len(), out_cpu.len(), "输出个数不一致");
+    let (a, c) = (&out_gpu[0].f32, &out_cpu[0].f32);
+    assert_eq!(out_gpu[0].shape, out_cpu[0].shape, "输出形状不一致");
+    assert_eq!(a.len(), c.len(), "输出元素数不一致");
+    let max_abs = a
+        .iter()
+        .zip(c.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    let mean_abs = a.iter().zip(c.iter()).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
+    (max_abs, mean_abs, out_gpu[0].shape.clone())
 }
 
 /// 端到端：真实 cls（B=17 批维——历史 bug 高发形态），argmax 对齐 +
@@ -669,4 +876,298 @@ fn rec_batch_padding() {
         / a.len() as f32;
     eprintln!("[metal-rec-b3] B=3→pad8 mean|diff|={mean_abs:.3e}");
     assert!(mean_abs < 1e-3, "补齐批均值偏差超容差: {mean_abs}");
+}
+
+// ─────────────── 裸内核对拍：注意力块三件套 ───────────────
+//
+// det / cls / tiny-rec 三条端点用例**都不经过** `n_attn_mm` /
+// `n_softmax` / `n_transpose_nd`——它们是本后端唯一没有端点覆盖的内核。
+// small 档 rec（173 dispatch 的 transformer）与 tiny 档（纯卷积 63
+// dispatch）的差异恰好只有这一段，所以 `rec_small_end_to_end` 报出的
+// max|diff| 4.6e-1 的嫌疑全部落在这里。
+//
+// 三个用例从 vulkan 侧 `n_kernel_tests.rs` 的同名用例移植：同样的形状、
+// 同样的 LCG 种子、同样的 CPU 参考算法——一侧红一侧绿就直接定位到后端。
+
+/// `n_softmax` 的 CPU 参考。**必须复刻内核的运算顺序**：exp1 多项式的
+/// 展开序、以及 x86 `softmax_row_vec` 的 8-lane 顺序和（树归约序差
+/// ~1e-6 就足以翻 CTC 单字——这是 vulkan 侧用整段注释换来的教训）。
+/// 只写「数学上等价的 softmax」会让参考自己在 1e-6 量级漂。
+fn softmax_ref(src: &[f32], rows: usize, cols: usize, cpad: usize) -> Vec<f32> {
+    fn exp1(x: f32) -> f32 {
+        const LN2_HI: f32 = 0.6931472;
+        const LN2_LO: f32 = -2.9802322e-8;
+        const INV_LN2: f32 = 1.442695;
+        let x = x.clamp(-88.0, 88.0);
+        let kf = (x * INV_LN2).round_ties_even();
+        let mut r = (-kf).mul_add(LN2_HI, x);
+        r = (-kf).mul_add(LN2_LO, r);
+        let mut p = 1.0f32 / 720.0;
+        p = p.mul_add(r, 1.0 / 120.0);
+        p = p.mul_add(r, 1.0 / 24.0);
+        p = p.mul_add(r, 1.0 / 6.0);
+        p = p.mul_add(r, 0.5);
+        p = p.mul_add(r, 1.0);
+        p = p.mul_add(r, 1.0);
+        let ki = kf as i32 + 127;
+        f32::from_bits((ki as u32) << 23) * p
+    }
+    let mut out = vec![0f32; rows * cpad];
+    for row in 0..rows {
+        let base = &src[row * cpad..row * cpad + cols];
+        // 内核起手 -3.4e38（不是 -inf）——照抄，别「顺手改对」
+        let m = base.iter().copied().fold(-3.4e38f32, f32::max);
+        let e: Vec<f32> = base.iter().map(|v| exp1(v - m)).collect();
+        // 8-lane 顺序和 + ((l0+l4)+(l1+l5))+((l2+l6)+(l3+l7))
+        let mut l = [0f32; 8];
+        let q = cols >> 3;
+        for t in 0..q {
+            for k in 0..8 {
+                l[k] += e[t * 8 + k];
+            }
+        }
+        let mut s = ((l[0] + l[4]) + (l[1] + l[5])) + ((l[2] + l[6]) + (l[3] + l[7]));
+        for j in q * 8..cols {
+            s += e[j];
+        }
+        let inv = 1.0 / s;
+        for j in 0..cols {
+            out[row * cpad + j] = e[j] * inv;
+        }
+    }
+    out
+}
+
+/// `n_transpose_nd` 裸内核：rank-5 `[2,0,3,1,4]`（small rec 的
+/// `Transpose.3` 同构）对拍 CPU 参考，逐元素位级。
+#[test]
+fn transpose_nd_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let dims: [u32; 5] = [4, 3, 2, 8, 15];
+    let perm: [u32; 5] = [2, 0, 3, 1, 4];
+    let total: usize = dims.iter().map(|&d| d as usize).product();
+    let mut seed = 0x1234_0000_5555_aaaa_u64;
+    let src: Vec<f32> = (0..total).map(|_| lcg(&mut seed)).collect();
+
+    // CPU 参考：输出线性下标 i → 按输出维（dims 按 perm 重排）分解 →
+    // 经 perm 映射回输入坐标 → 行主序 Horner
+    let odims: Vec<usize> = (0..5).map(|d| dims[perm[d] as usize] as usize).collect();
+    let want: Vec<f32> = (0..total)
+        .map(|i| {
+            let mut oc = [0usize; 5];
+            let mut rem = i;
+            for d in (0..5).rev() {
+                oc[d] = rem % odims[d];
+                rem /= odims[d];
+            }
+            let mut ic = [0usize; 5];
+            for d in 0..5 {
+                ic[perm[d] as usize] = oc[d];
+            }
+            let mut s = 0usize;
+            for k in 0..5 {
+                s = s * dims[k] as usize + ic[k];
+            }
+            src[s]
+        })
+        .collect();
+
+    let seg = |n: usize| n.div_ceil(4) * 4;
+    let in_off = 4usize; // word 0 是 real_n 槽
+    let out_off = in_off + seg(total);
+    let pbase = out_off + seg(total);
+    let (buf, mut m) = Words::new(&ctx.inner.device, pbase + 32);
+
+    m[0] = 0;
+    for (i, v) in src.iter().enumerate() {
+        m[in_off + i] = v.to_bits();
+    }
+    let p = pbase;
+    m[p] = in_off as u32;
+    m[p + 1] = out_off as u32;
+    m[p + 2] = total as u32;
+    m[p + 3] = 5;
+    for d in 0..5 {
+        m[p + 4 + d] = dims[d];
+        m[p + 9 + d] = perm[d];
+    }
+
+    submit_compute(&ctx.inner.queue, |enc| {
+        ks.dispatch(
+            enc,
+            "n_transpose_nd",
+            &buf,
+            p as u32,
+            [total.div_ceil(256) as u32, 1, 1],
+        )
+        .expect("dispatch n_transpose_nd");
+    })
+    .expect("submit");
+
+    let got: Vec<u32> = (0..total).map(|i| m[out_off + i]).collect();
+    let wantb: Vec<u32> = want.iter().map(|v| v.to_bits()).collect();
+    let bad = got.iter().zip(&wantb).filter(|(a, b)| a != b).count();
+    eprintln!("[metal] n_transpose_nd dims={dims:?} perm={perm:?} 分歧 {bad}/{total}");
+    assert_eq!(bad, 0, "n_transpose_nd rank-5 位级对拍失败");
+}
+
+/// `n_attn_mm` 裸内核：batched `[b,M,K]×[b,K,N]`（QK^T 与 scores×V
+/// 同构）对拍 CPU 参考。
+///
+/// 形状刻意与 vulkan 侧一致（b=6 行进 `real_n` 早退分支、m=5 不整齐），
+/// 因为这条内核的**行索引取自在网格的 y 维**（grid = [1, batch*m, 1]），
+/// 而 GLSL 的 `gl_WorkGroupID.y` 到 Metal 的映射正是本用例要钉住的。
+#[test]
+fn attn_mm_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let (batch, heads, m_, k, n) = (6usize, 3usize, 5usize, 4usize, 7usize);
+    let mut seed = 0xabcd_ef01_2345_6789_u64;
+    let a: Vec<f32> = (0..batch * m_ * k).map(|_| lcg(&mut seed)).collect();
+    let b: Vec<f32> = (0..batch * k * n).map(|_| lcg(&mut seed)).collect();
+    // 累加序 = k 升序标量（与内核/CPU MatMul 一致——换了序就是另一个
+    // 数，参考值自己先漂，判据就废了）
+    let mut want = vec![0f32; batch * m_ * n];
+    for bi in 0..batch {
+        for mi in 0..m_ {
+            for j in 0..n {
+                let mut acc = 0f32;
+                for ki in 0..k {
+                    acc += a[(bi * m_ + mi) * k + ki] * b[(bi * k) * n + ki * n + j];
+                }
+                want[(bi * m_ + mi) * n + j] = acc;
+            }
+        }
+    }
+
+    let seg = |x: usize| x.div_ceil(4) * 4;
+    let (a_w, b_w, o_w) = (
+        seg(batch * m_ * k),
+        seg(batch * k * n),
+        seg(batch * m_ * n),
+    );
+    let a_off = 4usize;
+    let b_off = a_off + a_w;
+    let o_off = b_off + b_w;
+    let pbase = o_off + o_w;
+    let (buf, mut m) = Words::new(&ctx.inner.device, pbase + 32);
+
+    m[0] = 0; // real_n = 0：不走早退，全批真算
+    for (i, v) in a.iter().enumerate() {
+        m[a_off + i] = v.to_bits();
+    }
+    for (i, v) in b.iter().enumerate() {
+        m[b_off + i] = v.to_bits();
+    }
+    let p = pbase;
+    m[p] = a_off as u32;
+    m[p + 1] = b_off as u32;
+    m[p + 2] = o_off as u32;
+    m[p + 3] = m_ as u32;
+    m[p + 4] = k as u32;
+    m[p + 5] = n as u32;
+    m[p + 6] = batch as u32;
+    m[p + 7] = heads as u32;
+
+    submit_compute(&ctx.inner.queue, |enc| {
+        ks.dispatch(enc, "n_attn_mm", &buf, p as u32, [1, (batch * m_) as u32, 1])
+            .expect("dispatch n_attn_mm");
+    })
+    .expect("submit");
+
+    let got: Vec<f32> = (0..want.len())
+        .map(|i| f32::from_bits(m[o_off + i]))
+        .collect();
+    let max_abs = got
+        .iter()
+        .zip(&want)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    let bad = got
+        .iter()
+        .zip(&want)
+        .filter(|(x, y)| (**x - **y).abs() > 1e-5)
+        .count();
+    eprintln!("[metal] n_attn_mm 分歧 {bad}/{} max|diff|={max_abs:.3e}", want.len());
+    assert_eq!(bad, 0, "n_attn_mm 对拍失败");
+}
+
+/// `n_softmax` 裸内核对拍 CPU 参考。两档形状：一档**小而行多**
+/// （`[64, 8]`——注意力分数矩阵，cols 不足 256 线程，走尾部单轮），
+/// 一档**宽而列多**（`[5, 603]`——CTC 头形态，cols > 256 走多轮、
+/// 且 603 不是 8 的倍数以触到标量尾段）。
+#[test]
+fn softmax_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    for (rows, cols) in [(64usize, 8usize), (5usize, 603usize)] {
+        let cpad = cols.div_ceil(4) * 4;
+        let mut seed = 0x0bad_c0de_dead_beef_u64 ^ (rows as u64 * 31 + cols as u64);
+        // 值域拉开 [-10, 10)：exp 的多项式分支、max 平移都要真走
+        let src: Vec<f32> = (0..rows * cpad)
+            .map(|_| lcg(&mut seed) * 20.0 - 10.0)
+            .collect();
+        let want = softmax_ref(&src, rows, cols, cpad);
+
+        let in_off = 4usize;
+        let out_off = in_off + rows * cpad;
+        let pbase = out_off + rows * cpad;
+        let (buf, mut m) = Words::new(&ctx.inner.device, pbase + 32);
+
+        m[0] = 0; // real_n 不限
+        for (i, v) in src.iter().enumerate() {
+            m[in_off + i] = v.to_bits();
+        }
+        let p = pbase;
+        m[p] = in_off as u32;
+        m[p + 1] = out_off as u32;
+        m[p + 2] = rows as u32;
+        m[p + 3] = cols as u32;
+        m[p + 4] = cpad as u32;
+        m[p + 5] = 8; // rpb：rows/批（real_n=0 时无意义，填真实值）
+
+        submit_compute(&ctx.inner.queue, |enc| {
+            ks.dispatch(enc, "n_softmax", &buf, p as u32, [rows as u32, 1, 1])
+                .expect("dispatch n_softmax");
+        })
+        .expect("submit");
+
+        let got: Vec<f32> = (0..rows * cpad)
+            .map(|i| f32::from_bits(m[out_off + i]))
+            .collect();
+        let (mut max_abs, mut at) = (0f32, 0usize);
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            let d = (g - w).abs();
+            if d > max_abs {
+                max_abs = d;
+                at = i;
+            }
+        }
+        let bad = got
+            .iter()
+            .zip(&want)
+            .filter(|(g, w)| (**g - **w).abs() > 1e-6)
+            .count();
+        // 行和：softmax 的**语义**判据（不依赖参考实现）——某一行整体
+        // 错时位级比较会报「一堆小差」，行和会直接报「这行不是分布」
+        let mut sum_bad = 0usize;
+        for r in 0..rows {
+            let s: f32 = got[r * cpad..r * cpad + cols].iter().sum();
+            if (s - 1.0).abs() > 1e-4 {
+                sum_bad += 1;
+            }
+        }
+        eprintln!(
+            "[metal] n_softmax rows={rows} cols={cols} 分歧 {bad}/{} \
+             max|diff|={max_abs:.3e}(@{at} gpu={:.6e} cpu={:.6e}) 行和异常 {sum_bad}/{rows}",
+            rows * cpad,
+            got[at],
+            want[at]
+        );
+        assert_eq!(bad, 0, "n_softmax [{rows},{cols}] 对拍失败");
+    }
 }

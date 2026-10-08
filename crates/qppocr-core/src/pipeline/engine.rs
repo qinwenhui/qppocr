@@ -1077,16 +1077,18 @@ impl Engine {
             .filter(|&v| v > 0)
             .unwrap_or(self.cfg.rec_batch);
         let per_batch = if !self.rec.prefers_host_parallelism() {
-            // GPU 会话：同桶行合批至上限 batch_grain（下方桶宽分组分支），
-            // 会话侧批维补齐 + 内核空行早退——形状塌缩成 (grain,W桶)、
-            // 每图提交次数 = 桶数而非行数。历史上两条歧路都已封死：不补齐的
-            // per=8 是 (bsz∈1..8)×宽桶 ≈106 形状/百图（重建摊销 88ms/图）；
-            // 无早退的补齐是纯 8× 算力（宽行网格 bsz=1 已吃满 EU）。
+            // GPU 会话：同桶行合批至 rec_chunk 上限（下方桶宽分组分支）——
+            // 合的是**真实**行，省的是每轮编码/提交开销，不浪费算力。
+            // **不再**顺带补齐批维：补齐只对读 `params[0]` 早退的内核免费，
+            //而批维折进 x 网格的算子（分类头）按补齐量白算。历史遗留的
+            // 「补齐到 grain 换形状塌缩」在 Metal 上实测付 8 倍算力（见
+            // MetalSession::batch_grain），计划体积也大 2.5–8 倍、逼出
+            // 预算淘汰；退真实行数后计划变小反而全命中。
             std::env::var("QPPOCR_REC_CHUNK")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|&v| v > 0)
-                .unwrap_or(self.rec.batch_grain().max(1) as usize)
+                .unwrap_or(self.rec.rec_chunk())
         } else if std::env::var_os("QPPOCR_REC_BATCH_NOCLAMP").is_some() {
             rec_batch_cfg.max(1)
         } else {
@@ -1101,11 +1103,13 @@ impl Engine {
         let mut batches: Vec<(usize, usize)> = Vec::new();
         // 分桶粒度（与 rec_fn 同一条优先级链）：env 显式值 > 配置 > 设备
         // 上报（GPU 会话 64——每新形状付 ~10ms 计划重建，见 DeviceSession::
-        // bucket_grain）。
+        // bucket_grain）。**1 是合法值**：显式给 1 = 关掉宽度取整，喂给
+        // 模型的宽与 CPU 逐像素相同（诊断/精度对拍用——宽度取整会经无
+        // mask 的注意力混入真步，是 CPU/GPU 置信度差异的一个来源）。
         let rec_grain = std::env::var("QPPOCR_REC_GRAIN")
             .ok()
             .and_then(|v| v.trim().parse::<i32>().ok())
-            .filter(|&v| v > 1)
+            .filter(|&v| v > 0)
             .or_else(|| {
                 let g = self.cfg.rec_width_grain;
                 (g > 1).then_some(g)
@@ -1234,10 +1238,10 @@ impl Engine {
             }
 
             let bsz = end - beg;
-            // 注：GPU 会话把批维补齐到 batch_grain，空行由内核 real_n
-            // 早退守卫零算力（曾实测无守卫的补齐 = 纯 8× 算力）；
-            // (bsz≤grain, W桶) 形状多样性由桶宽分组 + 补齐塌缩掉。
-            // CPU 会话批维即行数，不补。
+            // 批维 = 真实行数（bsz）：**不补齐**。补齐只在所有内核都读
+            // real_n 早退时才免费，而折进网格的算子按补齐量白算——Metal
+            // 实测付 8 倍。形状多样性靠桶宽分组（rec_grain）压，不靠补齐。
+            // CPU 会话批维即行数，同理。
             let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (img_h as usize) * (img_w as usize));
             let t_pack = std::time::Instant::now();
             for (k, &i) in order[beg..end].iter().enumerate() {

@@ -99,7 +99,8 @@ impl KernelSet {
         Ok(Self { pipes })
     }
 
-    fn get(&self, name: &str) -> Result<&ComputePipelineState> {
+    /// 取某内核的管线（诊断/微基准要拿单条管线自己录分发时用）。
+    pub(crate) fn get(&self, name: &str) -> Result<&ComputePipelineState> {
         self.pipes
             .get(name)
             .ok_or_else(|| Error::Device(format!("内核 {name} 不在 KernelSet 里")))
@@ -117,27 +118,56 @@ impl KernelSet {
         p_off: u32,
         groups: [u32; 3],
     ) -> Result<()> {
-        enc.set_compute_pipeline_state(self.get(name)?);
-        // 同一 arena 绑 0/1/2：f32 / u32 / float4 三视图（各内核按需
-        // 声明，编号沿用 GLSL 侧 binding 编号）。
-        enc.set_buffer(0, Some(arena), 0);
-        enc.set_buffer(1, Some(arena), 0);
-        enc.set_buffer(2, Some(arena), 0);
-        // push constant 的对应物：4 字节参数块偏移（set_bytes 在本调用
-        // 期间同步拷贝，无生命周期尾巴）
-        enc.set_bytes(
-            3,
-            std::mem::size_of::<u32>() as u64,
-            &p_off as *const u32 as *const std::ffi::c_void,
-        );
-        enc.dispatch_threads(
-            MTLSize::new(
-                groups[0] as u64 * THREADS_PER_GROUP,
-                groups[1] as u64,
-                groups[2] as u64,
-            ),
-            MTLSize::new(THREADS_PER_GROUP, 1, 1),
-        );
-        Ok(())
+        dispatch_with(enc, self.get(name)?, arena, p_off, groups)
     }
+}
+
+/// 录一条分发（管线已定）。**与 `KernelSet` 解耦**——微基准拿自己的
+/// 变体管线复用同一套绑定/网格语义，量到的差异才只归因于内核本身。
+pub(crate) fn dispatch_with(
+    enc: &ComputeCommandEncoderRef,
+    pipe: &ComputePipelineState,
+    arena: &BufferRef,
+    p_off: u32,
+    groups: [u32; 3],
+) -> Result<()> {
+    dispatch_with_tg(enc, pipe, arena, p_off, groups, THREADS_PER_GROUP)
+}
+
+/// 同上，但线程组尺寸可指定。
+///
+/// 存在的唯一理由是**诊断**：生产路径恒用 [`THREADS_PER_GROUP`]，而
+/// 「线程组尺寸是否影响达成吞吐」本身是 Mac 侧一个待证的性能假设
+/// （见 `microbench::threads_per_group_sweep`）。把它做成参数而不是在
+/// 探针里另抄一份编码，量到的差异才只归因于尺寸这一项。
+pub(crate) fn dispatch_with_tg(
+    enc: &ComputeCommandEncoderRef,
+    pipe: &ComputePipelineState,
+    arena: &BufferRef,
+    p_off: u32,
+    groups: [u32; 3],
+    tg: u64,
+) -> Result<()> {
+    enc.set_compute_pipeline_state(pipe);
+    // 同一 arena 绑 0/1/2：f32 / u32 / float4 三视图（各内核按需
+    // 声明，编号沿用 GLSL 侧 binding 编号）。
+    enc.set_buffer(0, Some(arena), 0);
+    enc.set_buffer(1, Some(arena), 0);
+    enc.set_buffer(2, Some(arena), 0);
+    // push constant 的对应物：4 字节参数块偏移（set_bytes 在本调用
+    // 期间同步拷贝，无生命周期尾巴）
+    enc.set_bytes(
+        3,
+        std::mem::size_of::<u32>() as u64,
+        &p_off as *const u32 as *const std::ffi::c_void,
+    );
+    enc.dispatch_threads(
+        MTLSize::new(
+            groups[0] as u64 * tg,
+            groups[1] as u64,
+            groups[2] as u64,
+        ),
+        MTLSize::new(tg, 1, 1),
+    );
+    Ok(())
 }
