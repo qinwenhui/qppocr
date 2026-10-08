@@ -6,3 +6,5 @@ gpualu2
 stress
 membw
 cpumin
+# 消融/对照用的整份二进制（几十 MB，且可由 build.sh + 同名 .m 现场重建）
+bin/
