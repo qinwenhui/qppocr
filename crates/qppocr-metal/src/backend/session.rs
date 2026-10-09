@@ -167,6 +167,16 @@ pub(crate) struct MetalSession {
     /// `pub(crate)` 是为了测试能直连两条路对拍（同 `batch_grain` 的用法）；
     /// 计划是**惰性构建**的，所以构造后、首次 run 前改它仍然生效。
     pub(crate) weight_f16: bool,
+    /// 1×1 稠密 conv 走 simdgroup_matrix MMA 内核（`n_conv8_mma`）。
+    ///
+    /// **默认 true**：全程 f32，没有 `weight_f16` 那种精度档位可谈；累加顺序
+    /// 与标量路不同（MMA 的 K 分片顺序），故**不是逐位相同**——但误差就是
+    /// float 舍入本身（`conv8_mma_matches_cpu` 对拍 4 形状最大 1.5e-8）。
+    /// 这是「换个加法顺序」，不是「降精度」，所以不需要用户决策。
+    /// `QPPOCR_METAL_CONV1X1_MMA=0` 可关闭（A/B 对照用）。
+    ///
+    /// 见 [`conv1x1_mma`] 与 `plan.rs::PlanBuilder::conv1x1_mma`。
+    pub(crate) conv1x1_mma: bool,
     /// 执行串行锁：每 run 重编码 + 同步等待不支持并发在飞（deferred
     /// 流水是 P4 的性能项；trait 默认的同步 run_deferred 语义等价）。
     run_lock: Mutex<()>,
@@ -275,6 +285,18 @@ fn weight_f16() -> bool {
     )
 }
 
+/// 1×1 conv 走 `n_conv8_mma`（`QPPOCR_METAL_CONV1X1_MMA`，默认 **true**）。
+///
+/// 与 [`weight_f16`] 不同，这个开关**不动精度**（MMA 与标量路都是 f32，
+/// 对拍最大误差 1e-8 = float 舍入），所以默认开；置 `0`/`off` 关掉，
+/// 供 A/B 对照与排障（`bench/gpuhealth/env_ab.sh` 直接吃它）。
+fn conv1x1_mma() -> bool {
+    !matches!(
+        std::env::var("QPPOCR_METAL_CONV1X1_MMA").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
 impl MetalSession {
     pub(crate) fn new(
         ctx: Arc<super::Inner>,
@@ -322,6 +344,7 @@ impl MetalSession {
                 }
                 on
             },
+            conv1x1_mma: conv1x1_mma(),
             run_lock: Mutex::new(()),
             prof_left: std::sync::atomic::AtomicUsize::new(
                 std::env::var("QPPOCR_GPU_KERNEL_PROF")
@@ -440,6 +463,8 @@ impl MetalSession {
             grid_cap: group_cap(),
             // 权重的 fp16 存储（默认关）。见 [`weight_f16`]。
             weight_f16: self.weight_f16,
+            // 1×1 conv 走 simdgroup_matrix MMA（默认开）。见 [`conv1x1_mma`]。
+            conv1x1_mma: self.conv1x1_mma,
         }
         .build(&self.input_name, in_shape)?;
 

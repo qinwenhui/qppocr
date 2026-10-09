@@ -186,6 +186,32 @@ pub struct PlanBuilder<'a> {
     /// `n_conv8→n_conv8h` 这条动了（1.93×），其余内核是干净的对照列。
     /// 完整的表与判读见 `MetalSession` 的 `weight_f16()` 文档。
     pub weight_f16: bool,
+    /// 1×1 稠密 conv 走 `simdgroup_matrix` MMA 内核（`n_conv8_mma`）——
+    /// **只有 Metal 有这支内核**，故由会话侧给值：Metal 默认 true，
+    /// Vulkan 恒 false（GLSL/SPIR-V 无对应物）。
+    ///
+    /// ## 为什么
+    ///
+    /// `n_conv8` 的瓶颈是 load 指令发射：m4×n8 瓦片每条权重装载只被 4 个
+    /// 输出行复用，提高复用的标量手段全撞在寄存器文件上（累加器 = m×8 个
+    /// float4）。`simdgroup_float8x8` 把 8×8 累加分片摊在 32 个 lane 上，
+    /// 瓦片能开到 64 行（权重复用 4× → 64×）。
+    ///
+    /// Metal 侧孤立实测（同形状、奇偶轮换序，`conv8_mma_throughput`）：
+    /// 2.0~2.5×，达成 2.2~2.5 TFLOPS（≈ 本机 ALU 天花板的 90%），
+    /// 而 `n_conv8` 只有 0.95~1.1 TFLOPS。
+    ///
+    /// ## 启用判据（不满足则回落到 `n_conv8`/`n_conv8h`）
+    ///
+    /// 三条硬约束，缺一不可（内核头部有逐条理由）：
+    /// - `kh==kw==1 && sh==sw==1 && pad==0`：输出位置与输入像素一一对应，
+    ///   A 无 gather；
+    /// - `cpad4(Cin) % 8 == 0`：K 步长 8 不越界；
+    /// - `cpad4(Co) % 64 == 0`：64 列块不越界。
+    ///
+    /// 与 `weight_f16` 同款：**两边必须同步**——Vulkan 的 GLSL 侧没有
+    /// `n_conv8_mma`，开了会派发到不存在的内核（硬失败，非静默降级）。
+    pub conv1x1_mma: bool,
 }
 
 impl PlanBuilder<'_> {
@@ -927,7 +953,28 @@ impl PlanBuilder<'_> {
                     // `n_conv` 没有 ⇒ 只能用 `div256`。
                     // 权重存储与内核**必须成对**选：`n_conv8h` 读 half4、
                     // `n_conv8` 读 float4，同一个 `w_off` 两种解释。
-                    if use8 {
+                    // 1×1 且满足 MMA 三条硬约束时走 simdgroup_matrix 内核：
+                    // 网格与瓦片映射都与 n_conv8 不同（x=64 行块、y=64 列块、
+                    // **批从 y 挪到 z**），见 n_conv8_mma.metal 头注释。
+                    // fp16 权重不参与（MMA 内核读的是 f32 权重）。
+                    let mma = self.conv1x1_mma
+                        && !fp16
+                        && kh == 1
+                        && kw == 1
+                        && sh == 1
+                        && sw == 1
+                        && pads.0 == 0
+                        && pads.1 == 0
+                        && cpad4(ws[1]) % 8 == 0
+                        && cpad4(ws[0]) % 64 == 0;
+                    if mma {
+                        let co4 = cpad4(ws[0]);
+                        Ok(vec![(
+                            "n_conv8_mma",
+                            pb,
+                            [m_dim.div_ceil(64), co4 / 64, nb],
+                        )])
+                    } else if use8 {
                         let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
                         Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1])])
                     } else {

@@ -14,6 +14,9 @@ cd "$(dirname "$0")"
 N=${1:?图数}; R=${2:?轮数}; shift 2
 B=("$@")
 BIN=${BIN:-./bin/qppocr-cc}
+# 档位：默认 small（与 bench 自己的默认一致），`TIER=medium ./env_ab.sh ...` 可换。
+# 曾经的坑：脚本不传 --tier，报出来的数被当成「默认档」，其实是 small。
+TIER=${TIER:-small}
 
 # ── 陈旧二进制门禁（2026-10-09 加的，因为踩过一次）────────────────────
 #
@@ -35,7 +38,7 @@ for kv in "${B[@]}"; do
         exit 3
     fi
 done
-echo "# BIN=$BIN  (mtime $(stat -f %Sm -t '%m-%d %H:%M' "$BIN" 2>/dev/null || echo '?'))  开关=${B[*]}"
+echo "# BIN=$BIN  (mtime $(stat -f %Sm -t '%m-%d %H:%M' "$BIN" 2>/dev/null || echo '?'))  档位=$TIER  开关=${B[*]}"
 
 set -- $(ls corpus100/img-*.jpg | head -"$N")
 IMGS=("$@")
@@ -45,10 +48,10 @@ for r in $(seq 1 "$R"); do
     for v in $order; do
         if [ "$v" = B ]; then
             out=$(env "${B[@]}" "$BIN" bench "${IMGS[@]}" \
-                    --models ../../models --device metal --rounds 3 --quiet 2>/dev/null | grep '^base' | head -1)
+                    --models ../../models --device metal --tier "$TIER" --rounds 3 --quiet 2>/dev/null | grep '^base' | head -1)
         else
             out=$("$BIN" bench "${IMGS[@]}" \
-                    --models ../../models --device metal --rounds 3 --quiet 2>/dev/null | grep '^base' | head -1)
+                    --models ../../models --device metal --tier "$TIER" --rounds 3 --quiet 2>/dev/null | grep '^base' | head -1)
         fi
         printf '%s\t%s\t%s\n' "$r" "$v" "$(echo "$out" | awk '{print $2, $3, $4, $5, $6}')" >>"$TSV"
     done

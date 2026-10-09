@@ -27,7 +27,12 @@ pub fn rgb_from_bytes(w: u32, h: u32, data: Vec<u8>) -> Result<Image, crate::Err
 /// 解码图像文件（PNG/JPEG；feature `image-decode`）。
 #[cfg(feature = "image-decode")]
 pub fn decode_file(path: impl AsRef<std::path::Path>) -> Result<Image, crate::Error> {
-    decode_bytes(&std::fs::read(path)?)
+    let path = path.as_ref();
+    // 报错必须带路径：否则 `io: No such file or directory` 完全定位不到是哪张图、
+    // 是谁传进来的路径（2026-10-10 排查 medium 多图 ENOENT 时被这条坑过）。
+    let bytes = std::fs::read(path)
+        .map_err(|e| crate::Error::Io(format!("{}: {e}", path.display())))?;
+    decode_bytes(&bytes)
 }
 
 /// 只读图片头部取尺寸（不解码像素；feature `image-decode`）。

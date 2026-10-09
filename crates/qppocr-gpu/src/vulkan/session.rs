@@ -694,6 +694,10 @@ impl VulkanSession {
             // 会派发到不存在的 `n_conv8h`——所以这里恒 false，等 Vulkan
             // 侧也补上 fp16 变体再接线（`.comp` 与 `.metal` 必须成对改）。
             weight_f16: false,
+            // 1×1 MMA（`n_conv8_mma`）同样是**只做了 Metal 的一支**：
+            // simdgroup_matrix 是 MSL 独有的（GLSL/SPIR-V 侧没有对应实现），
+            // 开了会派发到不存在的内核。恒 false。
+            conv1x1_mma: false,
         }
         .build(&self.input_name, in_shape)?;
 

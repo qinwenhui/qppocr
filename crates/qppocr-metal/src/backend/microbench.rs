@@ -21,7 +21,7 @@ use metal::MTLSize;
 use super::device::submit_compute;
 use super::pipeline::{dispatch_with_tg, KernelSet};
 use super::MetalContext;
-use super::conv_probe::{MM_PROBE_SHADERS, ProbeSet};
+use super::conv_probe::{mm_sg_groups, MM_PROBE_SHADERS, ProbeSet};
 
 /// 有 Metal 设备就打开，否则跳过（CI 非 mac）。与 `kernel_tests` 同款。
 fn open_or_skip() -> Option<MetalContext> {
@@ -345,7 +345,6 @@ fn mm_sg_scan() {
     let _g = gpu_guard();
     let Some(ctx) = open_or_skip() else { return };
     let ps = ProbeSet::from_list(&ctx.inner.device, MM_PROBE_SHADERS).expect("编译 MM 探针");
-    let pipe = ps.pipe("p_mm_sg").expect("取 p_mm_sg 管线");
 
     // 生产里的 1×1 卷积层形状（det/rec 各几个关键 C→O）。
     let cases = [
@@ -367,7 +366,7 @@ fn mm_sg_scan() {
     let n_max = cases.iter().map(|(_, _, n, _)| *n).max().unwrap();
     let k_max = cases.iter().map(|(_, _, _, k)| *k).max().unwrap();
     let buf_size = (m_max * k_max + n_max * k_max + m_max * n_max) as u64 * 2;
-    let mut buf = ctx.inner.device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
+    let buf = ctx.inner.device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
     let zeros = vec![0u8; 64 << 20];
     unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), buf.contents() as *mut u8, zeros.len()) };
 
@@ -409,8 +408,11 @@ fn mm_sg_scan() {
                     );
                 }).expect("提交");
             });
-            let gflops = flops as f64 / (ms / 1000.0) / 1e6;
-            let roof = 3.34 * 1000.0; // FP32 峰值（竞品 doc 说 MMA≈fp32）
+            // FLOPs ÷ 秒 ÷ 1e9 = GFLOPS。（曾错写 /1e6——打印值大 1000 倍，
+            // 「44236%」其实是 44.2%。读数自洽但单位错了，和陈旧二进制同款
+            // 的静默误导，2026-10-10 修。）
+            let gflops = flops as f64 / (ms / 1000.0) / 1e9;
+            let roof = 3.34 * 1000.0; // FP32 峰值 GFLOPS（竞品 doc：MMA≈fp32）
             eprintln!(
                 "[mb/mm_sg] {:20} {:20} M={:6} N={:6} K={:6}  grid={:5}x{:3}  time={:6.2} ms  gflops={:7.1}  util={:4.1}%  B/FLOP={:.3} B/FLOP",
                 name, label, m, n, k, groups[0], groups[1], ms, gflops, gflops / roof * 100.0, bytes / flops as f64
@@ -971,6 +973,64 @@ fn conv8_param_layout_matches_cpu() {
     assert!(worst < 1e-4, "n_conv8 与 CPU 卷积不符（最大误差 {worst:.3e}）——参数块搬错了");
 }
 
+/// `n_conv8_mma` 与朴素 CPU 卷积对拍（1×1，f32 MMA）。
+///
+/// ## 为什么必须先过这一关
+///
+/// 这个内核里有两处**从未被数值验证过**的假设，任一处错了都会得到
+/// 「跑得飞快但结果是垃圾」——而只量时间的扫描会把它当大赢家：
+///
+/// 1. **`simdgroup_load` 的行 stride 语义**：`simdgroup_load(m, base, s)`
+///    里 `s` 是源矩阵的**行**元素数（行主序）。我们的 A（NHWC，行 stride
+///    `kf`）与 B（`[k][n]` k-主序，行 stride `nDim`）都押在这条上。
+/// 2. **`simdgroup_multiply_accumulate` 的 f32×f32→f32 组合**：
+///    编译过了只说明重载存在，不说明算的是对的（MMA 的 lane 分发与
+///    转置约定错了照样编译）。
+///
+/// 三个形状覆盖三种边界：`mDim` 是 64 的整数倍（满块）、`mDim < 64`
+/// （**单块尾掩码**）、多块（`mDim=256` 跨 4 个 m 块）。`nDim`/`kf` 都由
+/// 内核契约要求 64/8 对齐，故不测非对齐（计划层不会派发）。
+#[test]
+fn conv8_mma_matches_cpu() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // (h, w, cin, cout, 说明)：m_dim = h*w。
+    let cases: [(u32, u32, u32, u32, &str); 4] = [
+        (8, 8, 64, 64, "满块 64 行 × 64 列"),
+        (4, 8, 64, 64, "尾掩码 32 行（<64）"),
+        (16, 16, 128, 128, "多块 256 行 × 2 列块"),
+        (5, 7, 32, 64, "怪形状 35 行 × 64 列"),
+    ];
+
+    for (h, w, cin, cout, note) in cases {
+        let c = ConvCase { label: "mma", h, w, cin, cout, kh: 1, kw: 1 };
+        let mut pr = build_conv_case(&ctx.inner.device, &c);
+        // MMA 网格与 n_conv8 不同：x = 64 行块，y = 64 列块，z = 批。
+        let groups = [
+            (h * w).div_ceil(64),
+            pr.co4.div_ceil(64),
+            1,
+        ];
+        submit_compute(&ctx.inner.queue, |enc| {
+            ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, groups)
+                .expect("dispatch");
+        })
+        .expect("提交");
+        let worst = conv_error(&pr, &c);
+        eprintln!(
+            "[mb] conv8_mma 对拍 {note:<22} ({h}×{w} c{cin}->{cout} k1): 最大误差 {worst:.3e}"
+        );
+        assert!(
+            worst < 1e-4,
+            "n_conv8_mma 与 CPU 卷积不符（{note}）：最大误差 {worst:.3e}——\
+             simdgroup_load/MMA 的布局假设错了"
+        );
+        std::hint::black_box(&mut pr);
+    }
+}
+
 /// 频率爬坡探针：同一条内核连跑不同次数，看**单次时间**随累计时长的变化。
 ///
 /// ## 为什么怀疑它
@@ -1375,6 +1435,73 @@ fn conv8_throughput() {
             b,
             gf(b),
             a / b
+        );
+    }
+}
+
+/// `n_conv8` vs `n_conv8_mma` 的孤立吞吐对比（**只跑 MMA 启用条件下的 1×1 层**）。
+///
+/// 形状取自 `QPPOCR_METAL_PLAN_DUMP` 实测的 det/rec 重头 1×1 层（见
+/// `conv8_throughput` 名单里的 k1 项）。两臂用奇偶轮换序 + 取最小轮，
+/// 抵消本机「先跑的那条快 6~15%」的次序效应。
+#[test]
+fn conv8_mma_throughput() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let cases = [
+        // det medium 重头 1×1（2.1 GFLOP，门内）
+        ConvCase { label: "det m32640 c128->256 k1", h: 136, w: 240, cin: 128, cout: 256, kh: 1, kw: 1 },
+        // det 34x60 门下（1.05 GFLOP 各）
+        ConvCase { label: "det 34x60 c1024->512 k1", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
+        ConvCase { label: "det 34x60 c512->1024 k1", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
+        // det 全分辨率 k1（m=32640，通道小）
+        ConvCase { label: "det m32640 c32->64 k1", h: 136, w: 240, cin: 32, cout: 64, kh: 1, kw: 1 },
+        // rec 1×1（行批次，m 小）
+        ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
+        ConvCase { label: "rec 6x208 c192->384 k1", h: 6, w: 208, cin: 192, cout: 384, kh: 1, kw: 1 },
+    ];
+
+    for c in &cases {
+        let pr = build_conv_case(&ctx.inner.device, c);
+        // MMA 网格与 n_conv8 完全不同（见内核头注释）。
+        let mma_groups = mm_sg_groups(c.h * c.w, pr.co4);
+        // 契约检查：不满足就该跳过（计划层不会派发这种形状）。
+        assert!(c.cin % 8 == 0 && pr.co4 % 64 == 0, "{} 不满足 MMA 启用条件", c.label);
+
+        let run = |pr: &ConvProbe, name: &str, groups: [u32; 3], reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    ks.dispatch(enc, name, &pr.buf, pr.p_off, groups)
+                        .expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        let (mut a, mut b) = (f64::INFINITY, f64::INFINITY);
+        for i in 0..3 {
+            let (x, y) = if i % 2 == 0 {
+                (
+                    time_dispatch(&|r| run(&pr, "n_conv8", pr.groups, r)),
+                    time_dispatch(&|r| run(&pr, "n_conv8_mma", mma_groups, r)),
+                )
+            } else {
+                let y = time_dispatch(&|r| run(&pr, "n_conv8_mma", mma_groups, r));
+                let x = time_dispatch(&|r| run(&pr, "n_conv8", pr.groups, r));
+                (x, y)
+            };
+            a = a.min(x.ms);
+            b = b.min(y.ms);
+        }
+        let gf = |ms: f64| pr.flops / (ms * 1e6);
+        eprintln!(
+            "[mb] {:<26} base {:>7.3} ms ({:>6.1} GFLOPS) → mma {:>7.3} ms ({:>6.1} GFLOPS) = {:.2}×  [grid {:?} → {:?}]",
+            c.label, a, gf(a), b, gf(b), a / b, pr.groups, mma_groups
         );
     }
 }
