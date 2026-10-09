@@ -1314,3 +1314,142 @@ QPPOCR_GPU_PROF=1 bin/qppocr-cc bench … 2>&1 | grep -oE '输入 \[[0-9]+, 3, 4
 # 逐层几何（cin/co/taps/m/grid）
 QPPOCR_METAL_PLAN_DUMP=1 bin/qppocr-cc bench …
 ```
+
+---
+
+## 15. 逐组直测把 §14 的结论钉死，同时**推翻 §14.3 的 FLOP 归属**（2026-10-09）
+
+§14 的结论（「重层已在自身天花板上、增量调参走完了」）方向是对的，但它的
+**证据是错的**：§14.3 那句「52 个 conv8 里前 5 个就占了 **92%** 的 FLOP」
+自己就自相矛盾（同一段里写着 `MatMul.12` 8.3%、`Conv.49/50/52/53` 各 6.5%，
+加起来 34%，不是 92%）。本节**从计划转储重新数**，并用**分组重复**把
+§14 只测了 3 个节点的单价扩到 3 组共 28 个节点。
+
+### 15.1 先纠正 FLOP 归属（`QPPOCR_METAL_PLAN_DUMP`，img-004，14 个 rec 计划）
+
+| 名次 | 节点 | GFLOP/图 | 占比 | 累计 |
+|---|---|---|---|---|
+| 1 | `MatMul.12`（CTC 头） | 2.771 | 9.3% | 9.3% |
+| 2–5 | `Conv.49/50/52/53`（FFN） | 各 1.939 | 各 6.5% | **35.2%** |
+| 6 | `Conv.3`（3×3，m≈696） | 1.091 | 3.6% | 38.9% |
+| 7–19 | `Conv.22/23/25/26/30/31/33/34/38/39/41/42/45` | 各 ~0.95 | 各 3.2% | 77.5% |
+| 20–29 | `Conv.1/2/8/9/11/12/14/15/18/44` | 各 ~0.48 | 各 1.6% | 97.7% |
+
+**合计 29.90 GFLOP/图、725 条 conv8，平均 41.2 MFLOP/条。**
+
+⇒ **前 5 名只有 35.2%，不是 92%。** FLOP 是**摊在约 24 个形状相似的层上**的：
+13 个 `cin192→co384` 的中层（各 3.2%）+ 10 个高分辨率层（各 1.6%）。
+§14.3 那张「重层 5 条 ≈29 ms / 中层 12 条 ≈23 ms / 尾层 35 条 ≈6 ms」的
+归属表**作废**——它按错误的名次分配，把 64% 的算力算成了「尾层」。
+
+§14.5 的**结论**不受影响（下面 15.2 用更全的采样重新证了一遍），但**推理
+过程不能用**：目标从来就不该只盯 `Conv.49` 这一族。
+
+### 15.2 分组重复直测：三组 28 个节点的生产单价
+
+方法同 §14.2（`env_ab.sh`，20 图 × 4 轮奇偶轮换、`REC_REPEAT_N=2` 或 `4`，
+看 `det` 控制列）。FLOP 取自 15.1 的表；`Δline / (N−1) / FLOP` 即达成算力。
+
+| 组 | 节点 | FLOP/图 | Δline | 一次完整摊分 | **达成 GFLOPS** | Δdet |
+|---|---|---|---|---|---|---|
+| 中层 | `Conv.22/23/25/26/30/31`（6） | 5.766 | +33.85（N=4） | 11.28 ms | **511** | +0.05 |
+| FFN | `Conv.49/50/52/53`（4） | 7.756 | +15.40（N=2） | 15.40 ms | **504** | +0.10 |
+| 大名单 | 上面 18 个（3+7+8） | 12.664 | +26.50（N=2） | 26.50 ms | **478** | −0.05 |
+
+三条都是 4/4 同号，`det` 控制列 |Δ|≤0.1。**三组独立落在 478–511 GFLOPS**，
+离散 ~7%。
+
+（第三组本轮偏脏：A 列从 135.6 漂到 155.3、配对差离散 13.0 ms，只有
+中位数站得住；干净的第 2 轮给 +20.9 ⇒ 606 GFLOPS。所以 478 是**下界**
+写法，按干净轮应读 ~500–600。）
+
+**FFN 那一行同时是 `@节点名` 仪器的第二次互证**：§14.2 单独测 `Conv.49`
+推出来的 15.3 ms，与本节四节点合测的 15.40 ms 只差 0.7%。
+
+### 15.3 尺子：同一个内核在这些形状上孤立跑 609 GFLOPS
+
+`conv8_variant_scan` 的现产路径（`p_colmaj`）在**生产同形**上：
+
+| 形状 | ms | MFLOP | GFLOPS |
+|---|---|---|---|
+| `rec 6x208 c192->384 k1`（m=1248） | 0.281 | 184.3 | **656** |
+| `rec 3x208 c384->768 k1`（m=624） | 0.604 | 368.3 | **609** |
+| `rec 3x208 c768->384 k1`（m=624） | 0.639 | 368.3 | 576 |
+
+生产 478–511 ÷ 孤立 576–656 = **0.78–0.84**。
+
+⇒ **§14 的结论成立，而且现在有三组独立采样撑着：conv8 在生产里已经跑到
+它自己孤立能力的 80% 上下。** 剩下那 1.2× 是「生产恰好等于微基准」这种
+永远拿不满的数；叠加 §13.1 实测的 `p_wstage`（真落地只有 0.71×）与
+`p_colmajsmall`（权重全进 1KB 才 1.21×）⇒ **任务 #14 的真实上限从
+§12.5 的 1.56× 收窄到 ~1.2×，且实现风险为正。**
+
+### 15.4 rec 的其余部分：14 个非 conv8 内核族合计 **13.6 ms/图**
+
+`env_ab.sh 20 4 'QPPOCR_METAL_STUB_REC=n_elem,n_channel,n_conv_dw,n_reduce_last,n_reduce_fin,n_reduce_hw,n_transpose_nd,n_attn_mm,n_softmax,n_pool,n_concat_c,n_resize,n_convt,n_conv'`
+
+Δtotal **−13.60**、Δdet +0.15、4/4 同号、离散 1.5 ms。
+
+⇒ §9.3 的「12 族合计 9.4%」今天复现值 13.6 ms（当时 16.1 ms），**一致**。
+`n_elem` 一图 690 条、`n_conv8` 719 条，条数相当，但**逐族去抠没有期望值**
+这条依然成立。
+
+### 15.5 整图稳态基线（`QPPOCR_GPU_PROF`，img-004 第二遍）
+
+| 阶段 | ms | 说明 |
+|---|---|---|
+| det | **23.11** | 154 条 dispatch，conv8 10.089 GFLOP |
+| cls | **3.17** | `[8,3,48,192]` 1.91 + `[5,3,48,192]` 1.26 |
+| rec | **84.25** | 11 个 run 之和（`[1,48,232]`…`[1,48,832]`，173 条/run） |
+| **合计** | **110.5** | 稳态单图 GPU 墙钟 |
+
+**注意 rec 的 11 个 run 之和 = 84.25 ms，而 §9.3 的非 conv8 只有 13.6 ms
+⇒ rec conv8 ≈ 70.6 ms**，对 29.90 GFLOP = **423 GFLOPS**。这个 423 比
+15.2 三组的 478–511 低，差额来自**没进三组名单的那些层**（`MatMul.12`
+权重流型、`Conv.3` 的 taps=9、以及一批 `grid=[1,1,1]` 的 m≤16 尾层），
+不再往下拆。
+
+**整图里 conv8 合计 10.089+29.90 = 40.0 GFLOP，按 ~500 GFLOPS ≈ 78 ms，
+占 110.5 ms 的 70%**。剩下的 30% 是 det 的 154 条、cls、以及 13.6 ms 的
+rec 其它内核。
+
+### 15.6 竞品那条线的读数（回答本次的「看看竞品」）
+
+`bench/COMPARISON.md` 全套口径在**另一台机器**（Intel Core Ultra 5 125H），
+但那台机器上的对决早已两档全胜（tiny 0.965 / small 0.937）。本条只取
+**同一个 M4 上的可比数**：
+
+| 项 | 竞品（M4 paravirt VM，他们 `docs/metal-m4.md`） | 我们（本机） |
+|---|---|---|
+| small 端到端 | **54.6 ms** | **110.5 ms（稳态）** |
+| 单条 dispatch 摊销 | 40–48 µs | **~2 µs**（§12.1 直接测） |
+| 他们**保留**的优化 | 隐式 GEMM 免 im2col、SE 两阶段减 barrier、concurrent encoder | — |
+
+**他们赢在「干的活少」，不在单条 dispatch 便宜**（§11.2 早就这么判过）。
+而本节把「我们干的活」拆开后，唯一还站着的结构性差异是：
+
+> **`n_conv8` 每 FLOP 要搬 0.5 字节权重（§13.2 的结构常数，源自 4 行寄存器
+> 瓦片），导致这些形状孤立跑只有 576–656 GFLOPS = 峰的 17–20%。**
+
+我们**不是**被 dispatch 条数拖的（13.6 ms 全部非 conv8 内核），**不是**被
+主机侧拖的（§9.4：`rec_infer ≈ Σrun()`，编码 0.3 µs/条），**也不是**算错了
+（生产 = 孤立能力的 0.8，三组互证）。剩下的全部在**那个 0.5 B/FLOP**。
+
+### 15.7 本节可复制命令
+
+```sh
+# 三组分组重复（就是 15.2 的三行）
+bench/gpuhealth/env_ab.sh 20 4 'QPPOCR_METAL_REC_REPEAT=@Conv.22,@Conv.23,@Conv.25,@Conv.26,@Conv.30,@Conv.31' QPPOCR_METAL_REC_REPEAT_N=4
+bench/gpuhealth/env_ab.sh 20 4 'QPPOCR_METAL_REC_REPEAT=@Conv.49,@Conv.50,@Conv.52,@Conv.53' QPPOCR_METAL_REC_REPEAT_N=2
+bench/gpuhealth/env_ab.sh 20 4 'QPPOCR_METAL_REC_REPEAT=@Conv.33,@Conv.39,@Conv.41,@Conv.42,@Conv.45,@Conv.34,@Conv.38,@Conv.3,@Conv.1,@Conv.2,@Conv.8,@Conv.9,@Conv.11,@Conv.12,@Conv.14,@Conv.15,@Conv.18,@Conv.44' QPPOCR_METAL_REC_REPEAT_N=2
+# 非 conv8 的 14 个内核族合计
+bench/gpuhealth/env_ab.sh 20 4 'QPPOCR_METAL_STUB_REC=n_elem,n_channel,n_conv_dw,n_reduce_last,n_reduce_fin,n_reduce_hw,n_transpose_nd,n_attn_mm,n_softmax,n_pool,n_concat_c,n_resize,n_convt,n_conv'
+# 整图稳态逐 run（第二遍才是稳态，第一遍含冷启动）
+QPPOCR_GPU_PROF=1 bench/gpuhealth/bin/qppocr-cc bench bench/gpuhealth/corpus100/img-004.jpg --models models --device metal --rounds 1 --quiet 2>&1 | grep 'run#'
+# FLOP 归属（数 [plan] 行；注意 [metal] 行会插进 [plan] 行中间，按行过滤 '\[metal\]'）
+QPPOCR_METAL_PLAN_DUMP=1 bench/gpuhealth/bin/qppocr-cc infer bench/gpuhealth/corpus100/img-004.jpg --models models --device metal 2>&1 | grep '^\[plan\]'
+```
+
+> **纪律备忘（本轮踩到的）**：`env_ab.sh` 报的 A 列绝对值**必须一起看**。
+> 本轮第三次（大名单组）的 A 从 135.6 漂到 155.3，配对差离散 13.0 ms——
+> 这种轮**只有中位数能用**，而且要在结论里标出干净轮是多少。
