@@ -257,6 +257,18 @@ fn run_det_tiny_forward() {
 /// 放大 4×）是**死重**：71.64 MB 的白占，与文件里那 17.91 MB 一一对应。
 /// 死重不参与每次 run 的读，所以只吃内存；**换形状重拷那一半**已由
 /// `Layout` 的两段分离修掉（见 plan.rs 的 `Layout`）。
+///
+/// **已落地**：`plan.rs` 的 `matmul_w_names` 现在预环跳过这些块（与
+/// `conv_w_names` 同款），medium rec 的静态区 148.1 → **76.5 MB**。
+/// 实测**性能中性**（`ab.sh` 中位 Δtotal +0.15 ms，det 对照 −0.40 混号；
+/// 逐形状墙钟逐条不变，例如 [1,3,48,408] 改前后都是 10.79 ms）——正
+/// 因为死重本来就不被读，省下来的是常驻内存不是时间。当初曾反推
+/// 「静态区每 run 被读一遍 ⇒ 2.9 ms/run 的固定成本是权重流量」，
+/// 这次实测把这个假设证伪了：固定成本与静态区大小无关。
+///
+/// 下面把那个前提**断言下来**：`plan.rs` 的跳过门槛是「只被 MatMul
+/// 引用」，模型哪天多一个算子共用同一块权重，`off_of` 就会落空——
+/// 那会是一次运行时崩溃，不如在这里先炸。
 #[test]
 fn matmul_weight_owners() {
     let Some(g) = check_model("medium/rec.onnx") else {
@@ -272,6 +284,7 @@ fn matmul_weight_owners() {
         }
     }
     let mut tot = 0i64;
+    let mut shared: Vec<&str> = Vec::new();
     for n in &g.nodes {
         if n.op_type != "MatMul" || n.inputs.len() < 2 {
             continue;
@@ -291,7 +304,17 @@ fn matmul_weight_owners() {
             numel as f64 * 4.0 / 1e6,
             users.get(n.inputs[1].as_str())
         );
+        if let Some(u) = users.get(n.inputs[1].as_str()) {
+            if u.iter().any(|o| *o != "MatMul") && !shared.contains(&n.inputs[1].as_str()) {
+                shared.push(n.inputs[1].as_str());
+            }
+        }
     }
+    assert!(
+        shared.is_empty(),
+        "MatMul 权重被别的算子共用了：{shared:?} —— `plan.rs::matmul_w_names` \
+         会跳过它们的 NHWC 区，共用方的 `off_of` 将落空"
+    );
     println!("MatMul 权重合计 {:.2} MB", tot as f64 * 4.0 / 1e6);
     // 反向：哪些 initializer 只被 MatMul 引用（⇒ 若 MatMul 走自己的重排，
     // 那份 init_to_nhwc 拷贝就是死的）

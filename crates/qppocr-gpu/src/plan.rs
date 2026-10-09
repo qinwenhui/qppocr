@@ -340,6 +340,33 @@ impl PlanBuilder<'_> {
                 }
             }
         }
+        // MatMul 权重（B）名单：同 `conv_w_names`，预环跳过。
+        //
+        // MatMul 分支自己走 `n_weight_off` 重排一份紧凑的 [N,K] blob，**从不
+        // 读** `init_to_nhwc` 那份；而 2-D [K,N] 权重被当成 [1,1,K,N] 顶成
+        // `cpad4(1)=4` ⇒ 整份放大 4×。medium rec 实测 9 块 / 71.6 MB 死重，
+        // 占了 148.1 MB 静态区的近一半（见 `qppocr-core/tests/models.rs::
+        // matmul_weight_owners`）。死重不参与每次 run 的读，只吃内存——但
+        // 会话 arena 是所有计划共用的一块，省下来是 71.6 MB 常驻。
+        //
+        // 门槛比 conv 那条严：**必须只被 MatMul 引用**。同时喂给别的算子
+        // （Mul / Conv / …）时那份 NHWC 区仍被读，跳过会让 `off_of` 落空。
+        let mut matmul_w_names: std::collections::HashSet<String> = Default::default();
+        {
+            let mut non_mm_users: std::collections::HashSet<&str> = Default::default();
+            for n in &self.graph.nodes {
+                if n.op_type == "MatMul" {
+                    if let Some(b) = n.inputs.get(1).filter(|b| !b.is_empty()) {
+                        matmul_w_names.insert(b.clone());
+                    }
+                } else {
+                    for i in n.inputs.iter().filter(|i| !i.is_empty()) {
+                        non_mm_users.insert(i.as_str());
+                    }
+                }
+            }
+            matmul_w_names.retain(|k| !non_mm_users.contains(k.as_str()));
+        }
         // **确定序**（按名排序）：HashMap 迭代序逐进程随机——区域布局会
         // 跟着漂移，任何依赖布局的越界/重叠 bug 都会以「两次运行分歧层
         // 不同」的形态出现（实测发生过）。排序后布局恒定，分歧可稳定
@@ -355,6 +382,9 @@ impl PlanBuilder<'_> {
             }
             if conv_w_names.contains(name) {
                 continue; // conv 权重/bias 惰性重排，同样落 upload_init（map_node_n）
+            }
+            if matmul_w_names.contains(name) {
+                continue; // MatMul 权重：MatMul 分支自己重排，这份 NHWC 区是死重
             }
             // 转换进会话级缓存（与 conv 权重重排同款）：非 conv 权重可
             // 巨大（small rec 的分类器矩阵 4.5M 元素）——曾每计划重算
