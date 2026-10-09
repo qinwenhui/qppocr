@@ -34,6 +34,7 @@ const SHADERS: &[(&str, &str)] = &[
     // 内核体只有一份模板，见该 .metal 的头注释。
     ("n_conv8", include_str!("../../shaders/n_conv8.metal")),
     ("n_conv8h", include_str!("../../shaders/n_conv8.metal")),
+    ("n_conv8_mma", include_str!("../../shaders/n_conv8_mma.metal")),
     ("n_conv_dw", include_str!("../../shaders/n_conv_dw.metal")),
     ("n_convt", include_str!("../../shaders/n_convt.metal")),
     ("n_pool", include_str!("../../shaders/n_pool.metal")),
