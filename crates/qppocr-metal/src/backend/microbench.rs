@@ -437,7 +437,89 @@ struct ConvProbe {
 
 /// 组一个 conv 用例的 arena 与参数块。
 fn build_conv_case(device: &metal::DeviceRef, c: &ConvCase) -> ConvProbe {
-    build_conv_case_batch(device, c, 1)
+    build_conv_case_batch(device, c, 1, false)
+}
+
+/// 同 `build_conv_case`，但**权重段存 fp16**（`p_whalf` 用）。
+///
+/// **单变量控制**：arena 的总长、`in_off`/`w_off`/`b_off`/`out_off` 与
+/// `build_conv_case` 逐位相同，输入/输出/bias 的内容也逐位相同——**只有
+/// 权重段前一半被写成 fp16**（后一半清零闲置）。于是「足迹/line 数」是
+/// 两版之间唯一的自变量，与 `p_wsmall` 改地址范围的手法同型。
+fn build_conv_case_half(device: &metal::DeviceRef, c: &ConvCase) -> ConvProbe {
+    build_conv_case_batch(device, c, 1, true)
+}
+
+/// f32 → f16 位型，**就近偶数**舍入（与 IEEE binary16、与 GPU 上的
+/// `(half)f` 同规则）。
+///
+/// 手写而不是用标准库的 `f16`：后者到 1.97 还是 unstable feature
+/// （issue #116909），而本仓库不为一次微基准引第三方 `half` 依赖。
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mant = bits & 0x007f_ffff;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    if exp == 0xff {
+        // inf / NaN：NaN 保留“非零尾数”这一位，免得把 NaN 洗成 inf。
+        let m = if mant != 0 { 0x0200 | (mant >> 13) as u16 } else { 0 };
+        return sign | 0x7c00 | m;
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00; // 超出 f16 范围 → inf（与硬件一致）
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign; // 小到连次正规都不够 → 0
+        }
+        let m = mant | 0x0080_0000; // 补回隐含首位
+        let shift = (14 - e) as u32; // 14..=24
+        let mut q = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        if rem > half || (rem == half && (q & 1) == 1) {
+            q += 1; // 进位到 0x400 时自然滚成最小正规数，位型正确
+        }
+        return sign | q as u16;
+    }
+    let mut h = ((e as u32) << 10) | (mant >> 13);
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
+        h += 1; // 进位溢出到指数域是正确行为
+    }
+    sign | h as u16
+}
+
+/// 期望值由 Python `struct.pack('<e', v)` 生成（CPython 实现的就是 IEEE
+/// binary16 就近偶数）——**不自己算一遍再自己对**，那样等于没测。
+/// `p_whalf` 那一列的误差读数只有在这个转换是对的前提下才有意义。
+#[test]
+fn f32_to_f16_matches_ieee_reference() {
+    let cases: &[(f32, u16)] = &[
+        (0.0, 0x0000),
+        (-0.0, 0x8000),
+        (1.0, 0x3c00),
+        (-1.0, 0xbc00),
+        (0.5, 0x3800),
+        (1.0 / 3.0, 0x3555),
+        (65504.0, 0x7bff), // f16 最大正规数
+        (65520.0, 0x7c00), // 溢出：就近偶数恰好进位到 inf
+        (65536.0, 0x7c00),
+        (1e-5, 0x00a8),
+        (6e-8, 0x0001),            // 次正规
+        (1e-9, 0x0000),            // 太小 → 0
+        (6.103515625e-05, 0x0400), // 最小正规数
+        (5.960464477539063e-08, 0x0001), // 最小次正规数
+        (0.1, 0x2e66),
+        (-123.456, 0xd7b7),
+        (f32::INFINITY, 0x7c00),
+        (f32::NEG_INFINITY, 0xfc00),
+    ];
+    for &(v, want) in cases {
+        let got = f32_to_f16_bits(v);
+        assert_eq!(got, want, "f32 {v} → 期望 0x{want:04x}，实得 0x{got:04x}");
+    }
 }
 
 /// 同 `build_conv_case`，但输入/输出段按 `batch` 份铺开、网格 y = `batch`。
@@ -459,7 +541,7 @@ fn build_conv_case(device: &metal::DeviceRef, c: &ConvCase) -> ConvProbe {
 ///
 /// 注意这是**唯一**不靠「砍掉某样东西」来做的实验：`p_wconst`/`p_wsmall`/
 /// `p_fmaonly` 全都同时改了延迟与字节，只能证伪不能定位。
-fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32) -> ConvProbe {
+fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, half_w: bool) -> ConvProbe {
     assert!(batch >= 1, "batch 至少 1");
     let (pt, pl) = (c.kh / 2, c.kw / 2);
     let out_h = (c.h + 2 * pt - c.kh) + 1;
@@ -549,7 +631,18 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32) ->
         }
         // 张量
         std::ptr::copy_nonoverlapping(input.as_ptr(), base.add(in_off_w as usize) as *mut f32, n_in as usize);
-        std::ptr::copy_nonoverlapping(w_repacked.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+        if half_w {
+            // 权重存 fp16：同一逻辑序（`[t][ci4][co4]`）、同一元素下标，
+            // 只是每个值占 2 B。整段先清零（`new_buffer` 不清零，尾部的
+            // 闲置区必须确定，否则 NaN 会经未定义路径影响计时），再把
+            // `n_w` 个 half 写进段的前半。
+            let w16: Vec<u16> = w_repacked.iter().map(|&v| f32_to_f16_bits(v)).collect();
+            let wp = base.add(w_off_w as usize) as *mut u16;
+            std::ptr::write_bytes(wp, 0, n_w as usize);
+            std::ptr::copy_nonoverlapping(w16.as_ptr(), wp, n_w as usize);
+        } else {
+            std::ptr::copy_nonoverlapping(w_repacked.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+        }
         // bias 清零（b_off 有效但全 0）
         std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, co4 as usize);
         // 输出区铺哨兵 7.0：跑完还是 7.0 = 内核根本没写（早退/没派发），
@@ -566,7 +659,10 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32) ->
     let groups = [(m_dim.div_ceil(4) * (nv / 2)).div_ceil(256), batch, 1];
     let flops = m_dim as f64 * c.cout as f64 * c.cin as f64 * taps as f64 * 2.0 * batch as f64;
     // 下界流量：权重只算一份（真实网络里它在 L2 里被各份共用）。
-    let bytes = (n_in + n_w + n_out) as f64 * 4.0;
+    // `half_w` 时权重段每元素 2 B——这个差额就是 `p_whalf` 要验的那件事，
+    // 分母必须如实反映，否则达成带宽会虚高。
+    let w_bytes = if half_w { n_w as f64 * 2.0 } else { n_w as f64 * 4.0 };
+    let bytes = (n_in + n_out) as f64 * 4.0 + w_bytes;
     ConvProbe {
         buf,
         p_off: p_words,
@@ -888,6 +984,11 @@ fn conv8_variant_scan() {
     const ROUNDS: usize = 3;
     for c in &cases {
         let pr = build_conv_case(&ctx.inner.device, c);
+        // `p_whalf` 用自己的 arena：**只有权重段存 fp16**，其余段（输入/
+        // bias/输出/参数块）与 `pr` 逐位相同、偏移也相同。于是两版之间
+        // 唯一的自变量就是权重足迹，见 `build_conv_case_half`。
+        let prh = build_conv_case_half(&ctx.inner.device, c);
+        let arenas = [&pr, &prh];
         let m_dim = pr.out_h * pr.out_w;
 
         // 同一轮、同一网格下量分母。峰值随网格大小变化（小网格铺不满
@@ -914,17 +1015,24 @@ fn conv8_variant_scan() {
                     groups, pr.groups
                 );
             }
-            plans.push((v.name, v.tile, v.rows, probes.pipe(v.name).expect("管线"), groups));
+            // `p_whalf` 读自己的 arena（fp16 权重），其余全走 `pr`。
+            let ai = usize::from(v.name == "p_whalf");
+            plans.push((v.name, v.tile, v.rows, probes.pipe(v.name).expect("管线"), groups, ai));
         }
 
         // 一条命令缓冲里跑 reps 次，返回总墙钟（毫秒）
-        let run = |pipe: &metal::ComputePipelineState, groups: [u32; 3], reps: u32| -> f64 {
+        let run = |arena: &metal::Buffer,
+                   p_off: u32,
+                   pipe: &metal::ComputePipelineState,
+                   groups: [u32; 3],
+                   reps: u32|
+         -> f64 {
             let t = Instant::now();
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..reps {
-                    super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, groups)
+                    super::pipeline::dispatch_with(enc, pipe, arena, p_off, groups)
                         .expect("dispatch");
-                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    let res: [&metal::ResourceRef; 1] = [arena];
                     enc.memory_barrier_with_resources(&res);
                 }
             })
@@ -938,28 +1046,33 @@ fn conv8_variant_scan() {
         // 一起弄丢了）。
         let mut reps = Vec::with_capacity(plans.len());
         let mut errs = Vec::with_capacity(plans.len());
-        for (_, _, _, pipe, groups) in &plans {
-            let _ = run(pipe, *groups, 1);
-            errs.push(conv_error(&pr, c));
-            reps.push(calibrate(&|r| run(pipe, *groups, r)));
+        for (_, _, _, pipe, groups, ai) in &plans {
+            let a = arenas[*ai];
+            let _ = run(&a.buf, a.p_off, pipe, *groups, 1);
+            errs.push(conv_error(a, c));
+            reps.push(calibrate(&|r| run(&a.buf, a.p_off, pipe, *groups, r)));
         }
 
         // 轮转交错取最小
         let mut best = vec![f64::INFINITY; plans.len()];
         for _ in 0..ROUNDS {
-            for (i, (_, _, _, pipe, groups)) in plans.iter().enumerate() {
-                let t = run(pipe, *groups, reps[i]) / reps[i] as f64;
+            for (i, (_, _, _, pipe, groups, ai)) in plans.iter().enumerate() {
+                let a = arenas[*ai];
+                let t = run(&a.buf, a.p_off, pipe, *groups, reps[i]) / reps[i] as f64;
                 best[i] = best[i].min(t);
             }
         }
 
         eprintln!("[mb] ── {} ──（同轮峰值 {peak:.0} GFLOPS）", c.label);
-        for (i, (name, tile, rows, _, groups)) in plans.iter().enumerate() {
+        for (i, (name, tile, rows, _, groups, ai)) in plans.iter().enumerate() {
             let ms = best[i].max(1e-6);
-            let gflops = pr.flops / (ms * 1e6);
+            // 分母一律取**该变体自己那份 arena** 的计数：`p_whalf` 的权重
+            // 只占一半字节，拿 `pr.bytes` 会把它算成「白赚一倍带宽」。
+            let base = arenas[*ai];
+            let gflops = base.flops / (ms * 1e6);
             // 达成带宽（下界流量 / 时间）——权重流型的层（如 CTC 分类）
             // 光看 GFLOPS 会误判成「算力差 20 倍」，其实卡在 DRAM 上。
-            let gbs = pr.bytes / (ms * 1e3);
+            let gbs = base.bytes / (ms * 1e3);
             eprintln!(
                 "[mb]   {name:<9} {tile:<6} rows(grid)={rows} grid={:<10} {ms:>7.3} ms  \
                  {gflops:>7.1} GFLOPS  = {:.0}% 峰值  {gbs:>6.1} GB/s(下界)  误差 {:.2e}",
@@ -1074,7 +1187,7 @@ fn conv8_grid_scaling_real_shapes() {
         eprintln!("[mb] ── {} ──", c.label);
         let mut base_ms = f64::NAN;
         for batch in BATCHES {
-            let pr = build_conv_case_batch(&ctx.inner.device, c, batch);
+            let pr = build_conv_case_batch(&ctx.inner.device, c, batch, false);
             let run = |reps: u32| -> f64 {
                 let t = Instant::now();
                 submit_compute(&ctx.inner.queue, |enc| {
@@ -1119,7 +1232,7 @@ fn conv8_batch_sweep() {
         eprintln!("[mb] ── {} ──", c.label);
         let mut base_ms = f64::NAN;
         for batch in BATCHES {
-            let pr = build_conv_case_batch(&ctx.inner.device, c, batch);
+            let pr = build_conv_case_batch(&ctx.inner.device, c, batch, false);
             let run = |reps: u32| -> f64 {
                 let t = Instant::now();
                 submit_compute(&ctx.inner.queue, |enc| {

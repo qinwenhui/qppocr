@@ -25,6 +25,7 @@
 //! | `p_colmajw` | 窗口序 + 窗内列主序 | **否**（诊断） | 两个映射能否叠成一条路、免掉按尺寸切阈值 |
 //! | `p_colmajsmall` | 列主序 + 权重地址掩进 1 KB | **否**（诊断） | **`p_wsmall` 的 1.56× 余量被列主序吃掉了吗**（决定任务 #12 做不做） |
 //! | `p_wstage` | 列主序 + 权重切片协作搬进线程组内存 | **是**（应位级等于 `p_colmaj`） | 任务 #12 的可落地处方到底值多少 |
+//! | `p_whalf` | 权重存 fp16（其余一字不改） | 否（fp16 舍入） | **权重足迹砍半值多少**——决定 fp16 权重这条路做不做 |
 //!
 //! `p_wsmall` 是这组里最要紧的一条：`p_base` 与 `p_wconst` 的差（83%）既
 //! 可能是「权重流量」（→ 线程组暂存能救）也可能是「权重装载指令条数」
@@ -111,6 +112,11 @@ pub(crate) const VARIANTS: &[Variant] = &[
     // k1 同分辨率快路：gather 地址整体提出热循环（见 probe_p_k1fast.metal）。
     // 与 p_base 的**唯一**差别是那个 `if`——累加顺序逐字相同，结果位级一致。
     Variant { name: "p_k1fast", rows: 4, nblk: 2, tile: "m4×n2", k1_only: true, is_control: false },
+    // 权重存 fp16（见 probe_p_whalf.metal 头注释）：与 p_base 的唯一语义差
+    // 是权重基址 `>>2` → `>>1`，装载条数/网格/热循环全同。要回答的是
+    // 「§4 认定的 line 数/局部性」这根杠杆上，fp16 值多少——**在动生产
+    // 代码之前**把这条路的价值量出来。
+    Variant { name: "p_whalf", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
     // 瓦片空间（网格一律 = 计划的 m4n8；`p_t4n2` 是模板自身的控制组，
     // 它必须与 `p_base` 同时间——对不上就是模板没把累加器标量化）。
     Variant { name: "p_t4n2", rows: 4, nblk: 2, tile: "m4×n2", k1_only: true, is_control: false },
@@ -142,6 +148,7 @@ const PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_wstage", include_str!("probe_p_wstage.metal")),
     ("p_wstage_nb", include_str!("probe_p_wstage_nb.metal")),
     ("p_k1fast", include_str!("probe_p_k1fast.metal")),
+    ("p_whalf", include_str!("probe_p_whalf.metal")),
     // 同一份源码被列多次：每个 (名字, 源码) 是独立一次编译、只取该名字
     // 对应的入口——模板化的瓦片探针就是这样一次源码、五个内核。
     ("p_t4n2", include_str!("probe_p_tile.metal")),
