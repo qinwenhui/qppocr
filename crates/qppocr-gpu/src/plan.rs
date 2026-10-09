@@ -183,6 +183,10 @@ impl PlanBuilder<'_> {
             self.initializers,
             &[(input_name.to_string(), in_shape.to_vec(), DType::F32)],
         )?;
+        // 分段计时（`QPPOCR_GPU_BUILD_TIME`）：rec 计划 ~3 ms/形状 × 9.4 个形状
+        // /图 = 33 ms/图纯 CPU（2026-10-09 实测，占单图 20%），必须知道这 3 ms
+        // 落在哪一段才谈得上优化——形状推断 / 预扫与权重 / 节点环三者对策完全不同。
+        let t_shape = t_build.elapsed();
 
         let dbg_env = std::env::var_os("QPPOCR_GPU_STEP_DEBUG").is_some();
         let refs = consumer_counts(self.graph);
@@ -388,6 +392,7 @@ impl PlanBuilder<'_> {
             rc.insert(input_name.to_string(), (nr as u32, cr));
         }
 
+        let t_pre = t_build.elapsed();
         for (node_idx, n) in self.graph.nodes.iter().enumerate() {
             let out = n.outputs[0].clone();
             // ---- 存储恒等节点（Squeeze/Unsqueeze/Transpose(0,2,1)/
@@ -737,11 +742,16 @@ impl PlanBuilder<'_> {
             .collect();
 
         if std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some() {
+            let t_end = t_build.elapsed();
             eprintln!(
-                "[plan] 计划就绪：输入 {in_shape:?}，{} 个 dispatch，整块 {:.1} MB（建 {:.1} ms）",
+                "[plan] 计划就绪：输入 {in_shape:?}，{} 个 dispatch，整块 {:.1} MB\
+                 （建 {:.1} ms = 形状推断 {:.2} + 预扫/权重 {:.2} + 节点环 {:.2}）",
                 recs.len(),
                 layout.total as f64 * 4.0 / 1e6,
-                t_build.elapsed().as_secs_f64() * 1000.0
+                t_end.as_secs_f64() * 1000.0,
+                t_shape.as_secs_f64() * 1000.0,
+                (t_pre - t_shape).as_secs_f64() * 1000.0,
+                (t_end - t_pre).as_secs_f64() * 1000.0
             );
         }
         Ok(GraphPlan {
@@ -1207,12 +1217,6 @@ impl PlanBuilder<'_> {
                         n.inputs[1]
                     ))
                 })?;
-                let mut w_t = vec![0f32; nn * k];
-                for i in 0..k {
-                    for j in 0..nn {
-                        w_t[j * k + i] = bt.f32[i * nn + j];
-                    }
-                }
                 let w_off = n_weight_off(
                     self.initializers,
                     &n.inputs[1],
@@ -1220,7 +1224,27 @@ impl PlanBuilder<'_> {
                     w_upload,
                     w_offs,
                     self.repack_cache,
-                    |_| nhwc::repack_conv_w(&w_t, nn, k, 1, 1),
+                    // 转置**必须在闭包内**：`n_weight_off` 只在会话级重排缓存
+                    // （按名键控）未命中时才调 `repack`。而 `k`/`nn` 取自 B 这个
+                    // initializer 的形状、与输入形状无关 ⇒ 这份 [K,N]→[N,K]
+                    // 转置整个会话只需做一次。原来写在闭包外，于是**每次重建
+                    // 计划都重做一遍**——rec 的 CTC 头 `MatMul.12` 是
+                    // 120×18712 = 2.24 M 元素，占全部 MatMul 权重的 90.5%，
+                    // 实测吃掉了「节点环 2.9 ms」的绝大部分（而 rec 一图就有
+                    // 12 个形状、每形状 173 条 dispatch 里它是固定的一份）。
+                    |_| {
+                        // 外层走 j：写 `w_t[j*k + i]` 时 i 连续 ⇒ 写侧顺序访存；
+                        // 反过来内层跑 j 会让每次写跨 k 个 float（960 B），
+                        // 每写一个都吃一条新 cache line。
+                        let mut w_t = vec![0f32; nn * k];
+                        for j in 0..nn {
+                            let (src, dst) = (&bt.f32[j..], &mut w_t[j * k..j * k + k]);
+                            for i in 0..k {
+                                dst[i] = src[i * nn];
+                            }
+                        }
+                        nhwc::repack_conv_w(&w_t, nn, k, 1, 1)
+                    },
                 )?;
                 let (_, cols) = rc
                     .get(out)

@@ -62,8 +62,18 @@ pub(crate) struct MetalPlan {
     out_shapes: Vec<Vec<i64>>,
     /// dispatch 序列（每 run 重编码执行）。
     pub(crate) dispatches: Vec<plan::Dispatch>,
-    /// 整块字节数（计划缓存预算记账）。
+    /// 计划缓存记账用的**独占**字节 = 动态（激活）区，即整块 − 静态段。
+    ///
+    /// 为什么不是整块：会话级 arena 全会话只有**一块**（见 `Arena`），静态段
+    /// （rec 60.7 MB）也全会话只有一份。按整块记账等于把这份共享内存重复计
+    /// N 次，而它远比计划本身大——实测 rec 一份计划「整块 68.3 MB、静态
+    /// 60.7 MB」，于是 1536 MB 预算只留得住 22 份，可一图就有 12 个桶形状、
+    /// 16 图共 147 个不同形状 ⇒ 淘汰-重建成为常态（实测 147 建 / 53 命中，
+    /// 其中 **45 建纯属淘汰浪费**）。独占口径下 1536 MB 能留 ~120 份。
     block_bytes: u64,
+    /// 静态段字节数。同会话所有计划共用一份（最大值即上界），
+    /// `plan_for` 里只计一次——见 [`Self::block_bytes`]。
+    static_bytes: u64,
 }
 
 // SAFETY: base 是 buf（Shared arena）的持久映射指针，存活期与 MetalPlan
@@ -391,6 +401,9 @@ impl MetalSession {
         // 分配/复用 arena：容量够就沿用（旧 arena 若仍被既有计划持有则
         // 自然存活——MetalPlan 各持一份引用）。
         let bytes = built.total_words as u64 * 4;
+        // 缓存记账口径：独占 = 动态区。静态段会话共享，`plan_for` 里单独只计
+        // 一次最大值（理由见 `MetalPlan::block_bytes` 的文档）。
+        let cache_bytes = (built.total_words - built.static_words) as u64 * 4;
         // 诊断开关：停用 arena 复用（每次新建 buffer、全量上传）——用来
         // 把「复用的代价」与「复用引入的错」分开定位。
         let share = std::env::var_os("QPPOCR_METAL_NO_ARENA").is_none();
@@ -714,7 +727,8 @@ impl MetalSession {
             out_offs: built.out_offs,
             out_shapes: built.out_shapes,
             dispatches: built.dispatches,
-            block_bytes: bytes,
+            block_bytes: cache_bytes,
+            static_bytes: built.static_words as u64 * 4,
             buf,
         })
     }
@@ -837,19 +851,39 @@ impl MetalSession {
             .plans
             .lock()
             .map_err(|_| Error::Device("计划缓存锁中毒".into()))?;
+        // 命中/新建的每一笔都记账（`QPPOCR_GPU_BUILD_TIME`）：计划重建是
+        // 纯 CPU、与 GPU 等待串行的 33 ms/图（占单图 20%），而**同一形状
+        // 被建两次**是当时最大的疑点——命中率是「能不能再省一半」的全部依据。
+        let dbg = std::env::var_os("QPPOCR_GPU_BUILD_TIME").is_some();
         if let Some((_, p)) = plans.iter().find(|(s, _)| s == shape) {
+            if dbg {
+                eprintln!("[cache] 命中 {shape:?}（缓存 {} 份）", plans.len());
+            }
             return Ok(p.clone());
         }
         let p = Arc::new(self.build_plan(shape)?);
+        if dbg {
+            eprintln!("[cache] 新建 {shape:?}（缓存 {} 份）", plans.len() + 1);
+        }
         plans.push((shape.to_vec(), p.clone()));
         let budget: u64 = std::env::var("QPPOCR_GPU_PLAN_MB")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(self.plan_budget_mb);
-        let mut total: u64 = plans.iter().map(|(_, p)| p.block_bytes).sum();
-        while total > budget * (1 << 20) && plans.len() > 1 {
-            let (_, evicted) = plans.remove(0);
-            total -= evicted.block_bytes;
+        // 独占区累加 + 静态段按**最大的一份**只计一次（会话共享一块 arena，
+        // 见 `MetalPlan::block_bytes`）。旧口径把两份都按整块逐计划累加，
+        // 实测让 rec 的计划命中率掉到 26%（147 建 / 53 命中），其中 45 次
+        // 新建纯粹是被自己的共享静态段挤掉后重建的。
+        //
+        // 每剔一份就整体重算：静态段那一项是**集合上的最大值**，剔掉的正是
+        // 队首，增量维护会让它偏大（把已经不在集合里的份额继续算着）。n 是
+        // 几十~几百，O(n²) 在这里完全不是瓶颈。
+        let weigh = |ps: &[(Vec<i64>, Arc<MetalPlan>)]| -> u64 {
+            ps.iter().map(|(_, p)| p.block_bytes).sum::<u64>()
+                + ps.iter().map(|(_, p)| p.static_bytes).max().unwrap_or(0)
+        };
+        while weigh(&plans) > budget * (1 << 20) && plans.len() > 1 {
+            plans.remove(0);
         }
         Ok(p)
     }
