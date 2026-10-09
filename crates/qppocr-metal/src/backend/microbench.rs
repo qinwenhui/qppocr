@@ -614,6 +614,163 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
     }
 }
 
+// ---------------------------------------------------------------------------
+// depthwise（`n_conv_dw`）的用例构造
+// ---------------------------------------------------------------------------
+
+/// 一个 depthwise 层的形状。语义与 `plan.rs` 的 `xs[1..]` 一致：weight
+/// 是 `[C,1,kh,kw]`，输入是 NHWC `[h][w][c]`，输出通道 = 输入通道 = `c`。
+struct DwCase {
+    label: &'static str,
+    /// 输入高/宽（**不是**输出 —— 与 `ConvCase` 的约定相反，那边给的是输出）。
+    h: u32,
+    w: u32,
+    c: u32,
+    kh: u32,
+    kw: u32,
+    stride: u32,
+}
+
+/// depthwise 的 `(输出高, 输出宽, 上/左 padding)`。
+///
+/// `no_pad` 那份是 `p_dw_nobc` 专用的：pad=0 且输出只覆盖「每个 tap 都在
+/// 界内」的位置，于是内核里删掉边界判断**不会**越界。它只有 `p_dw_base`
+/// 在**同一 no_pad 配置**上的读数可比 —— 换配置后 m 变了，绝对值不可比。
+fn dw_dims(c: &DwCase, no_pad: bool) -> (u32, u32, u32) {
+    let pad = if no_pad { 0 } else { (c.kh - 1) / 2 };
+    (((c.h + 2 * pad - c.kh) / c.stride) + 1, ((c.w + 2 * pad - c.kw) / c.stride) + 1, pad)
+}
+
+/// 朴素 depthwise 卷积（NHWC 输入、ONNX `[C,1,kh,kw]` 权重），对拍基准。
+fn cpu_dw_ref(input: &[f32], weight: &[f32], c: &DwCase, no_pad: bool) -> Vec<f32> {
+    let (out_h, out_w, pad) = dw_dims(c, no_pad);
+    let (ch, kh, kw, s) = (c.c as usize, c.kh as usize, c.kw as usize, c.stride as usize);
+    let (ih_max, iw_max) = (c.h as i64, c.w as i64);
+    let mut out = vec![0f32; out_h as usize * out_w as usize * ch];
+    for oh in 0..out_h as usize {
+        for ow in 0..out_w as usize {
+            for ic in 0..ch {
+                let mut acc = 0f32;
+                for ky in 0..kh {
+                    for kx in 0..kw {
+                        let ih = (oh * s + ky) as i64 - pad as i64;
+                        let iw = (ow * s + kx) as i64 - pad as i64;
+                        if ih < 0 || iw < 0 || ih >= ih_max || iw >= iw_max {
+                            continue;
+                        }
+                        let a = input[(ih as usize * c.w as usize + iw as usize) * ch + ic];
+                        acc += a * weight[ic * kh * kw + ky * kw + kx];
+                    }
+                }
+                out[(oh * out_w as usize + ow) * ch + ic] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// 组一个 depthwise 用例的 arena 与参数块（字段含义同 `ConvProbe`，
+/// `co4` 这里装的是补齐后的通道数 `cDim`）。
+///
+/// 参数块**逐字段抄 `plan.rs`**（那里是 `n_conv_dw` 的唯一出口），偏移一律
+/// 是 word 下标 —— 内核内部 `>>2` 折成 float4 下标，传字节会整个写飞。
+fn build_dw_case(device: &metal::DeviceRef, c: &DwCase, no_pad: bool) -> ConvProbe {
+    let (out_h, out_w, pad) = dw_dims(c, no_pad);
+    let m_dim = out_h * out_w;
+    let c_dim = c.c.div_ceil(4) * 4; // cpad4(Co)
+    let cv4 = c_dim / 4;
+    let taps = c.kh * c.kw;
+
+    let mut seed = 0x0bad_c0de_dead_beefu64;
+    let mut rnd = || -> f32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 0.125
+    };
+    // 输入 NHWC；权重 ONNX 布局 [c][1][kh][kw]（对拍用），再重排成
+    // 内核要的 `[t][c4]`（一个 float4 = 4 个通道该 tap 的权重）。
+    let input: Vec<f32> = (0..(c.h * c.w * c.c) as usize).map(|_| rnd()).collect();
+    let weight: Vec<f32> = (0..(c.c * taps) as usize).map(|_| rnd()).collect();
+    let mut w_repacked = vec![0f32; (taps * cv4 * 4) as usize];
+    for t in 0..taps {
+        let (ky, kx) = (t / c.kw, t % c.kw);
+        for c4 in 0..cv4 {
+            for l in 0..4u32 {
+                let ch = c4 * 4 + l;
+                w_repacked[(t * cv4 + c4) as usize * 4 + l as usize] =
+                    if ch < c.c { weight[(ch * c.kh * c.kw + ky * c.kw + kx) as usize] } else { 0.0 };
+            }
+        }
+    }
+
+    let n_in = c.h * c.w * c_dim;
+    let n_w = taps * c_dim;
+    let n_out = m_dim * c_dim;
+    let p_words = 64u32;
+    let in_off_w = 256u32;
+    let w_off_w = in_off_w + n_in;
+    let b_off_w = w_off_w + n_w;
+    let out_off_w = b_off_w + c_dim;
+    let total = (out_off_w + n_out + 64) as u64;
+    let buf = device.new_buffer(total * 4, metal::MTLResourceOptions::StorageModeShared);
+
+    let base = buf.contents() as *mut u32;
+    // SAFETY: 同 `build_conv_case_batch` —— Shared 存储的非空基址，缓冲按
+    // `total` 个 word 分配，各段起点依次相接，故所有下标 < total。
+    unsafe {
+        let p = base.add(p_words as usize);
+        *base = 0; // real_n = 0（不限批）
+        let words: [u32; 20] = [
+            in_off_w,
+            w_off_w,
+            b_off_w,
+            out_off_w,
+            m_dim,
+            c_dim,
+            out_w,
+            c.w,  // inW
+            c.h,  // inH
+            taps,
+            c.kw, // kW
+            c.stride,
+            c.stride,
+            pad,  // padT
+            pad,  // padL
+            0,    // act = 0（探针只量卷积本体；act 由尾部一次施加，81 tap 下可忽略）
+            0,    // c1
+            0,    // c2
+            0,    // c3
+            0xFFFF_FFFF, // r_off = OFF_NONE
+        ];
+        for (i, v) in words.iter().enumerate() {
+            *p.add(i) = *v;
+        }
+        std::ptr::copy_nonoverlapping(input.as_ptr(), base.add(in_off_w as usize) as *mut f32, n_in as usize);
+        std::ptr::copy_nonoverlapping(w_repacked.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+        std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, c_dim as usize);
+        let op = base.add(out_off_w as usize) as *mut f32;
+        for i in 0..n_out as usize {
+            *op.add(i) = 7.0; // 哨兵：跑完还是 7.0 = 内核没写
+        }
+    }
+
+    let groups = super::conv_probe::dw_groups_for(m_dim, c_dim);
+    let flops = m_dim as f64 * c.c as f64 * taps as f64 * 2.0;
+    let bytes = ((c.h * c.w * c.c) + n_out) as f64 * 4.0 + (n_w * 4) as f64;
+    ConvProbe {
+        buf,
+        p_off: p_words,
+        groups,
+        flops,
+        bytes,
+        out_off_w,
+        out_h,
+        out_w,
+        co4: c_dim,
+        input,
+        weight,
+    }
+}
+
 /// GPU 测试串行闸。
 ///
 /// `cargo test` 默认多线程并行跑测试，两个 GPU 基准同时跑会互相抢设备。
@@ -1755,5 +1912,227 @@ fn buffer_creation_path_bandwidth() {
             per,
             bytes / (per * 1e6)
         );
+    }
+}
+
+/// 读回 depthwise 输出段，与朴素 CPU depthwise 比最大绝对误差。
+///
+/// **只对 `p_dw_base` / `p_dw_nodiv` / `p_dw_nobc` 有意义**：`p_dw_now`
+/// 与 `p_dw_fma` 是**故意算错**的诊断变体（前者把权重换成常数、后者不
+/// 读输入），它们的输出不参与对拍。
+fn dw_error(pr: &ConvProbe, c: &DwCase, no_pad: bool) -> f32 {
+    let n = (pr.out_h * pr.out_w * c.c) as usize;
+    // SAFETY: Shared 存储，`out_off_w` 起 `out_h*out_w*co4` 个 word 有效；
+    // 调用方已 wait_until_completed。前 `out_w*c` 列是真实通道（尾部补齐）。
+    let got = unsafe {
+        std::slice::from_raw_parts((pr.buf.contents() as *const f32).add(pr.out_off_w as usize), n)
+    };
+    let want = cpu_dw_ref(&pr.input, &pr.weight, c, no_pad);
+    got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+}
+
+/// `n_conv_dw` 热循环拆解：medium det 里它只做 **3.2% 的 FLOP**，却占
+/// **15% 的设备时间**（12.6 / 82.4 ms），最大那条单条 6.54 ms 只有
+/// **207 GFLOPS**（`n_conv8h` 同机 1400+）。拆法见 `probe_dw.metal`。
+///
+/// 判读：`p_dw_fma` 与 `p_dw_base` 的差 = 这一档**全部**可动的量；
+/// 其中 `p_dw_nodiv` 吃掉的部分归**整数除法**、`p_dw_now` 吃掉的部分归
+/// **权重装载**，剩下的归地址数学与边界分支（后者由同轮 no_pad 那组
+/// 的 `p_dw_base` vs `p_dw_nobc` 单独钉死）。
+#[test]
+fn conv_dw_variant_scan() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    // 形状逐字取自 `QPPOCR_METAL_PLAN_DUMP` 的 medium det 计划块。dw 的
+    // `h/w` 是**输入**分辨率（stride 1 时 = 输出）。
+    let cases = [
+        // 首恶：单条 6.54 ms、1.354 GFLOP。输入由 Resize.2/Add.158 给到 136x240。
+        DwCase { label: "dw 9x9 c256 136x240 (Conv.64 首恶)", h: 136, w: 240, c: 256, kh: 9, kw: 9, stride: 1 },
+        DwCase { label: "dw 9x9 c256  68x120 (Conv.62)", h: 68, w: 120, c: 256, kh: 9, kw: 9, stride: 1 },
+        DwCase { label: "dw 9x9 c64  136x240 (Conv.69)", h: 136, w: 240, c: 64, kh: 9, kw: 9, stride: 1 },
+        // 3x3 那批条数多（Conv.5/10/13/…），单条小但铺满整个骨干。
+        DwCase { label: "dw 3x3 c128 136x240 (Conv.5)", h: 136, w: 240, c: 128, kh: 3, kw: 3, stride: 1 },
+        DwCase { label: "dw 3x3 c512  34x60 ", h: 34, w: 60, c: 512, kh: 3, kw: 3, stride: 1 },
+    ];
+    let probes = super::conv_probe::ProbeSet::from_list(
+        &ctx.inner.device,
+        super::conv_probe::DW_PROBE_SHADERS,
+    )
+    .expect("编译 dw 探针");
+    // 带 padding 的配置上只能跑这些；`p_dw_nobc` 会越界，见最后一个代码块。
+    // 除 `p_dw_wide4` 外全部**同网格**；`wide4` 的线程数是它们的 1/4，网格
+    // 由 `dw_groups_for_wide` 单独给 —— 它量的是「摊薄地址数学」，本就要
+    // 换一个线程划分。
+    // (变体, 结果是否应与 CPU 一致)。`false` 的是**故意算错**的诊断变体
+    // ——各自删掉或改写了某样东西，它们的输出不参与对拍。
+    let all: &[(&str, bool)] = &[
+        ("p_dw_base", true),
+        ("p_dw_nodiv", true),
+        ("p_dw_wide4", true),
+        ("p_dw_u9", true),
+        ("p_dw_u3", true),
+        ("p_dw_now", false),
+        ("p_dw_fma", false),
+        ("p_dw_noin", false),
+        ("p_dw_win", false),
+    ];
+
+    for c in &cases {
+        let pr = build_dw_case(&ctx.inner.device, c, false);
+        let m_dim = pr.out_h * pr.out_w;
+        // 控制关：网格必须与 `plan.rs` 的 `div256(m_dim * cp / 4)` 逐位一致，
+        // 否则线程覆盖不同，绝对值无从与生产对齐。
+        assert_eq!(
+            pr.groups,
+            super::conv_probe::dw_groups_for(m_dim, pr.co4),
+            "网格与 plan.rs 公式不一致（{}）",
+            c.label
+        );
+        assert_eq!(pr.co4 % 16, 0, "wide4 要求 cv4 能被 4 整除（{}）", c.label);
+        let wide = super::conv_probe::dw_groups_for_wide(m_dim, pr.co4);
+        // 特化变体只在与模板常量相符的形状上有意义，其余整条剔除
+        // （不剔除会拿常量算出的错地址乱读）。
+        let pad0 = (c.kh - 1) / 2;
+        let variants: Vec<(&str, bool)> = all
+            .iter()
+            .copied()
+            .filter(|(n, _)| super::conv_probe::dw_spec_ok(n, c.kh, c.kw, pad0, c.stride))
+            .collect();
+        let grid_of = |n: &str| if n == "p_dw_wide4" { wide } else { pr.groups };
+
+        let run = |pipe: &metal::ComputePipelineState, grid: [u32; 3], reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, grid)
+                        .expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+
+        let pipes: Vec<(&str, bool, &metal::ComputePipelineState, [u32; 3])> = variants
+            .iter()
+            .map(|(n, ok)| (*n, *ok, probes.pipe(n).expect("管线"), grid_of(n)))
+            .collect();
+        // 预热 + 就地取误差（变体逐个覆盖同一块输出，必须**跑完就立刻读**，
+        // 否则读到的是最后一个变体的结果 —— 这条在 conv8 扫描里踩过）+ 校准。
+        let mut errs = Vec::new();
+        let mut reps = Vec::new();
+        for (_, _, p, g) in &pipes {
+            let _ = run(p, *g, 1);
+            errs.push(dw_error(&pr, c, false));
+            reps.push(calibrate(&|r| run(p, *g, r)));
+        }
+        for (i, (n, ok, _, _)) in pipes.iter().enumerate() {
+            if *ok {
+                assert!(
+                    errs[i] < 1e-2,
+                    "{} 的 {} 与 CPU 对拍失败：最大绝对差 {}",
+                    c.label,
+                    n,
+                    errs[i]
+                );
+            }
+        }
+
+        // 轮转交错取最小（本机先跑的那条快 6~15%）
+        let mut best = vec![f64::INFINITY; pipes.len()];
+        for _ in 0..3 {
+            for (i, (_, _, p, g)) in pipes.iter().enumerate() {
+                let t = run(p, *g, reps[i]) / reps[i] as f64;
+                best[i] = best[i].min(t);
+            }
+        }
+
+        let base = best[0].max(1e-6);
+        eprintln!(
+            "[mb] ── {} ── grid={:?}  {} GFLOP  下界 {:.2} ms（{:.0} GB/s）",
+            c.label,
+            pr.groups,
+            pr.flops / 1e9,
+            pr.bytes / 93.0e6,
+            pr.bytes / (base * 1e6)
+        );
+        for (i, (n, ok, _, _)) in pipes.iter().enumerate() {
+            let ms = best[i].max(1e-6);
+            eprintln!(
+                "[mb]    {:<11} {:>8.3} ms  {:>7.1} GFLOPS  {:.2}× base{}",
+                n,
+                ms,
+                pr.flops / (ms * 1e6),
+                base / ms,
+                if *ok { "" } else { "   （故意算错）" }
+            );
+        }
+    }
+
+    // ── 边界分支的代价（只能在无 padding 的配置上量）─────────────────
+    //
+    // `p_dw_nobc` 删掉了 `ih/iw` 的界内判断。带 padding 时内点之外的 tap
+    // 会算出负的 `ih`，`uint` 回绕成天文数字 —— 直接读飞。所以换一份
+    // pad=0、输出只覆盖「每个 tap 恒在界内」的配置：此时判断永真，
+    // 删掉它**不改变结果**，两臂都能过 CPU 对拍。
+    //
+    // 注意这两条的绝对值**不与上面那块可比**（m 从 32640 变 29696），
+    // 只有它俩之间的比值有意义。
+    {
+        let c0 = &cases[0];
+        let prn = build_dw_case(&ctx.inner.device, c0, true);
+        let groups = prn.groups;
+        let names = ["p_dw_base", "p_dw_nobc"];
+        let run = |pipe: &metal::ComputePipelineState, reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    super::pipeline::dispatch_with(enc, pipe, &prn.buf, prn.p_off, groups)
+                        .expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&prn.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        let pipes: Vec<&metal::ComputePipelineState> =
+            names.iter().map(|n| probes.pipe(n).expect("管线")).collect();
+        let mut reps = Vec::new();
+        let mut errs = Vec::new();
+        for p in &pipes {
+            let _ = run(p, 1);
+            errs.push(dw_error(&prn, c0, true));
+            reps.push(calibrate(&|r| run(p, r)));
+        }
+        for i in 0..2 {
+            assert!(
+                errs[i] < 1e-2,
+                "no_pad 配置上 {} 与 CPU 对拍失败：{}（{}）",
+                names[i],
+                errs[i],
+                c0.label
+            );
+        }
+        let mut best = [f64::INFINITY; 2];
+        for _ in 0..3 {
+            for (i, p) in pipes.iter().enumerate() {
+                best[i] = best[i].min(run(p, reps[i]) / reps[i] as f64);
+            }
+        }
+        eprintln!(
+            "[mb] ── {} no_pad（pad=0，输出 {}x{}）── 边界分支的代价",
+            c0.label, prn.out_h, prn.out_w
+        );
+        for (i, n) in names.iter().enumerate() {
+            eprintln!(
+                "[mb]    {:<11} {:>8.3} ms  {:>7.1} GFLOPS  {:.2}× base",
+                n,
+                best[i],
+                prn.flops / (best[i] * 1e6),
+                best[0] / best[i]
+            );
+        }
     }
 }

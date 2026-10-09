@@ -165,15 +165,53 @@ pub(crate) struct ProbeSet {
     pipes: HashMap<&'static str, ComputePipelineState>,
 }
 
+/// depthwise 探针（`probe_dw.metal`，见该文件的头注释）。与 conv8 那组
+/// 分开是因为参数块语义不同（`n_conv_dw` 的 `params[P+9]` 是 taps 不是
+/// cin4v），混进一张表会让 `groups_for` 的网格公式对错对象。
+pub(crate) const DW_PROBE_SHADERS: &[(&str, &str)] = &[
+    ("p_dw_base", include_str!("probe_dw.metal")),
+    ("p_dw_nodiv", include_str!("probe_dw.metal")),
+    ("p_dw_nobc", include_str!("probe_dw.metal")),
+    ("p_dw_now", include_str!("probe_dw.metal")),
+    ("p_dw_fma", include_str!("probe_dw.metal")),
+    // 4 个通道块 / 线程（16 通道）。**网格与其他变体不同**，见
+    // `dw_groups_for_wide`；调用方必须按变体选网格。
+    ("p_dw_wide4", include_str!("probe_dw.metal")),
+    ("p_dw_noin", include_str!("probe_dw.metal")),
+    ("p_dw_win", include_str!("probe_dw.metal")),
+    // 全展开特化（编译期常量 KH/KW/pad）。**结果正确**，可过 CPU 对拍；
+    // 各只在匹配的形状上有意义（`dw_spec_ok` 判）。
+    ("p_dw_u9", include_str!("probe_dw.metal")),
+    ("p_dw_u3", include_str!("probe_dw.metal")),
+];
+
+/// `p_dw_u9`/`p_dw_u3` 只对「参数与其模板常量逐位相符」的形状成立 ——
+/// 拿 u9 去跑 3×3 会读到常量算出的错地址，输出全错。
+pub(crate) fn dw_spec_ok(name: &str, kh: u32, kw: u32, pad: u32, stride: u32) -> bool {
+    match name {
+        "p_dw_u9" => (kh, kw, pad, stride) == (9, 9, 4, 1),
+        "p_dw_u3" => (kh, kw, pad, stride) == (3, 3, 1, 1),
+        _ => true,
+    }
+}
+
 impl ProbeSet {
     /// 逐个变体独立编译成一个库——编译失败时错误信息里带得动内核名，
     /// 和 `KernelSet` 同一纪律。
     pub(crate) fn new(device: &metal::DeviceRef) -> Result<Self> {
+        Self::from_list(device, PROBE_SHADERS)
+    }
+
+    /// 同 `new`，但编译指定的表（depthwise 那组用 `DW_PROBE_SHADERS`）。
+    pub(crate) fn from_list(
+        device: &metal::DeviceRef,
+        shaders: &[(&'static str, &'static str)],
+    ) -> Result<Self> {
         let opts = metal::CompileOptions::new();
         // 与生产侧同开关：关 fast-math，保住运算语义可比。
         opts.set_fast_math_enabled(false);
         let mut pipes = HashMap::new();
-        for (name, src) in PROBE_SHADERS {
+        for (name, src) in shaders {
             let lib = device
                 .new_library_with_source(src, &opts)
                 .map_err(|e| Error::Device(format!("探针 MSL 编译失败（{name}）: {e}")))?;
@@ -203,4 +241,16 @@ pub(crate) fn groups_for(m_dim: u32, co4: u32, rows: u32, nblk: u32) -> [u32; 3]
     let nv = co4.div_ceil(4);
     let tiles = m_dim.div_ceil(rows) * (nv / nblk);
     [tiles.div_ceil(256), 1, 1]
+}
+
+/// `n_conv_dw` 的网格（工作组数）：一线程一个 (m, c4)，故线程数
+/// = `m_dim * (cDim/4)`。必须与 `plan.rs` 里 `div256(m_dim * cp / 4)`
+/// 逐字一致（`cp` = `cpad4(Co)`，已含在 `c_dim` 里）。
+pub(crate) fn dw_groups_for(m_dim: u32, c_dim: u32) -> [u32; 3] {
+    [(m_dim * (c_dim / 4)).div_ceil(256), 1, 1]
+}
+
+/// `p_dw_wide4` 的网格：一线程 4 个通道块，故线程数 = `mDim * cv4 / 4`。
+pub(crate) fn dw_groups_for_wide(m_dim: u32, c_dim: u32) -> [u32; 3] {
+    [(m_dim * (c_dim / 16)).div_ceil(256), 1, 1]
 }
