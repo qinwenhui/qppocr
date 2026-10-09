@@ -371,43 +371,51 @@ fn mm_sg_scan() {
     let zeros = vec![0u8; 64 << 20];
     unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), buf.contents() as *mut u8, zeros.len()) };
 
-    for (label, m, n, k) in cases {
-        // 必须是 64 的倍数（探针要求），且 K 是 8 的倍数。
-        let m_pad = m.div_ceil(64) * 64;
-        let n_pad = n.div_ceil(64) * 64;
-        let k_pad = k.div_ceil(8) * 8;
-        let flops = (m as u64) * (n as u64) * (k as u64) * 2; // FMA = MAC ×2
-        let bytes = (m_pad * k_pad * 2 + n_pad * k_pad * 2 + m_pad * n_pad * 2) as f64;
+    for variant in &[("p_mm_sg", "pure GEMM, ideal 64x64 tile"), ("p_mm_sg_conv8", "conv8 adapted tile")] {
+        let name = variant.0;
+        let pipe = ps.pipe(name).expect(&format!("取 {} 管线", name));
+        eprintln!("--- Variant: {} ---", name);
+        for (label, m, n, k) in &cases {
+            let m = *m;
+            let n = *n;
+            let k = *k;
+            // 必须是 64 的倍数（探针要求），且 K 是 8 的倍数。
+            let m_pad = m.div_ceil(64) * 64;
+            let n_pad = n.div_ceil(64) * 64;
+            let k_pad = k.div_ceil(8) * 8;
+            let flops = (m as u64) * (n as u64) * (k as u64) * 2; // FMA = MAC ×2
+            let bytes = (m_pad * k_pad * 2 + n_pad * k_pad * 2 + m_pad * n_pad * 2) as f64;
 
-        // 参数：M,N,K（对齐后的值）。
-        let params = [m_pad as u32, n_pad as u32, k_pad as u32];
-        let params_bytes = unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
+            // 参数：M,N,K（对齐后的值）。
+            let params = [m_pad as u32, n_pad as u32, k_pad as u32];
+            let params_bytes = unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
 
-        // 网格与线程组：与 mm_sg_groups 一致，tg=256 线程/组。
-        let groups = [m_pad.div_ceil(64), n_pad.div_ceil(64), 1];
-        let threads = [groups[0] * 256, groups[1], groups[2]];
+            // 网格与线程组：与 mm_sg_groups 一致，tg=256 线程/组。
+            let groups = [m_pad.div_ceil(64), n_pad.div_ceil(64), 1];
+            let threads = [groups[0] * 256, groups[1], groups[2]];
 
-        // 预热 3 轮，然后 best-of-5 取 median。
-        let ms = bench(15, || {
-            submit_compute(&ctx.inner.queue, |enc| {
-                enc.set_compute_pipeline_state(pipe);
-                // 同一 arena 绑 0/1/2：probe 的 A/W/C 都按 half 解释，与 conv8 同 abi。
-                for b in 0..3u64 {
-                    enc.set_buffer(b, Some(&buf), 0);
-                }
-                enc.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const std::ffi::c_void);
-                enc.dispatch_threads(
-                    MTLSize::new(threads[0] as u64, threads[1] as u64, threads[2] as u64),
-                    MTLSize::new(256, 1, 1),
-                );
-            }).expect("提交");
-        });
-        let gflops = flops as f64 / (ms / 1000.0) / 1e6;
-        let roof = 3.34 * 1000.0; // FP32 峰值（竞品 doc 说 MMA≈fp32）
-        eprintln!(
-            "[mb/mm_sg] {:20} M={:6} N={:6} K={:6}  grid={:3}x{:3}  time={:6.2} ms  gflops={:7.1}  util={:4.1}%  B/FLOP={:.3} B/FLOP",
-            label, m, n, k, groups[0], groups[1], ms, gflops, gflops / roof * 100.0, bytes / flops as f64
-        );
+            // 预热 3 轮，然后 best-of-5 取 median。
+            let ms = bench(15, || {
+                submit_compute(&ctx.inner.queue, |enc| {
+                    enc.set_compute_pipeline_state(pipe);
+                    // 同一 arena 绑 0/1/2：probe 的 A/W/C 都按 half 解释，与 conv8 同 abi。
+                    for b in 0..3u64 {
+                        enc.set_buffer(b, Some(&buf), 0);
+                    }
+                    enc.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const std::ffi::c_void);
+                    enc.dispatch_threads(
+                        MTLSize::new(threads[0] as u64, threads[1] as u64, threads[2] as u64),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }).expect("提交");
+            });
+            let gflops = flops as f64 / (ms / 1000.0) / 1e6;
+            let roof = 3.34 * 1000.0; // FP32 峰值（竞品 doc 说 MMA≈fp32）
+            eprintln!(
+                "[mb/mm_sg] {:20} {:20} M={:6} N={:6} K={:6}  grid={:5}x{:3}  time={:6.2} ms  gflops={:7.1}  util={:4.1}%  B/FLOP={:.3} B/FLOP",
+                name, label, m, n, k, groups[0], groups[1], ms, gflops, gflops / roof * 100.0, bytes / flops as f64
+            );
+        }
     }
 }
 

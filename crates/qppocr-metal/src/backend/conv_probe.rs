@@ -185,12 +185,13 @@ pub(crate) const DW_PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_dw_u3", include_str!("probe_dw.metal")),
 ];
 
-/// simdgroup_matrix 探针（`probe_mm_sg.metal`）。
+/// simdgroup_matrix 探针（`probe_mm_sg.metal`：纯 GEMM，竞品结构；`probe_mm_sg_conv8.metal`：适配 conv8 形状）。
 ///
 /// **单开一张表**：参数块语义（`p[0..3] = M,N,K`）与网格（64×64 瓦片）
 /// 都和 conv8 那组无关，混进去 `groups_for` 会给出错的网格。
 pub(crate) const MM_PROBE_SHADERS: &[(&str, &str)] =
-    &[("p_mm_sg", include_str!("probe_mm_sg.metal"))];
+    &[("p_mm_sg", include_str!("probe_mm_sg.metal")),
+      ("p_mm_sg_conv8", include_str!("probe_mm_sg_conv8.metal"))];
 
 /// 64×64 瓦片的网格：`[ceil(M/64), ceil(N/64), 1]`，线程组固定 256。
 pub(crate) fn mm_sg_groups(m_pad: u32, n_pad: u32) -> [u32; 3] {
