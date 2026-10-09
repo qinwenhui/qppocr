@@ -18,6 +18,7 @@ Thumbs.db
 tools/*.f32
 *.f32
 bench/__pycache__/
+bench/gpuhealth/__pycache__/
 
 # GPU 健康门禁/基准：只收**源码**（*.sh / *.m / *.md），产物与素材不进仓库
 # ——二进制由 bench/gpuhealth/build.sh 从同名 .m 现场构建，见其 .gitignore。
