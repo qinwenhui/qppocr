@@ -87,6 +87,59 @@ fn parse_upstream_models() {
     }
 }
 
+/// 权重字节账：图里到底装了多少 f32 权重、有多少**没有任何节点引用**。
+///
+/// 动机（Metal 侧实测）：medium rec 的计划静态区 = **148.1 MB**，而
+/// `medium/rec.onnx` 整个文件才 **76.6 MB** ⇒ 1.93×。det 同口径是
+/// 61.8 MB 对 62.0 MB（**1.00×**，零膨胀）。两条读数各自自洽，所以
+/// 差额只能落在「rec 图的权重本身就比文件大」或「Metal 侧重排把它放大
+/// 了」这两者之一 —— 本测试分开量前一半（纯 CPU，零 GPU 风险）。
+///
+/// 判读：
+/// * `init f32 字节 ≈ file_bytes` ⇒ 膨胀在**重排**侧（Metal/Vulkan 的
+///   `repack_*`），按 blob 逐个查；
+/// * `init f32 字节 ≈ 2 × file_bytes` ⇒ 文件本身**就是**紧凑存的（比如
+///   fp16/量化），解析时展开成 f32，那 2× 是解析器的选择而不是 bug。
+#[test]
+fn weight_bytes_report() {
+    use std::collections::HashSet;
+    for f in [
+        "tiny/det.onnx",
+        "tiny/rec.onnx",
+        "medium/det.onnx",
+        "medium/rec.onnx",
+        "cls.onnx",
+    ] {
+        let Some(g) = check_model(f) else { continue };
+        let mut items: Vec<(i64, &String)> =
+            g.initializers.iter().map(|(k, t)| (t.numel(), k)).collect();
+        items.sort_by(|a, b| b.0.cmp(&a.0));
+        let total: i64 = items.iter().map(|(n, _)| *n).sum();
+        let used: HashSet<&str> = g
+            .nodes
+            .iter()
+            .flat_map(|nd| nd.inputs.iter().map(|s| s.as_str()))
+            .collect();
+        let (nu, nu_bytes) = items
+            .iter()
+            .filter(|(_, k)| !used.contains(k.as_str()))
+            .fold((0usize, 0i64), |(c, b), (n, _)| (c + 1, b + n * 4));
+        println!(
+            "== {f}: file={:.1} MB · init {} 块 / {} elem / {:.1} MB(f32) = {:.2}×file · 未被引用 {} 块 / {:.1} MB",
+            g.file_bytes as f64 / 1e6,
+            items.len(),
+            total,
+            total as f64 * 4.0 / 1e6,
+            total as f64 * 4.0 / g.file_bytes as f64,
+            nu,
+            nu_bytes as f64 / 1e6
+        );
+        for (n, k) in items.iter().take(10) {
+            println!("     {:>10.2} MB  {k}  ({n} elem)", *n as f64 * 4.0 / 1e6);
+        }
+    }
+}
+
 /// rec tiny 前向一遍：固定输入、确定性输出形状 + 基本健全性。
 /// 逐位对拍在 dump 对比测试里做（需要  侧黄金值）。
 #[test]
@@ -192,5 +245,68 @@ fn run_det_tiny_forward() {
     assert!(
         (0.0..=1.0).contains(&mx) && (0.0..=1.0).contains(&mn),
         "概率图值域 [{mn},{mx}]"
+    );
+}
+
+/// MatMul 权重的名字/形状，以及「谁引用了它」——查 148 MB 静态区里那
+/// 71.6 MB 的死重（见 `weight_bytes_report` 的动机）。
+///
+/// 结论（2026-10-10）：9 块 MatMul 权重**全部只被 MatMul 引用**，而
+/// `plan.rs` 的 MatMul 分支自己会走 `n_weight_off` 重排一份紧凑的
+/// `[n4][k4]` blob ⇒ `init_to_nhwc` 那 9 份（被 `[1,1,C,N]` 顶成 cpad4(1)=4，
+/// 放大 4×）是**死重**：71.64 MB 的白占，与文件里那 17.91 MB 一一对应。
+/// 死重不参与每次 run 的读，所以只吃内存；**换形状重拷那一半**已由
+/// `Layout` 的两段分离修掉（见 plan.rs 的 `Layout`）。
+#[test]
+fn matmul_weight_owners() {
+    let Some(g) = check_model("medium/rec.onnx") else {
+        return;
+    };
+    use std::collections::HashMap;
+    let mut users: HashMap<&str, Vec<&str>> = HashMap::new();
+    for n in &g.nodes {
+        for i in &n.inputs {
+            if !i.is_empty() {
+                users.entry(i.as_str()).or_default().push(n.op_type.as_str());
+            }
+        }
+    }
+    let mut tot = 0i64;
+    for n in &g.nodes {
+        if n.op_type != "MatMul" || n.inputs.len() < 2 {
+            continue;
+        }
+        let Some(t) = g.initializers.get(&n.inputs[1]) else {
+            println!("  {} B={} 不是 initializer（动态）", n.name, n.inputs[1]);
+            continue;
+        };
+        let numel = t.numel();
+        tot += numel;
+        println!(
+            "  {} B={} {:?} {} elem {:.2} MB · 引用者 {:?}",
+            n.name,
+            n.inputs[1],
+            t.shape,
+            numel,
+            numel as f64 * 4.0 / 1e6,
+            users.get(n.inputs[1].as_str())
+        );
+    }
+    println!("MatMul 权重合计 {:.2} MB", tot as f64 * 4.0 / 1e6);
+    // 反向：哪些 initializer 只被 MatMul 引用（⇒ 若 MatMul 走自己的重排，
+    // 那份 init_to_nhwc 拷贝就是死的）
+    let mut only_mm = 0i64;
+    let mut only_mm_n = 0;
+    for (name, t) in &g.initializers {
+        if let Some(u) = users.get(name.as_str()) {
+            if !u.is_empty() && u.iter().all(|o| *o == "MatMul") {
+                only_mm += t.numel();
+                only_mm_n += 1;
+            }
+        }
+    }
+    println!(
+        "只被 MatMul 引用的 initializer：{only_mm_n} 块 / {:.2} MB（f32）",
+        only_mm as f64 * 4.0 / 1e6
     );
 }

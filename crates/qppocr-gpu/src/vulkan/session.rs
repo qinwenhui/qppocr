@@ -171,6 +171,11 @@ pub(crate) struct VulkanSession {
     /// 刻旧计划 Arc 常在飞（get_mut 失败），驱逐路径归池曾大量失效
     /// （实测每图仍 17ms 新建）。池封顶 2 对（按容量留大——deferred 流水深度 2，见 Drop 归池注释）。
     arena_pool: std::sync::Arc<Mutex<Vec<(Arena, KernelSet, u64)>>>,
+    /// 本会话静态段的上界（word）。**单调不减**——静态段与激活段在
+    /// `plan::Layout` 里各用各的 bump 指针后，静态偏移只由这一个数决定；
+    /// 它一变，所有计划的静态偏移一起变（已建计划要靠 `ensure_statics`
+    /// 重放找补）。首次为 0，`PlanBuilder::build` 自行量出并重建一遍。
+    static_reserve: std::sync::atomic::AtomicU32,
     /// 批维补齐粒度（rec 会话=8，其余 1）：run() 把输入批维向上取整到
     /// 该值建计划，空行由内核 real_n 早退守卫零算力——(bsz,W) 形状塌缩
     /// 成 (grain,W桶)，计划全命中。与 `DeviceSession::batch_grain` 同源
@@ -237,6 +242,7 @@ impl VulkanSession {
             producer_idx: std::sync::OnceLock::new(),
             session_id: NEXT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             arena_pool: std::sync::Arc::new(Mutex::new(Vec::new())),
+            static_reserve: std::sync::atomic::AtomicU32::new(0),
             batch_grain: 1,
             exact_width: false,
             argmax_exit: false,
@@ -701,7 +707,16 @@ impl VulkanSession {
             // k×k MMA（`n_conv8_mma3` + `n_conv8_edge`）同理恒 false。
             conv_kxk_mma: false,
         }
-        .build(&self.input_name, in_shape)?;
+        .build(
+            &self.input_name,
+            in_shape,
+            self.static_reserve
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )?;
+        self.static_reserve.fetch_max(
+            built.static_words,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         // === 实分配：整块一次（KernelSet 绑单缓冲）===
         let t_alloc = std::time::Instant::now();
@@ -956,7 +971,7 @@ impl VulkanSession {
         // 模型 crate::plan 里）。
         let f32_mode = true;
 
-        let mut layout = Layout::new();
+        let mut layout = Layout::unsplit(); // 旧语义：见 Layout::unsplit 的注释
         let mut ledger: Vec<(String, u32, u32)> = Vec::new(); // (名, off, len)
         let mut offs: HashMap<String, u32> = HashMap::new();
         // 权重占区（F32 且被引用；i64 常量链由 planner 折叠，不上传）。

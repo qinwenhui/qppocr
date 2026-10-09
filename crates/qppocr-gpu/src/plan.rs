@@ -263,7 +263,43 @@ impl PlanBuilder<'_> {
     ///
     /// 不支持的算子/形状在此报 [`Error::Graph`] 并点名——后端把它透传
     /// 给 create_session 的分级/探针逻辑，不静默降级。
-    pub fn build(&self, input_name: &str, in_shape: &[i64]) -> Result<GraphPlan> {
+    ///
+    /// `static_reserve` = **本会话静态段的上界**（word），由调用方记住
+    /// （首次传 0，之后传历次 `static_words` 的最大值）——静态段与激活段
+    /// 在 [`Layout`] 里各用各的 bump 指针，这个数就是两段的分界。
+    ///
+    /// 传 0（或低估）时第一遍是**不健全**的：静态段会伸进激活段（交叠 =
+    /// 当初「参数被冲掉 → 巨循环 → GPU 挂死」的形态）。所以这里量出第一遍
+    /// 的静态段大小后**立即用正确的保留量重建一遍**，只把健全的那份返回；
+    /// 第一遍纯数据、不派发、不进缓存，直接丢弃（同一会话里很快收敛，
+    /// 之后每次 build 只走一遍）。
+    pub fn build(
+        &self,
+        input_name: &str,
+        in_shape: &[i64],
+        static_reserve: u32,
+    ) -> Result<GraphPlan> {
+        let plan = self.build_inner(input_name, in_shape, static_reserve)?;
+        if plan.static_words <= static_reserve {
+            return Ok(plan);
+        }
+        let again = self.build_inner(input_name, in_shape, plan.static_words)?;
+        if again.static_words > plan.static_words {
+            return Err(Error::Device(format!(
+                "静态段大小不收敛：{in_shape:?} 第一遍 {} word、第二遍 {} word\
+                 ——静态分配序依赖形状，保留区方案不成立",
+                plan.static_words, again.static_words
+            )));
+        }
+        Ok(again)
+    }
+
+    fn build_inner(
+        &self,
+        input_name: &str,
+        in_shape: &[i64],
+        static_reserve: u32,
+    ) -> Result<GraphPlan> {
         let t_build = std::time::Instant::now();
         let table = planner::infer_shapes(
             self.graph,
@@ -280,7 +316,7 @@ impl PlanBuilder<'_> {
         let mut live: HashMap<String, u32> = refs.clone();
         let is_output = |nm: &str| self.graph.is_graph_output(nm);
 
-        let mut layout = Layout::new();
+        let mut layout = Layout::with_reserve(static_reserve);
         let mut offs: HashMap<String, u32> = HashMap::new();
         // 权重占区（F32 且被引用；i64 常量链由 planner 折叠，不上传）。
         // 权重**永不释放**：dispatch 每次重放都读它，区域复用=数据被覆盖。
@@ -455,8 +491,21 @@ impl PlanBuilder<'_> {
                     }
                 }
             }
+            // **走激活区（`alloc`）而不是静态区**：它的大小正比于输入的
+            // H×W（`nb × ceil(HW/1024) × cpad4(C)`），而静态段的偏移一旦
+            // 随形状变，整段静态区（rec 148 MB）换形状就要重拷——实测
+            // W=1024/1088 比 W≤512 多 256 word 正是这一笔，把静态布局劈成
+            // 了两个「类」，跨类换形状白烧 76.4 MB / 1.7 ms 一次（详见
+            // `Layout` 的结构体注释）。
+            //
+            // 语义上它本来就是**每次 run 重写的 scratch**（阶段 1 写、
+            // 阶段 2 读），不是权重。放激活区的前提是这块永不被别处复用，
+            // 所以**只 `alloc` 不 `free`**：布局里没有第二个申请者能拿到它，
+            // 与静态区同样安全，只是偏移允许随形状变。
             if need > 0 {
-                layout.alloc_static(need)
+                let off = layout.alloc(need);
+                debug_assert!(off > 0, "scratch 落到 arena 第 0 词（rn 单元）上");
+                off
             } else {
                 0
             }
@@ -1966,9 +2015,39 @@ impl PlanBuilder<'_> {
 }
 
 /// 区域布局：活性复用的 bump + first-fit 空闲表（全部相对同一整块）。
+///
+/// 两段分离：**静态段 [0, static_cursor)** 与**激活段 [reserve, …)**，
+/// 各有各的 bump 指针（`static_cursor` / `cursor`）。
+///
+/// 为什么必须分开（2026-10-10 实测）：原来两段共用一个 `cursor`，于是
+/// 「第 k 次 `alloc_static` 落在哪」取决于它前面分配过多少**激活**——
+/// 激活大小随形状变，静态偏移就跟着形状变。同一会话里 A、B 两个 rec
+/// 形状各 356 块静态、**内容逐位相同**，却只有 41 块偏移相同 ⇒ 换形状
+/// 时整段 76.4/148.1 MB 必须重拷（`ensure_statics` 实测 1.7 ms/次，
+/// 每图十几次）——纯主机侧 memcpy 白烧在 rec 的 168.8 ms 里。
+///
+/// 分开之后静态偏移只由「调用序 + 各自大小」决定（同一张图逐形状不变），
+/// 于是跨形状的 (偏移, 长度, Arc) 三元组全部相等：`ensure_statics` 的
+/// `g.blobs == plan.recipe` 早退即可命中，重拷归零。
+///
+/// `reserve` 必须是**本会话所有形状静态段的上界**（`build` 会自查并重建），
+/// 否则静态段会伸进激活段——两段交叠正是当初「参数被冲掉 → 巨循环 →
+/// GPU 挂死」的形态（见 `alloc_static`）。
 pub(crate) struct Layout {
     pub(crate) free: Vec<(u32, u32)>,
+    /// 激活段 bump（从 `reserve` 起）。
     pub(crate) cursor: u32,
+    /// 静态段 bump（从 0 起，永不与激活段混用）。`split == false` 时不使用。
+    pub(crate) static_cursor: u32,
+    /// 激活段起点 = 静态段的上界（见结构体注释）。
+    pub(crate) reserve: u32,
+    /// 两段分离（新语义，见结构体注释）。
+    ///
+    /// `false` = **旧语义**（静态与激活共用一个 bump 指针），只留给 Vulkan
+    /// 的 `QPPOCR_GPU_F32` 回退路径：那条路自带一套 arena/上传簿记，且是
+    /// env 兜底（默认不走）。默认的 n_ 路径（本文件 `build_inner`）必须用
+    /// 分离语义——不然同一会话里换形状就要重拷整段静态区。
+    pub(crate) split: bool,
     /// 已触及的最大偏移（word）——arena 的总字数。
     pub(crate) total: u32,
     /// `alloc_static` 累计申请量。静态段只增不复用，所以这是「与形状无关
@@ -1977,12 +2056,25 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    pub(crate) fn new() -> Self {
+    /// 预留 `reserve` 个 word 给静态段（= 上一版计划量出的静态段大小）。
+    pub(crate) fn with_reserve(reserve: u32) -> Self {
         Self {
             free: Vec::new(),
-            cursor: 0,
-            total: 0,
+            cursor: reserve,
+            static_cursor: 0,
+            reserve,
+            split: true,
+            total: reserve,
             static_total: 0,
+        }
+    }
+
+    /// 旧语义（两段共用一个 bump 指针）——只给 Vulkan 的 f32 回退路径用。
+    /// 新路径用 [`Self::with_reserve`]，理由见结构体注释。
+    pub(crate) fn unsplit() -> Self {
+        Self {
+            split: false,
+            ..Self::with_reserve(0)
         }
     }
 
@@ -2001,12 +2093,13 @@ impl Layout {
                     self.free[i].0 = off + n;
                     self.free[i].1 = rest;
                 }
+                debug_assert!(off >= self.reserve, "激活段落进静态保留区");
                 return off;
             }
         }
         let off = self.cursor;
         self.cursor += n;
-        self.total = self.cursor;
+        self.total = self.total.max(self.cursor);
         off
     }
 
@@ -2017,7 +2110,7 @@ impl Layout {
         }
     }
 
-    /// 静态区（权重/参数）专用：**只 bump、永不复用**。
+    /// 静态区（权重/参数）专用：**只 bump、永不复用**，且只在 [0, static_cursor)。
     ///
     /// 激活区域可以 free-复用——生产者 dispatch 先写、消费者后读，
     /// 单次重放内自洽。但静态内容只在装载期写一次，而命令缓冲每帧重放
@@ -2025,11 +2118,19 @@ impl Layout {
     /// = 运行时被冲掉、消费方读到垃圾参数（实测形态：conv 参数损坏 →
     /// 巨循环 → GPU 挂死设备丢失）。
     pub(crate) fn alloc_static(&mut self, n: u32) -> u32 {
-        let off = self.cursor;
         let n = n.div_ceil(4) * 4;
-        self.cursor += n;
-        self.total = self.cursor;
+        if !self.split {
+            // 旧语义：与激活共用一个指针（偏移随形状漂移，见结构体注释）。
+            let off = self.cursor;
+            self.cursor += n;
+            self.total = self.cursor;
+            self.static_total += n;
+            return off;
+        }
+        let off = self.static_cursor;
+        self.static_cursor += n;
         self.static_total += n;
+        self.total = self.total.max(self.static_cursor);
         off
     }
 }

@@ -186,6 +186,10 @@ pub(crate) struct MetalSession {
     run_lock: Mutex<()>,
     /// 逐内核剖析的剩余次数（`QPPOCR_GPU_KERNEL_PROF`，0 = 关闭）。
     prof_left: std::sync::atomic::AtomicUsize,
+    /// 本会话静态段的上界（word）。**单调不减**——见 `plan_for`：静态段
+    /// 与激活段分离后，静态偏移只由这一个数决定，而它一变，所有计划的
+    /// 静态偏移一起变（已建计划则要靠重放找补，正是要消除的那笔开销）。
+    static_reserve: std::sync::atomic::AtomicU32,
 }
 
 /// 网格上限默认值（单位：线程组数，每组 256 线程）。
@@ -374,13 +378,14 @@ impl MetalSession {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(0),
             ),
+            static_reserve: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
     /// 覆盖面探针：小形状试建一次计划（不出执行）——算子支持与形状
     /// 无关，不支持的算子在此点名（create_session 分级用）。
     pub(crate) fn probe(&self, in_shape: &[i64]) -> Result<()> {
-        self.build_plan(in_shape).map(|_| ())
+        self.build_plan(in_shape, 0).map(|_| ()) // 探针：保留量未知，build 自查重建
     }
 
     /// 探针失败后的退路：把吃进去的 (graph, initializers) 原样吐还，
@@ -472,7 +477,11 @@ impl MetalSession {
         Ok(())
     }
 
-    fn build_plan(&self, in_shape: &[i64]) -> Result<MetalPlan> {
+    /// `static_reserve` = 本会话静态段的上界（word）——由 `plan_for` 从
+    /// 已有计划里取最大值传入。理由见 `plan::Layout` 与 `PlanBuilder::build`：
+    /// 静态段与激活段各用各的 bump 指针，静态偏移就不再随形状漂移，
+    /// `ensure_statics` 的跨形状重拷（rec 实测 76.4 MB / 1.7 ms 一次）随之归零。
+    fn build_plan(&self, in_shape: &[i64], static_reserve: u32) -> Result<MetalPlan> {
         let t0 = std::time::Instant::now();
         let built = PlanBuilder {
             graph: &self.graph,
@@ -490,7 +499,7 @@ impl MetalSession {
             // k×k（k>1）同款（默认开）。见 [`conv_kxk_mma`]。
             conv_kxk_mma: self.conv_kxk_mma,
         }
-        .build(&self.input_name, in_shape)?;
+        .build(&self.input_name, in_shape, static_reserve)?;
 
         // 本次静态区的**写入清单**（顺序 = build 期写序：`uploads` → `upload_init`）。
         // 缓存命中时要靠它重放自己那片字节（`ensure_statics`），所以计划里必须
@@ -977,7 +986,14 @@ impl MetalSession {
             }
             return Ok(p.clone());
         }
-        let p = Arc::new(self.build_plan(shape)?);
+        // 静态段保留量（word）——**会话内单调不减**：计划缓存会淘汰，从
+        // 缓存里现取会让保留量回退，新计划随之落到更小的偏移上，反而把
+        // 已建计划的偏移稳定性打掉。首个形状传 0，`build` 量出真实大小后
+        // 自己重建一遍，之后每次只走一遍。
+        let reserve = self.static_reserve.load(Ordering::Relaxed);
+        let p = Arc::new(self.build_plan(shape, reserve)?);
+        self.static_reserve
+            .fetch_max((p.static_bytes / 4) as u32, Ordering::Relaxed);
         if dbg {
             eprintln!("[cache] 新建 {shape:?}（缓存 {} 份）", plans.len() + 1);
         }
