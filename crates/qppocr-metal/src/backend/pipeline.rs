@@ -30,11 +30,27 @@ const SHADERS: &[(&str, &str)] = &[
     ("n_entry", include_str!("../../shaders/n_entry.metal")),
     ("n_elem", include_str!("../../shaders/n_elem.metal")),
     ("n_conv", include_str!("../../shaders/n_conv.metal")),
-    // 同一份源码两个入口：`n_conv8`（f32 权重）与 `n_conv8h`（fp16 权重）。
-    // 内核体只有一份模板，见该 .metal 的头注释。
+    // 同一份源码三个入口：`n_conv8`（f32 权重）、`n_conv8h`（fp16 权重）、
+    // `n_conv8_edge`（边框补算，与 `n_conv8_mma3` 配套）。内核体只有一份
+    // 模板，见该 .metal 的头注释。
+    //
+    // ⚠️ 三个入口共用一份源码 ⇒ **一个模板编译不过，三支一起消失**，整个
+    // Metal 后端全灭。所以改 `conv8_body` 的模板签名后必须先跑
+    // `cargo test -p qppocr-metal`（`KernelSet::new` 才会真的编译 MSL），
+    // `cargo build` 是不看 .metal 的。
     ("n_conv8", include_str!("../../shaders/n_conv8.metal")),
     ("n_conv8h", include_str!("../../shaders/n_conv8.metal")),
+    ("n_conv8_edge", include_str!("../../shaders/n_conv8.metal")),
     ("n_conv8_mma", include_str!("../../shaders/n_conv8_mma.metal")),
+    // 同一份源码两个入口：`n_conv8_mma3`（64 通道块）与 `n_conv8_mma3_n32`
+    // （32 通道块，收 Co 是 32 倍数但不是 64 倍数的那批 conv）。网格公式、
+    // 参数块、覆盖矩形两条完全一致，只有 NCOLS 模板参数不同——见该 .metal
+    // 头注释「32 通道块」一节。同样：一份源码两个入口，编译不过一起消失。
+    ("n_conv8_mma3", include_str!("../../shaders/n_conv8_mma3.metal")),
+    (
+        "n_conv8_mma3_n32",
+        include_str!("../../shaders/n_conv8_mma3.metal"),
+    ),
     ("n_conv_dw", include_str!("../../shaders/n_conv_dw.metal")),
     ("n_convt", include_str!("../../shaders/n_convt.metal")),
     ("n_pool", include_str!("../../shaders/n_pool.metal")),

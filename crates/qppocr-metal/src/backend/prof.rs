@@ -43,6 +43,10 @@ pub(crate) struct KernelTime {
     pub kernel: &'static str,
     /// 图里的节点序号（定位是哪一层）。
     pub node_idx: usize,
+    /// 图里的节点名（`Conv.78` 之类）。**与 ONNX 直接对得上**——只有序号时
+    /// 无法把「哪条 dispatch 贵」与模型的算子、形状对上，`node#160` 这种
+    /// 编号要另开一次建图调试才查得到，等于查不动。
+    pub node: String,
     /// 网格（组数）：[x, y, z]。
     pub groups: [u32; 3],
     /// 单次执行时间（毫秒，斜率口径）。
@@ -127,6 +131,7 @@ pub(crate) fn sample_kernels(
         out.push(KernelTime {
             kernel: d.kernel,
             node_idx: d.node_idx,
+            node: d.node.clone(),
             groups: d.groups,
             ms,
             reps,

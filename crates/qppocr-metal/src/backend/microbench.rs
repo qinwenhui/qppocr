@@ -1031,6 +1031,380 @@ fn conv8_mma_matches_cpu() {
     }
 }
 
+/// `n_conv8` vs `n_conv8_mma3 + n_conv8_edge` 的孤立吞吐对比（k×k 稠密层）。
+///
+/// 形状取 `conv8_throughput` 名单里的 k3 项（那批是 det 的 FLOP 前几名与
+/// rec 的前段）——**"变体探针有用" 与 "这条形状上有用" 是两件事**，后者
+/// 必须按真实名单量。
+///
+/// 三列读数：base（`n_conv8` 一条）、mma3（只派 MMA 那支）、edge（只派补算
+/// 那支）。生产的 B 臂是 `mma3 + edge` 两条 dispatch，所以**看的是 mma3+edge
+/// 的和**，单列出来是为了让「边框补算到底值多少」可见——它是这套设计唯一的
+/// 固定成本：edge 在整图上空转，只做边框那不到 1% 的像素。
+///
+/// ## 为什么给 edge 单列一栏（而不是合起来量一个数）
+///
+/// 若合起来只报一个和，两种完全不同的失败会长得一样慢：MMA 慢（处方在内核）
+/// 与 edge 空转贵（处方在「缩小 edge 网格」）。分栏才能一眼分开。
+#[test]
+fn conv8_mma3_throughput() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let cases = [
+        // det medium 的 FLOP 首名（9.6 GFLOP）
+        ConvCase { label: "det 136x240 c256->64 k3", h: 136, w: 240, cin: 256, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "det 136x240 c128->64 k3", h: 136, w: 240, cin: 128, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "det 240x216 c64->64 k3", h: 240, w: 216, cin: 64, cout: 64, kh: 3, kw: 3 },
+        // 这两条曾是**门外**（`co4=32 < 64`，64 宽通道瓦片放不下），逼出了
+        // `n_conv8_mma3_n32`。det 480x432 c32->32 k3 正是 `conv8_variant_scan`
+        // 量 p_base 的地方（1157 GFLOPS），现在可以直接对着那条 2.38× 的
+        // 处方空间量 N32 兑现了多少。
+        ConvCase { label: "det 480x432 c32->32 k3 (N32)", h: 480, w: 432, cin: 32, cout: 32, kh: 3, kw: 3 },
+        ConvCase { label: "rec 48x544 c32->32 k3 (N32)", h: 48, w: 544, cin: 32, cout: 32, kh: 3, kw: 3 },
+        // rec 前段（3×3 占 rec 设备时间的 16.2%）
+        ConvCase { label: "rec 24x272 c64->64 k3", h: 24, w: 272, cin: 64, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "rec 12x136 c128->128 k3", h: 12, w: 136, cin: 128, cout: 128, kh: 3, kw: 3 },
+    ];
+
+    for c in &cases {
+        let pr = build_conv_case(&ctx.inner.device, c);
+        let k = c.kh;
+        let nfb = (pr.out_w - (k - 1)) / 64;
+        let nrows = pr.out_h - (k - 1);
+        // 通道块宽与 plan.rs 同一判据（第 N 份拷贝，测试里就是要独立一份）。
+        let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
+        let nch = pr.co4 / ncols;
+        let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
+        // 契约检查：不满足就是**门外**（计划层不会派发这种形状），打印后跳过。
+        if nfb < 1 || c.cin % 8 != 0 || pr.co4 % 32 != 0 {
+            eprintln!(
+                "[mb] {:<26} 门外：nfb={nfb} cin={} co4={}（计划层会回落 n_conv8）",
+                c.label, c.cin, pr.co4
+            );
+            continue;
+        }
+        let inner_w = pr.out_w - (k - 1);
+        let tail = inner_w - nfb * 64;
+        let nx = nfb + if tail > 0 { 1 } else { 0 };
+        let mma_groups = [nx * nch, nrows, 1];
+
+        let run = |names: &[&str], groups: [u32; 3], reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    for nm in names {
+                        ks.dispatch(enc, nm, &pr.buf, pr.p_off, groups).expect("dispatch");
+                        let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                        enc.memory_barrier_with_resources(&res);
+                    }
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        // 奇偶轮换序（本机先跑的那条快 6~15%）
+        let (mut a, mut b, mut e) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        for i in 0..3 {
+            let one = |nm: &str, g: [u32; 3]| {
+                time_dispatch(&|r| run(&[nm], g, r))
+            };
+            let (x, y, z) = if i % 2 == 0 {
+                (one("n_conv8", pr.groups), one(kname, mma_groups), one("n_conv8_edge", pr.groups))
+            } else {
+                let z = one("n_conv8_edge", pr.groups);
+                let y = one(kname, mma_groups);
+                let x = one("n_conv8", pr.groups);
+                (x, y, z)
+            };
+            a = a.min(x.ms);
+            b = b.min(y.ms);
+            e = e.min(z.ms);
+        }
+        // 生产 B 臂 = 两条 dispatch 的和（不单独量一遍：那要再多轮，而这里的
+        // 每支读数已经各自用「总时/r」的口径摊掉了命令缓冲固定开销）。
+        let gf = |ms: f64| pr.flops / (ms * 1e6);
+        eprintln!(
+            "[mb] {:<26} base {:>7.3} ms ({:>6.1} GF) → mma{:<2} {:>7.3} ({:>6.1} GF) + edge {:>6.3} \
+             = {:>7.3} ms = **{:.2}×**  [grid {:?} → {:?}, 尾 {tail} 列, 走慢路 {:.1}%]",
+            c.label,
+            a,
+            gf(a),
+            ncols,
+            b,
+            gf(b),
+            e,
+            b + e,
+            a / (b + e),
+            pr.groups,
+            mma_groups,
+            100.0 * (1.0 - (nrows * inner_w) as f64 / (pr.out_h * pr.out_w) as f64)
+        );
+    }
+}
+
+/// `n_conv8_edge` 的**地板**：同一形状、同一网格上的三条读数。
+///
+/// ## 为什么必须单独量这个
+///
+/// 边框补算那 2.3% 的像素，按 `n_conv8` 的每像素速率只值 ~0.2 ms，而
+/// `conv8_mma3_throughput` 量到的 edge 是 **1.43 ms**——模型与读数差 7 倍。
+/// 这种分歧只有两种可能，处方完全相反：真边框那 2.3% 比我想的贵得多
+/// （处方：把边框也搬进 MMA），或者「第二跳 dispatch + 前导 + 早退」本身
+/// 就要这么多（处方：别无脑加 dispatch，或者把前导做便宜）。
+///
+/// 判据是把「全平面都被覆盖」这一档**造出来**：`padT=padL=0, taps=kW=1`
+/// 时覆盖矩形 = 整个输出平面 ⇒ 每个线程组都在早退那一行返回、一次 tap
+/// 循环都不进。于是：
+///
+///   C = 纯启动 + 前导 + 早退的地板；  B − C = 真边框 2.3% 的代价；
+///   B 与 A 的差 = 这一跳到底值不值。
+#[test]
+fn conv8_edge_floor_diag() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let cases = [
+        ConvCase { label: "det 136x240 c256->64 k3", h: 136, w: 240, cin: 256, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "rec 12x136 c128->128 k3", h: 12, w: 136, cin: 128, cout: 128, kh: 3, kw: 3 },
+    ];
+    for c in &cases {
+        let pr = build_conv_case(&ctx.inner.device, c);
+        let run = |name: &str, groups: [u32; 3], reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    ks.dispatch(enc, name, &pr.buf, pr.p_off, groups).expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+        let base = time_dispatch(&|r| run("n_conv8", pr.groups, r)).ms;
+
+        // B：正常参数的 edge
+        let edge = time_dispatch(&|r| run("n_conv8_edge", pr.groups, r)).ms;
+
+        // C：把覆盖矩形改成「全平面」再量同一支——只动 4 个参数词
+        // （padT/padL → 0，kW → 1，taps → 1），一个算术分支都不改。
+        {
+            // SAFETY: 参数块在 word 64 起（21 词），落在输入段（word 256 起）之前。
+            unsafe {
+                let p = (pr.buf.contents() as *mut u32).add(pr.p_off as usize);
+                *p.add(10) = 1; // taps
+                *p.add(11) = 1; // kW
+                *p.add(14) = 0; // padT
+                *p.add(15) = 0; // padL
+            }
+            let all_exit = time_dispatch(&|r| run("n_conv8_edge", pr.groups, r)).ms;
+            eprintln!(
+                "[mb] edge 地板 {:<24} base {:>7.3} ms | edge 正常 {:>7.3} | edge 全早退 {:>7.3} \
+                 ⇒ 边框本体 {:>7.3} ms、第二跳地板 {:>7.3} ms（{:>5.1}% of base）",
+                c.label,
+                base,
+                edge,
+                all_exit,
+                edge - all_exit,
+                all_exit,
+                100.0 * all_exit / base
+            );
+        }
+    }
+}
+
+/// 读回输出段（NHWC，`co4` 通道/像素）。
+fn read_out(pr: &ConvProbe) -> Vec<f32> {
+    // SAFETY: 见 conv_error——输出段完全在 arena 内，调用方已同步。
+    unsafe {
+        std::slice::from_raw_parts(
+            (pr.buf.contents() as *const f32).add(pr.out_off_w as usize),
+            (pr.out_h * pr.out_w * pr.co4) as usize,
+        )
+    }
+    .to_vec()
+}
+
+/// 把输出段重铺哨兵 7.0（每次「只派一支」的对拍都要先复位）。
+fn refill_out_sentinel(pr: &ConvProbe) {
+    // SAFETY: 同 read_out；写的是同一段长度。
+    unsafe {
+        let n = (pr.out_h * pr.out_w * pr.co4) as usize;
+        let p = (pr.buf.contents() as *mut f32).add(pr.out_off_w as usize);
+        for i in 0..n {
+            *p.add(i) = 7.0;
+        }
+    }
+}
+
+/// `n_conv8_mma3` + `n_conv8_edge` 对拍（k×k，f32 MMA）。
+///
+/// ## 为什么要「一支一支跑」而不是合起来比一次
+///
+/// 生产里这两支是**同一次 conv 的两半**：MMA 只吃「全内点块」（每块 = 一行
+/// 内 64 个连续输出 x，9 个 tap 的读数学上全落在平面内），edge 吃补集。于是
+/// 有两类失败都表现为「数值对不上」，但处方完全不同：
+///
+///   · **一半算错** —— 内核里的 stride/layout 假设错了（`simdgroup_load`
+///     的行 stride 语义、A 瓦片的 64 行是不是真的连续、tap→(ky,kx) 解对没）；
+///   · **两半重叠** —— 同一个输出像素被写两次，谁赢取决于 dispatch 顺序。
+///     这是**静默错**：不报错、不越界、只在特定形状上偶发。
+///
+/// 只比一次整幅图分不出这两类。所以每次**只派一支**、把另一支的像素要求
+/// 「必须还是哨兵 7.0」：pass A 证明「MMA 算得对 + 没碰 border」，pass B 证明
+/// 「edge 算得对 + 没碰内点」。两 pass 合起来 = 每个像素恰好被写一次。
+///
+/// ## 覆盖矩形的定义（与计划层必须逐字一致）
+///
+///   y_lo = padT,                       y_hi = padT + (outH-(kh-1)) - 1
+///   x_lo = padL,                       x_hi = padL + 64*nfb - 1
+///   nfb  = (outW-(kw-1)) / 64          （**向下取整，不进位**）
+///
+/// 计划层那份拷贝在 `plan.rs` 的 conv 分支里；两边对不上就是「一圈没被算」
+/// 或「算两遍」。这条耦合是本设计**唯一的**新耦合面，所以这里把公式硬编码
+/// 一遍再做交叉验证，而不是从生产代码里 import（那会让错的那份掩盖对的那份）。
+#[test]
+fn conv8_mma3_matches_cpu() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // (outH, outW, cin, cout, k, 说明)。**后四例专打 32 通道块那一档**
+    // （`n_conv8_mma3_n32`）：det 的 CSP 三连 Conv.111/114/117 就是 Co=32
+    // Ci=32 落在 240×216 上，空间门全过、只被旧的 `Co%64` 判据挡住。
+    let cases: [(u32, u32, u32, u32, u32, &str); 9] = [
+        (16, 130, 32, 64, 3, "nfb=2 **无尾块**"),
+        (32, 96, 64, 128, 3, "nfb=1 双通道块 尾30"),
+        (9, 200, 32, 64, 3, "nfb=3 奇行数 尾6"),
+        (16, 67, 32, 64, 3, "nfb=1 **尾1 列**"),
+        (16, 132, 32, 64, 5, "5×5 无尾块"),
+        (16, 130, 32, 32, 3, "**N32** Co=32 nfb=2"),
+        (32, 96, 32, 96, 3, "**N32** Co=96=3×32 尾30"),
+        (16, 67, 32, 32, 3, "**N32** Co=32 尾1"),
+        (24, 200, 32, 32, 7, "**N32** Co=32 7×7 尾3"),
+    ];
+
+    for (h, w, cin, cout, k, note) in cases {
+        let c = ConvCase { label: "mma3", h, w, cin, cout, kh: k, kw: k };
+        let pr = build_conv_case(&ctx.inner.device, &c);
+        let (out_h, out_w, co4) = (pr.out_h, pr.out_w, pr.co4);
+        let (pad, ci4, taps) = (k / 2, c.cin.div_ceil(4) * 4, k * k);
+        let nfb = (out_w - (k - 1)) / 64;
+        let nrows = out_h - (k - 1);
+        // 通道块宽 64/32 二选一——与 plan.rs 那支**同一判据**（这里是它的
+        // 第 N 份拷贝，见下面覆盖矩形那段的自述）。
+        let ncols = if co4 % 64 == 0 { 64 } else { 32 };
+        let nch = co4 / ncols;
+        let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
+        assert!(
+            nfb >= 1 && nrows >= 1 && co4 % 32 == 0 && (ci4 % 8) == 0,
+            "用例本身不满足内核契约：nfb={nfb} nrows={nrows} co4={co4} ci4={ci4}"
+        );
+
+        // 段布局重算（与 build_conv_case_batch 同式）+ 自检：公式漂了就先炸在
+        // 这里，而不是让下面读到别的段上。
+        let n_in = h * w * ci4;
+        let n_w = taps * ci4 * co4;
+        let out_off_w = 256u32 + n_in + n_w + co4; // 参数块 64 起、输入 256 起
+        assert_eq!(out_off_w, pr.out_off_w, "段布局重算与构造函数不一致");
+
+        // 覆盖矩形（MMA 写这些像素，edge 写其余）。**三份公式中的第三份**：
+        // 生产在 plan.rs，内核在 MSL，这里再硬编码一份做交叉验证。x 上摊到
+        // **内点列全宽**（尾块吃掉了余数），不是 64 的整数倍。
+        let (y_lo, y_hi) = (pad, pad + nrows - 1);
+        let (x_lo, x_hi) = (pad, pad + (out_w - (k - 1)) - 1);
+
+        let want = cpu_conv_nhwc(&pr.input, &pr.weight, &c, out_h, out_w);
+
+        // 两 pass 都用 `build_conv_case` 写好的**标准参数块**——本内核与
+        // `n_conv8_edge` 共用一套布局（见 n_conv8_mma3.metal 文件头），所以
+        // 这里一个参数词都不用碰。这一步本身就是那条共享契约的验证。
+
+        // ── pass A：只派 MMA（含尾块），要求「内点全对 + 边框原封不动」──
+        let inner_w = out_w - (k - 1);
+        let tail = inner_w - nfb * 64;
+        let nx = nfb + if tail > 0 { 1 } else { 0 };
+        let groups = [nx * nch, nrows, 1];
+        submit_compute(&ctx.inner.queue, |enc| {
+            ks.dispatch(enc, kname, &pr.buf, pr.p_off, groups).expect("dispatch");
+        })
+        .expect("提交");
+        let got = read_out(&pr);
+        let (mut worst_in, mut stray_out, mut covered) = (0f32, 0u32, 0u32);
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let inside = y >= y_lo && y <= y_hi && x >= x_lo && x <= x_hi;
+                if inside {
+                    covered += 1;
+                }
+                for n in 0..cout {
+                    let g = got[((y * out_w + x) * co4 + n) as usize];
+                    let wn = want[((y * out_w + x) * cout + n) as usize];
+                    if inside {
+                        worst_in = worst_in.max((g - wn).abs());
+                    } else if g != 7.0 {
+                        stray_out += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            stray_out == 0,
+            "n_conv8_mma3 写了覆盖矩形**之外**的 {stray_out} 个元素（{note}）——\
+             与 n_conv8_edge 重叠了"
+        );
+        assert!(
+            worst_in < 1e-4,
+            "n_conv8_mma3 内点数值不符（{note}）：最大误差 {worst_in:.3e}——\
+             simdgroup_load 的 A 瓦片/权重行 stride 假设错了"
+        );
+
+        // ── pass B：只派 edge，要求「边框全对 + 内点原封不动」──
+        refill_out_sentinel(&pr);
+        submit_compute(&ctx.inner.queue, |enc| {
+            ks.dispatch(enc, "n_conv8_edge", &pr.buf, pr.p_off, pr.groups).expect("dispatch");
+        })
+        .expect("提交");
+        let got = read_out(&pr);
+        let (mut worst_out, mut stray_in) = (0f32, 0u32);
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let inside = y >= y_lo && y <= y_hi && x >= x_lo && x <= x_hi;
+                for n in 0..cout {
+                    let g = got[((y * out_w + x) * co4 + n) as usize];
+                    let wn = want[((y * out_w + x) * cout + n) as usize];
+                    if inside {
+                        if g != 7.0 {
+                            stray_in += 1;
+                        }
+                    } else {
+                        worst_out = worst_out.max((g - wn).abs());
+                    }
+                }
+            }
+        }
+        assert!(
+            stray_in == 0,
+            "n_conv8_edge 写了覆盖矩形**之内**的 {stray_in} 个元素（{note}）——\
+             MMA 的覆盖矩形与 edge 的跳过谓词不自洽"
+        );
+        assert!(
+            worst_out < 1e-4,
+            "n_conv8_edge 边框数值不符（{note}）：最大误差 {worst_out:.3e}"
+        );
+
+        let border = out_h * out_w - covered;
+        eprintln!(
+            "[mb] conv8_mma3 对拍 {note:<22} ({out_h}×{out_w} c{cin}->{cout} k{k} 尾块 {tail} 列): \
+             内点 {covered} px 误差 {worst_in:.3e}、边框 {border} px 误差 {worst_out:.3e}、\
+             越界写 0/0"
+        );
+    }
+}
+
 /// 频率爬坡探针：同一条内核连跑不同次数，看**单次时间**随累计时长的变化。
 ///
 /// ## 为什么怀疑它

@@ -18,6 +18,22 @@ BIN=${BIN:-./bin/qppocr-cc}
 # 曾经的坑：脚本不传 --tier，报出来的数被当成「默认档」，其实是 small。
 TIER=${TIER:-small}
 
+# ── 并发门禁：默认 --workers 1（2026-10-10 加的，因为又踩了一次）──────────
+#
+# 不传 `--workers` 时 bench 走 **auto**，在这台 10 核机上 = 5 个并发 Metal
+# 进程。这台机器的**静默致瘸路径**正是「并发 Metal 进程数一多」——见
+# memory `metal-unbound-buffer-wedges-gpu`。后果不是慢慢变慢，而是：
+#
+#   同一条命令、同一批图，4 张 medium 的一轮 A/B 里 total/img 从 259 ms
+#   一路爬到 477 ms（1.84×），而**两臂同步漂** ⇒ 配对差全是垃圾：
+#   Δdet 控制在 +13.6 / +14.4 ms 晃，符号 9 正 3 负，离散 36 ms。
+#   紧接着把 `--workers 1` 单独跑三次同一命令：191.7 / 192.6 / 191.7 ms
+#   （轮内离散 ±1 ms）。
+#
+# 所以：**A/B 一律单进程**。要量「并发吞吐」另开专门的探针，别拿 A/B 当它。
+# `WORKERS=0` 可以显式覆盖回 auto（知道自己在干什么时）。
+WORKERS=${WORKERS:-1}
+
 # ── 陈旧二进制门禁（2026-10-09 加的，因为踩过一次）────────────────────
 #
 # `bin/qppocr-cc` 是**手工拷贝的快照**，不会随源码更新——它一度比源码旧 6
@@ -38,7 +54,7 @@ for kv in "${B[@]}"; do
         exit 3
     fi
 done
-echo "# BIN=$BIN  (mtime $(stat -f %Sm -t '%m-%d %H:%M' "$BIN" 2>/dev/null || echo '?'))  档位=$TIER  开关=${B[*]}"
+echo "# BIN=$BIN  (mtime $(stat -f %Sm -t '%m-%d %H:%M' "$BIN" 2>/dev/null || echo '?'))  档位=$TIER  workers=$WORKERS  开关=${B[*]}"
 
 set -- $(ls corpus100/img-*.jpg | head -"$N")
 IMGS=("$@")
@@ -48,10 +64,12 @@ for r in $(seq 1 "$R"); do
     for v in $order; do
         if [ "$v" = B ]; then
             out=$(env "${B[@]}" "$BIN" bench "${IMGS[@]}" \
-                    --models ../../models --device metal --tier "$TIER" --rounds 3 --quiet 2>/dev/null | grep '^base' | head -1)
+                    --models ../../models --device metal --tier "$TIER" --rounds 3 --quiet \
+                    --workers "$WORKERS" 2>/dev/null | grep '^base' | head -1)
         else
             out=$("$BIN" bench "${IMGS[@]}" \
-                    --models ../../models --device metal --tier "$TIER" --rounds 3 --quiet 2>/dev/null | grep '^base' | head -1)
+                    --models ../../models --device metal --tier "$TIER" --rounds 3 --quiet \
+                    --workers "$WORKERS" 2>/dev/null | grep '^base' | head -1)
         fi
         printf '%s\t%s\t%s\n' "$r" "$v" "$(echo "$out" | awk '{print $2, $3, $4, $5, $6}')" >>"$TSV"
     done

@@ -698,6 +698,8 @@ impl VulkanSession {
             // simdgroup_matrix 是 MSL 独有的（GLSL/SPIR-V 侧没有对应实现），
             // 开了会派发到不存在的内核。恒 false。
             conv1x1_mma: false,
+            // k×k MMA（`n_conv8_mma3` + `n_conv8_edge`）同理恒 false。
+            conv_kxk_mma: false,
         }
         .build(&self.input_name, in_shape)?;
 

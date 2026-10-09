@@ -177,6 +177,10 @@ pub(crate) struct MetalSession {
     ///
     /// 见 [`conv1x1_mma`] 与 `plan.rs::PlanBuilder::conv1x1_mma`。
     pub(crate) conv1x1_mma: bool,
+    /// 稠密 k×k conv（k>1）走 `n_conv8_mma3` + `n_conv8_edge`。
+    ///
+    /// 见 [`conv_kxk_mma`] 与 `plan.rs::PlanBuilder::conv_kxk_mma` 的启用判据。
+    pub(crate) conv_kxk_mma: bool,
     /// 执行串行锁：每 run 重编码 + 同步等待不支持并发在飞（deferred
     /// 流水是 P4 的性能项；trait 默认的同步 run_deferred 语义等价）。
     run_lock: Mutex<()>,
@@ -297,6 +301,23 @@ fn conv1x1_mma() -> bool {
     )
 }
 
+/// 稠密 k×k conv（k>1）走 `n_conv8_mma3` + `n_conv8_edge`
+/// （`QPPOCR_METAL_CONV_KXK_MMA`，默认 **true**）。
+///
+/// 同 [`conv1x1_mma`]：不动精度（f32 进 f32 出，只有 K 分片的加法顺序不同，
+/// `conv8_mma3_matches_cpu` 对拍 5 形状最大 2.0e-7），默认开；置 `0`/`off`
+/// 关掉，供 A/B 对照。
+///
+/// **与 1×1 那条不同的一点**：这条会改变**派发条数**（一条 conv → 两条
+/// dispatch），所以关掉它时计划层逐位回到改前，端到端 A/B 的对照列必须是
+/// 它而不是别的开关。
+fn conv_kxk_mma() -> bool {
+    !matches!(
+        std::env::var("QPPOCR_METAL_CONV_KXK_MMA").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
 impl MetalSession {
     pub(crate) fn new(
         ctx: Arc<super::Inner>,
@@ -345,6 +366,7 @@ impl MetalSession {
                 on
             },
             conv1x1_mma: conv1x1_mma(),
+            conv_kxk_mma: conv_kxk_mma(),
             run_lock: Mutex::new(()),
             prof_left: std::sync::atomic::AtomicUsize::new(
                 std::env::var("QPPOCR_GPU_KERNEL_PROF")
@@ -465,6 +487,8 @@ impl MetalSession {
             weight_f16: self.weight_f16,
             // 1×1 conv 走 simdgroup_matrix MMA（默认开）。见 [`conv1x1_mma`]。
             conv1x1_mma: self.conv1x1_mma,
+            // k×k（k>1）同款（默认开）。见 [`conv_kxk_mma`]。
+            conv_kxk_mma: self.conv_kxk_mma,
         }
         .build(&self.input_name, in_shape)?;
 
@@ -1012,13 +1036,13 @@ impl MetalSession {
         for (k, (sum, n, mx)) in &v {
             eprintln!("[prof]   {k:<18} {sum:>8.2} ms  {n:>4} 条  单条最大 {mx:>7.2} ms");
         }
-        // 最贵的 12 条明细（节点序号 + 网格）。
+        // 最贵的 20 条明细（节点名 + 序号 + 网格）。
         let mut top = rows.clone();
         top.sort_by(|a, b| b.ms.partial_cmp(&a.ms).unwrap());
         for r in top.iter().take(20) {
             eprintln!(
-                "[prof]   · {:<16} {:>7.3} ms  node#{:<4} grid={:?} reps={}",
-                r.kernel, r.ms, r.node_idx, r.groups, r.reps
+                "[prof]   · {:<16} {:>7.3} ms  node#{:<4} {:<24} grid={:?} reps={}",
+                r.kernel, r.ms, r.node_idx, r.node, r.groups, r.reps
             );
         }
         eprintln!(

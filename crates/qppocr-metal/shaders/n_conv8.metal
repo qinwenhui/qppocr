@@ -133,7 +133,14 @@ float4 apply_act(float4 v, uint act, float c1, float c2, float c3) {
 // `WVec` = 权重装载的向量视图（`float4` 或 `half4`），`WSHIFT` = 把 word
 // 偏移折算成该视图下标的右移量（4 B 元素 >>2，2 B 元素 >>1）。二者必须
 // 一起选——见文件头注释。
-template <typename WVec, uint WSHIFT>
+//
+// `EDGE` = 边框变体（见 `n_conv8_edge`）：把「已被 MMA 覆盖」的矩形
+// （y_lo, y_hi, x_lo, x_hi，闭区间，**由标准参数块现算**，见正文里那段）
+// 里的输出像素跳过——那些由 `n_conv8_mma3` 写，本内核写**互不相交**的补集。
+// 参数块与另两支**逐字相同**（21 词），因为一次 conv 的两条 dispatch 共用
+// 一块参数（编码期不能改它，见 n_conv8_mma3.metal 文件头）。
+// `EDGE == false` 时整段矩形计算是编译期死代码，热循环一条指令都不多。
+template <typename WVec, uint WSHIFT, bool EDGE>
 static inline void conv8_body(
     device float4* d,
     device const uint* params,
@@ -158,6 +165,30 @@ static inline void conv8_body(
     float c2 = as_type<float>(params[P + 18]);
     float c3 = as_type<float>(params[P + 19]);
     uint r_off = params[P + 20];
+
+    // 覆盖矩形（`n_conv8_mma3` 写这些像素，本内核写补集）。**由标准参数块
+    // 现算**，不额外占参数词——理由见 n_conv8_mma3.metal 文件头：两条 dispatch
+    // 读同一块参数，参数块在编码期不能改。算式与计划层的派发网格、与
+    // n_conv8_mma3 内核里的同一组导出式**必须三份一致**。
+    //
+    //   y_lo = padT     y_hi = padT + (mDim/outW - (taps/kW - 1)) - 1
+    //   x_lo = padL     x_hi = padL + (outW - (kW-1)) - 1
+    //
+    // 注意 x 上用**内点列全宽**而不是「64 的整数倍块」——`n_conv8_mma3` 用
+    // 一个尾部块（锚在最后 64 个内点列、写掩码裁到行尾）吃掉了余数，所以
+    // 覆盖矩形一直铺到 padL + inner_w - 1。用旧的 64 取整式会把那 48 列
+    // 算两遍（MMA 写一次、edge 再写一次，静默错）。
+    //
+    // 非 EDGE 实例化下整段是编译期死代码（`EDGE` 是模板常量）。
+    uint y_lo = 0u, y_hi = 0u, x_lo = 0u, x_hi = 0u;
+    if (EDGE) {
+        uint outH = mDim / outW;          // 输出平面恒 outH*outW 个像素
+        uint kH = taps / kW;
+        y_lo = padT;
+        y_hi = padT + (outH - (kH - 1u)) - 1u;
+        x_lo = padL;
+        x_hi = padL + (outW - (kW - 1u)) - 1u;
+    }
 
     uint b = wg.y;
     if (params[0] != 0u && b >= params[0]) return; // real_n 早退：批维补齐的空行零算力；0=不限（裸 dispatch 安全默认）
@@ -272,7 +303,14 @@ static inline void conv8_body(
             ok[i] = m < mDim;
             oh[i] = m / outW;
             ow[i] = m - oh[i] * outW;
+            if (EDGE && oh[i] >= y_lo && oh[i] <= y_hi && ow[i] >= x_lo && ow[i] <= x_hi)
+                ok[i] = false; // 已被 n_conv8_mma3 覆盖
         }
+        // 整块都在覆盖矩形内 ⇒ 本 tile 无事可做。这一条是**必需**的而不是
+        // 优化：EDGE 的网格与 n_conv8 同形（覆盖全部 tile），不做早退的话
+        // 绝大多数线程组仍会跑完整圈权重装载（每 ci4 12 条），把边框 kernel
+        // 变成一次全量空转。
+        if (EDGE && !(ok[0] || ok[1] || ok[2] || ok[3])) continue;
 
         for (uint t = 0u; t < taps; t++) {
             uint ky = t / kW, kx = t - ky * kW;
@@ -340,7 +378,7 @@ kernel void n_conv8(
     uint3 tpg [[threads_per_grid]],
     uint3 wg [[threadgroup_position_in_grid]])
 {
-    conv8_body<float4, 2u>(d, params, p_off, gid3, tpg, wg);
+    conv8_body<float4, 2u, false>(d, params, p_off, gid3, tpg, wg);
 }
 
 // 入口二：fp16 权重。**参数块完全一样**——`w_off` 还是同一个 word 偏移，
@@ -354,5 +392,27 @@ kernel void n_conv8h(
     uint3 tpg [[threads_per_grid]],
     uint3 wg [[threadgroup_position_in_grid]])
 {
-    conv8_body<half4, 1u>(d, params, p_off, gid3, tpg, wg);
+    conv8_body<half4, 1u, false>(d, params, p_off, gid3, tpg, wg);
+}
+
+// 入口三：**边框补算**。与 `n_conv8_mma3` 配套——MMA 那支只吃「全内点块」
+// （每块 = 一行内 64 个连续输出 x，9 个 tap 的读全落在平面内），本入口负责
+// 剩下的补集：两行整行、两列整列、以及每行尾不到 64 的余数。
+//
+// **参数块与 `n_conv8` 逐字相同**（同一次 conv 的两条 dispatch 读同一块
+// 参数，编码期不能改；覆盖矩形由内核从标准字段现算）。计划层保证这两支的
+// 覆盖**恰好互补、无交**——交了的后果是「同一个输出像素被两个内核写」，
+// 谁后写谁赢且结果取决于 dispatch 顺序，是那种只在特定形状上偶发的静默错。
+//
+// 网格与 `n_conv8` 同形（`ceil(m/4)*nh`），因为 tile→像素的映射一字未动；
+// 代价是全图 tile 数的一次空转，靠内核里的整块早退压到指令级。
+kernel void n_conv8_edge(
+    device float4* d [[buffer(0)]],
+    device const uint* params [[buffer(1)]],
+    constant uint& p_off [[buffer(3)]],
+    uint3 gid3 [[thread_position_in_grid]],
+    uint3 tpg [[threads_per_grid]],
+    uint3 wg [[threadgroup_position_in_grid]])
+{
+    conv8_body<float4, 2u, true>(d, params, p_off, gid3, tpg, wg);
 }

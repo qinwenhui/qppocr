@@ -54,7 +54,7 @@ impl PcParams {
 /// 参数块写入器：形状参数太多（conv 20+ 项）装不进 128 B 的 Vulkan
 /// push constant，写进 arena 一小块，内核经 u32 视图读取。装载期写
 /// 一次、随命令复用——零每帧成本。
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ParamBlock {
     words: Vec<u32>,
 }
@@ -212,6 +212,50 @@ pub struct PlanBuilder<'a> {
     /// 与 `weight_f16` 同款：**两边必须同步**——Vulkan 的 GLSL 侧没有
     /// `n_conv8_mma`，开了会派发到不存在的内核（硬失败，非静默降级）。
     pub conv1x1_mma: bool,
+    /// 稠密 k×k conv（k>1、stride 1、对称 pad）走 simdgroup_matrix MMA
+    /// （`n_conv8_mma3` + `n_conv8_edge` 两条 dispatch）。
+    ///
+    /// 病根与 `conv1x1_mma` 同一个：m4×n8 瓦片里每条权重装载只被 4 个输出行
+    /// 复用，3×3 的变体探针把三个假说全部钉死（`conv8_variant_scan`：权重
+    /// 流量/列主序/输入合并不解释余量，**装载指令条数**才是），p_fmaonly
+    /// 2758 vs p_base 1157 GFLOPS = 2.38× 的处方空间。
+    ///
+    /// ## 为什么是两条 dispatch
+    ///
+    /// k>1 时 A 操作数不再是恒等映射：输出像素要读输入的空间邻居。让块沿
+    /// 行主序线性铺开会**横向绕行**（行首读到上一行末像素＝错值；y=0 再往前
+    /// 就越过输入平面基址＝未绑定 BIF0 page fault 那条致瘸路径）。所以
+    /// `n_conv8_mma3` 只覆盖**全内点块**（内点行 × 内点列），真正的边框
+    /// （两行整行 + 两列整列）由 `n_conv8_edge` 补。
+    ///
+    /// 两条读的是**同一块参数**（`n_conv8` 的 21 字标准布局，逐字段同义）：
+    /// 覆盖矩形由 `mDim/outW` 与 `taps/kW` 在**内核与这里各导出一份**，两份
+    /// 对不上就是「漏算/算两遍」的静默错——这是本设计唯一的新耦合面，
+    /// `microbench::conv8_mma3_matches_cpu` 用第三份硬编码做交叉验证。
+    ///
+    /// **两条 dispatch 各自拿一份独立的 `ParamBlock`**（内容相同、写法相同），
+    /// 不是什么共享优化——是因为参数写在 arena 的普通内存里，两条背靠背时
+    /// 改它就是「编码期 CPU 写 GPU 正在读的缓冲」。
+    ///
+    /// ## 启用判据（不满足则回落 `n_conv8`/`n_conv8h`）
+    ///
+    /// - `kh==kw>=2 && sh==sw==1`：瓦片映射要求方形 k×k、步长 1；
+    /// - **对称 pad**（`2*padT==2*padB==kh-1`、左右同理）：内点行/列的范围
+    ///   与「读下标必在平面内」的证明都建立在这条上，且它等价于
+    ///   `outH==inH && outW==inW`；
+    /// - `outW-(kw-1) >= 64`：内点列宽至少一个块，尾块锚点 `x0>=padL` 也靠它；
+    /// - `cpad4(Cin)%8==0`：K 步长 8 不越界；
+    /// - **`cpad4(Co)%32==0`**：通道块宽按 `Co%64==0 ? 64 : 32` 二选一
+    ///   （`n_conv8_mma3` / `n_conv8_mma3_n32`）。**32 这一档不是锦上添花**：
+    ///   端到端剖析（`kxk_scan.py`）显示 medium det 的 k×k 家族 15 条里有
+    ///   **12 条 Co=32**（CSP 三连 Co=32 Ci=32），其中 Conv.111/114/117 在
+    ///   240×216、空间门全过——第一版只收 64 时**整张图只有 1 条 conv 点火**
+    ///   （Conv.121）。挡住的从来不是几何，是通道块宽。两条实例化的网格
+    ///   公式/覆盖矩形**逐字相同**，只有 NCOLS 不同，见内核头注释。
+    /// - `!weight_f16`：MMA 内核读的是 f32 权重（与 1×1 同）。
+    ///
+    /// 与 `conv1x1_mma` 同款：Vulkan 的 GLSL 侧没有这两个内核。
+    pub conv_kxk_mma: bool,
 }
 
 impl PlanBuilder<'_> {
@@ -967,7 +1011,57 @@ impl PlanBuilder<'_> {
                         && pads.1 == 0
                         && cpad4(ws[1]) % 8 == 0
                         && cpad4(ws[0]) % 64 == 0;
-                    if mma {
+                    // k×k（k>1）：方块、步长 1、**对称 pad**（四个 pad 都必须
+                    // 是 (k-1)/2）时走 `n_conv8_mma3`。对称 pad 是硬条件而非
+                    // 装饰：内核「读到的一定在平面内」的证明、以及内点行/列
+                    // 的矩形公式都建立在 `outH==inH && outW==inW` 上——这里把
+                    // 那条等式显式写出来（它由对称 pad 蕴含），免得以后有人
+                    // 只看 pad 条件就以为更宽的 pad 也能走。
+                    let kxk = self.conv_kxk_mma
+                        && !fp16
+                        && kh == kw
+                        && kh >= 2
+                        && sh == 1
+                        && sw == 1
+                        && 2 * pads.0 == kh as i64 - 1
+                        && 2 * pads.2 == kh as i64 - 1
+                        && 2 * pads.1 == kw as i64 - 1
+                        && 2 * pads.3 == kw as i64 - 1
+                        && xs[2] == out_shape[2]
+                        && xs[3] == out_shape[3]
+                        && cpad4(ws[1]) % 8 == 0
+                        && cpad4(ws[0]) % 32 == 0
+                        && ow as i64 - (kw as i64 - 1) >= 64;
+                    if kxk {
+                        // 两条 dispatch、**两块内容相同的参数**（理由见
+                        // `PlanBuilder::conv_kxk_mma`）。网格公式与内核逐字
+                        // 一致：`n_conv8_mma3` 无 grid-stride 循环 ⇒ 用裸
+                        // `div_ceil` 不夹；`n_conv8_edge` 复用 `n_conv8` 的体
+                        // ⇒ 网格也必须与 `n_conv8` 那一支逐字相同（含 `capped`）。
+                        //
+                        // 通道块宽 64/32 二选一（内核是同一模板的两条实例化，
+                        // 网格公式只差 `nch` 这个除数——内核里同样是
+                        // `nDim / NCOLS`，所以两份仍然逐字对应）。
+                        let co4 = cpad4(ws[0]);
+                        let ncols = if co4 % 64 == 0 { 64 } else { 32 };
+                        let inner_w = ow - (kw as u32 - 1);
+                        let nrows = oh - (kh as u32 - 1);
+                        let nch = co4 / ncols;
+                        let nx = inner_w / 64 + u32::from(inner_w % 64 != 0);
+                        let kname = if ncols == 64 {
+                            "n_conv8_mma3"
+                        } else {
+                            "n_conv8_mma3_n32"
+                        };
+                        Ok(vec![
+                            (kname, pb.clone(), [nx * nch, nrows, nb]),
+                            (
+                                "n_conv8_edge",
+                                pb,
+                                [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1],
+                            ),
+                        ])
+                    } else if mma {
                         let co4 = cpad4(ws[0]);
                         Ok(vec![(
                             "n_conv8_mma",
