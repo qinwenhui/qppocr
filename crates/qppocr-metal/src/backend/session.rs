@@ -372,6 +372,12 @@ impl MetalSession {
             conv1x1_mma: conv1x1_mma(),
             conv_kxk_mma: conv_kxk_mma(),
             run_lock: Mutex::new(()),
+            // ⚠ 这个预算是**每会话一份**，而 det / rec / cls 是三个会话
+            //（各自 new 一次）。所以 `QPPOCR_GPU_KERNEL_PROF=3` 不是
+            //「剖前 3 次运行」，而是「**每个会话各剖前 3 份计划**」——
+            // rec 有 10+ 份形状计划时，给 3 只会剖到前 3 份，其余静默缺失。
+            // 曾照此得出「rec 设备时间只有 38 ms、其余是主机开销」的假结论
+            //（真值 127 ms / 94% 设备绑定）。要全剖就给够，如 `=60`。
             prof_left: std::sync::atomic::AtomicUsize::new(
                 std::env::var("QPPOCR_GPU_KERNEL_PROF")
                     .ok()

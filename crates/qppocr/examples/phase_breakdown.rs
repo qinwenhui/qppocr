@@ -5,7 +5,27 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(5);
-    let eng = qppocr::Engine::new(qppocr::Tier::Tiny, "models").unwrap();
+    // 档位/设备靠环境变量切（默认 tiny+auto，保持原行为）：
+    // `PHASE_TIER=medium PHASE_DEVICE=metal`。诊断工具，改配置不用重编。
+    let tier = match std::env::var("PHASE_TIER").as_deref() {
+        Ok("small") => qppocr::Tier::Small,
+        Ok("medium") => qppocr::Tier::Medium,
+        _ => qppocr::Tier::Tiny,
+    };
+    let device = match std::env::var("PHASE_DEVICE").as_deref() {
+        Ok("metal") => qppocr::DeviceChoice::Gpu {
+            api: qppocr::GpuApi::Metal,
+            index: None,
+        },
+        _ => qppocr::DeviceChoice::Cpu,
+    };
+    // 预设跟 CLI 的 `bench` 默认对齐（balanced），否则两边数字不可比。
+    let eng = qppocr::Engine::builder()
+        .tier(tier)
+        .preset(qppocr::Preset::Balanced)
+        .device(device)
+        .build("models")
+        .unwrap();
     let img = qppocr::decode_file(&img_path).unwrap();
     let _ = eng.run(&img); // warm
     for i in 0..n {

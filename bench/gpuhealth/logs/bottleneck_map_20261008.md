@@ -1601,3 +1601,119 @@ cargo test --release -p qppocr-metal -- --nocapture mm_sg_scan conv8_mma_through
 > 平面、不是它真干的活，会把 FLOP 虚增 26 GFLOP（看起来 13700 GFLOPS，
 > 一眼假）；`n_convt` 按 `kW²` 算是**上界**，步长 2 时真实值约 1/4。
 > 读表时这两个必须手动打折扣。
+
+---
+
+## §17 把 rec 的预算也补上：整图 36% 峰值，且两段都是纯 GPU 时间（2026-10-10）
+
+§16 只画了 det。det 其实是**小的那一半**——medium 档 line 阶段比 det 还贵。
+这一节把 rec 补上，同时钉死一个之前让我得错结论的**仪器陷阱**。
+
+### 17.1 分档绝对数（corpus100 100 图，`--workers 1`）
+
+| 档 | ms/图 | det | line | cls | img/s |
+|---|---|---|---|---|---|
+| tiny   |  37.3 | 13.1 |  23.1 | 3.7 | 25.3 |
+| small  |  88.4 | 23.0 |  64.2 | 3.5 | 11.0 |
+| medium | 267.3 | 98.3 | 167.7 | 3.6 |  3.7 |
+
+单图分段（medium / img-001，`examples/phase_breakdown.rs`，6 轮离散 < 1% ——
+该例原本硬编码 `Tier::Tiny`，现已可用 `PHASE_TIER`/`PHASE_DEVICE` 切档）：
+
+```
+total=260 det_pre=0.7 det_inf=118.4 det_post=1.3 crop=0.5 cls=3.6
+      rec_pre=0.0 rec_inf=135.2 rec_post=0.0 | 未归类=0.8  boxes=10
+```
+
+### 17.2 ⚠ 仪器陷阱：`QPPOCR_GPU_KERNEL_PROF` 是**每会话**的倒计时
+
+`session.rs:375` 把 `prof_left` 初始化成 `QPPOCR_GPU_KERNEL_PROF` 的值，
+而 **det / rec / cls 各是一个会话、各有一份独立计数器**。用 `=3` 量 rec，
+只会剖析**前 3 份 rec 计划**，其余 7 份静默缺失。
+
+我曾据此得出「rec 设备时间只有 ~38 ms，剩下 ~100 ms 是主机开销」——**是错的**。
+`=60` 剖全 22 份计划后：
+
+| 阶段 | 设备 ms | 挂钟 ms | 设备占比 |
+|---|---|---|---|
+| det（180 条 ×2 轮） | 115.7 | 118.4 | **98%** |
+| rec（182 条 ×10 计划） | **127.1** | 135.2 | **94%** |
+
+**两段都是纯 GPU 时间**，顶层调度/打包/读回没有肥肉。别再去优化"主机侧"了。
+
+### 17.3 整图预算
+
+| | GFLOP | ms | GFLOPS | % 峰值 |
+|---|---|---|---|---|
+| det | 143.2（169.5 去掉 `n_conv8_edge` 假数） | 115.7 | 1238 | 37.0 |
+| rec | 172.4（10 行：..8.24/8.79/9.66/14.07/16.48/36.37/36.94/41.77 GFLOP） | 127.1 | 1356 | 40.6 |
+| **整图** | **315.6** | **260** | **1214** | **36.4%** |
+
+按 3340 GFLOPS 全速跑的理论下限 = **94.5 ms**。
+⇒ rec 的 FLOP 量**比 det 还大**（172 vs 143），处理的行像素却只有 det 的 3 成
+（rec 输入 48×5216 px vs det 960×864 px）——即 rec 每输入像素的算术密度是 det 的 4 倍。
+这是模型结构（rec 有 1536/768 通道的 1×1 堆叠），不是浪费。
+
+### 17.4 rec 的阶梯：`n_conv8_mma` 就是全部，且已到顶
+
+每份 rec 计划（42 条 mma）里 `n_conv8_mma` 都排第一，且**随行宽线性**：
+
+| 行宽 | plan ms | n_conv8_mma | n_conv8 | n_softmax |
+|---|---|---|---|---|
+| 232 |  6.81 |  4.31 | 1.53 | 0.23 |
+| 464 | 11.40 |  7.64 | 2.13 | 0.40 |
+| 1024 | 22.43 | 15.62 | 3.34 | 1.01 |
+| 1176 | 25.33 | **17.84** | 3.62 | 1.06 |
+
+线性拟合 `n_conv8_mma ≈ 0.98 ms + 0.0143 ms/px`。W=1176 计划卷积类 41.77 GFLOP /
+25.35 ms = 1648 GFLOPS，其中：
+
+| 内核 | device ms | GFLOPS | % 峰值 |
+|---|---|---|---|
+| `n_conv8_mma` | 17.84 | **2198** | **66** |
+| `n_conv8` | 3.62 | 653 | 20 |
+| `n_softmax` | 1.06 | —（零有效 FLOP） | — |
+| `n_conv_dw` | 1.03 | 182 | 5.4 |
+
+**2198 GFLOPS = 孤立探针的天花板（2204~2479）⇒ rec 的卷积也已经到顶。**
+与其去猜"哪还能快"，不如承认：这两段的差距都不在卷积主循环里。
+
+### 17.5 还站着的三个口子（按钱排序，都是"小而孤立"）
+
+1. **`n_softmax`：每条 rec 行 1.06 ms**（W=1176 计划的 4.2%）。最贵那条是
+   `Softmax.2 grid=[147,1,1] out=[1,147,18710]` = 0.99 ms，张量 11 MB，
+   读+写 22 MB ⇒ 内存下界 **0.24 ms**，**实际慢 4×**。
+   而且它的输出**只喂 argmax**（`n_exit3_argmax` 就在后面）——
+   argmax 与 softmax 单调等价，confidence 只需要 log-sum-exp ⇒
+   **可以融进 argmax 一个 pass，完全不物化 11 MB**。10 行 ≈ 10 ms/图 ≈ **3.8%**。
+2. **`MatMul.12`（CTC 头）1.909 ms = rec 计划里最贵的单条 dispatch。**
+   形状 `m=147 cin=192 co=18712`，2×147×18712×192 = 1.06 GFLOP ⇒
+   **554 GFLOPS = 16.6% 峰值**。掉出 MMA 的原因非常具体（`plan.rs` mma 谓词）：
+   `cpad4(co)%64==0`，而 co 被填到 **18712**（18710 不是 8 的倍数）⇒ 18712%64=24
+   ⇒ 判否 ⇒ 掉回通用 `n_conv8`。**但预期只有 ~1.3×**：fp16 探针在几乎同形
+   （`ctc104_c120o18710`，grid 2×293）上只有 719 GFLOPS，因为我们 f32 `n_conv8`
+   在这里已是 554。⇒ 约 4.4 ms/图 ≈ **1.7%**，且要动 MMA 的 N 维尾部。
+3. **`n_conv_dw` 18.8 ms（det）** —— §16.3 已钉死，`p_dw_fma`（去掉装载）4.7×，
+   九个单因子变体全负。**这条别再碰。**
+
+三个加起来乐观也就 **~10%**，而且要拆成三个独立的内核工程。
+
+### 17.6 复现命令
+
+```sh
+# 分段（该例已支持切档/切设备）
+PHASE_TIER=medium PHASE_DEVICE=metal cargo run --release --example phase_breakdown \
+    -p qppocr --features gpu -- bench/gpuhealth/corpus100/img-001.jpg 6
+
+# 全计划剖析（**必须给够预算**，否则 rec 只剖前 N 份）
+QPPOCR_GPU_KERNEL_PROF=60 ./target/release/qppocr bench bench/gpuhealth/corpus100/img-001.jpg \
+    --models models --device metal --tier medium --preset balanced --rounds 1 --quiet --workers 1
+
+# 对照：rec 走 CPU（证明 GPU rec 赢了 7×，这条路是对的）
+PHASE_TIER=medium PHASE_DEVICE=metal QPPOCR_GPU_STAGES=det cargo run --release \
+    --example phase_breakdown -p qppocr --features gpu -- bench/gpuhealth/corpus100/img-001.jpg 4
+# → rec_inf 906~909 ms（GPU 是 135 ms）
+```
+
+> **顺带一个正面结论**：rec 上 GPU 是 **7×** 于 CPU（135 vs 908 ms），
+> 所以「rec 退回 CPU 省计划构建税」那条老建议在当前实现下已经不成立。
