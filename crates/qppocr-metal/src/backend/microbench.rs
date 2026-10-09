@@ -916,6 +916,34 @@ fn conv8_variant_scan() {
         // 576 KB 那档 3 条、640 KB 那档 3 条。有了它才能判 `p_colmajw`
         // （窗口序+列主序叠加）是不是**两端都不劣**，从而免掉阈值。
         ConvCase { label: "rec 6x208 c384->384 k1 (576K 中档)", h: 6, w: 208, cin: 384, cout: 384, kh: 1, kw: 1 },
+        // ── 1–4 MB 权重档（2026-10-09）：**门下那段空白** ────────────────
+        //
+        // 窗口序的门（`cin4v*nv >= 65536`，即权重 ≥ 4 MB）当初划在 4 MB，
+        // 理由是「生产里 1152 KB 与 8771 KB 之间没有别的权重档」。那句话
+        // 对 tiny/small 成立，**对 medium 是错的**：`QPPOCR_METAL_PLAN_DUMP`
+        // 数出来 medium det 有 **37 条**落在 1–4 MB，合计 **21.65 GFLOP =
+        // 全 det 的 25.2%**——它们现在**全走列主序，从没进过窗口序**。
+        //
+        // 而它们恰恰是 f32 下最慢的一档（`conv8_throughput` 同轮实测 516
+        // GFLOPS，而 3×3 那批 1148）。形状逐字取自计划：
+        // `out=[1,512,34,60]`（m=2040，grid=[128,1,1]）。
+        //
+        // **判读（2026-10-09 实测，假设被推翻）**：`p_colmajw` 在这三条上
+        // 分别 1.964 / 4.188 / 3.668，而 `p_colmaj` 1.935 / 4.070 / 3.576
+        // ——**窗口序一致慢 1.5~2.9%**，`p_window` 更差（4.221）。所以门
+        // 虽然理由（那句话）是错的，**它给出的决定是对的，不该动**。
+        //
+        // 真正有价值的是同轮的诊断列：把权重地址掩进 1 KB（`p_wsmall`，
+        // 指令条数不变、流量归零）只快 **1.27~1.32×**，而 `p_fmaonly`
+        // （去掉全部 load）快 **3.2~3.4×**。⇒ 这一档**不是权重带宽瓶颈，
+        // 是 load 指令发射瓶颈**；带宽类手段（窗口序、LDS 中转、fp16 的
+        // 字节）在这里全都撞同一堵墙——fp16 的 1.6× 里有近一半来自指令数
+        // 以外的东西，这也解释了它为何显著超过权重的字节收益。
+        // 下一根真正的杠杆是**减少 load 指令条数**（更宽的 load / 输入复用），
+        // 不是提高局部性。
+        ConvCase { label: "det 34x60 c512->512 k1 (1.05M 门下)", h: 34, w: 60, cin: 512, cout: 512, kh: 1, kw: 1 },
+        ConvCase { label: "det 34x60 c512->1024 k1 (2.10M 门下)", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
+        ConvCase { label: "det 34x60 c1024->512 k1 (2.10M 门下)", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
     ];
     const ROUNDS: usize = 3;
     for c in &cases {
@@ -1020,7 +1048,15 @@ fn conv8_variant_scan() {
     }
 }
 
-/// 真实层形状的达成 FLOPS。
+/// 真实层形状的达成 FLOPS，**f32 与 fp16 两条生产入口同轮对照**。
+///
+/// 两条入口（`n_conv8` / `n_conv8h`）读同一个逻辑权重、同一个网格、同一份
+/// 输入输出；`build_conv_case_half` 只把权重段写成 fp16。所以比值就是
+/// 「0.5 → 0.25 B/FLOP」在这一形状上的兑现程度。
+///
+/// 判读：若某形状 fp16 只值 ~1.2×，说明它本来就不是被权重带宽卡的
+/// （权重早已 L2 常驻 / 算术受限）；值接近 2× 的形状才是真正吃这一刀的。
+/// 这两类在后端里要分开对待，不能拿平均比值去外推。
 #[test]
 fn conv8_throughput() {
     let _g = gpu_guard();
@@ -1039,15 +1075,31 @@ fn conv8_throughput() {
         ConvCase { label: "det 120x108 c128->128 k3", h: 120, w: 108, cin: 128, cout: 128, kh: 3, kw: 3 },
         // 大通道 1×1（rec 头常见）
         ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
+        // ── medium det 的**重头层**（`QPPOCR_METAL_PLAN_DUMP` 实测的 FLOP
+        // 前几名，2026-10-09）。medium 与小档的差距（我们 4.9× vs 竞品 2.0×）
+        // 全在这批层的效率上，而它们**一个都没进过上面的名单**。
+        //
+        // 形状从 dump 的 `out=[1,co,H,W]` 抄，**不是**输入图分辨率：
+        // 960×864 的图在 det 骨干里是 `m = 136*240 = 32640`（PaddleOCR 的
+        // 下采样把 H/W 各砍到 1/4），照图像尺寸写会把 FLOP 放大 16 倍。
+        ConvCase { label: "det m32640 c256->64  k3 (9.6G 首名)", h: 136, w: 240, cin: 256, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "det m32640 c128->64  k3 (4.8G)", h: 136, w: 240, cin: 128, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "det m32640 c32->32   k7 (4.3G)", h: 136, w: 240, cin: 32, cout: 32, kh: 7, kw: 7 },
+        ConvCase { label: "det m32640 c128->256 k1 (2.1G)", h: 136, w: 240, cin: 128, cout: 256, kh: 1, kw: 1 },
+        ConvCase { label: "det m130560 c64->32  k2 (2.1G)", h: 272, w: 480, cin: 64, cout: 32, kh: 2, kw: 2 },
+        ConvCase { label: "det 34x60  c1024->512 k1 (1.05G 门下)", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
+        ConvCase { label: "det 34x60  c512->1024 k1 (1.05G 门下)", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
     ];
     for c in &cases {
         let pr = build_conv_case(&ctx.inner.device, c);
+        let prh = build_conv_case_half(&ctx.inner.device, c);
+        assert_eq!(pr.groups, prh.groups, "两臂网格不一致（{}）", c.label);
         // 重复外推：同一条内核跑 R 次，斜率 = 单次时间（消掉命令缓冲固定开销）
-        let run = |reps: u32| -> f64 {
+        let run = |pr: &ConvProbe, name: &str, reps: u32| -> f64 {
             let t = Instant::now();
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..reps {
-                    ks.dispatch(enc, "n_conv8", &pr.buf, pr.p_off, pr.groups)
+                    ks.dispatch(enc, name, &pr.buf, pr.p_off, pr.groups)
                         .expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [&pr.buf];
                     enc.memory_barrier_with_resources(&res);
@@ -1056,16 +1108,30 @@ fn conv8_throughput() {
             .expect("提交");
             t.elapsed().as_secs_f64() * 1000.0
         };
-        let t = time_dispatch(&run);
-        let gflops = pr.flops / (t.ms * 1e6);
-        let gbs = pr.bytes / (t.ms * 1e6);
+        // 奇偶轮换序（本机先跑的那条快 6~15%，固定序的 A/B 等于没量）
+        let (mut a, mut b) = (f64::INFINITY, f64::INFINITY);
+        for i in 0..3 {
+            let (x, y) = if i % 2 == 0 {
+                (time_dispatch(&|r| run(&pr, "n_conv8", r)), time_dispatch(&|r| run(&prh, "n_conv8h", r)))
+            } else {
+                let y = time_dispatch(&|r| run(&prh, "n_conv8h", r));
+                let x = time_dispatch(&|r| run(&pr, "n_conv8", r));
+                (x, y)
+            };
+            a = a.min(x.ms);
+            b = b.min(y.ms);
+        }
+        let gf = |ms: f64| pr.flops / (ms * 1e6);
         eprintln!(
-            "[mb] {:<38} grid={:<12} {:>7.3} ms  {gflops:>7.1} GFLOPS  离散×{:.2}  \
-             流量下界 {gbs:>6.1} GB/s",
+            "[mb] {:<38} grid={:<12} f32 {:>7.3} ms ({:>7.1} GFLOPS) → \
+             fp16 {:>7.3} ms ({:>7.1} GFLOPS) = {:.2}×",
             c.label,
             format!("{:?}", pr.groups),
-            t.ms,
-            t.spread
+            a,
+            gf(a),
+            b,
+            gf(b),
+            a / b
         );
     }
 }
