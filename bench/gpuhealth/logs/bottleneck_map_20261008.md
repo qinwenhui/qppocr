@@ -1453,3 +1453,151 @@ QPPOCR_METAL_PLAN_DUMP=1 bench/gpuhealth/bin/qppocr-cc infer bench/gpuhealth/cor
 > **纪律备忘（本轮踩到的）**：`env_ab.sh` 报的 A 列绝对值**必须一起看**。
 > 本轮第三次（大名单组）的 A 从 135.6 漂到 155.3，配对差离散 13.0 ms——
 > 这种轮**只有中位数能用**，而且要在结论里标出干净轮是多少。
+
+## 16. 把整图的「分母」补上：det 的真实 FLOP 是多少，我们在峰值的几成（2026-10-10）
+
+前十五节一直在比**相对份额**（谁占百分之几），缺一个绝对标尺：**这张图
+到底有多少 FLOP、离 fp32 FMA 峰值还有多远**。没有它，「还有多少余量」
+就只能靠感觉。本节把它量出来，顺手关掉三条还开着的假设。
+
+工具：`QPPOCR_METAL_PLAN_DUMP=1` 的计划转储（原来只给 `n_conv8`/`n_conv_dw`
+打形状）现在**也认 MMA 族与 `n_convt`**（见 `session.rs` 的 `extra` 段），
+配 `bench/gpuhealth/flopsmap.py` 把「计划里的形状」和「逐内核剖析里的时间」
+按节点名拼起来，直接出 **GFLOPS / 占峰值百分比 / 浪费毫秒**。
+用法：
+
+```bash
+S=$(grep -n 'out=\[1, 3, 960, 864\] node=<entry>' plan.txt | tail -1 | cut -d: -f1)
+python3 bench/gpuhealth/flopsmap.py plan.txt prof.txt --start-line=$S
+```
+
+### 16.1 det 的分母：169.5 GFLOP，我们在峰值的 **47.5%**（去掉边框内核后 40%）
+
+`plan_det_shape.txt`（medium、img-001、真实计划 180 条）逐节点累加：
+
+| kernel | GFLOP | 备注 |
+|---|---|---|
+| `n_conv8_mma` | 82.46 | 51 条，1×1 主体 |
+| `n_conv8_edge` | 26.30 | **是假数**：它的参数块里 `m` 是整张平面，实际只补边框，实测算力 13700 GFLOPS ⇒ 不可信，剔除 |
+| `n_conv8` | 21.85 | 43 条 |
+| `n_conv8_mma3` | 15.29 | |
+| `n_conv8_mma3_n32` | 11.01 | |
+| `n_convt` | 8.49 | 上界（步长 2 按 kW² 算，实际约 1/4） |
+| `n_conv_dw` | 4.13 | |
+| 其余（elem/concat/channel/resize/pool/reduce） | 0 | 纯访存 |
+
+**合计 169.54 GFLOP；剔除 `n_conv8_edge` 的假数后 143.2 GFLOP。**
+fp32 FMA 峰值 3340 GFLOPS（`bench/gpuhealth/gpualu2` 实测）⇒ 理论下限
+**42.9 ms**；实测 `det/img = 106.9 ms` ⇒ **整体 40% 利用率**。
+
+**这是第一次有一个绝对尺子。** 结论有两面：det 确实还有 2.5× 的余量；
+但余量是**碎在十几个内核里**的，不是某一处的。
+
+### 16.2 余量碎在哪：按「浪费毫秒」排（= ms × (1 − 占峰)）
+
+| ms | GFLOPS | %峰 | 节点 | 可达性 |
+|---|---|---|---|---|
+| 9.31 | 231 | 6.9 | `n_conv_dw Conv.64`（9×9,c256,m51840） | **已证死**：`probe_dw` 九个单因子变体全负（`wide4` 0.85×、`nodiv` 0.75×、`wstage` 0.71×），只 `nobc`（去边界判断）1.16×，且只在无 pad 配置上成立 |
+| 6.64 | 1151 | 34.5 | `n_conv8 Conv.3`（3×3 **s2**, cin128→co64） | **结构上挡住**：k×k MMA 要求 `sh==sw==1` |
+| 6.15 | 1106 | 33.1 | `n_convt ConvTranspose.0`（64→64 2×2 s2） | 真实 FLOP 只有 0.85 GFLOP（我的公式高估 4×）⇒ 实际 **138 GFLOPS**；下界是**写 212 MB @93 GB/s = 2.28 ms**，现在 6.15 |
+| 2.82 | 191 | 5.7 | `n_conv_dw Conv.62` | 同 `Conv.64` |
+| 7.07 | 2161 | 64.7 | `n_conv8_mma3 Conv.121`（7×7） | 已在天花板附近 |
+| 2.94 / 2.87 | 1158 / 1183 | 35 | `n_conv8 Conv.1/Conv.2`（**2×2 s1**） | **结构上挡住**：2×2 的 SAME padding 是 (0,1) 非对称，`2*pad==k-1` 不成立 |
+| 3.47 | 3174 | **95** | `n_conv8_mma3_n32 Conv.111` | 已到顶 |
+| 2.12 | — | — | `n_concat_c Concat.0` | 已到顶：212 MB 流量 / 2.12 ms = 100 GB/s ≈ DRAM |
+| 1.60 | — | — | `n_elem Add.158` | 已到顶：159 MB / 1.60 ms = 99 GB/s |
+
+**`n_conv8`（非 MMA）那一族 21.85 GFLOP / 20.83 ms = 1049 GFLOPS** 的共同
+病根，读 `n_conv8.metal:380-410` 就能看见：每 `(t, ci4)` 是 **4 次输入
+float4 + 8 次权重 float4 = 12 次装载，换 32 个 FMA**（权重按
+`[tap][ci4][i(4cin)][n4]` 存，`i` 走 4 个 cin lane，每个 i 要 wv0/wv1
+两个 n4）= **1 : 2.67**。m4 瓦片让每条权重装载只被复用 4 次。
+把 m 加宽到 8/16 是教科书解法，但 `conv8_variant_scan` 已经量过
+**大瓦片全部更慢**（累加器吃满寄存器文件）。
+
+### 16.3 三条还开着的假设，全部关掉
+
+**(a) fp16 权重现在是净亏 1.14×（不是收益）。**
+`env_ab.sh 12 4 QPPOCR_METAL_WF16=1`（medium）：
+
+```
+中位配对差：Δtotal = +35.10 ms   Δdet = +5.15   Δline = +30.05
+符号：Δtotal 正 4/4；离散 11.9 ms
+```
+
+**原因不是噪声，是结构**：`plan.rs:1083` 的 MMA 门里有 `&& !fp16`，
+开了 fp16 之后**每个 1×1 conv 都掉回 `n_conv8h`**，而 1×1 正是 MMA
+收益最大的一类（见 16.4）。当年那个 1.79× 是**在没有 MMA 的 f32 底座上**
+量出来的；底座换了，结论就反号了。**「保持 f32 默认」现在不只是精度取舍，
+也是性能上正确的选择。**
+
+**(b) fp16 MMA 在这台 M4 上不是杠杆。** `mm_sg_scan`（探针用的是
+`simdgroup_half8x8`，即竞品结构）在生产同形状上的实测：
+
+| 形状 | `p_mm_sg`（fp16 MMA） | 生产 `n_conv8_mma`（f32 MMA） |
+|---|---|---|
+| det 960² c512→1024 | 1517 GFLOPS | —— |
+| det 960² c1024→512 | 1535 GFLOPS | —— |
+| det 34×60 c1024→512 | —— | **2479 GFLOPS**（`conv8_mma_throughput`） |
+| det m32640 c128→256 | —— | **2204 GFLOPS** |
+
+**竞品的结构（fp16 + simdgroup_matrix + 64×64 瓦片）在这台机器上只跑到
+1535 GFLOPS，我们的 f32 MMA 跑到 2204–3326。** ⇒ 所谓「竞品快 2.4×」
+不可能是同一块 M4 GPU 上的 fp16 优势；那组数字多半来自别的后端
+（CoreML/ANE 或独显）。**在 fp32 + Metal 这条路里，我们已经在竞品结构前面。**
+
+**(c) 逐条 dispatch 的 barrier 是免费的，dispatch 机制也不贵。**
+`microbench` 直测：
+
+```
+[mb] 空命令缓冲 commit+wait 往返: 0.013 ms
+[mb]    1 条 dispatch（含逐条 barrier）: 0.199 ms
+[mb]  256 条 dispatch（含逐条 barrier）: 1.428 ms（边际 0.006 ms/条）
+[mb]  256 条 dispatch（无 barrier）  : 1.506 ms（边际 0.006 ms/条）
+[mb] 仿 173 条真实名 dispatch（守卫早退，纯开销）: 1.329 ms
+```
+
+⇒ §11.5 方向 (3)「每条 dispatch 后对整块 arena 下 barrier = 全序列化」
+**被证伪**：`QPPOCR_METAL_NO_BARRIER=1` 的端到端 A/B 是
+`Δtotal = −0.10 ms`（符号 2 负 1 正，噪声）。**整条 180 条计划的调度开销
+只有 1.33 ms**，不是瓶颈。§11「真正的瓶颈是 dispatch 条数」也在这一节
+正式作废。
+
+### 16.4 顺带量到的：MMA 在同形状上的真实收益（`conv8_mma_throughput`）
+
+| 形状 | `n_conv8` | `n_conv8_mma` | 倍数 |
+|---|---|---|---|
+| det m32640 c128→256 k1 | 1099.6 | 2204.2 | 2.00× |
+| det 34×60 c1024→512 k1 | 988.3 | 2479.0 | 2.51× |
+| det 34×60 c512→1024 k1 | 964.3 | 2437.1 | 2.53× |
+| det m32640 c32→64 k1 | 986.6 | 1238.4 | **1.26×** |
+| rec 6×68 c256→256 k1 | 663.9 | 1558.1 | 2.35× |
+| rec 6×208 c192→384 k1 | 874.2 | 2028.2 | 2.32× |
+
+`co=64` 那档只有 1.26×，因为 MMA 网格 `[m/64, co4/64, nb]` 的 y 维只剩 1
+（`det m32640 c32→64` 是 `[510, 1, 1]`）。**这是唯一一处「MMA 还可以再
+宽一点」的证据**：给 `co ≤ 64` 配一个 32 列变体（`n_conv8_mma3` 那边已经
+有 `n_conv8_mma3_n32` 这个先例）理论上能把这 1.26× 抬到 ~2×。det 里
+`co=64` 的 MMA 节点 14 个，但按 16.2 表它们**都不是重头**（`Conv.59/61/63/65/70/…`
+单条都 <1.5 ms）⇒ 期望收益在 1 ms 量级，先记着不做。
+
+### 16.5 本节的可复现命令
+
+```bash
+# 形状认全的计划转储（MMA 族 + n_convt）
+QPPOCR_METAL_PLAN_DUMP=1 target/release/qppocr bench bench/gpuhealth/corpus100/img-001.jpg \
+  --models models --device metal --tier medium --preset balanced --rounds 1 --quiet --workers 1 --det-only
+# 拼 GFLOPS 表
+python3 bench/gpuhealth/flopsmap.py bench/gpuhealth/logs/plan_det_shape.txt \
+  bench/gpuhealth/logs/prof_med_postmma.txt --start-line=466
+# 三条关假设
+BIN=$PWD/target/release/qppocr TIER=medium bench/gpuhealth/env_ab.sh 12 4 QPPOCR_METAL_WF16=1
+BIN=$PWD/target/release/qppocr TIER=medium bench/gpuhealth/env_ab.sh  8 3 QPPOCR_METAL_NO_BARRIER=1
+cargo test --release -p qppocr-metal -- --nocapture mm_sg_scan conv8_mma_throughput \
+  cmd_buffer_roundtrip dispatch_marginal_cost real_plan_replay_cost
+```
+
+> **`flopsmap.py` 的两个坑（踩过）**：`n_conv8_edge` 的参数块里 `m` 是整张
+> 平面、不是它真干的活，会把 FLOP 虚增 26 GFLOP（看起来 13700 GFLOPS，
+> 一眼假）；`n_convt` 按 `kW²` 算是**上界**，步长 2 时真实值约 1/4。
+> 读表时这两个必须手动打折扣。

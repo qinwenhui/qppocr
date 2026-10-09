@@ -807,8 +807,13 @@ impl MetalSession {
                     .filter(|p| p.get(3).copied() == Some(d.out_off))
                     .map_or(String::new(), |p| {
                         let g = |k: usize| p.get(k).copied().unwrap_or(0);
+                        // MMA 系内核的 P+4/P+5/P+9/P+10/P+11 与 `n_conv8` **逐字段
+                        // 同义**（见各 shader 头部：mDim/cols/cin4v/taps/kW），
+                        // 所以同一段格式化直接复用。少了 cin 就没法算 GFLOPS，
+                        // 也就没法把「谁跑得远低于天花板」排出来。
                         match d.kernel {
-                            "n_conv8" | "n_conv" => format!(
+                            "n_conv8" | "n_conv" | "n_conv8_mma" | "n_conv8_mma3"
+                            | "n_conv8_mma3_n32" | "n_conv8_edge" => format!(
                                 "  cin={:<4} co={:<4} taps={} ({}x{})  m={}",
                                 g(9) * 4,
                                 g(5),
@@ -824,6 +829,21 @@ impl MetalSession {
                                 g(9) / g(10).max(1),
                                 g(10),
                                 g(4)
+                            ),
+                            // 步长卷积：P+5=co、P+9=cin、P+13=kW、P+11/P+12=步长。
+                            // 打的是**输出位置数**（m）而 FLOPs 按每个输出位置
+                            // 累 kW² 个输入算 —— 步长 2 时实际贡献只有 1/4，
+                            // 所以这一项是**上界**，别拿它当准数。
+                            "n_convt" => format!(
+                                "  cin={:<4} co={:<4} taps={} ({}x{})  m={}  步长 {}x{}",
+                                g(9),
+                                g(5),
+                                g(13) * g(13),
+                                g(13),
+                                g(13),
+                                g(4),
+                                g(11),
+                                g(12)
                             ),
                             _ => String::new(),
                         }
