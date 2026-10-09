@@ -689,6 +689,11 @@ impl VulkanSession {
             // Vulkan 侧的 n_conv8 是 GLSL 版本、**没有** grid-stride 循环
             //（夹了就是少算），故不夹；上限是 Metal 内核的形状特性。
             grid_cap: 0,
+            // 权重的 fp16 存储**只做了 Metal 的一支**（`n_conv8h`，见
+            // n_conv8.metal）。Vulkan 的 GLSL 内核没有对应实现，开了计划
+            // 会派发到不存在的 `n_conv8h`——所以这里恒 false，等 Vulkan
+            // 侧也补上 fp16 变体再接线（`.comp` 与 `.metal` 必须成对改）。
+            weight_f16: false,
         }
         .build(&self.input_name, in_shape)?;
 

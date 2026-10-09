@@ -9,6 +9,32 @@
 // 存储/重排/act/残差语义与 n_conv 完全一致（见其头注释）。
 // 与 qppocr-gpu/shaders/n_conv8.comp 逐行对应——改语义必须两边同步。
 //
+// # 两个入口：`n_conv8`（f32 权重）与 `n_conv8h`（fp16 权重）
+//
+// 内核体只有一份（`conv8_body` 模板），两个 `kernel` 入口分别用
+// `float4`/`half4` 实例化——**热循环、网格、瓦片映射、累加顺序逐字相同**，
+// 唯一变量是「一条权重装载覆盖几个字节」：f32 下一个 `float4` 是 16 B，
+// fp16 下一个 `half4` 是 8 B，而**两者覆盖的是同样的 4 个输出通道**
+// （权重段内的元素序没变，只换了每个元素的宽度）。
+//
+// 所以内核里所有权重下标表达式一字不动，只有基址的折算变：
+// `w_off >> 2`（float4 下标）→ `w_off >> 1`（half4 下标）。`w_off` 以
+// u32 word 计，而静态段起始恒 16 B 对齐（`Layout::alloc_static`），
+// 故 `>>1` 是精确的、不需要额外对齐。
+//
+// 这支 fp16 路子的价值是**先量过才写的**：探针 `p_whalf` 与该模板的
+// 唯一语义差就是这一处 `>>`，实测热点 1×1 上 1.7~2.6×，吃掉整个权重
+// 装载成本的 73~88%（见 `bench/gpuhealth/logs/` 与 conv_probe.rs 的
+// 变体表）。精度代价在 CPU 侧量过：三层模型 CER 0.072~0.199%。
+//
+// 选择哪一支是**计划层**的事（`PlanBuilder::weight_f16`，默认 false），
+// 并且与权重怎么重排**必须成对**：`n_conv8h` 读 half4、`n_conv8` 读
+// float4，同一个 `w_off` 两种解释，错配就是静默读垃圾。
+//
+// ⚠️ Vulkan 侧的 `n_conv8.comp` **没有** fp16 变体（GLSL 版是离线编译的
+// SPIR-V 产物链，要同步加）。所以 Vulkan 的 `weight_f16` 恒 false——
+// 两边不同步时计划会派发到不存在的内核，是硬失败而非静默降级。
+//
 // **瓦片到线程的映射有两套**（见内核里 `taps == 1u && ...` 那一段的
 // 注释）：通道最快变化的默认序，与「窗口序」（1×1 且权重段 ≥ 256 KB
 // 时启用，把同一片权重的所有行组铺在一起，复用距离 9 MB → 123 KB）。
@@ -104,14 +130,21 @@ float4 apply_act(float4 v, uint act, float c1, float c2, float c3) {
     return v;
 }
 
-kernel void n_conv8(
-    device float4* d [[buffer(0)]],
-    device const uint* params [[buffer(1)]],
-    constant uint& p_off [[buffer(3)]],
-    uint3 gid3 [[thread_position_in_grid]],
-    uint3 tpg [[threads_per_grid]],
-    uint3 wg [[threadgroup_position_in_grid]])
+// `WVec` = 权重装载的向量视图（`float4` 或 `half4`），`WSHIFT` = 把 word
+// 偏移折算成该视图下标的右移量（4 B 元素 >>2，2 B 元素 >>1）。二者必须
+// 一起选——见文件头注释。
+template <typename WVec, uint WSHIFT>
+static inline void conv8_body(
+    device float4* d,
+    device const uint* params,
+    constant uint& p_off,
+    uint3 gid3,
+    uint3 tpg,
+    uint3 wg)
 {
+    // 权重的**另一个视图**：热循环里所有 `w[...]` 都走它，`d[...]` 仍是
+    // f32（输入/输出/bias/残差全不变）。
+    device WVec* w = (device WVec*)d;
     uint P = p_off;
     uint in_off = params[P + 0], w_off = params[P + 1], b_off = params[P + 2];
     uint out_off = params[P + 3];
@@ -135,7 +168,7 @@ kernel void n_conv8(
 
     // 整块不随 tile 变的基址（本来就在映射之后算，纯外提）。
     uint ib = (in_off >> 2) + b * inH * inW * cin4v;
-    uint wb = w_off >> 2;
+    uint wb = w_off >> WSHIFT;
     uint ob = (out_off >> 2) + b * mDim * nv;
 
     // stride = 本网格实际铺开的线程数（计划侧可能夹过）。不夹时
@@ -257,8 +290,11 @@ kernel void n_conv8(
                 }
                 uint wRow = wb + (t * cin4v + ci4) * 4u * nv + n4;
                 for (uint i = 0u; i < 4u; i++) {
-                    float4 wv0 = d[wRow + i * nv];
-                    float4 wv1 = d[wRow + i * nv + dcol];
+                    // WVec → float4：f32 视图下是恒等，fp16 视图下是
+                    // half4→float4 的升宽。这是整个 fp16 路径**唯一**的
+                    // 语义差，其余（下标、条数、累加顺序）逐字相同。
+                    float4 wv0 = float4(w[wRow + i * nv]);
+                    float4 wv1 = float4(w[wRow + i * nv + dcol]);
                     float s0 = g0[i], s1 = g1[i], s2 = g2[i], s3 = g3[i];
                     a0c0 += s0 * wv0; a1c0 += s1 * wv0; a2c0 += s2 * wv0; a3c0 += s3 * wv0;
                     a0c1 += s0 * wv1; a1c1 += s1 * wv1; a2c1 += s2 * wv1; a3c1 += s3 * wv1;
@@ -293,4 +329,30 @@ kernel void n_conv8(
         if (ok[2]) { d[ob + (m0 + 2u) * nv + n4] = a2c0; d[ob + (m0 + 2u) * nv + n4b] = a2c1; }
         if (ok[3]) { d[ob + (m0 + 3u) * nv + n4] = a3c0; d[ob + (m0 + 3u) * nv + n4b] = a3c1; }
     }
+}
+
+// 入口一：f32 权重（默认）。参数块语义、网格公式与改写前逐字相同。
+kernel void n_conv8(
+    device float4* d [[buffer(0)]],
+    device const uint* params [[buffer(1)]],
+    constant uint& p_off [[buffer(3)]],
+    uint3 gid3 [[thread_position_in_grid]],
+    uint3 tpg [[threads_per_grid]],
+    uint3 wg [[threadgroup_position_in_grid]])
+{
+    conv8_body<float4, 2u>(d, params, p_off, gid3, tpg, wg);
+}
+
+// 入口二：fp16 权重。**参数块完全一样**——`w_off` 还是同一个 word 偏移，
+// 只是内核按 half4 去折它（权重段由 `repack_conv_w_f16` 压成半个长度）。
+// 计划层用 `PlanBuilder::weight_f16` 选，见文件头。
+kernel void n_conv8h(
+    device float4* d [[buffer(0)]],
+    device const uint* params [[buffer(1)]],
+    constant uint& p_off [[buffer(3)]],
+    uint3 gid3 [[thread_position_in_grid]],
+    uint3 tpg [[threads_per_grid]],
+    uint3 wg [[threadgroup_position_in_grid]])
+{
+    conv8_body<half4, 1u>(d, params, p_off, gid3, tpg, wg);
 }

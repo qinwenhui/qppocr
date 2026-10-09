@@ -160,6 +160,13 @@ pub(crate) struct MetalSession {
     /// 时间步写 (val, idx) 对——读回从 T×V×4 B/行降到 8 B/行。引擎按
     /// `rec_argmax_pairs` 探测并走 ctc_decode_pairs。
     pub(crate) argmax_exit: bool,
+    /// 权重按 fp16 存（`QPPOCR_METAL_WF16`，默认 **false = f32**）。
+    /// 会话级常量——同一会话里同一份权重只重排一次，不存在中间态。
+    /// 见 [`weight_f16`]。
+    ///
+    /// `pub(crate)` 是为了测试能直连两条路对拍（同 `batch_grain` 的用法）；
+    /// 计划是**惰性构建**的，所以构造后、首次 run 前改它仍然生效。
+    pub(crate) weight_f16: bool,
     /// 执行串行锁：每 run 重编码 + 同步等待不支持并发在飞（deferred
     /// 流水是 P4 的性能项；trait 默认的同步 run_deferred 语义等价）。
     run_lock: Mutex<()>,
@@ -222,6 +229,52 @@ fn group_cap() -> u32 {
     }
 }
 
+/// 权重的 fp16 存储：`QPPOCR_METAL_WF16` 显式给值（`1`/`0`）时用它，
+/// 否则 **f32**（精度是默认立场——用户侧的既定要求「默认就是 32 精度」）。
+///
+/// 量过的账——**探针先算、落地后复测**，两栏都在：
+///
+/// | | 热点 1×1 | 3×3 | CTC 头 | 精度代价（CPU 全模型 f16 = 上界） |
+/// |---|---|---|---|---|
+/// | 探针 `p_whalf` 预测 | 1.7~2.1× | 1.26~1.45× | 2.59× | CER 0.072~0.199% |
+///
+/// 落地后的**端到端实测**（2026-10-09，`bench/gpuhealth/ab.sh` 交错四轮
+/// 取配对中位数；精度用 `wf16_ab.sh` 走同一份 `models/`）：
+///
+/// | tier | 总耗时（40 图/轮） | 配对中位 Δ | 加速 | 逐图行数变化 | 行文本不同 | CER |
+/// |---|---|---|---|---|---|---|
+/// | tiny | 53.6 → 45.6 ms | −7.50 ms | 1.17× | 1/100 张 | 6/1096 | 0.072% |
+/// | small | 143 → 98 ms | −43.05 ms | 1.45× | 0 张 | 0/1041 | **0.000%** |
+/// | medium | 866 → 485 ms | −380.65 ms | 1.79× | 0 张 | 5/1034 | 0.017% |
+///
+/// 三档全部**低于**上表那个上界（0.199/0.072/0.165 分别对应 tiny/small/
+/// medium），与「只覆盖部分层」的预期一致。
+///
+/// 归因是**单变量**的（medium det 逐内核剖析，`QPPOCR_GPU_KERNEL_PROF=1`）：
+/// `n_conv8` 191.01 ms → `n_conv8h` 99.16 ms（**1.93×**），而 `n_conv_dw`
+/// 23.5→21.9、`n_convt` 11.1→9.0、`n_elem` 3.9→4.1、`n_channel` 2.4→2.4、
+/// `n_reduce_*` 0.97→0.92——**只有被改的那条内核动了**，其余是干净的对照列。
+/// 静态段同步减半（medium det 62.0→31.4 MB；rec 148.1→110.1 MB，未全减
+/// 是因为 `n_conv`/`n_conv_dw`/`n_convt` 与非偶 `nv` 的 `n_conv8` 仍是 f32）。
+///
+/// 几点如实记下、别被 1.79× 冲昏头：① 收益随模型变大而**变大**
+/// （tiny 1.17× < small 1.45× < medium 1.79×），小模型权重占比低时几乎
+/// 白给；② tiny 有 **1 张图的行数变了**（检测级事件，不是识别级）；
+/// ③ 行文本变的那几处里有 `Paddle0CR`→`PaddleOCR`、`PaddIeOCR`→
+/// `PaddleOCR` 这种**改对了**的，也有反方向的——数量级只有 0.5%，说明
+/// 这些行本来就在判定边界上，两种精度都可能倒向任一边，不是「fp16 更准」。
+///
+/// 留这个开关（而不是直接改默认）的理由有两条：① 精度是产品决策，默认
+/// 不能悄悄变；② 它是「一次可以逐位回到改前」的对照——否则量到端到端
+/// 差异时说不清是哪一步带来的。关掉时内核选择、重排、plan 布局**逐位**
+/// 回到改前（`n_conv8` + `repack_conv_w`），不是「差不多」。
+fn weight_f16() -> bool {
+    matches!(
+        std::env::var("QPPOCR_METAL_WF16").as_deref(),
+        Ok("1") | Ok("on") | Ok("true")
+    )
+}
+
 impl MetalSession {
     pub(crate) fn new(
         ctx: Arc<super::Inner>,
@@ -257,6 +310,18 @@ impl MetalSession {
             batch_grain: 1,
             exact_width: false,
             argmax_exit: false,
+            weight_f16: {
+                let on = weight_f16();
+                if on {
+                    // 非默认状态一律**声明**（同 QPPOCR_GPU_STAGES 的纪律）：
+                    // 这是个会动精度的开关，静默生效会让人对着数字猜。
+                    eprintln!(
+                        "[metal] QPPOCR_METAL_WF16：权重按 fp16 存储\
+                         （走 n_conv8 的层），精度代价见 weight_f16() 文档"
+                    );
+                }
+                on
+            },
             run_lock: Mutex::new(()),
             prof_left: std::sync::atomic::AtomicUsize::new(
                 std::env::var("QPPOCR_GPU_KERNEL_PROF")
@@ -373,6 +438,8 @@ impl MetalSession {
             // 网格上限：默认 [`GROUP_CAP_DEFAULT`] = 0（不夹）。夹网格在真实
             // 流水线上实测无收益、略亏，理由与实测表见该常量的文档。
             grid_cap: group_cap(),
+            // 权重的 fp16 存储（默认关）。见 [`weight_f16`]。
+            weight_f16: self.weight_f16,
         }
         .build(&self.input_name, in_shape)?;
 

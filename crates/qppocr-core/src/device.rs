@@ -67,8 +67,11 @@ pub enum ModelRole {
 /// 空壳起步（`#[non_exhaustive]`）：更多旋钮后续版本加，
 /// 调用方一律经 [`Default`] 构造后按需覆写字段。
 ///
-/// 注：全部后端（CPU / Metal / Vulkan）都是 **f32**；没有精度旋钮，
-/// 也不打算有——见 `qppocr-gpu/src/nhwc.rs` 头注释。
+/// 注：激活与累加在所有后端都是 **f32**。唯一的精度旋钮是 Metal 侧
+/// 的**权重存储**（`QPPOCR_METAL_WF16`，默认关）——它只把权重压成
+/// fp16，张量类型/解析器/模型文件全不受影响，见
+/// `qppocr-gpu/src/nhwc.rs` 与 `crates/qppocr-metal/shaders/n_conv8.metal`
+/// 的头注释。
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct SessionOptions {

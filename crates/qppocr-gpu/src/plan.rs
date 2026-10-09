@@ -169,6 +169,23 @@ pub struct PlanBuilder<'a> {
     /// 就是少算。**数值不受影响**：stride 只改「哪个线程算哪个 tile」，
     /// 每个输出的加法次序一字未动。
     pub grid_cap: u32,
+    /// 权重按 fp16 存储（`n_conv8h`）——**默认 false = f32**。
+    ///
+    /// 只影响 `n_conv8` 这条路径（taps 任意、`nv%2==0` 的稠密 conv 与
+    /// 「1×1 conv 语义」的常量 MatMul）；`n_conv`/`n_conv_dw`/`n_convt`
+    /// 与所有激活/累加仍是 f32。切换是**会话级**的：同一会话里同一份
+    /// 权重只会被重排一次（`repack_cache` 按名键控），所以不存在
+    /// 「一半 fp16 一半 f32」的中间态。
+    ///
+    /// 为什么值得：`n_conv8` 的热点 1×1 上权重装载占 58%，而 fp16 把这段
+    /// 足迹砍半。探针 `p_whalf`（与 `p_base` 唯一语义差就是权重基址
+    /// `>>2`→`>>1`）实测 1.7~2.6×，吃掉整个权重装载成本的 73~88%。
+    ///
+    /// 落地后端到端复核过：三档端到端加速 1.17×（tiny）/1.45×（small）/
+    /// 1.79×（medium），CER 0.072%/0.000%/0.017%；逐内核归因里**只有**
+    /// `n_conv8→n_conv8h` 这条动了（1.93×），其余内核是干净的对照列。
+    /// 完整的表与判读见 `MetalSession` 的 `weight_f16()` 文档。
+    pub weight_f16: bool,
 }
 
 impl PlanBuilder<'_> {
@@ -851,6 +868,16 @@ impl PlanBuilder<'_> {
                 let group = planner::get_i(n.attr("group"), 1);
                 if group == 1 {
                     let (co, ci) = (ws[0] as usize, ws[1] as usize);
+                    // 寄存器分块：Co%8==0 走 m4×n8（两列共享输入 gather，
+                    // 输入流量减半）；奇数列回 m4×n4 基线。
+                    //
+                    // 这段必须**提到取权重之前**：走哪条内核决定权重怎么存
+                    // ——`n_conv8` 有 fp16 变体（`n_conv8h` / `repack_conv_w_f16`），
+                    // `n_conv` 没有。原来 nv 在参数块之后才算，是纯净值，
+                    // 现在成了权重存储的前提。
+                    let nv = cpad4(ws[0]) / 4;
+                    let use8 = nv % 2 == 0;
+                    let fp16 = use8 && self.weight_f16;
                     let w_off = n_weight_off(
                         self.initializers,
                         &n.inputs[1],
@@ -858,7 +885,13 @@ impl PlanBuilder<'_> {
                         w_upload,
                         w_offs,
                         self.repack_cache,
-                        |t| repack_conv_w(&t.f32, co, ci, kh, kw),
+                        |t| {
+                            if fp16 {
+                                nhwc::repack_conv_w_f16(&t.f32, co, ci, kh, kw)
+                            } else {
+                                repack_conv_w(&t.f32, co, ci, kh, kw)
+                            }
+                        },
                     )?;
                     let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
                     // 残差（fuse_conv_residual 折进 conv 的 inputs[3]；
@@ -890,17 +923,13 @@ impl PlanBuilder<'_> {
                         .f(c2)
                         .f(c3)
                         .u(r_off);
-                    // 寄存器分块：Co%8==0 走 m4×n8（两列共享输入 gather，
-                    // 输入流量减半）；奇数列回 m4×n4 基线。
                     // `n_conv8` 有 grid-stride 循环 ⇒ 网格可夹到 grid_cap；
                     // `n_conv` 没有 ⇒ 只能用 `div256`。
-                    let nv = cpad4(ws[0]) / 4;
-                    if nv % 2 == 0 {
-                        Ok(vec![(
-                            "n_conv8",
-                            pb,
-                            [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1],
-                        )])
+                    // 权重存储与内核**必须成对**选：`n_conv8h` 读 half4、
+                    // `n_conv8` 读 float4，同一个 `w_off` 两种解释。
+                    if use8 {
+                        let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
+                        Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1])])
                     } else {
                         Ok(vec![(
                             "n_conv",
@@ -1217,6 +1246,15 @@ impl PlanBuilder<'_> {
                         n.inputs[1]
                     ))
                 })?;
+                // `cols`/`nv` 提到取权重之前——与 Conv 分支同理：走哪条内核
+                // 决定权重怎么存（`n_conv8h` 吃 fp16，`n_conv8` 吃 f32）。
+                let (_, cols) = rc
+                    .get(out)
+                    .copied()
+                    .ok_or_else(|| Error::Graph("MatMul 输出无 rc".into()))?;
+                let nv = cols / 4;
+                let use8 = nv % 2 == 0;
+                let fp16 = use8 && self.weight_f16;
                 let w_off = n_weight_off(
                     self.initializers,
                     &n.inputs[1],
@@ -1243,14 +1281,13 @@ impl PlanBuilder<'_> {
                                 dst[i] = src[i * nn];
                             }
                         }
-                        nhwc::repack_conv_w(&w_t, nn, k, 1, 1)
+                        if fp16 {
+                            nhwc::repack_conv_w_f16(&w_t, nn, k, 1, 1)
+                        } else {
+                            nhwc::repack_conv_w(&w_t, nn, k, 1, 1)
+                        }
                     },
                 )?;
-                let (_, cols) = rc
-                    .get(out)
-                    .copied()
-                    .ok_or_else(|| Error::Graph("MatMul 输出无 rc".into()))?;
-                let nv = cols / 4;
                 let mut pb = ParamBlock::new();
                 pb.u(off_of(&n.inputs[0])?)
                     .u(w_off)
@@ -1273,12 +1310,9 @@ impl PlanBuilder<'_> {
                     .f(1.0)
                     .f(0.5)
                     .u(OFF_NONE);
-                if nv % 2 == 0 {
-                    Ok(vec![(
-                        "n_conv8",
-                        pb,
-                        [capped(m_dim.div_ceil(4) * (nv / 2)), 1, 1],
-                    )])
+                if use8 {
+                    let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
+                    Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), 1, 1])])
                 } else {
                     Ok(vec![("n_conv", pb, [div256(m_dim.div_ceil(4) * nv), 1, 1])])
                 }

@@ -450,77 +450,13 @@ fn build_conv_case_half(device: &metal::DeviceRef, c: &ConvCase) -> ConvProbe {
     build_conv_case_batch(device, c, 1, true)
 }
 
-/// f32 → f16 位型，**就近偶数**舍入（与 IEEE binary16、与 GPU 上的
-/// `(half)f` 同规则）。
+/// f32 → f16 位型，**就近偶数**舍入。
 ///
-/// 手写而不是用标准库的 `f16`：后者到 1.97 还是 unstable feature
-/// （issue #116909），而本仓库不为一次微基准引第三方 `half` 依赖。
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let mant = bits & 0x007f_ffff;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    if exp == 0xff {
-        // inf / NaN：NaN 保留“非零尾数”这一位，免得把 NaN 洗成 inf。
-        let m = if mant != 0 { 0x0200 | (mant >> 13) as u16 } else { 0 };
-        return sign | 0x7c00 | m;
-    }
-    let e = exp - 127 + 15;
-    if e >= 0x1f {
-        return sign | 0x7c00; // 超出 f16 范围 → inf（与硬件一致）
-    }
-    if e <= 0 {
-        if e < -10 {
-            return sign; // 小到连次正规都不够 → 0
-        }
-        let m = mant | 0x0080_0000; // 补回隐含首位
-        let shift = (14 - e) as u32; // 14..=24
-        let mut q = m >> shift;
-        let rem = m & ((1u32 << shift) - 1);
-        let half = 1u32 << (shift - 1);
-        if rem > half || (rem == half && (q & 1) == 1) {
-            q += 1; // 进位到 0x400 时自然滚成最小正规数，位型正确
-        }
-        return sign | q as u16;
-    }
-    let mut h = ((e as u32) << 10) | (mant >> 13);
-    let rem = mant & 0x1fff;
-    if rem > 0x1000 || (rem == 0x1000 && (h & 1) == 1) {
-        h += 1; // 进位溢出到指数域是正确行为
-    }
-    sign | h as u16
-}
-
-/// 期望值由 Python `struct.pack('<e', v)` 生成（CPython 实现的就是 IEEE
-/// binary16 就近偶数）——**不自己算一遍再自己对**，那样等于没测。
-/// `p_whalf` 那一列的误差读数只有在这个转换是对的前提下才有意义。
-#[test]
-fn f32_to_f16_matches_ieee_reference() {
-    let cases: &[(f32, u16)] = &[
-        (0.0, 0x0000),
-        (-0.0, 0x8000),
-        (1.0, 0x3c00),
-        (-1.0, 0xbc00),
-        (0.5, 0x3800),
-        (1.0 / 3.0, 0x3555),
-        (65504.0, 0x7bff), // f16 最大正规数
-        (65520.0, 0x7c00), // 溢出：就近偶数恰好进位到 inf
-        (65536.0, 0x7c00),
-        (1e-5, 0x00a8),
-        (6e-8, 0x0001),            // 次正规
-        (1e-9, 0x0000),            // 太小 → 0
-        (6.103515625e-05, 0x0400), // 最小正规数
-        (5.960464477539063e-08, 0x0001), // 最小次正规数
-        (0.1, 0x2e66),
-        (-123.456, 0xd7b7),
-        (f32::INFINITY, 0x7c00),
-        (f32::NEG_INFINITY, 0xfc00),
-    ];
-    for &(v, want) in cases {
-        let got = f32_to_f16_bits(v);
-        assert_eq!(got, want, "f32 {v} → 期望 0x{want:04x}，实得 0x{got:04x}");
-    }
-}
+/// 实现在 `qppocr_gpu::nhwc::f32_to_f16_bits`——**只有一份**：生产侧的
+/// fp16 权重打包（`repack_conv_w_f16`）与这里的探针必须用同一个函数，
+/// 否则「探针量到的收益能不能兑现成生产收益」就多了一个假变量。那边
+/// 自带 CPython 参考值对拍测试，这里不再抄一遍测试。
+use qppocr_gpu::nhwc::f32_to_f16_bits;
 
 /// 同 `build_conv_case`，但输入/输出段按 `batch` 份铺开、网格 y = `batch`。
 /// 内核里 `b = wg.y`，权重各份**共用**（只读一份），输入与输出各占一份。

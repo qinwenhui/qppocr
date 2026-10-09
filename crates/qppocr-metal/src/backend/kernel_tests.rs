@@ -451,6 +451,199 @@ fn det_session_end_to_end() {
     assert!(max_abs < 5e-2, "概率图极值偏差超容差: {max_abs}");
 }
 
+/// 同图同输入，`weight_f16` **关 / 开**两条 Metal 路各跑一遍，返回两份
+/// 输出（关 = f32 参考）。
+///
+/// 交付**原始输出**而不是预先算好的误差统计：判「这条路径对不对」的
+/// 尺子取决于下游怎么用——det 是阈值二值化、rec 是 argmax，两者都不是
+/// 「和 f32 差多少」。把统计留在各测试里，才能对着**消费端**判。
+///
+/// 两条路各自从 `bytes` 装配（权重是 move 语义，各需一份）。
+fn f16_vs_f32_outputs(
+    ctx: &MetalContext,
+    bytes: &[u8],
+    shape: &[i64],
+    seed0: u64,
+) -> (Vec<f32>, Vec<f32>, Vec<i64>) {
+    use qppocr_core::executor::Session;
+    use qppocr_core::tensor::{DType, Tensor};
+    use qppocr_kernels::buf::F32Buf;
+
+    let n: usize = shape.iter().product::<i64>() as usize;
+    let mut seed = seed0;
+    let mut buf = F32Buf::with_zeroed(n);
+    for v in buf.as_mut_slice().iter_mut() {
+        *v = lcg(&mut seed);
+    }
+    let mk = |nm: &str| -> Tensor {
+        let mut b = F32Buf::with_zeroed(n);
+        b.as_mut_slice().copy_from_slice(buf.as_slice());
+        Tensor {
+            name: nm.into(),
+            shape: shape.to_vec(),
+            dtype: DType::F32,
+            f32: b,
+            i64: Vec::new(),
+        }
+    };
+    let run = |tag: &str, f16: bool| -> (Vec<f32>, Vec<i64>) {
+        let s = Session::from_memory(bytes, tag).unwrap();
+        let in_name = s
+            .graph
+            .inputs
+            .iter()
+            .find(|s| !s.is_empty())
+            .cloned()
+            .unwrap();
+        let (graph, init) = s.into_parts();
+        let mut gpu = super::session::MetalSession::new(ctx.inner.clone(), graph, init).unwrap();
+        // 计划是惰性构建的：构造后、首次 run 前改它仍然生效。
+        gpu.weight_f16 = f16;
+        gpu.batch_grain = shape[0] as i32;
+        let out =
+            qppocr_core::device::DeviceSession::run(&gpu, vec![(in_name.clone(), mk(&in_name))])
+                .unwrap();
+        (out[0].f32.as_slice().to_vec(), out[0].shape.clone())
+    };
+    let (a, shape_a) = run("metal.f16.off", false);
+    let (b, shape_b) = run("metal.f16.on", true);
+    assert_eq!(shape_a, shape_b, "两条路输出形状不一致");
+    (a, b, shape_a)
+}
+
+/// 两条路的逐元素差统计：`(max|diff|, mean|diff|, 非零差个数)`。
+fn diff_stats(a: &[f32], b: &[f32]) -> (f32, f32, usize) {
+    assert_eq!(a.len(), b.len(), "两条路输出元素数不一致");
+    let mut max_abs = 0.0f32;
+    let mut sum = 0.0f64;
+    let mut ndiff = 0usize;
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert!(x.is_finite() && y.is_finite(), "出现 NaN/inf —— 多半是权重索引错位");
+        let d = (x - y).abs();
+        if *x != *y {
+            ndiff += 1;
+        }
+        max_abs = max_abs.max(d);
+        sum += d as f64;
+    }
+    (max_abs, (sum / a.len() as f64) as f32, ndiff)
+}
+
+/// 端到端：**fp16 权重**（`n_conv8h`）与同一张图的 f32 路对拍。
+///
+/// 三件事，缺一条这条路径就不可信：
+///
+/// 1. **MSL 模板真的编出了 `n_conv8h`**——`KernelSet` 里没这个名字的话，
+///    派发时会硬报错（`dispatch` 查表失败），不会静默降级。
+/// 2. **计划真的换了内核**——判据是 `ndiff > 0`。若 `weight_f16` 没被
+///    计划层读到，两条路会**逐位相同**；「有非零差」正是「换过去了」的
+///    证明，比任何计数器都直接。
+/// 3. **换过去之后下游判得一样**——见下。
+///
+/// ## 判据是「二值化后有没有变」，不是「和 f32 差多少」
+///
+/// 本路径唯一的**结构性**风险是内核与打包配对错：`n_conv8h` 与
+/// `n_conv8` 解释同一个 `w_off`（half4 vs float4），配错了内核照样跑完，
+/// 只是读到**别人的字节**。这类错误落在输出上是什么样？——读错通道的
+/// 权重等于换了个网络，概率图会被推过下游阈值。
+///
+/// 所以尺子取消费端：det 的出口是 `det_thresh`（默认 0.2）二值化，
+/// 那就数**翻转的像素占比**。它同时是「不是垃圾」和「下游无感」两个
+/// 主张的判据，且不像「误差 ÷ 量程」那样在下游非线性（sigmoid 饱和区
+/// 把误差压扁、二值化再放大）时失真——随机输入下 det 输出几乎是常数
+/// 图，量程只有 2.8e-3，用绝对阈值或量程比都只会量到「图有多平」。
+#[test]
+fn det_session_f16_weights_end_to_end() {
+    let Some(ctx) = open_or_skip() else { return };
+    let p = std::path::Path::new("../../models/tiny/det.onnx");
+    if !p.is_file() {
+        eprintln!("[metal] 无模型，跳过");
+        return;
+    }
+    let bytes = std::fs::read(p).unwrap();
+    let (a, b, shape) = f16_vs_f32_outputs(&ctx, &bytes, &[1, 3, 960, 864], 0x5f16_0001);
+    eprintln!("[metal] det 输出形状 {shape:?}");
+    let (max_abs, mean_abs, ndiff) = diff_stats(&a, &b);
+
+    // 消费端：det 的二值化门限（`Config::det_thresh` 默认 0.2）。
+    const DET_THRESH: f32 = 0.2;
+    let flipped = a
+        .iter()
+        .zip(b.iter())
+        .filter(|(x, y)| (**x > DET_THRESH) != (**y > DET_THRESH))
+        .count();
+    let flip_frac = flipped as f64 / a.len() as f64;
+    eprintln!(
+        "[metal] det fp16 权重 vs f32：max|diff| = {max_abs:.3e}，mean|diff| = {mean_abs:.3e}，\
+         非零差 {ndiff}/{}，二值化翻转 {flipped}（{:.3e}）",
+        a.len(),
+        flip_frac
+    );
+    assert!(ndiff > 0, "fp16 权重没有生效：两条路逐位相同（weight_f16 没被计划读到？）");
+    // 千分之一是一个**很松**的界：真要读错通道的权重，翻转率是 O(1)
+    // （整块前景/背景判反），不是 O(1e-3)。
+    assert!(
+        flip_frac <= 1e-3,
+        "二值化翻转 {flip_frac:.3e}（>1e-3）——不是舍入级，查内核与打包是否配对"
+    );
+}
+
+/// 同上，rec（small）——**CTC 分类头**（`MatMul.12` → `n_conv8h`）是
+/// fp16 收益最大的一条（权重 9 MB、探针实测 2.59×），也是数值上最该
+/// 盯的一条：18710 类 argmax，权重一窄，临界行的翻转最先在这里出现。
+///
+/// 判据同样是消费端：rec 的出口是**逐帧 argmax**（GPU 侧
+/// `n_exit3_argmax` 直接吐 (val, idx) 对）。所以数 **argmax 不同的帧
+/// 占比**——它逐字对应 CER 的驱动量，而且不像 float 差值那样需要挑阈值：
+/// 要么同一类，要么不是。
+///
+/// **门是零容忍**（`disagree == 0`），依据是两层：读错通道的话 argmax 会
+/// 退化成近似随机，18710 类里命中率约 1/18710，瞬间就炸；而本机本模型
+/// 实测就是 0/384 帧（同一批权重下两条路的 argmax 逐帧一致）。零容忍
+/// 同时也是一条**回归**门：将来任何改动只要让两个精度在某一帧上分道，
+/// 这里就会红——那正是需要有人看一眼的时刻，而不是默默放过的噪声。
+/// （CPU 侧全量转 fp16 的 CER 增量 tiny 0.199% / small 0.072% /
+/// medium 0.165% 说明真实语料上的翻转确实存在，但那是**全部**权重都转
+/// 的代价；这里只转走 `n_conv8` 的那些层，且这条测试的输入是随机张量，
+/// 与语料分布无关。）
+#[test]
+fn rec_session_f16_weights_end_to_end() {
+    let Some(ctx) = open_or_skip() else { return };
+    let p = std::path::Path::new("../../models/small/rec.onnx");
+    if !p.is_file() {
+        eprintln!("[metal] 无 small rec 模型，跳过");
+        return;
+    }
+    let bytes = std::fs::read(p).unwrap();
+    let (a, c, shape) = f16_vs_f32_outputs(&ctx, &bytes, &[8, 3, 48, 384], 0x5f16_0002);
+    eprintln!("[metal] rec 输出形状 {shape:?}");
+    let (max_abs, mean_abs, ndiff) = diff_stats(&a, &c);
+    // 形状是 [B, T, V]，V（类别数）是最后一维——**从张量读**，不硬编码：
+    // 硬编码错了会把「帧」切在某行的中间，argmax 比的就是错位的数据。
+    let v = *shape.last().expect("输出无维度") as usize;
+    assert_eq!(a.len() % v, 0, "输出元素数不是 V 的整数倍，形状解读错了");
+    let nframes = a.len() / v;
+
+    let argmax = |x: &[f32], frame: usize| -> usize {
+        let s = &x[frame * v..(frame + 1) * v];
+        let mut best = 0usize;
+        for (i, val) in s.iter().enumerate() {
+            if *val > s[best] {
+                best = i;
+            }
+        }
+        best
+    };
+    let disagree = (0..nframes).filter(|f| argmax(&a, *f) != argmax(&c, *f)).count();
+    eprintln!(
+        "[metal] rec fp16 权重 vs f32：max|diff| = {max_abs:.3e}，mean|diff| = {mean_abs:.3e}，\
+         非零差 {ndiff}/{}，argmax 不一致 {disagree}/{nframes} 帧",
+        a.len()
+    );
+    assert!(ndiff > 0, "fp16 权重没有生效：两条路逐位相同");
+    assert_eq!(disagree, 0, "有 {disagree} 帧 argmax 变了——查内核与打包是否配对");
+}
+
 /// 端到端：真实 tiny rec，Metal 整图 vs CPU executor——概率图容差 +
 /// softmax 行和 + 每时间步 top-1 对齐（判据口径与 vulkan 侧
 /// rec_session_end_to_end 同源；直接构造会话 → 全量概率输出）。

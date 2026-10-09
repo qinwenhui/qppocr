@@ -30,7 +30,10 @@ const SHADERS: &[(&str, &str)] = &[
     ("n_entry", include_str!("../../shaders/n_entry.metal")),
     ("n_elem", include_str!("../../shaders/n_elem.metal")),
     ("n_conv", include_str!("../../shaders/n_conv.metal")),
+    // 同一份源码两个入口：`n_conv8`（f32 权重）与 `n_conv8h`（fp16 权重）。
+    // 内核体只有一份模板，见该 .metal 的头注释。
     ("n_conv8", include_str!("../../shaders/n_conv8.metal")),
+    ("n_conv8h", include_str!("../../shaders/n_conv8.metal")),
     ("n_conv_dw", include_str!("../../shaders/n_conv_dw.metal")),
     ("n_convt", include_str!("../../shaders/n_convt.metal")),
     ("n_pool", include_str!("../../shaders/n_pool.metal")),
