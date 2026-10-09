@@ -1062,8 +1062,19 @@ impl DeviceSession for MetalSession {
             .and_then(|v| v.parse().ok())
             .filter(|&n| n >= 1)
             .unwrap_or(1);
-        let rec_reps = |k: &str, _node: &str| -> u32 {
-            if self.argmax_exit && rep_rec.iter().any(|s| s == k) {
+        // 匹配规则与上面的 `skip_rec` 一致：裸名比内核名，`@名` 比节点名。
+        //
+        // `@` 这一支是**补的**：原实现形参写作 `_node` 直接丢掉，于是
+        // `QPPOCR_METAL_REC_REPEAT=@Conv.42` 恒不命中、delta 恒为 0——2026-10-09
+        // 那次「@Node 探针测出 0」不是「dispatch 免费」，是**仪器没接线**。
+        // 逐节点量「同一个 conv 在生产里 vs 孤立跑」的差价全靠它（§13.3 留的
+        // 209 vs 422 GB/s 那个开口），所以必须真的能选中单个节点。
+        let rec_reps = |k: &str, node: &str| -> u32 {
+            let hit = rep_rec.iter().any(|s| match s.strip_prefix('@') {
+                Some(n) => n == node,
+                None => s == k,
+            });
+            if self.argmax_exit && hit {
                 rep_rec_n
             } else {
                 1

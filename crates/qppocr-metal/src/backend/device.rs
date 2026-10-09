@@ -31,7 +31,29 @@ pub(crate) fn submit_compute_timed(
     record: impl FnOnce(&metal::ComputeCommandEncoderRef),
 ) -> Result<(f64, f64)> {
     let cb = queue.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
+    // 派发类型（诊断开关，`QPPOCR_METAL_CONCURRENT=1`）——**已实测证伪，留着
+    // 是为了不再试第二遍**。
+    //
+    // 猜想：「`Serial` 下每条 dispatch 之后都完整排空+重启，而 rec 一图
+    // 676 条 conv8（grid 只有 9~17 个线程组、单条几十 µs）会把排空开销摊到
+    // 每条上，改用 `Concurrent` 放开重叠即可吃掉这笔」。§9.9 那条「NO_BARRIER
+    // 只值 −0.20 ms」不能用来反驳它——serial 派发类型下屏障本就冗余，删掉当然
+    // 没变化，真正没被否证的变量就是这里的派发类型，所以必须单独量。
+    //
+    // 2026-10-09 实测（`bench/gpuhealth/conc_ab.sh`，20 图 × 3 轮，奇偶轮换序，
+    // 同一二进制只切环境变量）：中位配对差 **Δtotal = +0.90 ms（并发略慢）**，
+    // 单向为正 8/10、负 2/10，`det` 列几乎不动（Δ +0.00）⇒ 效应真实且只落在
+    // rec 上，不是噪声。数值先验：两版 OCR 输出 218 行逐字节相同，所以这不是
+    // 「并发不安全」，而是**根本没得重叠**——相邻 dispatch 本来就互为读写依赖，
+    // `Serial` 只是把依赖图已经强加的顺序写明了。
+    //
+    // 结论：派发类型**不是** rec conv8 慢于孤立微基准的自变量，别再往这条路上
+    // 找。（往前数被否掉的还有：epilogue 融合、屏障、权重带宽、跨图 batching。）
+    let enc = if std::env::var_os("QPPOCR_METAL_CONCURRENT").is_some() {
+        cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
+    } else {
+        cb.new_compute_command_encoder()
+    };
     let t0 = std::time::Instant::now();
     record(enc);
     enc.end_encoding();
