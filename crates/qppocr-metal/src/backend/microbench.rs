@@ -702,6 +702,41 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
     }
 }
 
+/// `n_conv8_edge` 的**紧凑网格**：只铺真正含边框像素的行组。
+///
+/// 生产在 `qppocr-gpu/src/plan.rs` 的 k×k 派发支，内核在
+/// `shaders/n_conv8.metal` 的 EDGE 枚举段。**这里是第三份独立拷贝，故意
+/// 的**：三份不一致时测试就该红，而不是让探针量到一个和生产不同的网格、
+/// 把「内核慢」和「网格算错」混成一个数。
+///
+/// 契约（`k` = 方块边长，对称 pad ⇒ `padT == padL == (k-1)/2`）：
+///
+/// ```text
+///   gh     = outW / 4              每行行组数（行组 = 一行内连续 4 个 x）
+///   gL     = ceil(padL / 4)        中带每行头/尾各铺几个行组
+///   tiles  = (2*(padT*gh) + (outH-2*padT)*2*gL) * nh      nh = nDim/8
+///   groups = ceil(tiles / 256)     与 `n_conv8` 同线程组尺寸、无 grid-stride
+/// ```
+///
+/// 两条门禁与 plan.rs、内核头注释逐字相同，这里用 `assert!` 顶住：`outW%4`
+/// 保证行组不跨行，`2*gL <= gh` 保证中带头尾不重叠（重叠 = 同一行组枚举
+/// 两次 = **写两次**，静默错）。
+fn edge_groups(pr: &ConvProbe, k: u32) -> [u32; 3] {
+    assert!(pr.out_w % 4 == 0, "紧凑网格门禁 outW%4（outW={}）", pr.out_w);
+    let pad = k / 2;
+    let gh = pr.out_w / 4;
+    let gl = (pad + 3) / 4;
+    assert!(2 * gl <= gh, "紧凑网格门禁 2*gL<=gh（gL={gl} gh={gh}）");
+    let nh = (pr.co4 / 4) / 2;
+    let tiles = (2 * (pad * gh) + (pr.out_h - 2 * pad) * 2 * gl) * nh;
+    // 上界对拍：紧凑网格必须是**全平面网格**的子集再被筛掉一些。`pr.groups`
+    // 是 `build_conv_case` 按旧的 `ceil(m/4)*nh` 算的，公式来源不同 ⇒ 这条
+    // 断言是有内容的（枚举式写错量级会当场红）。
+    let all = (pr.out_h * pr.out_w).div_ceil(4) * nh;
+    assert!(tiles <= all, "紧凑网格比全平面还大：{tiles} > {all}");
+    [tiles.div_ceil(256), 1, 1]
+}
+
 // ---------------------------------------------------------------------------
 // depthwise（`n_conv_dw`）的用例构造
 // ---------------------------------------------------------------------------
@@ -1078,10 +1113,13 @@ fn conv8_mma3_throughput() {
         let nch = pr.co4 / ncols;
         let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
         // 契约检查：不满足就是**门外**（计划层不会派发这种形状），打印后跳过。
-        if nfb < 1 || c.cin % 8 != 0 || pr.co4 % 32 != 0 {
+        // 后两条是边框紧凑网格的门禁（plan.rs 逐字同款）——把它们也算进契约，
+        // 否则这里会量到一种生产根本不派发的配置。
+        let gl = (k / 2 + 3) / 4;
+        if nfb < 1 || c.cin % 8 != 0 || pr.co4 % 32 != 0 || pr.out_w % 4 != 0 || 2 * gl > pr.out_w / 4 {
             eprintln!(
-                "[mb] {:<26} 门外：nfb={nfb} cin={} co4={}（计划层会回落 n_conv8）",
-                c.label, c.cin, pr.co4
+                "[mb] {:<26} 门外：nfb={nfb} cin={} co4={} outW={} 2gL={}（计划层会回落 n_conv8）",
+                c.label, c.cin, pr.co4, pr.out_w, 2 * gl
             );
             continue;
         }
@@ -1089,6 +1127,7 @@ fn conv8_mma3_throughput() {
         let tail = inner_w - nfb * 64;
         let nx = nfb + if tail > 0 { 1 } else { 0 };
         let mma_groups = [nx * nch, nrows, 1];
+        let eg = edge_groups(&pr, k);
 
         let run = |names: &[&str], groups: [u32; 3], reps: u32| -> f64 {
             let t = Instant::now();
@@ -1111,9 +1150,9 @@ fn conv8_mma3_throughput() {
                 time_dispatch(&|r| run(&[nm], g, r))
             };
             let (x, y, z) = if i % 2 == 0 {
-                (one("n_conv8", pr.groups), one(kname, mma_groups), one("n_conv8_edge", pr.groups))
+                (one("n_conv8", pr.groups), one(kname, mma_groups), one("n_conv8_edge", eg))
             } else {
-                let z = one("n_conv8_edge", pr.groups);
+                let z = one("n_conv8_edge", eg);
                 let y = one(kname, mma_groups);
                 let x = one("n_conv8", pr.groups);
                 (x, y, z)
@@ -1127,7 +1166,7 @@ fn conv8_mma3_throughput() {
         let gf = |ms: f64| pr.flops / (ms * 1e6);
         eprintln!(
             "[mb] {:<26} base {:>7.3} ms ({:>6.1} GF) → mma{:<2} {:>7.3} ({:>6.1} GF) + edge {:>6.3} \
-             = {:>7.3} ms = **{:.2}×**  [grid {:?} → {:?}, 尾 {tail} 列, 走慢路 {:.1}%]",
+             = {:>7.3} ms = **{:.2}×**  [grid {:?} → {:?} + edge {:?}, 尾 {tail} 列, 走慢路 {:.1}%]",
             c.label,
             a,
             gf(a),
@@ -1139,14 +1178,15 @@ fn conv8_mma3_throughput() {
             a / (b + e),
             pr.groups,
             mma_groups,
+            eg,
             100.0 * (1.0 - (nrows * inner_w) as f64 / (pr.out_h * pr.out_w) as f64)
         );
     }
 }
 
-/// `n_conv8_edge` 的**地板**：同一形状、同一网格上的三条读数。
+/// `n_conv8_edge` 的**地板**：同一形状上的三条读数。
 ///
-/// ## 为什么必须单独量这个
+/// ## 为什么必须单独量这个（2026-10-10，已结案）
 ///
 /// 边框补算那 2.3% 的像素，按 `n_conv8` 的每像素速率只值 ~0.2 ms，而
 /// `conv8_mma3_throughput` 量到的 edge 是 **1.43 ms**——模型与读数差 7 倍。
@@ -1156,10 +1196,20 @@ fn conv8_mma3_throughput() {
 ///
 /// 判据是把「全平面都被覆盖」这一档**造出来**：`padT=padL=0, taps=kW=1`
 /// 时覆盖矩形 = 整个输出平面 ⇒ 每个线程组都在早退那一行返回、一次 tap
-/// 循环都不进。于是：
+/// 循环都不进（那时的网格还铺满整张平面）。读数 1.43 ms 里绝大部分落在
+/// 这一档 ⇒ **空转本身就是成本**，不是边框像素贵。于是处方是紧凑网格
+/// （只铺真正含边框的行组，见 `n_conv8.metal` 文件头），B 读数随之掉到
+/// 地板上方一点点。
 ///
-///   C = 纯启动 + 前导 + 早退的地板；  B − C = 真边框 2.3% 的代价；
-///   B 与 A 的差 = 这一跳到底值不值。
+/// 紧凑网格之后这个「全早退」档的**构造方式变了**：内核现在自己按 pads
+/// 算 `e_tiles`，把 pads 归零就等于 `tiles = 0` ⇒ 连一个 tile 都不解码，
+/// 量到的是**纯启动地板**（网格照铺，循环不进体）。三读数仍然是：
+///
+///   C = 纯启动地板；  B − C = 真边框 2.3% 的代价；
+///   B + MMA vs A = 这一跳到底值不值。
+///
+/// 顺带打印紧凑网格相对全平面的**压缩比**——这个比值就是当初那 1.43 ms
+/// 的旋钮：tile 少掉多少，前导就少掉多少。
 #[test]
 fn conv8_edge_floor_diag() {
     let _g = gpu_guard();
@@ -1186,33 +1236,43 @@ fn conv8_edge_floor_diag() {
         };
         let base = time_dispatch(&|r| run("n_conv8", pr.groups, r)).ms;
 
-        // B：正常参数的 edge
-        let edge = time_dispatch(&|r| run("n_conv8_edge", pr.groups, r)).ms;
+        // B：正常参数的 edge，**紧凑网格**（生产配置）
+        let eg = edge_groups(&pr, c.kh);
+        let edge = time_dispatch(&|r| run("n_conv8_edge", eg, r)).ms;
 
-        // C：把覆盖矩形改成「全平面」再量同一支——只动 4 个参数词
-        // （padT/padL → 0，kW → 1，taps → 1），一个算术分支都不改。
-        {
+        // C：把 padT/padL 归零（只动 2 个参数词）⇒ 内核自算的 e_tiles = 0
+        // ⇒ 一个 tile 都不进体。网格仍铺全平面（与旧配置线程数一致），
+        // 所以量到的就是「启动 + 空网格」的地板。
+        let (all_exit, tiles_c, tiles_all) = {
             // SAFETY: 参数块在 word 64 起（21 词），落在输入段（word 256 起）之前。
             unsafe {
                 let p = (pr.buf.contents() as *mut u32).add(pr.p_off as usize);
-                *p.add(10) = 1; // taps
-                *p.add(11) = 1; // kW
                 *p.add(14) = 0; // padT
                 *p.add(15) = 0; // padL
             }
-            let all_exit = time_dispatch(&|r| run("n_conv8_edge", pr.groups, r)).ms;
-            eprintln!(
-                "[mb] edge 地板 {:<24} base {:>7.3} ms | edge 正常 {:>7.3} | edge 全早退 {:>7.3} \
-                 ⇒ 边框本体 {:>7.3} ms、第二跳地板 {:>7.3} ms（{:>5.1}% of base）",
-                c.label,
-                base,
-                edge,
-                all_exit,
-                edge - all_exit,
-                all_exit,
-                100.0 * all_exit / base
-            );
-        }
+            let t = time_dispatch(&|r| run("n_conv8_edge", pr.groups, r)).ms;
+            // C 档下内核自算的 e_tiles：（2*(0*gh) + (outH-0)*2*ceil(0/4)）*nh = 0
+            (t, 0u64, (pr.out_h * pr.out_w).div_ceil(4) as u64 * (pr.co4 / 8) as u64)
+        };
+        // B 档的 tile 数（与 edge_groups 同源，这里只是回读一遍用于打印）
+        let gh = (pr.out_w / 4) as u64;
+        let gl = ((c.kh / 2 + 3) / 4) as u64;
+        let tiles_b = (2 * ((c.kh as u64 / 2) * gh)
+            + (pr.out_h - c.kh + 1) as u64 * 2 * gl)
+            * (pr.co4 / 8) as u64;
+        eprintln!(
+            "[mb] edge 地板 {:<24} base {:>7.3} ms | edge 紧凑 {:>7.3}（网格 {:?}）| 空网格 {:>7.3} \
+             ⇒ 边框本体 {:>7.3} ms、启动地板 {:>7.3} ms；tile {tiles_b} vs 全平面 {tiles_all} = {:.1}%",
+            c.label,
+            base,
+            edge,
+            eg,
+            all_exit,
+            edge - all_exit,
+            all_exit,
+            100.0 * tiles_b as f64 / tiles_all as f64,
+        );
+        let _ = tiles_c;
     }
 }
 
@@ -1275,16 +1335,22 @@ fn conv8_mma3_matches_cpu() {
     // (outH, outW, cin, cout, k, 说明)。**后四例专打 32 通道块那一档**
     // （`n_conv8_mma3_n32`）：det 的 CSP 三连 Conv.111/114/117 就是 Co=32
     // Ci=32 落在 240×216 上，空间门全过、只被旧的 `Co%64` 判据挡住。
+    //
+    // **全部 outW ≡ 0 (mod 4)**：边框补算改紧凑网格后加了这条门禁（行组 =
+    // 连续 4 个 x，不跨行是枚举与平面映射不错位的前提）。原来的「尾 1 列」
+    // 用例（outW=67）因此**不再可达**——对称 pad + stride1 下 `outW≡0 mod 4`
+    // 蕴含 `tail = inner_w mod 64 = (outW-k+1) mod 64` 必为偶数（`k-1` 是
+    // 偶数）。最小可达尾是 2，第 4 例就是它。
     let cases: [(u32, u32, u32, u32, u32, &str); 9] = [
-        (16, 130, 32, 64, 3, "nfb=2 **无尾块**"),
+        (16, 132, 32, 64, 3, "nfb=2 尾2"),
         (32, 96, 64, 128, 3, "nfb=1 双通道块 尾30"),
         (9, 200, 32, 64, 3, "nfb=3 奇行数 尾6"),
-        (16, 67, 32, 64, 3, "nfb=1 **尾1 列**"),
-        (16, 132, 32, 64, 5, "5×5 无尾块"),
-        (16, 130, 32, 32, 3, "**N32** Co=32 nfb=2"),
+        (16, 68, 32, 64, 3, "nfb=1 **最小尾 2 列**"),
+        (16, 132, 32, 64, 5, "5×5 **无尾块**"),
+        (16, 132, 32, 32, 3, "**N32** Co=32 尾2"),
         (32, 96, 32, 96, 3, "**N32** Co=96=3×32 尾30"),
-        (16, 67, 32, 32, 3, "**N32** Co=32 尾1"),
-        (24, 200, 32, 32, 7, "**N32** Co=32 7×7 尾3"),
+        (16, 68, 32, 32, 3, "**N32** Co=32 最小尾"),
+        (24, 200, 32, 32, 7, "**N32** Co=32 7×7 尾2"),
     ];
 
     for (h, w, cin, cout, k, note) in cases {
@@ -1362,10 +1428,11 @@ fn conv8_mma3_matches_cpu() {
              simdgroup_load 的 A 瓦片/权重行 stride 假设错了"
         );
 
-        // ── pass B：只派 edge，要求「边框全对 + 内点原封不动」──
+        // ── pass B：只派 edge（**紧凑网格**），要求「边框全对 + 内点原封不动」──
+        let eg = edge_groups(&pr, k);
         refill_out_sentinel(&pr);
         submit_compute(&ctx.inner.queue, |enc| {
-            ks.dispatch(enc, "n_conv8_edge", &pr.buf, pr.p_off, pr.groups).expect("dispatch");
+            ks.dispatch(enc, "n_conv8_edge", &pr.buf, pr.p_off, eg).expect("dispatch");
         })
         .expect("提交");
         let got = read_out(&pr);
@@ -1400,7 +1467,8 @@ fn conv8_mma3_matches_cpu() {
         eprintln!(
             "[mb] conv8_mma3 对拍 {note:<22} ({out_h}×{out_w} c{cin}->{cout} k{k} 尾块 {tail} 列): \
              内点 {covered} px 误差 {worst_in:.3e}、边框 {border} px 误差 {worst_out:.3e}、\
-             越界写 0/0"
+             越界写 0/0｜edge 网格 {} → {} 组（紧凑/全平面）",
+            pr.groups[0], eg[0]
         );
     }
 }

@@ -1031,7 +1031,21 @@ impl PlanBuilder<'_> {
                         && xs[3] == out_shape[3]
                         && cpad4(ws[1]) % 8 == 0
                         && cpad4(ws[0]) % 32 == 0
-                        && ow as i64 - (kw as i64 - 1) >= 64;
+                        && ow as i64 - (kw as i64 - 1) >= 64
+                        // **高方向必须有内点行**：`oh < kh` 时内核里的
+                        // `mDim/outW - (kH-1)`、这里的 `nrows`、以及 edge 的
+                        // `outH-2*padT` 全是 u32 减法 ⇒ 下溢成天文数字 ⇒ 网格
+                        // 与循环界一起飞出去（y 维 `nrows` 甚至会直接进 dispatch
+                        // 的 grid）。宽度方向的同款下溢由上面那条 `>= 64` 挡住，
+                        // 高度方向一直没有对应门禁——真实模型里都够高，但这条
+                        // 判据不该依赖「模型够大」。
+                        && oh as i64 - (kh as i64 - 1) >= 1
+                        // 边框补算的紧凑网格要求（见 n_conv8.metal 的
+                        // 「紧凑网格」）：行组 = 一行内连续 4 个 x，`outW%4!=0`
+                        // 时行组会跨行、枚举与平面映射错位；`2*gL>gh` 时中带
+                        // 头尾重叠、同一行组被枚举两次＝**写两次**（静默错）。
+                        && ow % 4 == 0
+                        && 2 * ((pads.1 as u32 + 3) / 4) <= ow / 4;
                     if kxk {
                         // 两条 dispatch、**两块内容相同的参数**（理由见
                         // `PlanBuilder::conv_kxk_mma`）。网格公式与内核逐字
@@ -1053,13 +1067,20 @@ impl PlanBuilder<'_> {
                         } else {
                             "n_conv8_mma3_n32"
                         };
+                        // edge 用**紧凑网格**（只铺真正含边框像素的行组），
+                        // 公式与内核逐字一致（第 N 份拷贝，改了要同步改）：
+                        //   gh = outW/4；gL = ceil(padL/4)
+                        //   tiles = (2*(padT*gh) + nrows*2*gL) * nh
+                        // 旧式 `m_dim.div_ceil(4)*(nv/2)` 铺满整张平面 ——
+                        // 每个空 tile 仍要付 6~8 次整数除法才早退，实测
+                        // Conv.121 的 edge 1.75 ms 里绝大部分是这份空转。
+                        let gh = ow / 4;
+                        let gl = (pads.1 as u32 + 3) / 4;
+                        let e_tiles =
+                            (2 * (pads.0 as u32 * gh) + nrows * 2 * gl) * (nv / 2);
                         Ok(vec![
                             (kname, pb.clone(), [nx * nch, nrows, nb]),
-                            (
-                                "n_conv8_edge",
-                                pb,
-                                [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1],
-                            ),
+                            ("n_conv8_edge", pb, [capped(e_tiles), nb, 1]),
                         ])
                     } else if mma {
                         let co4 = cpad4(ws[0]);

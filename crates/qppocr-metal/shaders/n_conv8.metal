@@ -180,7 +180,39 @@ static inline void conv8_body(
     // 算两遍（MMA 写一次、edge 再写一次，静默错）。
     //
     // 非 EDGE 实例化下整段是编译期死代码（`EDGE` 是模板常量）。
-    uint y_lo = 0u, y_hi = 0u, x_lo = 0u, x_hi = 0u;
+    uint y_lo = 0u, y_hi = 0u, x_lo = 0u, x_hi = 0u, e_tiles = 0u, M_e = 0u;
+    // ── 紧凑网格（EDGE 专用）────────────────────────────────────────────
+    //
+    // 第一版让 edge 复用 `n_conv8` 的原网格（铺满整张输出平面）再逐 tile
+    // 早退。实测**空转本身就是成本**：Conv.121（240x216 k=7 Co=64）的 edge
+    // 要 1.75 ms，而真正含边框像素的 tile 只有 6%——每个空 tile 仍要付
+    // `gid%nh`、`gid/nh` 和 4 次 `m/outW` 共 6~8 次整数除法（GPU 上整数除
+    // 法是几十条的软实现）才走到早退那一行，103680 个线程一起做就是毫秒级。
+    //
+    // 处方：网格只铺**真正含边框像素的行组**（行组 = 一行内连续 4 个输出
+    // x，与 base 映射同一单位）。边框恰好是三段之并：
+    //
+    //   T 上台：y ∈ [0, padT)            整行，每行 gh=outW/4 个行组
+    //   M 中带：y ∈ [padT, outH-padT)    每行头 gL 个 + 尾 gL 个行组
+    //   B 下台：y ∈ [outH-padT, outH)    整行
+    //
+    //   gL = ceil(padL/4)。对称 pad 下`x_hi = outW-1-padL`，所以右带
+    //   `x ≥ outW-padL` 恰好落在**最后 gL 个行组**里。
+    //
+    // 上台/下台不能省成「只铺头尾 gL」——那些行的**全部**像素都在覆盖矩形
+    // 之外（`y_lo = padT`），必须整行补。
+    //
+    // 落进集合的行组仍可能含被覆盖的像素（比如中带头部那个行组的 x ∈ [padL,4)
+    // 部分），那几个像素由下面**一字未动**的逐像素 `ok[]` 谓词裁掉——所以
+    // 「每个像素恰好写一次」的证明还是原来那一条：本集合是补集的**子集**，
+    // 且并上 MMA 的覆盖矩形 = 全平面。
+    //
+    // 契约（计划层第三份拷贝，见 plan.rs 的 `n_conv8_edge` 派发式）：
+    //   tiles_edge = (2*T + M) * nh，**替换**原来的 rows_g*nh；
+    // 门禁另加两条：`outW % 4 == 0`（行组不跨行，否则枚举与平面映射错位）、
+    // `2*gL <= gh`（中带头尾不重叠，否则同一行组被枚举两次＝写两次）。
+    uint gh = outW >> 2;                  // 每行行组数
+    uint gL = (padL + 3u) >> 2;           // 头/尾各铺几个行组
     if (EDGE) {
         uint outH = mDim / outW;          // 输出平面恒 outH*outW 个像素
         uint kH = taps / kW;
@@ -188,6 +220,9 @@ static inline void conv8_body(
         y_hi = padT + (outH - (kH - 1u)) - 1u;
         x_lo = padL;
         x_hi = padL + (outW - (kW - 1u)) - 1u;
+        // 紧凑瓦片数（`nh = nDim >> 3`，与下面那个 `nv >> 1` 恒等）。
+        M_e = (outH - 2u * padT) * 2u * gL;
+        e_tiles = (2u * (padT * gh) + M_e) * (nDim >> 3u);
     }
 
     uint b = wg.y;
@@ -195,7 +230,9 @@ static inline void conv8_body(
     uint nv = nDim >> 2;
     uint nh = nv >> 1; // 列组数（每组 2 个 float4 列）
     uint rows_g = (mDim + 3u) >> 2; // 行组数
-    uint tiles = rows_g * nh;
+    // EDGE 用紧凑网格（见文件头「紧凑网格」）；非 EDGE 分支是编译期常量选择，
+    // 原式一字未动。
+    uint tiles = EDGE ? e_tiles : rows_g * nh;
 
     // 整块不随 tile 变的基址（本来就在映射之后算，纯外提）。
     uint ib = (in_off >> 2) + b * inH * inW * cin4v;
@@ -212,7 +249,34 @@ static inline void conv8_body(
         // 第二列的地方（权重、bias、残差、写回）都必须用 `n4b`，用错就是
         // 静默写坏一半通道。
         uint n4, m0, n4b;
-        if (taps == 1u && cin4v * nv >= 65536u) {
+        if (EDGE) {
+            // ── 紧凑解码：rg → (y, 行组) 三段 ──
+            //
+            // 与文件头「紧凑网格」逐字对应。**不跨行**：`outW%4==0` 由门禁
+            // 保证，所以行组 r 覆盖的 4 个像素恒在同一行 y 内（`ok[]` 里那个
+            // `m/outW` 仍按平面线性下标算，与这里给的行是同一个 y）。
+            uint rg = gid / nh;
+            n4 = (gid % nh) * 2u;
+            n4b = n4 + 1u;
+            uint T = padT * gh;
+            uint y, r;
+            if (rg < T) {                          // 上台：整行，rg 直接是行内序号
+                y = rg / gh;
+                r = rg - y * gh;
+            } else if (rg < T + M_e) {             // 中带：每行头 gL + 尾 gL
+                uint q = rg - T;
+                uint per = 2u * gL;
+                y = padT + q / per;
+                uint s = q - (q / per) * per;
+                r = (s < gL) ? s : (gh - gL + (s - gL));
+            } else {                               // 下台：整行
+                uint q = rg - T - M_e;
+                uint yy = q / gh;
+                y = (mDim / outW) - padT + yy;
+                r = q - yy * gh;
+            }
+            m0 = y * outW + r * 4u;
+        } else if (taps == 1u && cin4v * nv >= 65536u) {
             // ── 窗口序（**只换瓦片到线程的映射，热循环一字不动**）──
             //
             // 病根：权重段（本例 9 MB）被每个行组各读一遍 = 485 MB，而原
@@ -306,10 +370,11 @@ static inline void conv8_body(
             if (EDGE && oh[i] >= y_lo && oh[i] <= y_hi && ow[i] >= x_lo && ow[i] <= x_hi)
                 ok[i] = false; // 已被 n_conv8_mma3 覆盖
         }
-        // 整块都在覆盖矩形内 ⇒ 本 tile 无事可做。这一条是**必需**的而不是
-        // 优化：EDGE 的网格与 n_conv8 同形（覆盖全部 tile），不做早退的话
-        // 绝大多数线程组仍会跑完整圈权重装载（每 ci4 12 条），把边框 kernel
-        // 变成一次全量空转。
+        // 整块落在覆盖矩形内 ⇒ 本 tile 无事可做。紧凑网格之后这不是**全覆盖**
+        // 的兜底了（网格已是补集的子集），而是「子集里仍含被覆盖像素的那部分
+        // tile」的最后一道过滤：中带头部那个行组、以及左右边界不对齐 4 的行
+        // 组，都可能整块落在矩形内或部分落在矩形内。留着它，覆盖命题的证明
+        // 就仍然是「网格 ⊆ 补集、逐像素 ok[] 裁到补集」两段，与网格公式解耦。
         if (EDGE && !(ok[0] || ok[1] || ok[2] || ok[3])) continue;
 
         for (uint t = 0u; t < taps; t++) {
