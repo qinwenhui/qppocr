@@ -14,6 +14,29 @@ cd "$(dirname "$0")"
 N=${1:?图数}; R=${2:?轮数}; shift 2
 B=("$@")
 BIN=${BIN:-./bin/qppocr-cc}
+
+# ── 陈旧二进制门禁（2026-10-09 加的，因为踩过一次）────────────────────
+#
+# `bin/qppocr-cc` 是**手工拷贝的快照**，不会随源码更新——它一度比源码旧 6
+# 小时，于是 `QPPOCR_METAL_WF16` 这个开关在它里面**根本不存在**：两臂跑的
+# 是同一份 f32 代码，量出来的 Δtotal = −0.05 ms（符号 2 负 2 正、纯噪声），
+# 结论是「fp16 端到端零收益」，而真值是 **1.79×**。
+#
+# **这类失败是静默的，而且恰好长得像「这个优化没用」。** 所以这里对每个
+# `VAR=VAL` 断言 `VAR` 这个字符串真的在二进制里——开关压根没编进去时，A/B
+# 的结果**恒为零**，必须当场判废而不是当成结论。
+for kv in "${B[@]}"; do
+    v=${kv%%=*}
+    if [ "$(grep -c -a -- "$v" "$BIN" || true)" -eq 0 ]; then
+        echo "❌ $BIN 里找不到环境变量名 '$v' —— 这个二进制太旧，开关没编进去。" >&2
+        echo "   两臂会跑同一份代码，Δ 恒为 0，那不是结论。" >&2
+        echo "   先重建：cargo build --release -p qppocr-cli --features qppocr/gpu" >&2
+        echo "   再用：  BIN=\$PWD/../../target/release/qppocr $0 $N $R ${B[*]}" >&2
+        exit 3
+    fi
+done
+echo "# BIN=$BIN  (mtime $(stat -f %Sm -t '%m-%d %H:%M' "$BIN" 2>/dev/null || echo '?'))  开关=${B[*]}"
+
 set -- $(ls corpus100/img-*.jpg | head -"$N")
 IMGS=("$@")
 TSV=$(mktemp)
