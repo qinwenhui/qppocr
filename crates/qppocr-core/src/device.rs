@@ -64,8 +64,11 @@ pub enum ModelRole {
 
 /// 会话构造选项。
 ///
-/// 空壳起步（`#[non_exhaustive]`）：precision（fp16）等旋钮后续版本加，
+/// 空壳起步（`#[non_exhaustive]`）：更多旋钮后续版本加，
 /// 调用方一律经 [`Default`] 构造后按需覆写字段。
+///
+/// 注：全部后端（CPU / Metal / Vulkan）都是 **f32**；没有精度旋钮，
+/// 也不打算有——见 `qppocr-gpu/src/nhwc.rs` 头注释。
 #[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct SessionOptions {

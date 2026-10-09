@@ -22,7 +22,7 @@ pub fn nhwc_words(shape: &[i64]) -> u32 {
 }
 
 /// 稠密 conv 权重 [Co,Ci,kh,kw] → k-major（n_conv.comp 的布局）：
-/// f16vec4 下标 (t*cin4v + ci4)*4*nv + i*nv + n4，元素 = 4 个输出通道。
+/// f32vec4 下标 (t*cin4v + ci4)*4*nv + i*nv + n4，元素 = 4 个输出通道。
 pub fn repack_conv_w(w: &[f32], co: usize, cin: usize, kh: usize, kw: usize) -> Vec<u32> {
     let (cop, cip) = (cpad4(co as i64) as usize, cpad4(cin as i64) as usize);
     let (cin4v, nv, taps) = (cip / 4, cop / 4, kh * kw);

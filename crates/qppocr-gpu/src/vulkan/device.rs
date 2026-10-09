@@ -54,7 +54,12 @@ impl VulkanDevice {
                     .into(),
             ));
         }
-        // NHWC-f16 内核族的两个硬前提：f16 SSBO 存储 + fp16 算术。
+        // Cooperative matrix 的两个硬前提：f16 SSBO 存储 + fp16 算术。
+        //
+        // **当前无内核消费它们**——生产路径是标量 f32（`n_` 内核族）。
+        // 这里开的是「这家设备能不能跑 XMX/DNA 形状」的底座，配合
+        // [`super::probe_coopmat`] 的诊断；将来真上 coopmat 时不必再改
+        // 设备创建。`coopmat=false` 的设备这两项不碰。
         if coopmat && (v11.storage_buffer16_bit_access == 0 || v12.shader_float16 == 0) {
             return Err(Error::Device(
                 "有 VK_KHR_cooperative_matrix 但缺 16bit 存储/fp16 算术特性\
@@ -72,7 +77,8 @@ impl VulkanDevice {
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .timeline_semaphore(true)
             .shader_float16(coopmat);
-        // 协作矩阵按设备扩展启用（非核心）。
+        // 协作矩阵按设备扩展启用（非核心）——同上，为将来的 coopmat 内核
+        // 预置底座，当前无消费方。
         let exts = [ash::khr::cooperative_matrix::NAME.as_ptr()];
         let mut ci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_cis)

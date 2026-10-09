@@ -1,6 +1,7 @@
 // NHWC-f32 通道广播族：op 由参数块给出（0=mul_c 1=add_c 2=muladd_scale
 // 3=fused_hardsigmoid_mul 4=fused_sigmoid_mul 5=bn(a*g+b 全广播)）。
-// NHWC 里通道恒 = f16 下标 % C——每 vec4 恰是同一位置的 4 个通道，
+// NHWC 里通道按 vec4 分组：全局 vec4 下标 gid 满足 gid % (Cpad4/4) = 该位置
+// 的通道 vec4 号——每个 vec4 恰是同一位置的连续 4 个通道，
 // gate 直接按 vec4 取（gate[Cpad4]）。
 // 语义镜像：mul_c/add_c（广播）、muladd_scale.comp（out=f*gate+r）、
 // fused_*_mul（out=f*act(gate)，gate 为前激活值）。

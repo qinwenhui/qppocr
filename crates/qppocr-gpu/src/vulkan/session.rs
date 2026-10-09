@@ -595,39 +595,26 @@ impl VulkanSession {
                     record_dispatch(d, cb, ks, &kernel, &pc, groups);
                 }
             })?;
-            // 逐层 f16 统计：找数值死亡层（QPPOCR_GPU_STEP_STATS 时）
+            // 逐层 f32 统计：找数值死亡层（QPPOCR_GPU_STEP_STATS 时）。
+            //
+            // 全内核族（含 n_exit / n_exit3）的输出区都是 f32，`out_n` 就是
+            // f32 元素数：exit 族是 NCHW 逻辑 numel，NHWC 族是未补 pad 的
+            // numel——两者都 ≤ 实际分配的区，前缀扫描不越界。
             if std::env::var_os("QPPOCR_GPU_STEP_STATS").is_some() && *out_n > 0 {
                 let nf = *out_n as usize; // 全量扫描（死亡层定位）
-                let stats = if kernel == "n_exit" {
-                    // SAFETY: base 持久映射；out_off+n ≤ total。
-                    let v: Vec<f32> = unsafe {
-                        std::slice::from_raw_parts(
-                            plan.base.add(*out_off as usize * 4) as *const f32,
-                            nf,
-                        )
-                    }
-                    .to_vec();
-                    (
-                        v.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
-                        v.iter().sum::<f32>() / v.len() as f32,
-                        v.iter().filter(|x| x.is_nan()).count(),
+                // SAFETY: base 持久映射；out_off+n ≤ total。
+                let v: Vec<f32> = unsafe {
+                    std::slice::from_raw_parts(
+                        plan.base.add(*out_off as usize * 4) as *const f32,
+                        nf,
                     )
-                } else {
-                    // SAFETY: 同上。
-                    let w: Vec<u32> = unsafe {
-                        std::slice::from_raw_parts(
-                            plan.base.add(*out_off as usize * 4) as *const u32,
-                            nf.div_ceil(2),
-                        )
-                    }
-                    .to_vec();
-                    let v = super::fp16::f16_words_to_f32(&w);
-                    (
-                        v.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
-                        v.iter().sum::<f32>() / v.len() as f32,
-                        v.iter().filter(|x| x.is_nan()).count(),
-                    )
-                };
+                }
+                .to_vec();
+                let stats = (
+                    v.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
+                    v.iter().sum::<f32>() / v.len() as f32,
+                    v.iter().filter(|x| x.is_nan()).count(),
+                );
                 eprintln!(
                     "[gpu][层] #{i:<3} {kernel:<12} {node:<26} absmax={:.4} mean={:.6} nan={}",
                     stats.0, stats.1, stats.2
@@ -1466,9 +1453,12 @@ impl VulkanSession {
             inflight: std::sync::atomic::AtomicBool::new(false),
             arena: Some(arena),
             recs: dbg_recs,
-            // in_offs 指向 **f32 区**（host 每次 memcpy 的目标）。n_ 模式下
-            // offs[input] 是 entry 转换出的 f16 区——拿它当 memcpy 目标会把
-            // 原始 f32 字节灌进 f16 激活/参数区（曾碾碎参数块打死设备）。
+            // in_offs 指向 **NCHW f32 区**（host 每次 memcpy 的目标）。n_ 模式下
+            // offs[input] 是 entry 转换出的 **NHWC f32** 区（行 = 空间位置、
+            // 行距 cpad4）——拿它当 memcpy 目标会把 NCHW 字节按错布局灌进去。
+            // 别因为「两边都是 f32 同尺寸」就以为可换：cpad4(C) ≥ C 使 NHWC 区
+            // 不小于 NCHW 区，今天溢出不了；但 f16 时代该区只有一半大，同一次
+            // memcpy 曾溢进参数块、打死设备。
             in_offs: [(self.input_name.clone(), in_f32_off)]
                 .into_iter()
                 .collect(),

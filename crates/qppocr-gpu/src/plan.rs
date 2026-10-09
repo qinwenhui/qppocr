@@ -267,14 +267,14 @@ impl PlanBuilder<'_> {
         // entry 转换出的 NHWC 区。两区都不释放。
         let in_words = in_shape.iter().product::<i64>() as u32;
         let in_f32_off = layout.alloc(in_words);
-        let in_f16_off = layout.alloc(nhwc::nhwc_words(in_shape));
-        offs.insert(input_name.to_string(), in_f16_off);
+        let in_nhwc_off = layout.alloc(nhwc::nhwc_words(in_shape));
+        offs.insert(input_name.to_string(), in_nhwc_off);
         // entry 转换 dispatch（整图第一条）
         {
             let (nb, c, h, w) = (in_shape[0], in_shape[1], in_shape[2], in_shape[3]);
             let mut pb = ParamBlock::new();
             pb.u(in_f32_off)
-                .u(in_f16_off)
+                .u(in_nhwc_off)
                 .u(nb as u32)
                 .u(c as u32)
                 .u(h as u32)
@@ -286,7 +286,7 @@ impl PlanBuilder<'_> {
                 kernel: "n_entry",
                 node: "<entry>".into(),
                 node_idx: usize::MAX,
-                out_off: in_f16_off,
+                out_off: in_nhwc_off,
                 out_n: in_words,
                 p_off,
                 groups: [((nb * h * w) as u32).div_ceil(256), 1, 1],
@@ -374,7 +374,7 @@ impl PlanBuilder<'_> {
                 0
             }
         };
-        // exit 转换列表 (f16 源名, 图输出名, act)——节点环后统一发
+        // exit 转换列表 (NHWC 源名, 图输出名, act)——节点环后统一发
         let mut pending_exits: Vec<(String, String, u32)> = Vec::new();
         // argmax 出口的图输出名（读回长度/形状按 [N,T,2] 覆写）
         let mut argmax_outs: std::collections::HashSet<String> = Default::default();
@@ -1744,7 +1744,7 @@ impl PlanBuilder<'_> {
         }
     }
 
-    /// conv 族 bias 的惰性 f16 重排区（同 `w_upload`：形状无关、可跳写）。
+    /// conv 族 bias 的惰性重排区（同 `w_upload`：形状无关、可跳写）。
     #[allow(clippy::too_many_arguments)]
     fn n_bias_off(
         &self,

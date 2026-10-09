@@ -1,5 +1,5 @@
 #![allow(clippy::undocumented_unsafe_blocks)] // 裸内核取证：持久映射指针操作，逐块 SAFETY 注释无信息量
-//! n_ 内核族（NHWC f16）的设备冒烟：entry → conv → dw → convt → pool →
+//! n_ 内核族（NHWC f32）的设备冒烟：entry → conv → dw → convt → pool →
 //! resize → concat → reduce → elem → channel，**每内核一次独立提交**——
 //! 设备丢失按序定位肇事者。另含真实规模（960×864）entry 复现段。
 //! 数值判据在 det 端到端测试（对照 CPU executor 全图输出）。
@@ -56,32 +56,30 @@ fn n_family_smoke() {
     let dwv: Vec<f32> = (0..co2 * 25).map(|_| lcg(&mut seed) * 0.1).collect();
     let ctw: Vec<f32> = (0..co2 * co2 * 4).map(|_| lcg(&mut seed) * 0.1).collect();
 
-    let w1_16 = crate::nhwc::repack_conv_w(&w1, co1, ci, 3, 3);
-    let b1_16 = crate::nhwc::conv_bias(&b1, co1 as i64);
-    let w2_16 = crate::nhwc::repack_conv_w(&w2, co2, co1, 3, 3);
-    let dw_16 = crate::nhwc::repack_dw_w(&dwv, co2, 5, 5);
-    let ct_16 = crate::nhwc::repack_convt_w(&ctw, co2, co2, 2, 2);
+    let w1_rp = crate::nhwc::repack_conv_w(&w1, co1, ci, 3, 3);
+    let b1_rp = crate::nhwc::conv_bias(&b1, co1 as i64);
+    let w2_rp = crate::nhwc::repack_conv_w(&w2, co2, co1, 3, 3);
+    let dw_rp = crate::nhwc::repack_dw_w(&dwv, co2, 5, 5);
+    let ct_rp = crate::nhwc::repack_convt_w(&ctw, co2, co2, 2, 2);
 
     // 各段 word 数（16B 对齐）——真实规模段 + 参数段一起算总量
     let seg = |n: usize| n.div_ceil(4) * 4;
-    #[allow(unused_variables)]
-    let w16 = |n: usize| seg(n); // f32：word=元素
     let f32_in_w = seg(ci * hw);
-    let f16_in_w = seg(hw * cip);
+    let nhwc_in_w = seg(hw * cip);
     let c1_w = seg(ohw * co1p);
     let c2_w = seg(ohw * co2p);
     let cto_w = seg(ohw * 4 * co2p);
     let cato_w = seg(ohw * 4 * co2p * 2);
     let redo_w = seg(co2p);
-    let w1r_w = seg(w1_16.len());
-    let b1r_w = seg(b1_16.len());
-    let w2r_w = seg(w2_16.len());
-    let dwr_w = seg(dw_16.len());
-    let ctr_w = seg(ct_16.len());
+    let w1r_w = seg(w1_rp.len());
+    let b1r_w = seg(b1_rp.len());
+    let w2r_w = seg(w2_rp.len());
+    let dwr_w = seg(dw_rp.len());
+    let ctr_w = seg(ct_rp.len());
     let real_w = 9 << 20; // 真实规模 entry 段（9M words——总块 ~37.4MB 对齐 session）
     let params_w = 8192 + 128 + 8192; // 尾部含 reduce scratch + 批式 entry 冒烟段
     let total_w: usize = f32_in_w
-        + f16_in_w
+        + nhwc_in_w
         + c1_w
         + c2_w * 3
         + cto_w * 2
@@ -103,7 +101,7 @@ fn n_family_smoke() {
         o
     };
     let f32_in = sub(f32_in_w);
-    let f16_in = sub(f16_in_w);
+    let nhwc_in = sub(nhwc_in_w);
     let c1 = sub(c1_w);
     let c2 = sub(c2_w);
     let dwo = sub(c2_w);
@@ -129,11 +127,11 @@ fn n_family_smoke() {
         let s = std::slice::from_raw_parts_mut(p_of(f32_in) as *mut f32, ci * hw);
         s.copy_from_slice(&x);
         for (r, d) in [
-            (w1r, &w1_16),
-            (b1r, &b1_16),
-            (w2r, &w2_16),
-            (dwr, &dw_16),
-            (ctr, &ct_16),
+            (w1r, &w1_rp),
+            (b1r, &b1_rp),
+            (w2r, &w2_rp),
+            (dwr, &dw_rp),
+            (ctr, &ct_rp),
         ] {
             std::ptr::copy_nonoverlapping(d.as_ptr(), p_of(r) as *mut u32, d.len());
         }
@@ -168,10 +166,10 @@ fn n_family_smoke() {
             .unwrap();
     };
 
-    // 1) entry：f32 NCHW [1,3,16,12] → f16 NHWC
+    // 1) entry：f32 NCHW [1,3,16,12] → f32 NHWC
     let mut pb = ParamBlock::new();
     pb.u(f32_in)
-        .u(f16_in)
+        .u(nhwc_in)
         .u(1)
         .u(ci as u32)
         .u(h as u32)
@@ -181,7 +179,7 @@ fn n_family_smoke() {
 
     // 2) conv1：3x3 s2 p1，ci=3→16，bias + relu
     let mut pb = ParamBlock::new();
-    pb.u(f16_in)
+    pb.u(nhwc_in)
         .u(w1r)
         .u(b1r)
         .u(c1)
@@ -343,10 +341,10 @@ fn n_family_smoke() {
     step("n_reduce_hw", pb, [div256(co2p as u32), 1, 1]);
 
     // 10) elem：relu（op=0）
-    let n16 = (ohw * co2p) as u32;
+    let n_el = (ohw * co2p) as u32;
     let mut pb = ParamBlock::new();
-    pb.u(0).u(poolo).u(OFF_NONE).u(emo).u(n16).f(0.0).f(0.0);
-    step("n_elem", pb, [div256(n16 / 4), 1, 1]);
+    pb.u(0).u(poolo).u(OFF_NONE).u(emo).u(n_el).f(0.0).f(0.0);
+    step("n_elem", pb, [div256(n_el / 4), 1, 1]);
 
     // 11) channel：mul_c（op=0）
     let mut pb = ParamBlock::new();
@@ -355,11 +353,11 @@ fn n_family_smoke() {
         .u(redo)
         .u(OFF_NONE)
         .u(cho)
-        .u(n16)
+        .u(n_el)
         .u(co2p as u32)
         .f(0.0)
         .f(0.0);
-    step("n_channel", pb, [div256(n16 / 4), 1, 1]);
+    step("n_channel", pb, [div256(n_el / 4), 1, 1]);
 
     // ---- 对拍 ----
     let read32 = |off: u32, n: usize| -> Vec<f32> {
@@ -367,7 +365,7 @@ fn n_family_smoke() {
         let words = unsafe { std::slice::from_raw_parts(p_of(off) as *const u32, n) };
         words.iter().map(|w| f32::from_bits(*w)).collect()
     };
-    let got = read32(f16_in, hw * cip);
+    let got = read32(nhwc_in, hw * cip);
     let rt = x.clone();
     let want: Vec<f32> = {
         let mut v = vec![0f32; hw * cip];
@@ -398,7 +396,7 @@ fn n_family_smoke() {
         let _ = ((ci * hw2) as u32, (hw2 * cip) as u32); // 规模注释值
         // 精确复刻 session 的参数形态：in=36, out=1244196
         let in_off32 = real_base + 36;
-        let out_off16 = real_base + 1244196;
+        let out_off_nhwc = real_base + 1244196;
         // SAFETY: 偏移在 big 内。
         unsafe {
             let s2 = std::slice::from_raw_parts_mut(p_of(in_off32) as *mut f32, ci * hw2);
@@ -408,7 +406,7 @@ fn n_family_smoke() {
         }
         let mut pb = ParamBlock::new();
         pb.u(in_off32)
-            .u(out_off16)
+            .u(out_off_nhwc)
             .u(1)
             .u(ci as u32)
             .u(h2 as u32)
@@ -445,7 +443,7 @@ fn n_family_smoke() {
                 }
             })
             .unwrap();
-        let got = read32(out_off16, hw2 * cip);
+        let got = read32(out_off_nhwc, hw2 * cip);
         // SAFETY: 同上。
         let rt2 =
             unsafe { std::slice::from_raw_parts(p_of(in_off32) as *const f32, ci * hw2).to_vec() };
@@ -677,7 +675,7 @@ fn det_real_input_cmp() {
             i64: Vec::new(),
         }
     };
-    // CPU 参考（带逐节点 dump：GPU 区域按 NHWC f16 转 NCHW f32 对拍）
+    // CPU 参考（带逐节点 dump：GPU 区域按 NHWC f32 转 NCHW f32 对拍）
     let dump_dir = std::env::temp_dir().join("qppocr-real-cmp");
     let _ = std::fs::remove_dir_all(&dump_dir);
     std::fs::create_dir_all(&dump_dir).unwrap();
@@ -1048,7 +1046,8 @@ fn conv8_inf_forensics() {
         let wfull: Vec<u32> =
             unsafe { std::slice::from_raw_parts(base_dbg.add(wo * 4) as *const u32, 1024) }
                 .to_vec();
-        let wv = super::fp16::f16_words_to_f32(&wfull);
+        // 权重区是重排后的 f32（`repack_conv_w` 产出的 u32 就是 f32 位模式）。
+        let wv: Vec<f32> = wfull.iter().map(|w| f32::from_bits(*w)).collect();
         eprintln!(
             "[gpu][取证] 权重 absmax={:.3} inf={} nan={}",
             wv.iter().map(|x| x.abs()).fold(0.0f32, f32::max),
@@ -1060,20 +1059,17 @@ fn conv8_inf_forensics() {
                 // SAFETY: 测试独占设备与映射区；长度由本测试的分配保证。
                 unsafe { std::slice::from_raw_parts(base_dbg.add(bo * 4) as *const u32, 32) }
                     .to_vec();
-            eprintln!("[gpu][取证] bias={:?}", super::fp16::f16_words_to_f32(&bw));
+            let bv: Vec<f32> = bw.iter().map(|w| f32::from_bits(*w)).collect();
+            eprintln!("[gpu][取证] bias={bv:?}");
         }
     }
     // 输出 Inf 计数
     let count_inf_pub = |base: *mut u8| -> usize {
-        // SAFETY: base 持久映射；输出区 51840*64 f16。
-        let of: Vec<u32> = unsafe {
-            std::slice::from_raw_parts(base.add(out_off * 4) as *const u32, 51840 * 64 / 2)
-        }
-        .to_vec();
-        super::fp16::f16_words_to_f32(&of)
-            .iter()
-            .filter(|v| !v.is_finite())
-            .count()
+        // SAFETY: base 持久映射；输出区 51840*64 个 f32。
+        let of = unsafe {
+            std::slice::from_raw_parts(base.add(out_off * 4) as *const f32, 51840 * 64)
+        };
+        of.iter().filter(|v| !v.is_finite()).count()
     };
 
     let _ = base_dbg;
@@ -1093,16 +1089,16 @@ fn conv8_inf_forensics() {
     eprintln!("[gpu][取证] 原样重放后 Inf 数 = {n_inf}");
 
     if n_inf > 0 {
-        // 备份输入区（f16 NHWC [51840, 32]）
-        // SAFETY: base 持久映射；输入区 51840*32 f16。
-        let orig: Vec<u32> = unsafe {
-            std::slice::from_raw_parts(base.add(in_off * 4) as *const u32, 51840 * 32 / 2)
+        // 备份输入区（NHWC f32 [51840, 32]）
+        // SAFETY: base 持久映射；输入区 51840*32 个 f32。
+        let orig: Vec<f32> = unsafe {
+            std::slice::from_raw_parts(base.add(in_off * 4) as *const f32, 51840 * 32)
         }
         .to_vec();
         // 全零输入 → 若仍有 Inf：bias/weights/kernel 本身；否则输入位毒
         // SAFETY: 测试独占设备与映射区；长度由本测试的分配保证。
         let zero_all = |b: *mut u8| unsafe {
-            std::ptr::write_bytes(b.add(in_off * 4), 0, 51840 * 32 / 2 * 4);
+            std::ptr::write_bytes(b.add(in_off * 4), 0, 51840 * 32 * 4);
         };
         let (_, _, _) = gpu.debug_replay(&shape, rec14, Some(&zero_all)).unwrap();
         eprintln!("[gpu][取证] 全零输入后 Inf 数 = {}", count_inf_pub(base));
@@ -1114,19 +1110,13 @@ fn conv8_inf_forensics() {
             let zero_ch = move |b: *mut u8| unsafe {
                 std::ptr::copy_nonoverlapping(
                     orig.as_ptr(),
-                    b.add(in_off * 4) as *mut u32,
+                    b.add(in_off * 4) as *mut f32,
                     orig.len(),
                 );
-                // NHWC：位置 m 的通道 ch 在 f16 下标 m*32+ch → word (m*32+ch)/2 的半边
+                // NHWC f32：位置 m 的通道 ch 就是元素下标 m*32+ch。
+                let wp = b.add(in_off * 4) as *mut f32;
                 for m in 0..51840 {
-                    let e = m * 32 + ch;
-                    let wp = b.add(in_off * 4) as *mut u32;
-                    let w = wp.add(e / 2).read();
-                    wp.add(e / 2).write(if e % 2 == 0 {
-                        w & 0xFFFF_0000
-                    } else {
-                        w & 0x0000_FFFF
-                    });
+                    wp.add(m * 32 + ch).write(0.0);
                 }
             };
             let (_, _, _) = gpu.debug_replay(&shape, rec14, Some(&zero_ch)).unwrap();
@@ -1140,7 +1130,7 @@ fn conv8_inf_forensics() {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 orig.as_ptr(),
-                base.add(in_off * 4) as *mut u32,
+                base.add(in_off * 4) as *mut f32,
                 orig.len(),
             );
         }
@@ -1160,14 +1150,14 @@ fn n_conv_gelu_zero_repro() {
     let mut seed = 0xdead_beef_u64;
     let w: Vec<f32> = (0..co * ci).map(|_| lcg(&mut seed) * 0.5).collect();
     let bias: Vec<f32> = (0..co).map(|_| lcg(&mut seed)).collect();
-    let w16 = crate::nhwc::repack_conv_w(&w, co, ci, 1, 1);
-    let b16 = crate::nhwc::conv_bias(&bias, co as i64);
+    let w_rp = crate::nhwc::repack_conv_w(&w, co, ci, 1, 1);
+    let b_rp = crate::nhwc::conv_bias(&bias, co as i64);
 
     let seg = |n: usize| n.div_ceil(4) * 4;
     let in_w = seg(m_dim * ci);
     let out_w = seg(m_dim * co);
-    let w_w = seg(w16.len());
-    let b_w = seg(b16.len());
+    let w_w = seg(w_rp.len());
+    let b_w = seg(b_rp.len());
     let p_w = 256;
     let total = in_w + out_w + w_w + b_w + p_w;
     let big = arena.alloc((total * 4) as vk::DeviceSize).unwrap();
@@ -1182,8 +1172,8 @@ fn n_conv_gelu_zero_repro() {
     // SAFETY: big 单区持久映射；各子区互不相交。
     unsafe {
         std::ptr::write_bytes(p_of(in_off), 0, in_w * 4); // 零输入
-        std::ptr::copy_nonoverlapping(w16.as_ptr(), p_of(w_off) as *mut u32, w16.len());
-        std::ptr::copy_nonoverlapping(b16.as_ptr(), p_of(b_off) as *mut u32, b16.len());
+        std::ptr::copy_nonoverlapping(w_rp.as_ptr(), p_of(w_off) as *mut u32, w_rp.len());
+        std::ptr::copy_nonoverlapping(b_rp.as_ptr(), p_of(b_off) as *mut u32, b_rp.len());
     }
     let (buf, buf_size) = arena.chunk_range().unwrap();
     let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
@@ -2533,12 +2523,12 @@ fn dw_h3_repro() {
     let mut seed = 0xbeef_cafe_1234_5678_u64;
     let x: Vec<f32> = (0..nb3 * ci * hw).map(|_| lcg(&mut seed)).collect();
     let wt: Vec<f32> = (0..ci * 25).map(|_| lcg(&mut seed) * 0.3).collect();
-    let w16 = crate::nhwc::repack_dw_w(&wt, ci, 5, 5);
+    let w_rp = crate::nhwc::repack_dw_w(&wt, ci, 5, 5);
 
     let seg = |nn: usize| nn.div_ceil(4) * 4;
     let in_w = seg(nb3 * hw * cp);
     let out_w = seg(nb3 * m * cp);
-    let w_w = seg(w16.len());
+    let w_w = seg(w_rp.len());
     let p_w = 256;
     let big = arena
         .alloc(((in_w + out_w + w_w + p_w) * 4) as vk::DeviceSize)
@@ -2566,7 +2556,7 @@ fn dw_h3_repro() {
                 }
             }
         }
-        std::ptr::copy_nonoverlapping(w16.as_ptr(), p_of(w_off) as *mut u32, w16.len());
+        std::ptr::copy_nonoverlapping(w_rp.as_ptr(), p_of(w_off) as *mut u32, w_rp.len());
     }
     let (buf, buf_size) = arena.chunk_range().unwrap();
     let ks = KernelSet::new(&dev, buf, buf_size).unwrap();
@@ -3015,7 +3005,7 @@ fn cls_dw_precise() {
     // 曾以 48/48 误报 Conv.0——实为事后读已回收 region 的假阳性。
     assert!(
         bad_kernels.is_empty(),
-        "cls f16 路径全图对拍 {}/{} 个可比 rec 不符：{:?}（首个：{:?}）",
+        "cls 全图对拍 {}/{} 个可比 rec 不符：{:?}（首个：{:?}）",
         bad_kernels.len(),
         n_cmp,
         bad_kernels,

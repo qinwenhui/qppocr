@@ -29,14 +29,6 @@ const SHADERS: &[(&str, &[u8])] = &[
         "conv_gemm_nhwc",
         include_bytes!("../../shaders/spirv/conv_gemm_nhwc.spv"),
     ),
-    (
-        "conv_gemm_f16",
-        include_bytes!("../../shaders/spirv/conv_gemm_f16.spv"),
-    ),
-    (
-        "from_f16",
-        include_bytes!("../../shaders/spirv/from_f16.spv"),
-    ),
     ("conv_dw", include_bytes!("../../shaders/spirv/conv_dw.spv")),
     (
         "conv_gemm",
@@ -78,7 +70,6 @@ const SHADERS: &[(&str, &[u8])] = &[
         "resize_nearest",
         include_bytes!("../../shaders/spirv/resize_nearest.spv"),
     ),
-    ("to_f16", include_bytes!("../../shaders/spirv/to_f16.spv")),
     (
         "nchw_to_nhwc",
         include_bytes!("../../shaders/spirv/nchw_to_nhwc.spv"),
@@ -88,7 +79,7 @@ const SHADERS: &[(&str, &[u8])] = &[
         include_bytes!("../../shaders/spirv/nhwc_to_nchw.spv"),
     ),
     ("sigmoid", include_bytes!("../../shaders/spirv/sigmoid.spv")),
-    // ---- NHWC-f16 内核族（n_ 前缀；详见各 .comp 头注释）----
+    // ---- NHWC-f32 内核族（n_ 前缀；详见各 .comp 头注释）----
     (
         "n_channel",
         include_bytes!("../../shaders/spirv/n_channel.spv"),
@@ -269,8 +260,8 @@ impl KernelSet {
         cache: vk::PipelineCache,
     ) -> Result<Self> {
         // 三视图绑定：binding 0 = f32[]（计算数据）、binding 1 = u32[]
-        //（参数块）、binding 2 = f16vec4[]（NHWC-f16 内核族 + coopmat 装载）
-        //——同一 VkBuffer 的别名视图，GLSL 侧按需声明。
+        //（参数块）、binding 2 = vec4[]（entry/exit/reduce_hw/reduce_fin 的
+        // vec4 视图）——同一 VkBuffer 的别名视图，GLSL 侧按需声明。
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0)
@@ -325,7 +316,7 @@ impl KernelSet {
             .buffer(buffer)
             .offset(0)
             .range(size);
-        // 三个绑定指向同一缓冲（f32 / u32 / f16vec4 视图）
+        // 三个绑定指向同一缓冲（f32 / u32 / vec4 三视图，见上）
         let buf_infos = [buf_info, buf_info, buf_info];
         let writes = [
             vk::WriteDescriptorSet::default()

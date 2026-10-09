@@ -15,7 +15,6 @@
 // roundtrip 测试使用——豁免 dead_code 到接线完成。
 #[allow(dead_code)]
 pub(crate) mod device;
-pub(crate) mod fp16;
 #[allow(dead_code)]
 pub(crate) mod memory;
 #[allow(dead_code)]
@@ -135,11 +134,12 @@ pub(crate) struct Inner {
     pub(crate) device: std::sync::Arc<device::VulkanDevice>,
     /// 选定的 memory types 与 UMA 判定。
     pub(crate) mem_types: memory::MemoryTypes,
-    /// 协作矩阵（XMX/DNA）形状：fp16 输入、f32 累加、Subgroup 域。
-    /// （coopmat 内核路径未启用；探测结果留作诊断/后续路径的排布前提。）
+    /// 协作矩阵（XMX/DNA）形状：**仅诊断**——没有任何内核消费它，
+    /// 探测结果只回答「这台设备的 XMX 能不能按这个形状排布」。
+    /// 生产路径全部是标量 f32（`n_` 内核族）；见 [`probe_coopmat`]。
     #[allow(dead_code)]
     pub(crate) coopmat: Option<CoopMat>,
-    /// 计算队列族的 subgroup 大小（coopmat 内核的排布前提）。
+    /// 计算队列族的 subgroup 大小（诊断用，无内核消费）。
     #[allow(dead_code)]
     pub(crate) subgroup_size: u32,
     /// 实例句柄：`Drop::drop` 里显式 destroy（ash 0.38 无 Drop）。
@@ -230,10 +230,10 @@ impl VulkanContext {
         };
         let (physical, props) = all[pick];
         let name = device_name(&props);
-        // 协作矩阵探测：VK_KHR_cooperative_matrix + fp16/f32/Subgroup 形状。
-        // 没有就 None——内核族走标量 f16 路径（仍远快于 f32 标量）。
+        // 协作矩阵探测：VK_KHR_cooperative_matrix + fp16×f32/Subgroup 形状。
+        // **纯诊断**——探测结果不参与任何内核选择，生产路径是标量 f32。
         let coopmat = probe_coopmat(&entry, &instance, physical);
-        // 计算队列族的 subgroup 大小（Intel=16；coopmat 内核按 16 排布）。
+        // 计算队列族的 subgroup 大小（Intel=16；诊断用）。
         let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
         let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
         // SAFETY: physical 来自同实例枚举；p2 的 pNext 链在调用期间存活。
@@ -278,7 +278,10 @@ impl VulkanContext {
     }
 }
 
-/// 探测 fp16×f32(Subgroup) 的协作矩阵形状。
+/// 探测 fp16×f32(Subgroup) 的协作矩阵形状——**只回答设备能力，不选内核**。
+///
+/// 结果存在 [`Inner::coopmat`] 里供诊断；没有内核读它。留着的意义是：
+/// 将来真要上 XMX/DNA 时，先知道这台设备支持哪种 m×n×k 排布。
 fn probe_coopmat(
     entry: &Entry,
     instance: &Instance,
