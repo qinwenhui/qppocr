@@ -21,6 +21,7 @@ use metal::MTLSize;
 use super::device::submit_compute;
 use super::pipeline::{dispatch_with_tg, KernelSet};
 use super::MetalContext;
+use super::conv_probe::{MM_PROBE_SHADERS, ProbeSet};
 
 /// 有 Metal 设备就打开，否则跳过（CI 非 mac）。与 `kernel_tests` 同款。
 fn open_or_skip() -> Option<MetalContext> {
@@ -330,6 +331,83 @@ fn dispatch_floor_attribution() {
         // SAFETY: 缓冲 256 KB，写 256 KB 在界内。
         unsafe { std::ptr::write_bytes(p, 0, zeros.len()) };
         run(&priv1, 1, "priv   256 KB 网格 1 组");
+    }
+}
+
+/// 64×64 瓦片的 simdgroup_matrix GEMM 探针 —— 竞品结构的理想布局，测 fp16 MMA 能跑多快。
+///
+/// 竞品 `mm_sg_dd` 的核心：A 是 [M,K] 行主序、W 是 [N,K] n-主序、K 步 8、
+/// 2×4 acc 分片分布在 8 个 simdgroup 上，64×64 瓦片摊给 1 个线程组。
+/// 量的是**这个结构能达到的上限**：如果它在我们的生产 1×1 形状上能跑
+/// 2.5 TFLOPS 以上，那值得重写取数路径；否则不用在布局上浪费时间。
+#[test]
+fn mm_sg_scan() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ps = ProbeSet::from_list(&ctx.inner.device, MM_PROBE_SHADERS).expect("编译 MM 探针");
+    let pipe = ps.pipe("p_mm_sg").expect("取 p_mm_sg 管线");
+
+    // 生产里的 1×1 卷积层形状（det/rec 各几个关键 C→O）。
+    let cases = [
+        // det medium: 960x960, c512→1024 k1 → M=960*960=921600, N=1024, K=512
+        ("det960_c512o1024", 960u32 * 960, 1024u32, 512u32),
+        // det medium: c1024→512 k1
+        ("det960_c1024o512", 960u32 * 960, 512u32, 1024u32),
+        // rec: 6x208, c192→384 k1 → M=6*208=1248, N=384, K=192
+        ("rec6x208_c192o384", 6u32 * 208, 384u32, 192u32),
+        // rec: 3x208, c384→768 k1 → M=3*208=624, N=768, K=384
+        ("rec3x208_c384o768", 3u32 * 208, 768u32, 384u32),
+        // rec CTC head: 104x1, c120→18710 k1 → M=104, N=18710, K=120
+        ("ctc104_c120o18710", 104u32, 18710u32, 120u32),
+    ];
+
+    // 分配 fp16 缓冲：A [M,K], W [N,K], C [M,N]。
+    // 大小：M*K + N*K + M*N = 按 half 算字节，乘以 2。
+    let m_max = cases.iter().map(|(_, m, _, _)| *m).max().unwrap();
+    let n_max = cases.iter().map(|(_, _, n, _)| *n).max().unwrap();
+    let k_max = cases.iter().map(|(_, _, _, k)| *k).max().unwrap();
+    let buf_size = (m_max * k_max + n_max * k_max + m_max * n_max) as u64 * 2;
+    let mut buf = ctx.inner.device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
+    let zeros = vec![0u8; 64 << 20];
+    unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), buf.contents() as *mut u8, zeros.len()) };
+
+    for (label, m, n, k) in cases {
+        // 必须是 64 的倍数（探针要求），且 K 是 8 的倍数。
+        let m_pad = m.div_ceil(64) * 64;
+        let n_pad = n.div_ceil(64) * 64;
+        let k_pad = k.div_ceil(8) * 8;
+        let flops = (m as u64) * (n as u64) * (k as u64) * 2; // FMA = MAC ×2
+        let bytes = (m_pad * k_pad * 2 + n_pad * k_pad * 2 + m_pad * n_pad * 2) as f64;
+
+        // 参数：M,N,K（对齐后的值）。
+        let params = [m_pad as u32, n_pad as u32, k_pad as u32];
+        let params_bytes = unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
+
+        // 网格与线程组：与 mm_sg_groups 一致，tg=256 线程/组。
+        let groups = [m_pad.div_ceil(64), n_pad.div_ceil(64), 1];
+        let threads = [groups[0] * 256, groups[1], groups[2]];
+
+        // 预热 3 轮，然后 best-of-5 取 median。
+        let ms = bench(15, || {
+            submit_compute(&ctx.inner.queue, |enc| {
+                enc.set_compute_pipeline_state(pipe);
+                // 同一 arena 绑 0/1/2：probe 的 A/W/C 都按 half 解释，与 conv8 同 abi。
+                for b in 0..3u64 {
+                    enc.set_buffer(b, Some(&buf), 0);
+                }
+                enc.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const std::ffi::c_void);
+                enc.dispatch_threads(
+                    MTLSize::new(threads[0] as u64, threads[1] as u64, threads[2] as u64),
+                    MTLSize::new(256, 1, 1),
+                );
+            }).expect("提交");
+        });
+        let gflops = flops as f64 / (ms / 1000.0) / 1e6;
+        let roof = 3.34 * 1000.0; // FP32 峰值（竞品 doc 说 MMA≈fp32）
+        eprintln!(
+            "[mb/mm_sg] {:20} M={:6} N={:6} K={:6}  grid={:3}x{:3}  time={:6.2} ms  gflops={:7.1}  util={:4.1}%  B/FLOP={:.3} B/FLOP",
+            label, m, n, k, groups[0], groups[1], ms, gflops, gflops / roof * 100.0, bytes / flops as f64
+        );
     }
 }
 
