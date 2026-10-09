@@ -620,10 +620,19 @@ fn run(o: &Options) -> Result<(), Error> {
 // ================================================================ bench 子命令
 
 /// 一轮语料测量的累计（引擎阶段时间不含图像解码）。
+///
+/// `line` 拆成四项是为了定位「没有内核认领的时间」：`rec_infer_ms` 包住的是
+/// pack → 提交 → 收账（等信号+读回+CTC 解码）整段，而不只是 `run()` 的墙钟。
+/// 只盯 `line` 会把纯主机侧的解码/打包算成 GPU 开销——消融掉**全部** rec 内核
+/// 后 `line` 仍剩 ~46 ms/图（100 图实测），那部分正是这里要摊开的。
 struct RoundStats {
     total: f64,
     det: f64,
     line: f64,
+    cls: f64,
+    rec_pre: f64,
+    rec_infer: f64,
+    rec_post: f64,
     wall: f64,
 }
 
@@ -631,6 +640,7 @@ struct RoundStats {
 fn corpus_round(engine: &Engine, o: &Options) -> Result<RoundStats, Error> {
     let t0 = std::time::Instant::now();
     let (mut total, mut det, mut line) = (0.0f64, 0.0f64, 0.0f64);
+    let (mut cls, mut rec_pre, mut rec_infer, mut rec_post) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
     for path in &o.images {
         let img = qppocr::decode_file(path)?;
         let r = if o.det_only {
@@ -642,11 +652,19 @@ fn corpus_round(engine: &Engine, o: &Options) -> Result<RoundStats, Error> {
         total += t.total_ms;
         det += t.det_pre_ms + t.det_infer_ms + t.det_post_ms;
         line += t.cls_ms + t.rec_pre_ms + t.rec_infer_ms + t.rec_post_ms;
+        cls += t.cls_ms;
+        rec_pre += t.rec_pre_ms;
+        rec_infer += t.rec_infer_ms;
+        rec_post += t.rec_post_ms;
     }
     Ok(RoundStats {
         total,
         det,
         line,
+        cls,
+        rec_pre,
+        rec_infer,
+        rec_post,
         wall: t0.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -817,7 +835,8 @@ fn run_bench(o: &Options) -> Result<(), Error> {
     let n_img = o.images.len() as f64;
     let base_total = med(&stats[0].iter().map(|s| s.total).collect::<Vec<_>>());
     println!(
-        "config                          total/img   det/img  line/img  wall/img   img/s  ratio"
+        "config                          total/img   det/img  line/img  wall/img   img/s  ratio  \
+         cls/img recpre/img recinf/img recpost/img"
     );
     for (ci, (label, _)) in configs.iter().enumerate() {
         let (t, d, l, w) = (
@@ -826,8 +845,10 @@ fn run_bench(o: &Options) -> Result<(), Error> {
             med(&stats[ci].iter().map(|s| s.line).collect::<Vec<_>>()),
             med(&stats[ci].iter().map(|s| s.wall).collect::<Vec<_>>()),
         );
+        // ⚠ 前 7 列（total det line wall img/s ratio）是 `ab.sh` 的判读接口：
+        // 它按 `awk '{print $2,$3,$4,$5}'` 取数。新增列只能**往后接**。
         println!(
-            "{:<30} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.1} {:>6.2}x",
+            "{:<30} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>7.1} {:>6.2}x  {:>9.1} {:>10.1} {:>10.1} {:>11.1}",
             label,
             t / n_img,
             d / n_img,
@@ -835,6 +856,10 @@ fn run_bench(o: &Options) -> Result<(), Error> {
             w / n_img,
             1000.0 * n_img / w,
             base_total / t.max(1e-9),
+            med(&stats[ci].iter().map(|s| s.cls).collect::<Vec<_>>()) / n_img,
+            med(&stats[ci].iter().map(|s| s.rec_pre).collect::<Vec<_>>()) / n_img,
+            med(&stats[ci].iter().map(|s| s.rec_infer).collect::<Vec<_>>()) / n_img,
+            med(&stats[ci].iter().map(|s| s.rec_post).collect::<Vec<_>>()) / n_img,
         );
     }
     // 逐轮明细（判断噪声量级用）。

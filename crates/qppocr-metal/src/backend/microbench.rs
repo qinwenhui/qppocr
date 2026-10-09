@@ -1039,6 +1039,70 @@ fn conv8_throughput() {
 /// ⚠️ batch 一大，工作集就超出 L2（M4 的 SLC 十几 MB），DRAM 流量随之
 /// 上升。所以判读看的是**趋势**（每份时间单调下降 = 有得藏），不是把
 /// batch 推到最大就最好——生产上还有个「合批就得补宽度」的代价。
+/// **真实 rec 形状的网格伸缩扫描**——回答「13× 里有多少是网格太小」。
+///
+/// 动机：`fma_peak_reference` 测出峰值要 `grid >= 810`（`grid=13` 只有
+/// 53% 峰值、`grid=102` 才 91%）。而 `conv8_batch_sweep` 上面那三个 case
+/// 的 b=1 网格已经是 58 起——**从来没扫过低网格档**，而生产里 rec 的
+/// conv8 dispatch 网格是 **9 / 17 / 74**（`QPPOCR_METAL_PLAN_DUMP`）。
+/// 如果网格依赖在真实形状上也成立，那连一个完美的内核都上不去，
+/// 「重写内核」这件事就得先排队。
+///
+/// 形状逐字取自 `img-004` 的 rec 计划（`[1,3,48,232]`，173 条），
+/// 乘 y 铺 batch 会把网格线性放大而**每线程工作量、访存形状、指令序列
+/// 一个字节都不改**，权重各份共用（`n_w` 不随 batch 增长）⇒ 权重保持
+/// L2 热，变量只剩「常驻 warp 数」。这是唯一能不动内核就测网格的做法。
+///
+/// 判读：每份时间随 batch **下降** ⇒ 网格是瓶颈（处方是提并行度）；
+/// **持平** ⇒ 网格无罪，13× 全在访存结构上（与 §4 定案一致）。
+#[test]
+fn conv8_grid_scaling_real_shapes() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+    // (h, w, cin, cout) 取自 `QPPOCR_METAL_PLAN_DUMP`；b=1 网格见 label。
+    let cases = [
+        ConvCase { label: "Conv.42  3x58 c384->192 (grid= 9)", h: 6, w: 58, cin: 384, cout: 192, kh: 1, kw: 1 },
+        ConvCase { label: "Conv.49  3x58 c384->768 (grid=17)", h: 3, w: 58, cin: 384, cout: 768, kh: 1, kw: 1 },
+        ConvCase { label: "Conv.41  6x58 c192->384 (grid=17)", h: 6, w: 58, cin: 192, cout: 384, kh: 1, kw: 1 },
+        ConvCase { label: "MatMul.12  1x29 c120->18712 (grid=74)", h: 1, w: 29, cin: 120, cout: 18712, kh: 1, kw: 1 },
+    ];
+    // 要盖到 grid>=810：grid=9 那档得 b=90。取 96 一档给足余量。
+    const BATCHES: [u32; 7] = [1, 3, 12, 24, 48, 96, 192];
+
+    for c in &cases {
+        eprintln!("[mb] ── {} ──", c.label);
+        let mut base_ms = f64::NAN;
+        for batch in BATCHES {
+            let pr = build_conv_case_batch(&ctx.inner.device, c, batch);
+            let run = |reps: u32| -> f64 {
+                let t = Instant::now();
+                submit_compute(&ctx.inner.queue, |enc| {
+                    for _ in 0..reps {
+                        ks.dispatch(enc, "n_conv8", &pr.buf, pr.p_off, pr.groups)
+                            .expect("dispatch");
+                        let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                        enc.memory_barrier_with_resources(&res);
+                    }
+                })
+                .expect("提交");
+                t.elapsed().as_secs_f64() * 1000.0
+            };
+            let t = time_dispatch(&run);
+            let per = t.ms / batch as f64;
+            if batch == 1 {
+                base_ms = per;
+            }
+            eprintln!(
+                "[mb]   b={batch:>3}  grid={:<13} 单份 {per:>7.3} ms  {:.2}×b=1  {:>7.1} GFLOPS",
+                format!("{:?}", pr.groups),
+                per / base_ms,
+                pr.flops / (t.ms * 1e6),
+            );
+        }
+    }
+}
+
 #[test]
 fn conv8_batch_sweep() {
     let _g = gpu_guard();

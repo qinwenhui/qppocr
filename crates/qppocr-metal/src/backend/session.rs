@@ -749,6 +749,13 @@ impl MetalSession {
         if g.blobs == plan.recipe {
             return Ok(()); // 那片字节此刻就是本计划的
         }
+        // 诊断开关：**跳过静态区重放**（数值必然错，只作计时）。用它是为了把
+        // 「重放这 ~21 MB」的成本从 `rec_infer` 里单独拎出来——`rec_infer` 包住
+        // pack→提交→收账（等待+读回+CTC 解码）整段，光看它会把这笔主机侧拷贝
+        // 算成 GPU 开销（消融掉全部 rec 内核后它仍有 ~37 ms/图）。
+        if std::env::var_os("QPPOCR_METAL_STATIC_NOREPLAY").is_some() {
+            return Ok(());
+        }
         // 逐 blob 判等仍然有效：`blobs` 是最后触碰者的清单，它写过的区间在
         // 其后没有任何写（同上）。
         let mut skip: std::collections::HashSet<(u32, u32, usize)> = g
@@ -761,6 +768,7 @@ impl MetalSession {
         // SAFETY: `a.base` 指向 `cap_words` 个 word 的映射，而计划的所有偏移
         // 都 < 它自己的 total_words ≤ 本 arena 建它时的 cap_words（arena 只增
         // 不减、计划只落在自己那块的范围内）。
+        let t_replay = std::time::Instant::now();
         unsafe {
             let base = g.base;
             for (off, data) in &plan.statics {
@@ -781,11 +789,13 @@ impl MetalSession {
         drop(g);
         if wrote > 0 || std::env::var_os("QPPOCR_METAL_STATIC_DEBUG").is_some() {
             eprintln!(
-                "[static] 缓存命中重放静态区：写 {:.2}/跳 {:.2} MB（{} 块，plan recipe {} 块）",
+                "[static] 缓存命中重放静态区：写 {:.2}/跳 {:.2} MB（{} 块，plan recipe {} 块），\
+                 耗时 {:.2} ms",
                 wrote as f64 * 4.0 / 1e6,
                 skipped as f64 * 4.0 / 1e6,
                 plan.statics.len(),
-                plan.recipe.len()
+                plan.recipe.len(),
+                t_replay.elapsed().as_secs_f64() * 1000.0
             );
         }
         Ok(())
@@ -990,6 +1000,41 @@ impl DeviceSession for MetalSession {
                     None => s == k,
                 })
         };
+        // 诊断开关：把 rec 计划里指定内核的派发**连续重复 N 次**
+        // （`QPPOCR_METAL_REC_REPEAT=n_conv8,n_conv` + `QPPOCR_METAL_REC_REPEAT_N=2`）。
+        //
+        // 与 STUB_REC 不同，**这个开关不改变数值**：内核是输入的纯函数，
+        // 连续跑两遍第二遍写的字节与第一遍逐位相同，下游读到的仍是对的。
+        // 所以它是唯一能「在真实流水线里、带着真实 arena 与真实上游数据」
+        // 量「第 k 遍的边际成本」的手段。
+        //
+        // 问的是：生产里 rec 的 conv8 是**冷启动/冷 L2**主导，还是稳态算力
+        // 主导？微基准 `conv8_grid_scaling_real_shapes` 用 reps 循环量同一个
+        // 内核、同样的形状，得到 750–1100 GFLOPS（权重每 rep 都被重读 ⇒
+        // L2 热）；而端到端消融反推只有 ~240 GFLOPS。**第二遍若便宜很多，
+        // 差价就是「权重没留在 L2 / 每条 dispatch 都要重新起转」——那是可以
+        // 靠跨行复用权重拿回来的（11 行独立，却各读一遍全部 20.8 MB）。**
+        let rep_rec: Vec<String> = std::env::var("QPPOCR_METAL_REC_REPEAT")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rep_rec_n: u32 = std::env::var("QPPOCR_METAL_REC_REPEAT_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(1);
+        let rec_reps = |k: &str, _node: &str| -> u32 {
+            if self.argmax_exit && rep_rec.iter().any(|s| s == k) {
+                rep_rec_n
+            } else {
+                1
+            }
+        };
         // 诊断开关：把这一整条命令缓冲区按 N 条 dispatch 切块，每块单独
         // commit+wait，并把每块墙钟**立刻**刷到 stderr（`QPPOCR_METAL_CHUNK`）。
         //
@@ -1039,9 +1084,11 @@ impl DeviceSession for MetalSession {
                 let (e, w) = submit_compute_timed(&self.ctx.queue, |enc| {
                     for d in blk {
                         if !skip_rec(d.kernel, &d.node) {
-                            self.ks
-                                .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
-                                .expect("dispatch（内核名来自计划，必在套件内）");
+                            for _ in 0..rec_reps(d.kernel, &d.node) {
+                                self.ks
+                                    .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
+                                    .expect("dispatch（内核名来自计划，必在套件内）");
+                            }
                         }
                         if !no_barrier {
                             let resources: [&metal::ResourceRef; 1] = [&plan.buf];
@@ -1078,9 +1125,11 @@ impl DeviceSession for MetalSession {
             submit_compute_timed(&self.ctx.queue, |enc| {
                 for d in &plan.dispatches {
                     if !skip_rec(d.kernel, &d.node) {
-                        self.ks
-                            .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
-                            .expect("dispatch（内核名来自计划，必在套件内）");
+                        for _ in 0..rec_reps(d.kernel, &d.node) {
+                            self.ks
+                                .dispatch(enc, d.kernel, &plan.buf, d.p_off, d.groups)
+                                .expect("dispatch（内核名来自计划，必在套件内）");
+                        }
                     }
                     if !no_barrier {
                         let resources: [&metal::ResourceRef; 1] = [&plan.buf];
