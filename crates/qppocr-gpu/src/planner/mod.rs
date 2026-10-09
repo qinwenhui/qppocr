@@ -68,6 +68,44 @@ pub struct ShapeTable {
     pub values: HashMap<String, Value>,
 }
 
+/// `konst` 载荷的物化上限（元素数）。理由见 [`seed_initializers`]。
+/// 任何**形状类**常量都远在这个量级以下（Resize 的 scales 是 4 个）。
+const MAX_KONST_ELEMS: usize = 4096;
+
+/// 把 initializer 播种成值表（形状/类型一律记，`konst` 载荷按需物化）。
+///
+/// ⚠️ **大张量不物化 `konst`**：`infer_shapes` 每来一个输入形状就调一次，
+/// 而 `t.f32.to_vec()` 是**深拷贝**——rec 的 initializer 合计约 60 MB，
+/// 按本机实测的 CPU memcpy 68.7 GB/s（`bench/gpuhealth/health.sh`）算，
+/// 每次建计划光这一项就 **0.87 ms**，正是「形状推断 0.98 ms/计划」的全部
+/// 来源；而 rec 一图就有 12 个桶形状 ⇒ 每图 12 次白拷 ~60 MB。
+///
+/// 为什么可以只留小的：真正**读值**的地方全是形状类小常量——Resize 的
+/// sizes/scales、Slice 的 starts/ends/axes/steps、Cast/Concat 的形状链。
+/// [`Const`] 的文档本来就写着 f32 载荷是「scales 等小常量」。而恒权重的
+/// 形状推理只用到它们的**形状**（conv 的 [Co,Ci,kh,kw]、MatMul B 的
+/// [K,N]），那部分照记不误。
+///
+/// 失败模式是**响亮**的：真有算子需要拿大常量折叠，会在装载期报
+/// 「…非装载期常量」，不会静默算错形状。
+fn seed_initializers(values: &mut HashMap<String, Value>, initializers: &HashMap<String, Tensor>) {
+    for (name, t) in initializers {
+        let konst = match t.dtype {
+            DType::I64 => Some(Const::I64(t.i64.clone())),
+            DType::F32 if t.f32.len() <= MAX_KONST_ELEMS => Some(Const::F32(t.f32.to_vec())),
+            DType::F32 => None,
+        };
+        values.insert(
+            name.clone(),
+            Value {
+                shape: t.shape.clone(),
+                dtype: t.dtype,
+                konst,
+            },
+        );
+    }
+}
+
 /// 对给定输入做静态形状推理 + 常量折叠。
 ///
 /// 图按 `graph.nodes` 顺序单趟扫描（ONNX 图即拓扑序，与 executor 的
@@ -80,20 +118,7 @@ pub fn infer_shapes(
 ) -> Result<ShapeTable> {
     let mut values: HashMap<String, Value> = HashMap::new();
     // 初始值有两类：initializer（权重/常量，值已知）与图输入（形状已知）。
-    for (name, t) in initializers {
-        let konst = match t.dtype {
-            DType::I64 => Some(Const::I64(t.i64.clone())),
-            DType::F32 => Some(Const::F32(t.f32.to_vec())),
-        };
-        values.insert(
-            name.clone(),
-            Value {
-                shape: t.shape.clone(),
-                dtype: t.dtype,
-                konst,
-            },
-        );
-    }
+    seed_initializers(&mut values, initializers);
     for (name, dims, dtype) in inputs {
         values.insert(
             name.clone(),
@@ -259,23 +284,8 @@ mod tests {
         // planner 逐步走（与 infer_shapes 同序），首个分歧/错误即报，
         // 错误时带两侧输入形状——分歧的根因几乎总在报错节点的上游。
         let (graph, initializers) = session.into_parts();
-        let mut values: HashMap<String, Value> = initializers
-            .iter()
-            .map(|(name, t)| {
-                let konst = match t.dtype {
-                    DType::I64 => Some(Const::I64(t.i64.clone())),
-                    DType::F32 => Some(Const::F32(t.f32.to_vec())),
-                };
-                (
-                    name.clone(),
-                    Value {
-                        shape: t.shape.clone(),
-                        dtype: t.dtype,
-                        konst,
-                    },
-                )
-            })
-            .collect();
+        let mut values: HashMap<String, Value> = HashMap::new();
+        seed_initializers(&mut values, &initializers);
         values.insert(
             input_name.clone(),
             Value {
