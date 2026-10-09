@@ -1070,6 +1070,130 @@ fn conv8_throughput() {
     }
 }
 
+/// 两个**同形状**用例输出段的 `(最大绝对差, 参考臂量级 max|a|)`。
+///
+/// 差值一律相对量级判：这个形状的输出是 216×18712 个未归一化的
+/// logits，绝对值大小取决于权重初值，写死一个绝对阈值必然要么太松
+/// （垃圾差也能过）要么太紧（fp16 的舍入差被当成错）。
+fn out_diff(a: &ConvProbe, b: &ConvProbe) -> (f32, f32) {
+    let n = (a.out_h * a.out_w * a.co4) as usize;
+    assert_eq!(n, (b.out_h * b.out_w * b.co4) as usize, "两臂输出长度不一致");
+    // SAFETY: 两臂的段布局由同一段代码生成，输出段长 out_h*out_w*co4；
+    // 缓冲是 Shared 存储，调用方已 wait_until_completed。
+    let (sa, sb) = unsafe {
+        (
+            std::slice::from_raw_parts((a.buf.contents() as *const f32).add(a.out_off_w as usize), n),
+            std::slice::from_raw_parts((b.buf.contents() as *const f32).add(b.out_off_w as usize), n),
+        )
+    };
+    let scale = sa.iter().fold(0f32, |m, &v| m.max(v.abs()));
+    let dmax = sa.iter().zip(sb).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    (dmax, scale)
+}
+
+/// **生产内核** f32 ── fp16：rec 的 CTC 分类头。
+///
+/// ## 为什么这条要单独量（而不是看 `conv8_variant_scan`）
+///
+/// 变体扫描量的是 `p_*` 探针内核，它的 `p_whalf` 用的是 `p_base` 的映射。
+/// 而生产在 CTC 头上走的是**窗口序**（门 `taps==1 && cin4v*nv >= 65536`，
+/// 本层 30×4678 = 140340）。于是「探针给出的 1.7~2.6× 能不能在最大那条
+/// dispatch 上兑现」这个问题里，混进了一个**映射**假变量。这条测试把它
+/// 钉死：只 dispatch 生产注册表里真实存在的两个入口，参数块、网格、
+/// arena 布局全部出自同一段构造代码，两臂唯一的自变量是
+/// `build_conv_case_half` 把权重段写成 fp16。
+///
+/// ## 顺带验一件事：half4 的地址折算
+///
+/// `n_conv8h` 用 `w_off >> 1` 把「4 B 元素偏移」折成 half4 下标，而
+/// `w_off` 是**同一个 word 偏移**——两个视图落在同一字节地址上，差别只在
+/// 步距。这套折算若有一处错，读到的就是**整块错位的垃圾**，误差是
+/// 量级差而不是 1e-3 量级。所以下面的对拍断言顺手把它证了。
+#[test]
+fn conv8_ctc_head_prod_f32_vs_f16() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+    // 形状逐字取自 rec 计划（`[8,27,120]→[8,27,18710]` 折批），与
+    // `conv8_variant_scan` 里那条同形状。
+    let c = ConvCase {
+        label: "rec ctc head 216x1 c120->18710 k1",
+        h: 216,
+        w: 1,
+        cin: 120,
+        cout: 18712,
+        kh: 1,
+        kw: 1,
+    };
+    let pr = build_conv_case(&ctx.inner.device, &c);
+    let prh = build_conv_case_half(&ctx.inner.device, &c);
+    // 两臂除了权重段内容之外必须逐位同源。网格不同 = 「同一条内核同一个
+    // 形状」这个前提就破了，后面所有比较都无从归因。
+    assert_eq!(pr.groups, prh.groups, "两臂网格不一致");
+    assert_eq!(pr.p_off, prh.p_off, "两臂参数块偏移不一致");
+    assert_eq!(pr.out_off_w, prh.out_off_w, "两臂输出段偏移不一致");
+
+    let run = |pr: &ConvProbe, name: &str, reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, name, &pr.buf, pr.p_off, pr.groups)
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    // 正确性：各跑一次再读回两臂的输出段。
+    run(&pr, "n_conv8", 1);
+    run(&prh, "n_conv8h", 1);
+    let (dmax, scale) = out_diff(&pr, &prh);
+    eprintln!(
+        "[mb] CTC 头 fp16 ── f32 输出：最大绝对差 {dmax:.3e}（量级 {scale:.3e}，\
+         相对 {:.2e}）",
+        dmax / scale.max(1e-30)
+    );
+    assert!(scale > 0.0, "参考臂输出全 0 —— 内核没写（哨兵 7.0 也没了？）");
+    assert!(
+        dmax < scale * 1e-2,
+        "fp16 与 f32 输出差 {dmax:.3e}（量级 {scale:.3e}）——这不是舍入，\
+         是权重段的解释错了（w_off 折算 / half4 步距）"
+    );
+
+    // 计时：两臂各按自己的速度校准重复次数，取较大者共用——重复次数
+    // 相同才能让「每轮两臂的固定开销摊薄程度」一致。
+    let reps = calibrate(&|r| run(&pr, "n_conv8", r)).max(calibrate(&|r| run(&prh, "n_conv8h", r)));
+
+    // 奇偶轮换序：本机「一轮里先跑的那个」快 6~15%（见 bench/gpuhealth
+    // 的 ab.sh 注释），固定次序的 A/B 等于没量。
+    let (mut ta, mut tb) = (f64::INFINITY, f64::INFINITY);
+    let mut per = Vec::new();
+    for i in 0..4 {
+        let (a, b) = if i % 2 == 0 {
+            let a = run(&pr, "n_conv8", reps) / reps as f64;
+            let b = run(&prh, "n_conv8h", reps) / reps as f64;
+            (a, b)
+        } else {
+            let b = run(&prh, "n_conv8h", reps) / reps as f64;
+            let a = run(&pr, "n_conv8", reps) / reps as f64;
+            (a, b)
+        };
+        ta = ta.min(a);
+        tb = tb.min(b);
+        per.push(format!("{a:.3}/{b:.3}"));
+    }
+    eprintln!(
+        "[mb] CTC 头生产内核（reps={reps}，逐轮 f32/fp16: {}）：\
+         f32 {ta:.3} ms → fp16 {tb:.3} ms = {:.2}×",
+        per.join(" "),
+        ta / tb
+    );
+    assert!(tb < ta, "fp16 臂没有比 f32 快（{tb:.3} vs {ta:.3}）");
+}
+
 /// **batch 扫描**：把常驻 warp 数翻倍，看**单份**时间掉不掉。
 ///
 /// 见 `build_conv_case_batch` 的头注释——这是目前唯一不靠「砍掉某样东西」
