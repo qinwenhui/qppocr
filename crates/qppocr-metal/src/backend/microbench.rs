@@ -21,7 +21,7 @@ use metal::MTLSize;
 use super::device::submit_compute;
 use super::pipeline::{dispatch_with_tg, KernelSet};
 use super::MetalContext;
-use super::conv_probe::{mm_sg_groups, MM_PROBE_SHADERS, ProbeSet};
+use super::conv_probe::{mm_sg_groups, MM_PROBE_SHADERS, MM_TG_PROBE_SHADERS, ProbeSet};
 
 /// 有 Metal 设备就打开，否则跳过（CI 非 mac）。与 `kernel_tests` 同款。
 fn open_or_skip() -> Option<MetalContext> {
@@ -360,15 +360,21 @@ fn mm_sg_scan() {
         ("ctc104_c120o18710", 104u32, 18710u32, 120u32),
     ];
 
-    // 分配 fp16 缓冲：A [M,K], W [N,K], C [M,N]。
-    // 大小：M*K + N*K + M*N = 按 half 算字节，乘以 2。
-    let m_max = cases.iter().map(|(_, m, _, _)| *m).max().unwrap();
-    let n_max = cases.iter().map(|(_, _, n, _)| *n).max().unwrap();
-    let k_max = cases.iter().map(|(_, _, _, k)| *k).max().unwrap();
-    let buf_size = (m_max * k_max + n_max * k_max + m_max * n_max) as u64 * 2;
-    let buf = ctx.inner.device.new_buffer(buf_size, metal::MTLResourceOptions::StorageModeShared);
-    let zeros = vec![0u8; 64 << 20];
-    unsafe { std::ptr::copy_nonoverlapping(zeros.as_ptr(), buf.contents() as *mut u8, zeros.len()) };
+    // 分配 fp16 缓冲：A [M,K], W [N,K], C [M,N]，三段**互不重叠**。
+    //
+    // 这里原来是「把各 case 的 m/n/k 各取独立最大值再相乘」：
+    // `m_max * n_max` = 921600 × 18710 ⇒ **36.4 GB**，比本机 24 GB 物理内存
+    // 还大，而且 A/W/C **全绑在偏移 0 上互相覆写**。fp16 只碰 1.9 GB 时侥幸
+    // 过关，同日同款算法的 f32 版本（碰 3.8 GB）在 `mm_tg_scan` 里直接打出了
+    // **GPU 页故障**（`recoveryCount` 0→1）。改成「各 case 自己的精确尺寸取
+    // 最大值」后只有 2.83 GB，且不再有同址读写。
+    let per_case = |m: u32, n: u32, k: u32| {
+        let (mp, np, kp) = (m.div_ceil(64) * 64, n.div_ceil(64) * 64, k.div_ceil(8) * 8);
+        mp as u64 * kp as u64 + np as u64 * kp as u64 + mp as u64 * np as u64
+    };
+    let max_elems = cases.iter().map(|(_, m, n, k)| per_case(*m, *n, *k)).max().unwrap();
+    let buf = ctx.inner.device.new_buffer(max_elems * 2, metal::MTLResourceOptions::StorageModeShared);
+    unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, (max_elems * 2) as usize) };
 
     for variant in &[("p_mm_sg", "pure GEMM, ideal 64x64 tile"), ("p_mm_sg_conv8", "conv8 adapted tile")] {
         let name = variant.0;
@@ -384,6 +390,10 @@ fn mm_sg_scan() {
             let k_pad = k.div_ceil(8) * 8;
             let flops = (m as u64) * (n as u64) * (k as u64) * 2; // FMA = MAC ×2
             let bytes = (m_pad * k_pad * 2 + n_pad * k_pad * 2 + m_pad * n_pad * 2) as f64;
+            // 本 case 的三段基址（元素 → 字节），两臂共用同一布局：
+            // A 在 0、W 在 M*K、C 在 M*K + N*K。
+            let off_w = (m_pad as u64 * k_pad as u64) * 2;
+            let off_c = (m_pad as u64 * k_pad as u64 + n_pad as u64 * k_pad as u64) * 2;
 
             // 参数：M,N,K（对齐后的值）。
             let params = [m_pad as u32, n_pad as u32, k_pad as u32];
@@ -397,10 +407,10 @@ fn mm_sg_scan() {
             let ms = bench(15, || {
                 submit_compute(&ctx.inner.queue, |enc| {
                     enc.set_compute_pipeline_state(pipe);
-                    // 同一 arena 绑 0/1/2：probe 的 A/W/C 都按 half 解释，与 conv8 同 abi。
-                    for b in 0..3u64 {
-                        enc.set_buffer(b, Some(&buf), 0);
-                    }
+                    // probe 的 A/W/C 都按 half 解释，与 conv8 同 abi；三段错开。
+                    enc.set_buffer(0, Some(&buf), 0);
+                    enc.set_buffer(1, Some(&buf), off_w);
+                    enc.set_buffer(2, Some(&buf), off_c);
                     enc.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const std::ffi::c_void);
                     enc.dispatch_threads(
                         MTLSize::new(threads[0] as u64, threads[1] as u64, threads[2] as u64),
@@ -416,6 +426,111 @@ fn mm_sg_scan() {
             eprintln!(
                 "[mb/mm_sg] {:20} {:20} M={:6} N={:6} K={:6}  grid={:5}x{:3}  time={:6.2} ms  gflops={:7.1}  util={:4.1}%  B/FLOP={:.3} B/FLOP",
                 name, label, m, n, k, groups[0], groups[1], ms, gflops, gflops / roof * 100.0, bytes / flops as f64
+            );
+        }
+    }
+}
+
+/// **MMA 装载路径**探针 —— 分片从 device 直读 vs 经 threadgroup 中转。
+///
+/// 动机（见 `probe_mm_tg.metal` 头注释）：全图 36~66% 的天花板 + fp16 探针
+/// 反而只有 f32 的 0.62×，两个反常指向**同一个**共享病根。全仓四个 MMA 内核
+/// 的分片都是 `simdgroup_load` 从 device 直读，而 Apple 的标准快路是
+/// 协作拷贝 → threadgroup → barrier → 从 threadgroup 取分片。
+///
+/// **对照是 `p_mm_sg` 本身**（同一份 run、同一块 buffer、同一套网格），
+/// 不是历史读数。
+#[test]
+fn mm_tg_scan() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+
+    // 表 1 出 `p_mm_sg`（fp16 device 直读，对照），表 2 出四条新臂。
+    let ctl = ProbeSet::from_list(&ctx.inner.device, MM_PROBE_SHADERS).expect("编译对照探针");
+    let ps = ProbeSet::from_list(&ctx.inner.device, MM_TG_PROBE_SHADERS).expect("编译 TG 探针");
+
+    // ⚠️ det 那两个形状的 M **缩到 1/8**（960×120 而不是 960×960）。
+    // 原因不是性能，是**内存安全**：M=921600 时 C 是 921600×1024 f32 = 3.8 GB，
+    // 叠上 A 就 5.7 GB。这个探针的效果是**每线程组局部**的（协作拷贝 → 屏障 →
+    // 分片），与 M 只通过占用率相关：960×120 仍然是 1800×16 = 28800 个线程组，
+    // 对本机 ~40 个 GPU 核是 **90× 超订**，占用率早已饱和。
+    // 判据：`p_mm_sg` 在小形状上应当仍落在 ~1500（历史大形状读数 1500.5）。
+    let cases = [
+        ("det960_c512o1024", 960u32 * 120, 1024u32, 512u32),
+        ("det960_c1024o512", 960u32 * 120, 512u32, 1024u32),
+        ("rec6x208_c192o384", 6u32 * 208, 384u32, 192u32),
+        ("rec3x208_c384o768", 3u32 * 208, 768u32, 384u32),
+        ("ctc104_c120o18710", 104u32, 18710u32, 120u32),
+    ];
+
+    // (臂名, 元素字节数, 说明)。`p_mm_sg` 在对照表里，其余在 TG 表里。
+    let arms: [(&str, u64, &str); 6] = [
+        ("p_mm_sg", 2, "fp16  device 直读（对照）"),
+        ("p_mm_tg", 2, "fp16  threadgroup 单缓冲"),
+        ("p_mm_tg2", 2, "fp16  threadgroup 双缓冲"),
+        ("p_mm_f32_dev", 4, "f32   device 直读（对照）"),
+        ("p_mm_f32_tg", 4, "f32   threadgroup 单缓冲"),
+        ("p_mm_f32_tg2", 4, "f32   threadgroup 双缓冲"),
+    ];
+
+    for (label, m, n, k) in &cases {
+        let (m, n, k) = (*m, *n, *k);
+        let m_pad = m.div_ceil(64) * 64;
+        let n_pad = n.div_ceil(64) * 64;
+        let k_pad = k.div_ceil(8) * 8;
+        let flops = (m as u64) * (n as u64) * (k as u64) * 2;
+        let groups = [m_pad.div_ceil(64), n_pad.div_ceil(64), 1];
+        let threads = [groups[0] * 256, groups[1], groups[2]];
+        let params = [m_pad, n_pad, k_pad];
+        let params_bytes =
+            unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
+
+        // **每个 case 按自己的精确尺寸分配，A/W/C 三段互不重叠**。
+        //
+        // 这里原来是照抄 `mm_sg_scan` 的算法：把各 case 的 m/n/k 各取独立最大值
+        // 再乘起来 —— `m_max * n_max` = 921600 × 18710 ⇒ **34.4 GB**，比本机
+        // 24 GB 物理内存还大，而且 A/W/C 三者**全绑在同一个偏移 0 上互相覆写**。
+        // 2026-10-10 实测：fp16 臂（只碰 1.9 GB）三次侥幸过关，加上 f32 臂
+        // （要碰 3.8 GB）后 `p_mm_f32_dev` 直接触发 **GPU 页故障**
+        // （`recoveryCount` 0→1）。见 `bench/gpuhealth/health.sh`。
+        let a_len = m_pad as u64 * k_pad as u64;
+        let w_len = n_pad as u64 * k_pad as u64;
+        let c_len = m_pad as u64 * n_pad as u64;
+        let buf = ctx.inner.device
+            .new_buffer((a_len + w_len + c_len) * 4, metal::MTLResourceOptions::StorageModeShared);
+        unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, ((a_len + w_len + c_len) * 4) as usize) };
+
+        eprintln!(
+            "--- {} M={} N={} K={} grid={}x{}  buf={:.0} MB ---",
+            label, m, n, k, groups[0], groups[1],
+            (a_len + w_len + c_len) as f64 * 4.0 / 1e6
+        );
+        for (name, esz, desc) in &arms {
+            let pipe = match *name == "p_mm_sg" {
+                true => ctl.pipe(name),
+                false => ps.pipe(name),
+            }
+            .expect(&format!("取 {name} 管线"));
+            // 三段基址按本臂的元素宽度换算成字节偏移。
+            let off_w = a_len * esz;
+            let off_c = (a_len + w_len) * esz;
+            let ms = bench(15, || {
+                submit_compute(&ctx.inner.queue, |enc| {
+                    enc.set_compute_pipeline_state(pipe);
+                    enc.set_buffer(0, Some(&buf), 0);
+                    enc.set_buffer(1, Some(&buf), off_w);
+                    enc.set_buffer(2, Some(&buf), off_c);
+                    enc.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const std::ffi::c_void);
+                    enc.dispatch_threads(
+                        MTLSize::new(threads[0] as u64, threads[1] as u64, threads[2] as u64),
+                        MTLSize::new(256, 1, 1),
+                    );
+                }).expect("提交");
+            });
+            let gflops = flops as f64 / (ms / 1000.0) / 1e9;
+            eprintln!(
+                "[mb/mm_tg] {:16} {:20} time={:8.2} ms  gflops={:7.1}  util={:4.1}%   {}",
+                name, label, ms, gflops, gflops / 3340.0 * 100.0, desc
             );
         }
     }

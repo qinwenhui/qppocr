@@ -15,7 +15,7 @@ rec=$(ioreg -r -c IOAccelerator -l 2>/dev/null | grep -o '"recoveryCount"=[0-9]*
 if [ -z "$gpu" ]; then echo "读不到带宽，探针异常"; exit 2; fi
 
 verdict=0; msg=""
-if   [ "$rec" != "0" ]; then verdict=2; msg="recoveryCount=$rec（有过 GPU 页故障）→ 重启，重启前的所有数字作废"
+if   [ "$rec" != "0" ]; then verdict=2; msg="recoveryCount=${rec}（有过 GPU 页故障）→ 重启，重启前的所有数字作废"
 elif awk "BEGIN{exit !($gpu >= 60)}"; then verdict=0; msg="健康 —— 可以放心测性能"
 elif awk "BEGIN{exit !($gpu >= 10)}"; then verdict=1; msg="存疑（10~60 GB/s）—— 复跑一次；别用来出性能数字"
 else verdict=2; msg="访存通路已被打瘸 → 立刻停手，重启（没有任何免重启的恢复手段）"

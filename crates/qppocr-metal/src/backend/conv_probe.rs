@@ -274,6 +274,18 @@ pub(crate) fn mm_sg_groups(m_pad: u32, n_pad: u32) -> [u32; 3] {
     [m_pad.div_ceil(64), n_pad.div_ceil(64), 1]
 }
 
+/// **MMA 装载路径**那组（`probe_mm_tg.metal`）+ 对照 `p_mm_sg`。
+///
+/// 同参数块（`p[0..3] = M,N,K`）、同网格（64×64 瓦片、256 线程/组）、同数学，
+/// **只换 A/B 分片的来源**。`p_mm_sg` 从 `MM_PROBE_SHADERS` 借来当**同 run
+/// 对照**——没有它，「变快/变慢」就分不清是改动的功劳还是机器漂移。
+pub(crate) const MM_TG_PROBE_SHADERS: &[(&str, &str)] =
+    &[("p_mm_tg", include_str!("probe_mm_tg.metal")),
+      ("p_mm_tg2", include_str!("probe_mm_tg.metal")),
+      ("p_mm_f32_dev", include_str!("probe_mm_tg.metal")),
+      ("p_mm_f32_tg", include_str!("probe_mm_tg.metal")),
+      ("p_mm_f32_tg2", include_str!("probe_mm_tg.metal"))];
+
 /// `p_dw_u9`/`p_dw_u3` 只对「参数与其模板常量逐位相符」的形状成立 ——
 /// 拿 u9 去跑 3×3 会读到常量算出的错地址，输出全错。
 pub(crate) fn dw_spec_ok(name: &str, kh: u32, kw: u32, pad: u32, stride: u32) -> bool {
