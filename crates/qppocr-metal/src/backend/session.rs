@@ -181,6 +181,11 @@ pub(crate) struct MetalSession {
     ///
     /// 见 [`conv_kxk_mma`] 与 `plan.rs::PlanBuilder::conv_kxk_mma` 的启用判据。
     pub(crate) conv_kxk_mma: bool,
+    /// ConvTranspose 走空间分块的 `n_convt4w`（`QPPOCR_METAL_CONVT_TILE`，
+    /// 默认 **true**）。
+    ///
+    /// 见 [`conv_t_tile`] 与 `plan.rs::PlanBuilder::conv_t_tile` 的启用判据。
+    pub(crate) conv_t_tile: bool,
     /// 执行串行锁：每 run 重编码 + 同步等待不支持并发在飞（deferred
     /// 流水是 P4 的性能项；trait 默认的同步 run_deferred 语义等价）。
     run_lock: Mutex<()>,
@@ -322,6 +327,19 @@ fn conv_kxk_mma() -> bool {
     )
 }
 
+/// ConvTranspose 走空间分块的 `n_convt4w`
+/// （`QPPOCR_METAL_CONVT_TILE`，默认 **true**）。
+///
+/// 同 [`conv1x1_mma`]：不动精度（f32 进 f32 出，累加次序与 `n_convt` 的
+/// ci4 快路逐 ci 相同，探针对拍差 0.000e0），所以默认开；置 `0`/`off`
+/// 关掉，供 A/B 对照与排障（对照列会**逐位回到** `n_convt` 的派发）。
+fn conv_t_tile() -> bool {
+    !matches!(
+        std::env::var("QPPOCR_METAL_CONVT_TILE").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
 impl MetalSession {
     pub(crate) fn new(
         ctx: Arc<super::Inner>,
@@ -371,6 +389,7 @@ impl MetalSession {
             },
             conv1x1_mma: conv1x1_mma(),
             conv_kxk_mma: conv_kxk_mma(),
+            conv_t_tile: conv_t_tile(),
             run_lock: Mutex::new(()),
             // ⚠ 这个预算是**每会话一份**，而 det / rec / cls 是三个会话
             //（各自 new 一次）。所以 `QPPOCR_GPU_KERNEL_PROF=3` 不是
@@ -504,6 +523,8 @@ impl MetalSession {
             conv1x1_mma: self.conv1x1_mma,
             // k×k（k>1）同款（默认开）。见 [`conv_kxk_mma`]。
             conv_kxk_mma: self.conv_kxk_mma,
+            // ConvTranspose 的空间分块版（默认开）。见 [`conv_t_tile`]。
+            conv_t_tile: self.conv_t_tile,
         }
         .build(&self.input_name, in_shape, static_reserve)?;
 

@@ -262,6 +262,48 @@ pub struct PlanBuilder<'a> {
     ///
     /// 与 `conv1x1_mma` 同款：Vulkan 的 GLSL 侧没有这两个内核。
     pub conv_kxk_mma: bool,
+    /// ConvTranspose 走空间分块的 `n_convt4w`（**只有 Metal 有这支内核**，
+    /// 故由会话侧给值：Metal 默认 true，Vulkan 恒 false）。
+    ///
+    /// ## 为什么
+    ///
+    /// det 的 `n_convt` 两条共 10.1 ms（设备端 90 ms 的 11.3%），其中
+    /// ConvTranspose.0 单条 8.20 ms 却只做 1.70 GFLOP（210 GFLOPS）。
+    /// 注意 `flopsmap.py` 把它记成 6.79 GFLOP —— 那是按 `taps` 记 MAC 的
+    /// **4× 高估**：kH≤sH 且 kW≤sW 时每个输出只吃一个 tap。
+    ///
+    /// 探针 `convt_probe_attribution` 九臂的归因：每 ci 迭代 2 条 float4
+    /// 装载换 4 条 FMA，其中输入那条是 `d[...][ci & 3u]`（**动态 float4
+    /// 下标**，且每 4 个 ci 重复同一地址）；把地址掩进 1 KB 的臂显示瓶颈
+    /// 在**权重装载的访存路径**（权重 1.82×、输入 1.04×、输出 1.14×、
+    /// 访存全砍 4.37×）。
+    ///
+    /// `n_convt4w` 让一个线程吃掉同一 (ih,iw) 的 4 个 tap × 4 个相邻 iw：
+    /// 输入 1 读 4 用、权重 1 读 4 用，装载/float4-FMA 从 1.06 降到 0.31。
+    /// 同台实测 **3.45×**（5.023 → 1.456 ms），已达该形状 fmaonly 地板的 79%。
+    ///
+    /// ## 落地后实测（**同一二进制、同一次 run 内交错**，非跨二进制）
+    ///
+    /// det 单图逐内核（img-001，medium，`QPPOCR_GPU_KERNEL_PROF=60`，3 组
+    /// 开/关交错）：`n_convt` 家族 **6.55 ms（关）→ 2.33 ms（开）**，即
+    /// **−4.2 ms**；同一轮里没动过的兄弟内核漂移 <3%（n_conv8_mma
+    /// 39.3→39.9 / 39.2→40.5 ms），所以这个差不是漂移。设备端合计
+    /// 110.1 → 115.0 ms（3 组中位）。端到端 `env_ab.sh` 的 Δdet 中位
+    /// **+3.40 ms**（8 图×6 轮，但后两轮机器在漂，取前四轮）。
+    /// 改动前的 10.1 ms 是**旧二进制跨 run 读数**，只作量级参考——按
+    /// memory `sequential-cross-binary-compare-is-drift`，不进判据。
+    ///
+    /// ## 启用判据（不满足则回落 `n_convt`）
+    ///
+    /// - `kh==kw==2 && sh==sw==2`：4 个 tap 的枚举写死在内核里；
+    /// - `inW % 4 == 0`：空间块不跨行（两个真实形状 216/432 都满足）；
+    /// - `nv >= 4`：nv=1 那条上本内核实测只有 **1.73×**，低于 `n_convt`
+    ///   自己的 ci4 快路（**2.01×**）——16 个 float4 累加器在通道维没有
+    ///   并行度时被寄存器压力反噬。
+    ///
+    /// 与 `conv1x1_mma` 同款：Vulkan 的 GLSL 侧没有 `n_convt4w`，开了会
+    /// 派发到不存在的内核（硬失败，非静默降级）。
+    pub conv_t_tile: bool,
 }
 
 /// `n_conv8_mma3` 与 `n_conv8_edge` 共用的一张**覆盖几何**（全部是输出坐标）。
@@ -1407,6 +1449,18 @@ impl PlanBuilder<'_> {
                     .f(c1)
                     .f(c2)
                     .f(c3);
+                // 空间分块版：判据见 `PlanBuilder::conv_t_tile`。参数块与网格的
+                // **y 维（batch）同 n_convt**，只有 x 维改成「每线程 4 个 iw」的
+                // 计数（tiles 公式必须与 n_convt4w 里逐字一致）。
+                if self.conv_t_tile
+                    && kh == 2 && kw == 2
+                    && sh == 2 && sw == 2
+                    && xs[3] % 4 == 0
+                    && nv >= 4
+                {
+                    let tiles = (xs[2] as u32) * (xs[3] as u32 / 4) * nv;
+                    return Ok(vec![("n_convt4w", pb, [div256(tiles), xs[0] as u32, 1])]);
+                }
                 Ok(vec![("n_convt", pb, [div256(m_dim * nv), xs[0] as u32, 1])])
             }
             "MaxPool" | "AveragePool" => {

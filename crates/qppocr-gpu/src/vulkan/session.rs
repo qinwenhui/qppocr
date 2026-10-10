@@ -706,6 +706,8 @@ impl VulkanSession {
             conv1x1_mma: false,
             // k×k MMA（`n_conv8_mma3` + `n_conv8_edge`）同理恒 false。
             conv_kxk_mma: false,
+            // Metal 独有（GLSL 侧无此内核）。见 `PlanBuilder::conv_t_tile`。
+            conv_t_tile: false,
         }
         .build(
             &self.input_name,

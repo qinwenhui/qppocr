@@ -53,6 +53,9 @@ const SHADERS: &[(&str, &str)] = &[
     ),
     ("n_conv_dw", include_str!("../../shaders/n_conv_dw.metal")),
     ("n_convt", include_str!("../../shaders/n_convt.metal")),
+    // 2×2/s2 的空间分块版（探针 3.45×，见该文件头注释）。只在
+    // `PlanBuilder::conv_t_tile` 为真且几何/并行度满足时派发。
+    ("n_convt4w", include_str!("../../shaders/n_convt4w.metal")),
     ("n_pool", include_str!("../../shaders/n_pool.metal")),
     ("n_resize", include_str!("../../shaders/n_resize.metal")),
     ("n_concat_c", include_str!("../../shaders/n_concat_c.metal")),

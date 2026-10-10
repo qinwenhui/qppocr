@@ -2,7 +2,18 @@
 // 每输出恰由一个 (ih,iw,ky,kx) tap 决定。ONNX 权重 [Ci,Co,kh,kw] 重排为
 // 每 tap 一张 [Ci][nv] 的 float4 矩阵（元素 = 4 个输出通道）。
 // act：0=无、1=gelu(c1,c2,c3)、2=relu。
-// 与 qppocr-gpu/shaders/n_convt.comp 逐行对应——改语义必须两边同步。
+//
+// ## 与 GLSL 侧的关系（**已分叉，此处是唯一准确的说法**）
+//
+// `qppocr-gpu/shaders/n_convt.comp` 仍是**标量热循环**（`d[..][ci & 3u]`），
+// 本文件换成了下面的 ci4 展开。两者**语义/结果位级一致**（累加次序相同），
+// 但**源码不再逐行对应**——本机没有 SPIR-V 工具链（glslangValidator/glslc
+// 都没有），改 `.comp` 只会让它与签入的 `spirv/n_convt.spv` 脱钩，而真正
+// 跑的是 `.spv`。所以：**GLSL/Vulkan 侧保持原样（正确但慢），分叉是有意的**。
+// 哪天要同步，必须同时重编 `spirv/n_convt.spv`，不能只改 `.comp`。
+//
+// 2×2/s2/**nv≥4** 的形状也不走这里，走空间分块的 `n_convt4w`（见该文件头注释：
+// 探针 `convt_probe_attribution` 实测 3.45×，本内核同为 1×1 通道块时只有 1.28×）。
 #include <metal_stdlib>
 using namespace metal;
 
@@ -76,10 +87,27 @@ kernel void n_convt(
     uint ob = (out_off >> 2) + b * mDim * nv;
 
     uint px = ih * inW + iw;
+    uint wt = wb + tap * cin * nv + n4;
     float4 acc = float4(0.0);
-    for (uint ci = 0u; ci < cin; ci++) {
-        float xv = d[ib + px * ci4v + (ci >> 2)][ci & 3u];
-        acc += xv * d[wb + tap * cin * nv + ci * nv + n4];
+    // ci 按 4 展开：一次读整个 float4，四条 lane **静态**取用。这一步同时消掉
+    // 两样东西——`d[...][ci & 3u]` 的**动态 float4 下标**，以及同一地址每 4 个
+    // ci 重复一次的 **4× 冗余装载**。累加次序与标量版逐 ci 相同（ci = 4k+0..3
+    // 依次 fma），故**位级一致**：`probe_convt.metal` 的 `p_ct_ci4` 与 `p_ct_base`
+    // 实测差 0.000e0。
+    //
+    // 为什么值得（同一次探针，`convt_probe_attribution`）：nv=1 那条
+    // （ConvTranspose.2，`ismall` 2.13×）瓶颈就是输入侧这 4× 冗余 + 装载条数，
+    // 本改写单独给 **2.01×**，且**不改网格**。两条 real 形状上 ci4 是
+    // 1.28× / 2.01×。
+    //
+    // `cin` 恒为 4 的倍数（plan.rs 传 `cpad4(Ci)`，`ci4v` = 其 1/4），
+    // 故遍历 `ci4v` 覆盖全部 ci。
+    for (uint ci4 = 0u; ci4 < ci4v; ci4++) {
+        float4 x = d[ib + px * ci4v + ci4];
+        acc += x.x * d[wt + (ci4 << 2) * nv];
+        acc += x.y * d[wt + ((ci4 << 2) + 1u) * nv];
+        acc += x.z * d[wt + ((ci4 << 2) + 2u) * nv];
+        acc += x.w * d[wt + ((ci4 << 2) + 3u) * nv];
     }
     if (b_off != OFF_NONE) acc += d[(b_off >> 2) + n4]; // bias 全批共享（曾有 b*nv 越界）
     if (act == 2u) acc = max(acc, float4(0.0));

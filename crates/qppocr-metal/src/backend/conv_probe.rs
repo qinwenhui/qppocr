@@ -230,6 +230,37 @@ pub(crate) const DW_PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_dw_u3", include_str!("probe_dw.metal")),
 ];
 
+/// `n_convt` 探针（`probe_convt.metal`，见该文件的头注释）。
+///
+/// **单开一张表**：参数块语义（每 tap 一张 `[Cin][nv]` 权重矩阵、`kW` 显式给、
+/// `sH/sW` 显式给）与 conv8 那组不同，混进去 `groups_for` 会给出错的网格。
+pub(crate) const CT_PROBE_SHADERS: &[(&str, &str)] = &[
+    ("p_ct_base", include_str!("probe_convt.metal")),
+    ("p_ct_ci4", include_str!("probe_convt.metal")),
+    ("p_ct_noin", include_str!("probe_convt.metal")),
+    ("p_ct_now", include_str!("probe_convt.metal")),
+    ("p_ct_fmaonly", include_str!("probe_convt.metal")),
+    ("p_ct_ismall", include_str!("probe_convt.metal")),
+    ("p_ct_wsmall", include_str!("probe_convt.metal")),
+    ("p_ct_osmall", include_str!("probe_convt.metal")),
+    ("p_ct_tap4", include_str!("probe_convt.metal")),
+    ("p_ct_tap4w4", include_str!("probe_convt.metal")),
+];
+
+/// `n_convt` 探针的网格（工作组数）。必须与内核里 `tiles` 的算法一致。
+///
+/// `m_dim` = `outH*outW`；`co4` = `cpad4(Co)`（含 pad，与 `plan.rs` 同）。
+/// `p_ct_tap4` 一线程吃 `sH*sW` 个输出，`p_ct_tap4w4` 再叠 4 个相邻 `iw`。
+pub(crate) fn ct_groups_for(name: &str, m_dim: u32, in_h: u32, in_w: u32, co4: u32) -> [u32; 3] {
+    let nv = co4 / 4;
+    let tiles = match name {
+        "p_ct_tap4" => in_h * in_w * nv,
+        "p_ct_tap4w4" => in_h * (in_w / 4) * nv,
+        _ => m_dim * nv,
+    };
+    [tiles.div_ceil(256), 1, 1]
+}
+
 /// simdgroup_matrix 探针（`probe_mm_sg.metal`：纯 GEMM，竞品结构；`probe_mm_sg_conv8.metal`：适配 conv8 形状）。
 ///
 /// **单开一张表**：参数块语义（`p[0..3] = M,N,K`）与网格（64×64 瓦片）

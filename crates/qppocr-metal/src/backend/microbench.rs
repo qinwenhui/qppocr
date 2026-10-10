@@ -3950,3 +3950,347 @@ fn conv_dw_variant_scan() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// n_convt 探针的驱动（内核见 `probe_convt.metal`，变体表见其头注释）
+// ---------------------------------------------------------------------------
+
+/// 一个已组好的 ConvTranspose 用例的 arena。
+///
+/// **单开一份**而不复用 `build_conv_case_geom_w`：参数块语义不同——conv8 是
+/// `[…,cin4v,taps,kW,sH,sW,padT,padL,act,…]`（21 词），ConvTranspose 是
+/// `[…,cin(已 pad),ci4v,sH,sW,kW,act,c1,c2,c3]`（18 词），第 9/10/11 个位置
+/// 就会对错（conv8 的 `cin4v` 在 P+9，convt 的 `cin` 在 P+9）。混用 = 内核按
+/// 错参数跑，量出来的数是假的。
+struct CtProbe {
+    buf: metal::Buffer,
+    p_off: u32,
+    out_off_w: u32,
+    n_out: u32,
+    m_dim: u32,
+    in_h: u32,
+    in_w: u32,
+    cin: u32,
+    cout: u32,
+    co4: u32,
+    ci4: u32,
+    /// NHWC（含 cpad4）输入，CPU 对拍用。
+    input: Vec<f32>,
+    /// ONNX 布局 `[Ci][Co][2][2]` 权重，CPU 对拍用。
+    weight: Vec<f32>,
+    flops: f64,
+    bytes: f64,
+}
+
+/// 组一个 2×2 stride-2、无 pad 的 ConvTranspose 用例（`n_convt` 在 det 里
+/// 的两条都是这个几何）。字段顺序与 `plan.rs` 的 ConvTranspose 分支逐字一致。
+fn build_ct_case(device: &metal::DeviceRef, cin: u32, cout: u32, in_h: u32, in_w: u32) -> CtProbe {
+    assert!(in_w % 4 == 0, "p_ct_tap4w4 要求 inW%4==0");
+    let ci4 = cin.div_ceil(4) * 4;
+    let co4 = cout.div_ceil(4) * 4;
+    let (out_h, out_w) = (in_h * 2, in_w * 2);
+    let m_dim = out_h * out_w;
+    let taps = 4u32;
+    let nv = co4 / 4;
+
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = || -> f32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 0.25
+    };
+    let input: Vec<f32> = (0..(in_h * in_w * ci4) as usize).map(|_| rnd()).collect();
+    let weight: Vec<f32> = (0..(cin * cout * 4) as usize).map(|_| rnd()).collect();
+
+    // 重排成 [tap][ci][nv][4]（float 序）——与 `qppocr_gpu::nhwc::repack_convt_w`
+    // 逐字同布局：元素 (t, ci, oc) 在 `((t*ci4 + ci)*nv + oc/4)*4 + oc%4`。
+    let mut w_repacked = vec![0f32; (taps * ci4 * nv * 4) as usize];
+    for t in 0..taps {
+        let (ky, kx) = (t / 2, t % 2);
+        for ci_i in 0..ci4 {
+            for oc in 0..co4 {
+                let dst = (((t * ci4 + ci_i) * nv) + oc / 4) * 4 + oc % 4;
+                w_repacked[dst as usize] = if ci_i < cin && oc < cout {
+                    weight[((ci_i * cout + oc) * 4 + ky * 2 + kx) as usize]
+                } else {
+                    0.0
+                };
+            }
+        }
+    }
+
+    let n_in = in_h * in_w * ci4;
+    let n_w = taps * ci4 * co4;
+    let n_out = m_dim * co4;
+    // 参数块占 word 64..82，张量必须让开（同 `build_conv_case_geom_w`：
+    // 输入段从 word 256 起，否则第一段就把参数覆盖成浮点位型 → 巨循环）。
+    let p_words = 64u32;
+    let in_off_w = 256u32;
+    let w_off_w = in_off_w + n_in;
+    let b_off_w = w_off_w + n_w;
+    let out_off_w = b_off_w + co4;
+    let total = (out_off_w + n_out + 64) as u64;
+    let buf = device.new_buffer(total * 4, metal::MTLResourceOptions::StorageModeShared);
+
+    let base = buf.contents() as *mut u32;
+    // SAFETY: `base` 是 Shared 存储的非空基址，缓冲按 `total` 个 word 分配；
+    // 段按 word 依次相接（params[64..82] → in[256..] → w → b → out），每个
+    // 下标都 < total。参数块（≤82）与输入段（≥256）之间的空隙是刻意的。
+    unsafe {
+        let p = base.add(p_words as usize);
+        *base = 0;
+        // 偏移一律是 **word（f32 元素）下标**——内核内部 `>>2` 折算成 float4。
+        let words: [u32; 18] = [
+            in_off_w, w_off_w, b_off_w, out_off_w, // 0..3
+            m_dim, co4, out_w, in_w, in_h,         // 4..8
+            ci4, ci4 / 4, 2, 2, 2, 0,              // 9..14 cin,ci4v,sH,sW,kW,act
+            0, 0, 0,                               // 15..17 c1,c2,c3（act=0 用不到）
+        ];
+        for (i, v) in words.iter().enumerate() {
+            *p.add(i) = *v;
+        }
+        std::ptr::copy_nonoverlapping(input.as_ptr(), base.add(in_off_w as usize) as *mut f32, n_in as usize);
+        std::ptr::copy_nonoverlapping(w_repacked.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+        // bias 段存在但全 0：把 `b_off != OFF_NONE` 那条分支也照到（生产里
+        // det 的 ConvTranspose 有 bias）。每线程多一条广播装载，可忽略。
+        std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, co4 as usize);
+        // 哨兵 7.0：跑完还是 7.0 = 内核没写（早退/网格算错），一眼可辨。
+        let op = base.add(out_off_w as usize) as *mut f32;
+        for i in 0..n_out as usize {
+            *op.add(i) = 7.0;
+        }
+    }
+
+    let flops = m_dim as f64 * co4 as f64 * ci4 as f64 * 2.0;
+    let bytes = (n_in + n_out) as f64 * 4.0 + n_w as f64 * 4.0;
+    CtProbe {
+        buf, p_off: p_words, out_off_w, n_out, m_dim, in_h, in_w,
+        cin, cout, co4, ci4, input, weight, flops, bytes,
+    }
+}
+
+/// 朴素 ConvTranspose（2×2、stride 2、无 pad）：NHWC in、ONNX `[Ci][Co][2][2]` 权重。
+fn cpu_convt_ref(pr: &CtProbe) -> Vec<f32> {
+    let (ih_n, iw_n) = (pr.in_h as usize, pr.in_w as usize);
+    let (oh_n, ow_n) = (ih_n * 2, iw_n * 2);
+    let (cin, cout) = (pr.cin as usize, pr.cout as usize);
+    let (ci4, co4) = (pr.ci4 as usize, pr.co4 as usize);
+    let mut out = vec![0f32; oh_n * ow_n * co4];
+    for ih in 0..ih_n {
+        for iw in 0..iw_n {
+            for ic in 0..cin {
+                let xv = pr.input[(ih * iw_n + iw) * ci4 + ic];
+                if xv == 0.0 {
+                    continue;
+                }
+                for ky in 0..2usize {
+                    for kx in 0..2usize {
+                        let orow = (ih * 2 + ky) * ow_n + iw * 2 + kx;
+                        for oc in 0..cout {
+                            let w = pr.weight[((ic * cout + oc) * 2 + ky) * 2 + kx];
+                            out[orow * co4 + oc] += xv * w;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 回读输出段。
+fn ct_read_out(pr: &CtProbe) -> Vec<f32> {
+    // SAFETY: out_off_w + n_out ≤ total（见 build_ct_case 的段布局）；Shared 存储，
+    // 调用方已 wait_until_completed。
+    unsafe {
+        std::slice::from_raw_parts(
+            (pr.buf.contents() as *const f32).add(pr.out_off_w as usize),
+            pr.n_out as usize,
+        )
+        .to_vec()
+    }
+}
+
+/// `n_convt` 的余量归因：三条流（输入/权重/输出）的**字节**与**装载条数**分开量，
+/// 再试两个可落地的候选（4-tap 空间分块、叠空间复用）。见 `probe_convt.metal`。
+#[test]
+fn convt_probe_attribution() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let probes = ProbeSet::from_list(&ctx.inner.device, super::conv_probe::CT_PROBE_SHADERS)
+        .expect("编译 n_convt 探针");
+
+    // det 里真实的两条（plan dump：grid 分别是 [12960,1,1] 与 [3240,1,1]）。
+    let shapes: [(&str, u32, u32, u32, u32); 2] = [
+        ("ConvTranspose.0", 64, 64, 240, 216),
+        ("ConvTranspose.2", 64, 4, 480, 432),
+    ];
+    let arms = [
+        "p_ct_base", "p_ct_ci4", "p_ct_tap4", "p_ct_tap4w4", // 结果正确
+        "p_ct_noin", "p_ct_now", "p_ct_fmaonly",             // 诊断：砍流
+        "p_ct_ismall", "p_ct_wsmall", "p_ct_osmall",         // 诊断：留条数砍字节
+    ];
+
+    for (label, cin, cout, h, w) in shapes {
+        let pr = build_ct_case(&ctx.inner.device, cin, cout, h, w);
+        let base_g = super::conv_probe::ct_groups_for("p_ct_base", pr.m_dim, h, w, pr.co4);
+
+        let run = |arm: &str, reps: u32| -> f64 {
+            let pipe = probes.pipe(arm).expect("取管线");
+            let g = super::conv_probe::ct_groups_for(arm, pr.m_dim, h, w, pr.co4);
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, g)
+                        .expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+
+        // ---- 正确性：p_ct_base 对 CPU，另三个「结果正确」的臂对 p_ct_base
+        let want = cpu_convt_ref(&pr);
+        let _ = run("p_ct_base", 1);
+        let got = ct_read_out(&pr);
+        let err_base = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max);
+        let base_out = got.clone();
+        let mut errs = vec![("p_ct_base", err_base)];
+        for arm in ["p_ct_ci4", "p_ct_tap4", "p_ct_tap4w4"] {
+            let _ = run(arm, 1);
+                let g = ct_read_out(&pr);
+            // 与 p_ct_base 逐位比：这三个臂的累加顺序与 base 相同，应当**位级一致**。
+            let d = g.iter().zip(&base_out).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            errs.push((arm, d));
+        }
+
+        eprintln!(
+            "[ct] {label}: cin={cin} cout={cout} in={h}×{w} out={}×{} mDim={} nv={} 网格 base=[{},1,1] tap4=[{},1,1] tap4w4=[{},1,1]",
+            h * 2, w * 2, pr.m_dim, pr.co4 / 4,
+            base_g[0],
+            super::conv_probe::ct_groups_for("p_ct_tap4", pr.m_dim, h, w, pr.co4)[0],
+            super::conv_probe::ct_groups_for("p_ct_tap4w4", pr.m_dim, h, w, pr.co4)[0],
+        );
+        eprintln!(
+            "[ct] {label}: FLOPs(真)={:.4} GF（flopsmap 记 4×={:.4}）  下界流量={:.1} MB ⇒ DRAM 下界 {:.2} ms @77GB/s",
+            pr.flops / 1e9,
+            pr.flops * 4.0 / 1e9,
+            pr.bytes / 1e6,
+            pr.bytes / 77e9 * 1000.0,
+        );
+        eprintln!(
+            "[ct] {label}: 最大绝对误差 vs CPU / vs base: {}",
+            errs.iter().map(|(n, e)| format!("{n}={e:.3e}")).collect::<Vec<_>>().join("  ")
+        );
+
+        // ---- 计时：三轮，奇偶轮换序（顺序效应在本机是 6~15%，见 ab.sh 那条）
+        let na = arms.len();
+        let mut best = vec![f64::INFINITY; na];
+        for round in 0..3 {
+            let mut order: Vec<usize> = (0..na).collect();
+            if round % 2 == 1 {
+                order.reverse();
+            }
+            for a in order {
+                let ms = time_dispatch(&|r| run(arms[a], r)).ms;
+                best[a] = best[a].min(ms);
+            }
+        }
+        let b0 = best[0];
+        eprintln!(
+            "[ct] {label}  {:>9} {:>9} {:>9} {:>9} | {:>9} {:>9} {:>9} | {:>9} {:>9} {:>9}",
+            "base", "ci4", "tap4", "tap4w4", "noin", "now", "fmaonly", "ismall", "wsmall", "osmall"
+        );
+        eprintln!(
+            "[ct] {label}  {:>9.3} {:>9.3} {:>9.3} {:>9.3} | {:>9.3} {:>9.3} {:>9.3} | {:>9.3} {:>9.3} {:>9.3}",
+            best[0], best[1], best[2], best[3], best[4], best[5], best[6], best[7], best[8], best[9]
+        );
+        eprintln!(
+            "[ct] {label}  {:>9} {:>8.2}× {:>8.2}× {:>8.2}× | {:>8.2}× {:>8.2}× {:>8.2}× | {:>8.2}× {:>8.2}× {:>8.2}×",
+            "base/→",
+            b0 / best[1], b0 / best[2], b0 / best[3],
+            b0 / best[4], b0 / best[5], b0 / best[6],
+            b0 / best[7], b0 / best[8], b0 / best[9]
+        );
+        let gf = pr.flops / 1e9;
+        eprintln!(
+            "[ct] {label}: base {:.0} GFLOPS（峰值 6.3% 量级）/ tap4 {:.0} / tap4w4 {:.0}",
+            gf / best[0] * 1000.0, gf / best[2] * 1000.0, gf / best[3] * 1000.0
+        );
+    }
+}
+
+/// **生产内核** `n_convt` / `n_convt4w` 与 CPU 的逐点对拍（同一 arena、同一
+/// 参数块，只有内核名与网格不同）。
+///
+/// 为什么必须是生产内核而不是探针：`probe_convt.metal` 里的副本**探针自己
+/// 编译**，与 `KernelSet` 编译的那份是两个二进制。两者同源只能靠这一条测试
+/// 钉住——`conv8_mma3_matches_cpu` 用同一手法抓过 `n_conv8_mma3`。
+///
+/// 三条断言：
+/// 1. `n_convt` 对 CPU：只查量法本身（算子语义、权重排布、参数块）；
+/// 2. `n_convt4w` 对 CPU：新内核自己算对；
+/// 3. `n_convt4w` 对 `n_convt`：**位级相等**——两个内核的累加次序逐 ci 相同，
+///    所以差异必须恰好是 0.0。任何非零都说明「换个加法顺序」之外还动了别的东西。
+#[test]
+fn convt_prod_matches_cpu() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // 两个真实 det 形状 + 一个「nv=4 的边界档」（门禁 nv>=4 的下沿）+
+    // 一个 Batch 形状（网格 y 维）。
+    struct Case(&'static str, u32, u32, u32, u32);
+    let cases = [
+        Case("ConvTranspose.0 (nv=16)", 64, 64, 240, 216),
+        Case("ConvTranspose.2 (nv=1)", 64, 4, 480, 432),
+        Case("nv=4 下沿", 64, 16, 40, 36),
+        Case("小形状", 8, 8, 8, 8),
+    ];
+
+    for Case(label, cin, cout, h, w) in cases {
+        let pr = build_ct_case(&ctx.inner.device, cin, cout, h, w);
+        let want = cpu_convt_ref(&pr);
+        let g4 = super::conv_probe::ct_groups_for("p_ct_tap4w4", pr.m_dim, h, w, pr.co4);
+        let g1 = super::conv_probe::ct_groups_for("p_ct_base", pr.m_dim, h, w, pr.co4);
+
+        let run = |name: &str, g: [u32; 3]| {
+            submit_compute(&ctx.inner.queue, |enc| {
+                ks.dispatch(enc, name, &pr.buf, pr.p_off, g).expect("dispatch");
+            })
+            .expect("提交");
+        };
+
+        // 哨兵先复位，否则「没写」会被读成上一臂的结果。
+        let op = pr.buf.contents() as *mut f32;
+        let reset = || unsafe {
+            for i in 0..(pr.n_out as usize) {
+                *op.add(pr.out_off_w as usize + i) = 7.0;
+            }
+        };
+        let maxdiff = |a: &[f32], b: &[f32]| {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+        };
+
+        reset();
+        run("n_convt", g1);
+        let o1 = ct_read_out(&pr);
+        let e1 = maxdiff(&o1, &want);
+
+        reset();
+        run("n_convt4w", g4);
+        let o4 = ct_read_out(&pr);
+        let e4 = maxdiff(&o4, &want);
+
+        let e14 = maxdiff(&o1, &o4);
+        // 哨兵：内核没写的话输出全 7.0，maxdiff 会是大数——上面两条会先炸。
+        assert!(e1 < 1e-4, "{label}: n_convt 对 CPU 误差 {e1:.3e}");
+        assert!(e4 < 1e-4, "{label}: n_convt4w 对 CPU 误差 {e4:.3e}");
+        assert!(e14 == 0.0, "{label}: n_convt4w 与 n_convt 不是位级相等（{e14:.3e}）");
+        eprintln!(
+            "[ct/prod] {label}: cin={cin} cout={cout} in={h}×{w} 网格 n_convt=[{},1,1] n_convt4w=[{},1,1]  vs CPU {e1:.2e} / {e4:.2e}  vs 彼此 {e14:.1e} ✅",
+            g1[0], g4[0]
+        );
+    }
+}
