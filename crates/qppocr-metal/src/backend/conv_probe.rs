@@ -18,6 +18,7 @@
 //! | `p_wconst` | 权重装载 → 常量 | **否**（诊断） | 权重流量占多少（与上一条夹逼） |
 //! | `p_m8n4` | 行 4→8 且 通道块 2→1 | 是 | 同寄存器预算下把权重复用翻倍值多少 |
 //! | `p_wsmall` | 权重地址 → 1 KB 窗口 | **否**（诊断） | 卡在权重**流量**还是权重**装载指令** |
+//! | `p_ismall` | **激活读**地址 → 1 KB 窗口 | **否**（诊断） | 激活**流量**值不值（fp16 激活该不该做）——`p_wsmall` 的激活侧对照 |
 //! | `p_t4n2`…`p_t16n2` | 模板化的 ROWS×NBLK（网格不变） | 是 | 瓦片空间里最优点在哪（仅 1×1） |
 //! | `p_k1fast` | k1 同分辨率时把 gather 地址提出热循环 | 是 | 输入侧那 3 倍是**流量**还是**装载指令+地址算术** |
 //! | `p_window` | 只改 gid 映射：同片权重的行组铺到一起 | 是 | 复用距离（9 MB → ~123 KB）值多少 |
@@ -87,6 +88,10 @@ pub(crate) const VARIANTS: &[Variant] = &[
     // 诊断：权重地址掩进 1 KB 窗口（条数不变、流量≈0）——把「带宽」与
     // 「装载指令」两个假设分开，见 probe_p_wsmall.metal 的头注释。
     Variant { name: "p_wsmall", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
+    // 诊断：**激活**地址掩进 1 KB 窗口（条数不变、流量≈0）——`p_wsmall`
+    // 只管权重那半边，这条补上激活那半边，见 probe_p_ismall.metal 头注释。
+    // 要回答的是「把激活也改成 fp16（足迹砍半）值不值」。
+    Variant { name: "p_ismall", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
     // 窗口序：只改 gid 映射，把「同一片权重的行组」铺到一起，复用距离
     // 9 MB → ~123 KB。热循环、网格、覆盖全与 p_base 一致。
     Variant { name: "p_window", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
@@ -140,6 +145,7 @@ const PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_wconst", include_str!("probe_p_wconst.metal")),
     ("p_m8n4", include_str!("probe_p_m8n4.metal")),
     ("p_wsmall", include_str!("probe_p_wsmall.metal")),
+    ("p_ismall", include_str!("probe_p_ismall.metal")),
     ("p_window", include_str!("probe_p_window.metal")),
     ("p_window8", include_str!("probe_p_window8.metal")),
     ("p_colmajw", include_str!("probe_p_colmajw.metal")),
