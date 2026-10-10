@@ -1388,6 +1388,179 @@ fn conv8_mma3_throughput() {
     }
 }
 
+/// `n_conv8_mma3` 家族的**四臂诊断**（NCOLS=64 与 32 各一套）+ 尾块定价。
+///
+/// ## 靶子与两个待解释的数
+///
+/// 这族端到端 **23.98 ms / 11 条 = det 设备端的 20%**。把每条的形状从
+/// `QPPOCR_METAL_PLAN_DUMP` 取出来、按 `2·m·N·K` 算 GFLOPS 之后：
+///
+/// | 内核 | 形状 | 有用 GFLOPS | **纯 MMA** GFLOPS |
+/// |---|---|---|---|
+/// | Conv.121 | 240x216 c256→64 k3 | 1929 | 2307 |
+/// | Conv.3   | 240x216 c128→64 k3 | 1944 | 2315 |
+/// | Conv.2   | 480x432 c32→64 k2  | 1947 | 2024 |
+/// | Conv.66  | 120x108 c64→64 k3  | 2033 | 2455 |
+/// | Conv.111 | 240x216 c32→32 k7  | 1494 | 1821 |
+/// | Conv.114 | 240x216 c32→32 k5  | 1245 | 1503 |
+/// | Conv.1   | 480x432 c64→32 k2  | 1649 | 1714 |
+///
+/// 「纯 MMA」= 有用 × 尾块冗余（算出 256 列只需 214 列 ⇒ 1.196×）。两条读法：
+///
+/// 1. **64 宽那族已经到顶**：2024~2455 落在家族天花板（2044~2444，见
+///    `conv8_mma3_throughput` 的历史读数）里，没余量。它的 14~21% 冗余是
+///    **尾块**造成的——不是热循环问题，用四臂量不出来（所以本测试单列
+///    `tail`/`notail` 两臂直接给这笔账定价）。
+/// 2. **n32 明显低于天花板**：1503~1821。而 n32 每条 MMA 的装载数比 64 宽
+///    高 33%（8 组 = 4 行组 × 2 列组；每组 16×16 ⇒ 2A+2B 喂 4 条 MMA；
+///    64 宽是 16×32 ⇒ 2A+4B 喂 8 条 = 0.75）。**本测试就是要判 n32 是不是
+///    慢在这 0.33 上**——若是，处方是把每 simdgroup 的瓦片从 16×16 抬到
+///    512 格（n32: 32×16），比值回到 0.75，而且**网格/尾块/数值一字不改**。
+///
+/// ## 判读（`probe_m3.metal` 头注释有完整版）
+///
+///   base ≈ hoist                ⇒ 不是装载发射槽 ⇒ n32 的 0.33 不是主因，别改映射；
+///   base ≫ hoist（≈ small）     ⇒ 卡在**装载发射槽** ⇒ 抬瓦片值得做；
+///   base ≫ small，hoist ≈ base  ⇒ 卡在**流量/延迟** ⇒ 该动 L2 局部性。
+///
+/// 除 `base` 外**数值全是错的**（诊断件）。`notail` 臂只少发 wg.x 的最后一档，
+/// 尾部列不会被写。
+#[test]
+fn conv8_mma3_load_attribution() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+    let probes = super::conv_probe::ProbeSet::new(&ctx.inner.device).expect("编译探针");
+
+    // medium det 的真实形状（`QPPOCR_METAL_PLAN_DUMP`），按端到端时间排序。
+    // 全是 stride1 + 对称 pad 的内点几何 ⇒ `build_conv_case` 直接支持。
+    let cases = [
+        ConvCase { label: "Conv.121 240x216 c256->64 k3", h: 240, w: 216, cin: 256, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "Conv.3   240x216 c128->64 k3", h: 240, w: 216, cin: 128, cout: 64, kh: 3, kw: 3 },
+        ConvCase { label: "Conv.111 240x216 c32->32 k7 ", h: 240, w: 216, cin: 32, cout: 32, kh: 7, kw: 7 },
+        ConvCase { label: "Conv.114 240x216 c32->32 k5 ", h: 240, w: 216, cin: 32, cout: 32, kh: 5, kw: 5 },
+    ];
+
+    for c in &cases {
+        let pr = build_conv_case(&ctx.inner.device, c);
+        let k = c.kh;
+        let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
+        let nch = pr.co4 / ncols;
+        let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
+        let inner_w = pr.out_w - (k - 1);
+        let nfb = inner_w / 64;
+        let tail = inner_w - nfb * 64;
+        let nx = nfb + u32::from(tail > 0);
+        let nrows = pr.out_h - (k - 1);
+        let g_tail = [nx * nch, nrows, 1];
+        let g_notail = [nfb * nch, nrows, 1];
+
+        let run = |arm: &str, groups: [u32; 3], reps: u32| -> f64 {
+            let pipe = probes.pipe(arm).expect("取管线");
+            // `*_half` 是 128 线程/组的（4 个 simdgroup），其余都是 256。
+            let tg = if arm.ends_with("half") { 128u64 } else { 256u64 };
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    dispatch_with_tg(enc, pipe, &pr.buf, pr.p_off, groups, tg).expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+
+        // 生产内核作参照（同网格、同 arena）。
+        let run_prod = |reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    ks.dispatch(enc, kname, &pr.buf, pr.p_off, g_tail).expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+
+        // 变体名（NCOLS 前缀 p_m3_ / p_m3n_）× 网格档（带尾 / 不带尾）。
+        let pre = if ncols == 64 { "p_m3_" } else { "p_m3n_" };
+        let mut arms: Vec<(&str, [u32; 3])> = vec![
+            ("base", g_tail),
+            ("base", g_notail),
+            ("small", g_tail),
+            ("hoist", g_tail),
+            ("noepi", g_tail),
+            ("noepi", g_notail),
+        ];
+        // 候选：抬每 simdgroup 的瓦片（n32: 16×16→32×16，比值 1.00→0.75；
+        // 64 宽: 16×32→32×32，比值 0.75→0.50），代价都是累加器分片翻倍 +
+        // 线程组减半（128 线程）。
+        arms.push(("half", g_tail));
+
+        let na = arms.len();
+        let mut best = vec![f64::INFINITY; na];
+        let mut best_prod = f64::INFINITY;
+        // 奇偶轮换序（本机先跑的那条快 6~15%）。
+        for round in 0..3 {
+            let mut order: Vec<usize> = (0..na).collect();
+            if round % 2 == 1 {
+                order.reverse();
+            }
+            for a in order {
+                let name = format!("{pre}{}", arms[a].0);
+                let ms = time_dispatch(&|r| run(&name, arms[a].1, r)).ms;
+                best[a] = best[a].min(ms);
+            }
+            best_prod = best_prod.min(time_dispatch(&|r| run_prod(r)).ms);
+        }
+
+        let b_tail = best[0];
+        let b_notail = best[1];
+        let small = best[2];
+        let hoist = best[3];
+        let noepi = best[4];
+        let gf = |ms: f64| pr.flops / (ms * 1e6);
+        // 尾块「算完就丢」的纯度：尾块共 64 列，只有 `inner_w - nfb*64` 列
+        // 是有效输出，其余纯冗余。
+        let tail_valid = inner_w - nfb * 64;
+        let tail_waste = (b_tail - b_notail) * (64 - tail_valid) as f64 / 64.0;
+        eprintln!(
+            "[mb/m3] {:<28} NCOLS={ncols} 网格 {:?}  生产 {kname} {best_prod:>7.3} ms（{:>6.1} GF）",
+            c.label,
+            g_tail,
+            gf(best_prod)
+        );
+        eprintln!(
+            "[mb/m3]   base {b_tail:>7.3}（{:>6.1} GF）  small {small:>7.3}（{:.2}×）  hoist {hoist:>7.3}（{:.2}×）  noepi {noepi:>7.3}（{:.2}×）",
+            gf(b_tail),
+            b_tail / small,
+            b_tail / hoist,
+            b_tail / noepi
+        );
+        eprintln!(
+            "[mb/m3]   尾块：整块 {:.3} ms（带尾 {b_tail:.3} − 不带尾 {b_notail:.3}）；其中有效 {tail_valid}/64 列 ⇒ **纯冗余 {tail_waste:.3} ms（{:.1}%）**",
+            b_tail - b_notail,
+            100.0 * tail_waste / b_tail
+        );
+        eprintln!(
+            "[mb/m3]   纯 MMA 口径：有用 {:.0} → 除尾块冗余（{nx}×64/{inner_w} 列 = {:.3}×）**{:.0} GFLOPS**",
+            gf(b_tail),
+            (nx * 64) as f64 / inner_w as f64,
+            gf(b_tail) * (nx * 64) as f64 / inner_w as f64
+        );
+        let half = best[na - 1];
+        let half_tile = if ncols == 64 { "32×32" } else { "32×16" };
+        eprintln!(
+            "[mb/m3]   **候选 half（4 组/128 线程，每 sg {half_tile}）** {half:>7.3} ms（{:>6.1} GF）⇒ **{:.3}×**（vs base）",
+            gf(half),
+            b_tail / half
+        );
+    }
+}
+
 /// `n_conv8_edge` 的**地板**：同一形状上的三条读数。
 ///
 /// ## 为什么必须单独量这个（2026-10-10，已结案）

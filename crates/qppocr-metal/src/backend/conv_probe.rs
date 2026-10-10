@@ -175,6 +175,24 @@ const PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_mma_bsmall", include_str!("probe_mma_split.metal")),
     ("p_mma_ost16", include_str!("probe_mma_split.metal")),
     ("p_mma_ost2", include_str!("probe_mma_split.metal")),
+    // `n_conv8_mma3` 家族的四臂诊断，**NCOLS=64 与 32 各一套**（同一份源码、
+    // 八个入口）。k×k 多一层 taps 循环与一个尾块，1×1 那套的结论不能直接搬；
+    // 尤其是 n32 每条 MMA 要多花 33% 的装载（2A+2B:4 vs 2A+4B:8），
+    // 而端到端正是 n32 慢（1503~1821 vs 2024~2455 纯 MMA GFLOPS）。
+    // 见 `probe_m3.metal` 的头注释。
+    ("p_m3_base", include_str!("probe_m3.metal")),
+    ("p_m3_small", include_str!("probe_m3.metal")),
+    ("p_m3_hoist", include_str!("probe_m3.metal")),
+    ("p_m3_noepi", include_str!("probe_m3.metal")),
+    ("p_m3n_base", include_str!("probe_m3.metal")),
+    ("p_m3n_small", include_str!("probe_m3.metal")),
+    ("p_m3n_hoist", include_str!("probe_m3.metal")),
+    ("p_m3n_noepi", include_str!("probe_m3.metal")),
+    // **候选**：n32 用 4 个 simdgroup / 128 线程、瓦片仍是 64×32 ⇒ 每 MMA 的
+    // 装载数 1.00 → 0.75。派发时必须给 128 线程组（`dispatch_with_tg`）。
+    ("p_m3n_half", include_str!("probe_m3.metal")),
+    // 同一手法搬到 NCOLS=64：装载/MMA 0.75 → 0.50，但累加器分片 8 → 16。
+    ("p_m3_half", include_str!("probe_m3.metal")),
 ];
 
 /// 变体内核的管线集（一次编译，反复用）。
