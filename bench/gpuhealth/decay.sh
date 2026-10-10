@@ -92,7 +92,7 @@ bandwidth() {
         if [ -z "${BW:-}" ]; then echo "  ⚠️ 读不到带宽，停手。"; break; fi
         awk "BEGIN{exit !($BW < $BELOW)}" && {
             echo
-            echo "  ★ 带宽已掉到 $BW GB/s（阈值 $BELOW）—— **在这个工作量附近开始衰减**。已停手，"
+            echo "  ★ 带宽已掉到 ${BW} GB/s（阈值 ${BELOW}）—— **在这个工作量附近开始衰减**。已停手，"
             echo "    机器还有救，别重启，先看下面的结论。"
             break
         }

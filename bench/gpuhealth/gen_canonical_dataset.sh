@@ -24,7 +24,7 @@ OUT=${1:-"$HERE/gen100"}
 COMP=${SIMDPADDLEOCR_DIR:-"$HOME/Projects/SimdPaddleOCR"}
 FONTS="$HERE/fonts_cjk"
 
-[ -d "$COMP" ] || { echo "找不到竞品仓库：$COMP（用 SIMDPADDLEOCR_DIR 覆盖）" >&2; exit 1; }
+[ -d "$COMP" ] || { echo "找不到竞品仓库：${COMP}（用 SIMDPADDLEOCR_DIR 覆盖）" >&2; exit 1; }
 
 # macOS 自带的 CJK 字体；换别的也行，只是改像素
 if [ ! -e "$FONTS/Hiragino Sans GB.ttc" ]; then

@@ -36,7 +36,7 @@ mkdir -p "$WORK"
 [ -x "$Q" ] || { echo "先构建： cargo build --release -p qppocr-cli --features qppocr/gpu"; exit 1; }
 command -v python3 >/dev/null || { echo "需要 python3"; exit 1; }
 for f in det.onnx rec.onnx; do
-    [ -f "$MODELS/tiny/$f" ] || { echo "缺模型：$MODELS/tiny/$f（用 --models 指定或补齐 models/）"; exit 1; }
+    [ -f "$MODELS/tiny/$f" ] || { echo "缺模型：$MODELS/tiny/${f}（用 --models 指定或补齐 models/）"; exit 1; }
 done
 
 IMGS=()
@@ -150,7 +150,11 @@ v=0
 [ "$rc" = 0 ]  && echo "  ✅ ① 10 图一会话跑完"        || { echo "  ❌ ① rc=$rc"; v=1; }
 [ "$rep" -gt 0 ] && echo "  ✅ ② 触发了缓存命中重放（$rep 次）" || { echo "  ❌ ② 没触发重放——测试没覆盖到那条路径"; v=1; }
 [ "$ok3" = 0 ] && echo "  ✅ ③ 会话内(重放) == 单独跑(新计划)" || { echo "  ❌ ③ 重放路径与全新计划不一致"; v=1; }
-[ "$pre_h" = 0 ] && [ "$post_h" = 0 ] && echo "  ✅ ④ 跑前跑后都健康" || { echo "  ❌ ④ 健康门禁没过（跑前 $pre_h / 跑后 $post_h）"; v=1; }
+# ⚠️ `${post_h}` 的花括号是**必须**的：`$post_h）` 紧贴全角右括号时，bash 在非 UTF-8
+# locale 下把 `）` 的首字节 0xEF 当成合法变量名字符，于是去找变量 `post_h\xef` →
+# `post_h: unbound variable`，脚本在最后一行崩掉（2026-10-10 实测）。凡 `$VAR` 后紧跟
+# 中日韩全角字符，一律写成 `${VAR}`。
+[ "$pre_h" = 0 ] && [ "$post_h" = 0 ] && echo "  ✅ ④ 跑前跑后都健康" || { echo "  ❌ ④ 健康门禁没过（跑前 ${pre_h} / 跑后 ${post_h}）"; v=1; }
 [ "$ok5" = 0 ] && echo "  ✅ ⑤ 与 CPU 去空白后一致"   || { echo "  ❌ ⑤ 与 CPU 有实质差异"; v=1; }
 echo "  日志：$WORK"
 exit $v

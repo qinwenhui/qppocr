@@ -6,7 +6,7 @@ CC=${CC:-clang}
 FLAGS=(-fobjc-arc -framework Foundation -framework Metal -O2)
 
 for src in gpuhealth gpulat gpuaxes gpualu2 stress membw cpumin; do
-    [ -f "$src.m" ] || { echo "跳过 $src（源码不在）"; continue; }
+    [ -f "$src.m" ] || { echo "跳过 ${src}（源码不在）"; continue; }
     # AppKit 不需要；gpualu2 输出名为 gpualu2，其余同名
     "$CC" "${FLAGS[@]}" -o "$src" "$src.m"
     echo "built  $src"
