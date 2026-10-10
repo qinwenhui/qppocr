@@ -87,6 +87,25 @@ const SHADERS: &[(&str, &str)] = &[
 /// Apple GPU 每线程组上限 ≥ 1024，256 恒安全。
 const THREADS_PER_GROUP: u64 = 256;
 
+/// 线程组尺寸的**按内核覆盖表**——只有下面列出的内核例外，其余恒
+/// [`THREADS_PER_GROUP`]。
+///
+/// `n_conv8_mma3_n32` 用 **128 线程 / 4 个 simdgroup**：同一块 64×32 瓦片下，
+/// 每 simdgroup 的瓦片从 16×16 抬到 32×16，每 MMA 的装载数 1.00 → 0.75。
+/// 实测 1.26×（`microbench::conv8_mma3_load_attribution`），网格组数/覆盖矩形/
+/// 尾块掩码/参数/暂存区尺寸一字不改。
+///
+/// ⚠️ **这张表必须与内核里的 `NSG` 模板实参一致**（`n_conv8_mma3.metal` 的
+/// `mma3_body<NCOLS, NSG>`）：内核按 `tid>>5` 认 simdgroup，多给了线程就会有
+/// 线程认领到不存在的 sg、去写 `ost` 的界外行——**静默算错**，不会报错。
+/// 兜底是 `conv8_mma3_matches_cpu` 那条 CPU 对拍（它自带独立硬编码的覆盖几何）。
+fn threads_per_group(name: &str) -> u64 {
+    match name {
+        "n_conv8_mma3_n32" => 128,
+        _ => THREADS_PER_GROUP,
+    }
+}
+
 /// 一套内核：名 → compute pipeline state（装载期编译一次，会话级
 /// 共享——set_buffer 编码期绑 arena，与计划无关）。
 pub(crate) struct KernelSet {
@@ -138,7 +157,14 @@ impl KernelSet {
         p_off: u32,
         groups: [u32; 3],
     ) -> Result<()> {
-        dispatch_with(enc, self.get(name)?, arena, p_off, groups)
+        dispatch_with_tg(
+            enc,
+            self.get(name)?,
+            arena,
+            p_off,
+            groups,
+            threads_per_group(name),
+        )
     }
 }
 
