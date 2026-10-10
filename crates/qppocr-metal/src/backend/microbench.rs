@@ -624,6 +624,23 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
     build_conv_case_geom(device, c, ConvGeom::sym(c), batch, half_w)
 }
 
+/// 权重按**分片分块（fragment-blocked）**铺的探针（`p_mma_wfrag` 用）。
+///
+/// 与 `build_conv_case` **逐字节同布局**：arena 总长、`in_off`/`w_off`/`b_off`/
+/// `out_off`、输入/bias/输出的内容全都一样，**只有权重段里那 64 个 float 的
+/// 排列顺序**不同 —— 于是「B 侧 `simdgroup_load` 的行距」是两臂之间唯一的
+/// 自变量。
+///
+/// 为什么值得单独一个布局：`p_mma_base` 的 B 装载行距是 `nDim`（几百~几千个
+/// float），一条 8×8 分片被拆成 8 段各自的 32 B；分片连续之后同一条装载是
+/// 一段 256 B。权重是静态量，重排是一次性的（与既有 `repack_conv_w` 同族），
+/// 所以这条处方**不需要动热循环之外任何东西**。
+///
+/// 前置：`ci4 % 8 == 0 && co4 % 8 == 0`（生产门禁 `cpad4 % 8` / `% 64` 已保证）。
+fn build_conv_case_wfrag(device: &metal::DeviceRef, c: &ConvCase) -> ConvProbe {
+    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, true)
+}
+
 /// 同 [`build_conv_case_batch`]，但步长与 pad 由 `g` 给（写进参数块的
 /// P+12..P+15 四词，与 `plan.rs` 的 `ParamBlock` 逐字段同义）。
 fn build_conv_case_geom(
@@ -632,6 +649,19 @@ fn build_conv_case_geom(
     g: ConvGeom,
     batch: u32,
     half_w: bool,
+) -> ConvProbe {
+    build_conv_case_geom_w(device, c, g, batch, half_w, false)
+}
+
+/// [`build_conv_case_geom`] 的本体。`w_frag` 是**唯一**多出来的自由度：为真时
+/// 权重段按分片分块铺（见 [`build_conv_case_wfrag`]），其余一切逐位相同。
+fn build_conv_case_geom_w(
+    device: &metal::DeviceRef,
+    c: &ConvCase,
+    g: ConvGeom,
+    batch: u32,
+    half_w: bool,
+    w_frag: bool,
 ) -> ConvProbe {
     assert!(batch >= 1, "batch 至少 1");
     let (pt, pl) = (g.pt, g.pl);
@@ -667,6 +697,38 @@ fn build_conv_case_geom(
             }
         }
     }
+
+    // 权重按 8×8 分片分块重排（`p_mma_wfrag`）：同一批 64 个 float 换个次序，
+    // 元素总数与段长一字不变（`taps * ci4 * co4`）。下标约定与
+    // `probe_mma_split.metal` 里 `p_mma_wfrag` 的寻址逐字对应：
+    //   wf[((tap*(ci4/8) + ci4blk) * (co4/8) + co4blk) * 64 + (ci&7)*8 + (co&7)]
+    let w_store: Vec<f32> = if !w_frag {
+        w_repacked
+    } else {
+        assert!(
+            ci4 % 8 == 0 && co4 % 8 == 0,
+            "分片分块布局要 ci4/co4 都是 8 的倍数，本形状 {}->{}（cin%8 或 co%8 不为 0）",
+            c.cin,
+            c.cout
+        );
+        let ci8 = (ci4 / 8) as usize;
+        let co8 = (co4 / 8) as usize;
+        let mut v = vec![0f32; w_repacked.len()];
+        for t in 0..taps as usize {
+            for cb in 0..ci8 {
+                for ob in 0..co8 {
+                    let blk = (t * ci8 + cb) * co8 + ob;
+                    for r in 0..8usize {
+                        for s in 0..8usize {
+                            let src = ((t * ci4 as usize + cb * 8 + r) * co4 as usize) + ob * 8 + s;
+                            v[blk * 64 + r * 8 + s] = w_repacked[src];
+                        }
+                    }
+                }
+            }
+        }
+        v
+    };
 
     let n_in = c.h * c.w * ci4 * batch;
     let n_w = taps * ci4 * co4; // 权重**不随 batch 增长**（各份共用一份）
@@ -726,12 +788,12 @@ fn build_conv_case_geom(
             // 只是每个值占 2 B。整段先清零（`new_buffer` 不清零，尾部的
             // 闲置区必须确定，否则 NaN 会经未定义路径影响计时），再把
             // `n_w` 个 half 写进段的前半。
-            let w16: Vec<u16> = w_repacked.iter().map(|&v| f32_to_f16_bits(v)).collect();
+            let w16: Vec<u16> = w_store.iter().map(|&v| f32_to_f16_bits(v)).collect();
             let wp = base.add(w_off_w as usize) as *mut u16;
             std::ptr::write_bytes(wp, 0, n_w as usize);
             std::ptr::copy_nonoverlapping(w16.as_ptr(), wp, n_w as usize);
         } else {
-            std::ptr::copy_nonoverlapping(w_repacked.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+            std::ptr::copy_nonoverlapping(w_store.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
         }
         // bias 清零（b_off 有效但全 0）
         std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, co4 as usize);
@@ -2127,6 +2189,686 @@ fn conv8_mma_throughput() {
             "[mb] {:<26} base {:>7.3} ms ({:>6.1} GFLOPS) → mma {:>7.3} ms ({:>6.1} GFLOPS) = {:.2}×  [grid {:?} → {:?}]",
             c.label, a, gf(a), b, gf(b), a / b, pr.groups, mma_groups
         );
+    }
+}
+
+/// `n_conv8_mma` 的**受控 K 扫描**：固定 `m` 与 `co`，只动 `cin`。
+///
+/// ## 要回答的问题
+///
+/// `conv8_mma_throughput` 里最短的一条（`det m32640 c32->64`，K=32）只有
+/// **1017 GFLOPS**，而同族长 K 的到 **2455**（73% 峰）。两处差 2.4×。
+/// 但那条的形状与长 K 的**同时**变了 `co`（64 vs 256）⇒ 网格 y、线程组数、
+/// 权重足迹全跟着变，分不清是「K 太短」还是「co=64 天生慢」。
+///
+/// 本探针把自变量收敛成一个：`h/w/co` 全钉死，`cin` 取 32…1024。
+/// 于是每个线程组的**瓦片（64×64）、尾声（16 KB 线程组暂存 + 屏障 +
+/// 4096 次逐元素 bias/act/残差/写回）、网格形状**逐字相同，唯一变化是
+/// 热循环的 K 步数（`cin/8` = 4…128 步）。
+///
+/// ## 怎么读
+///
+/// 若时间 ≈ `E + c·(cin/8)`，则 `E` 就是**每组固定成本**（尾声为主）：
+///   * `E` 相对总时**小** ⇒ 短 K 的亏损不是尾声，回去查热循环；
+///   * `E` 相对总时**大** ⇒ 尾声是那一档的主项，值得动（去暂存/去屏障/
+///     把逐元素尾声改成 fragment 直出）。
+///
+/// 同一批数据也能读「长 K 饱和在多少」——那是这条内核自己的天花板，
+/// **拿它当尺子**（不许拿 3340 的理论峰算余量，见
+/// `roofline-must-use-kernels-own-ceiling`）。
+///
+/// 序：各 `cin` 交错跑，偶数轮升序、奇数轮降序，取每例最小——本机
+/// 「一轮里先跑的那条快 6~15%」，沿一个方向扫会把漂移记进斜率。
+#[test]
+fn conv8_mma_ksweep() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // m = 136*240 = 32640（det 全分辨率那一档），co = 64 ⇒ 网格 [510, 1, 1]，
+    // 510 个线程组足够喂满机器，且 64 列刚好一个通道块（无浪费）。
+    const H: u32 = 136;
+    const W: u32 = 240;
+    const CO: u32 = 64;
+    let cins: [u32; 6] = [32, 64, 128, 256, 512, 1024];
+
+    let cases: Vec<ConvCase> = cins
+        .iter()
+        .map(|&cin| ConvCase {
+            label: "ksweep",
+            h: H,
+            w: W,
+            cin,
+            cout: CO,
+            kh: 1,
+            kw: 1,
+        })
+        .collect();
+    let probes: Vec<ConvProbe> = cases
+        .iter()
+        .map(|c| build_conv_case(&ctx.inner.device, c))
+        .collect();
+
+    let run = |pr: &ConvProbe, reps: u32| -> f64 {
+        let t = Instant::now();
+        let g = mm_sg_groups(H * W, pr.co4);
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, g)
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let mut best = vec![f64::INFINITY; probes.len()];
+    for round in 0..3 {
+        let asc: Vec<usize> = (0..probes.len()).collect();
+        let order: Vec<usize> = if round % 2 == 0 {
+            asc
+        } else {
+            asc.into_iter().rev().collect()
+        };
+        for i in order {
+            let pr = &probes[i];
+            assert_eq!(
+                mm_sg_groups(H * W, pr.co4),
+                [510, 1, 1],
+                "cin={} 的网格变了（co 被补齐成 {}）——自变量不唯一，结论作废",
+                cins[i],
+                pr.co4
+            );
+            let ms = time_dispatch(&|r| run(pr, r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+
+    let ntg = 510.0f64;
+    eprintln!("[mb/ksweep] m={} co={CO} 网格 [510,1,1]，只动 cin", H * W);
+    for (i, &cin) in cins.iter().enumerate() {
+        let pr = &probes[i];
+        let ms = best[i];
+        let gf = pr.flops / (ms * 1e6);
+        eprintln!(
+            "[mb/ksweep] cin={:<5} K步={:<4} {:>7.3} ms  {:>7.1} GFLOPS  {:>4.1}%峰  每组 {:>6.3} µs",
+            cin,
+            cin / 8,
+            ms,
+            gf,
+            gf / 3340.0 * 100.0,
+            ms * 1000.0 / ntg
+        );
+    }
+}
+
+/// `n_conv8_mma` 热循环那 25% 缺口的**归因**：装载指令 还是 流量/延迟。
+///
+/// ## 背景
+///
+/// `conv8_mma_ksweep` 量出边际斜率 0.0262 µs/K步 ⇒ 热循环只到 **75% 峰**。
+/// 本测试用 `probe_mma_split.metal` 的三臂把它劈开：
+///
+/// | 臂 | 变了什么 | 回答 |
+/// |---|---|---|
+/// | `p_mma_base` | 与生产逐字节相同 | 对照 |
+/// | `p_mma_small` | A+B 基址+行距收进 1 KB（条数不变） | **流量/延迟**值多少 |
+/// | `p_mma_hoist` | 6 条 load 挪出 K 循环（MMA 不变） | **发射槽**值多少 |
+/// | `p_mma_asmall` | **只**收 A（2 条） | 1.22× 里 A 侧占多少 |
+/// | `p_mma_bsmall` | **只**收 B（4 条） | 1.22× 里 B 侧占多少 |
+/// | `p_mma_noepi` | 删掉 16 KB 暂存 + 尾声 + 输出写 | **动尾声的整体上界** |
+///
+/// 前两臂的分侧是给 `p_mma_small` 收尾用的：`p_mma_wfrag`（权重离线重排成分片
+/// 连续，**结果正确**）在 nDim=64 上量到 **1.00×** ⇒ B 侧不是行数/合并问题，
+/// 必须把 1.22× 劈到某一侧才知道处方往哪开。
+///
+/// 末臂同时去掉尾声算术、输出写流量、16 KB 线程组内存三样，所以它是**上界**
+/// 而不是可落地值——`p_mma_hoist` 给热循环的上界（1.44×），它给尾声的上界。
+///
+/// 判读见该 .metal 的头注释。**注意除 `p_mma_base` 外数值都是错的**——
+/// 诊断件，不是能落地的内核。
+///
+/// 序：五臂 × 6 个 cin 全交错，偶数轮升序、奇数轮降序，取每例最小。
+#[test]
+fn conv8_mma_load_attribution() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let probes = super::conv_probe::ProbeSet::new(&ctx.inner.device).expect("编译探针");
+
+    const H: u32 = 136;
+    const W: u32 = 240;
+    const CO: u32 = 64;
+    let cins: [u32; 6] = [32, 64, 128, 256, 512, 1024];
+    let arms = [
+        "p_mma_base",
+        "p_mma_small",
+        "p_mma_hoist",
+        "p_mma_asmall",
+        "p_mma_bsmall",
+        "p_mma_ost16",
+        "p_mma_ost2",
+    ];
+
+    let cases: Vec<ConvCase> = cins
+        .iter()
+        .map(|&cin| ConvCase {
+            label: "attr",
+            h: H,
+            w: W,
+            cin,
+            cout: CO,
+            kh: 1,
+            kw: 1,
+        })
+        .collect();
+    let built: Vec<ConvProbe> = cases
+        .iter()
+        .map(|c| build_conv_case(&ctx.inner.device, c))
+        .collect();
+
+    let run = |pr: &ConvProbe, arm: &str, reps: u32| -> f64 {
+        let pipe = probes.pipe(arm).expect("取管线");
+        let g = mm_sg_groups(H * W, pr.co4);
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, g)
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    // best[cin][arm]
+    let na = arms.len();
+    let mut best = vec![vec![f64::INFINITY; na]; built.len()];
+    for round in 0..3 {
+        let mut order: Vec<(usize, usize)> = Vec::new();
+        for i in 0..built.len() {
+            for a in 0..na {
+                order.push((i, a));
+            }
+        }
+        if round % 2 == 1 {
+            order.reverse();
+        }
+        for (i, a) in order {
+            let ms = time_dispatch(&|r| run(&built[i], arms[a], r)).ms;
+            best[i][a] = best[i][a].min(ms);
+        }
+    }
+
+    eprintln!(
+        "[mb/attr] m={} co={CO} 网格 [510,1,1]；base=生产逐字节同款，small=A+B 收 1KB，hoist=load 挪出循环，asmall/bsmall=只收一侧",
+        H * W
+    );
+    eprintln!(
+        "[mb/attr] ost16/ost2 = 热循环与尾声尾部逐字节相同，**只有线程组数组声明的大小不同**（16 KB vs 2 KB）"
+    );
+    eprintln!(
+        "[mb/attr] {:<6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}   {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
+        "cin", "base ms", "small ms", "hoist ms", "asmall ms", "bsmall ms", "ost16 ms", "ost2 ms",
+        "b/small", "b/hoist", "b/asmall", "b/bsmall", "b/ost16", "ost16/ost2"
+    );
+    for (i, &cin) in cins.iter().enumerate() {
+        let b = &best[i];
+        eprintln!(
+            "[mb/attr] {:<6} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>9.3}   {:>6.2}× {:>6.2}× {:>6.2}× {:>6.2}× {:>6.2}× {:>6.2}×",
+            cin,
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[0] / b[1],
+            b[0] / b[2],
+            b[0] / b[3],
+            b[0] / b[4],
+            b[0] / b[5],
+            b[5] / b[6]
+        );
+    }
+    // 长 K 那一档的绝对达成率（用 base 臂，K=1024 时尾声只占 4%）
+    let last = cins.len() - 1;
+    let gfa = |a: usize| built[last].flops / (best[last][a] * 1e6);
+    eprintln!(
+        "[mb/attr] cin=1024（尾声占比≈4%，≈纯热循环）: base {:.0} GFLOPS ({:.0}%峰) | small {:.0} ({:.0}%) | hoist {:.0} ({:.0}%) | asmall {:.0} ({:.0}%) | bsmall {:.0} ({:.0}%)",
+        gfa(0),
+        gfa(0) / 3340.0 * 100.0,
+        gfa(1),
+        gfa(1) / 3340.0 * 100.0,
+        gfa(2),
+        gfa(2) / 3340.0 * 100.0,
+        gfa(3),
+        gfa(3) / 3340.0 * 100.0,
+        gfa(4),
+        gfa(4) / 3340.0 * 100.0
+    );
+}
+
+/// 权重**分片分块**布局的收益（`p_mma_wfrag`）——把 B 侧那 4/6 条装载
+/// 从「8 段各自的 32 B、相距 `nDim*4` 字节」变成「一段连续的 256 B」。
+///
+/// ## 为什么只动权重这一侧
+///
+/// `conv8_mma_load_attribution` 量出 `p_mma_small`（A+B 的足迹与行距**全**
+/// 收进 1 KB）值 1.22×，但那条臂同时动了 A 与 B、且把流量整个抹掉，**没有
+/// 可落地性**。权重是**静态**量（离线重排一次，与 `repack_conv_w` 同族成本），
+/// 输入是激活、不能离线重排 ⇒ 唯一能落地的切法是**只动 B**。
+/// 6 条装载里 B 占 4 条，所以这条臂是 1.22× 的**部分版**，
+/// 上界猜法是 `1.22^(4/6) ≈ 1.14×`——**只当上限，真值看这张表**。
+///
+/// ## 单变量
+///
+/// `build_conv_case` 与 `build_conv_case_wfrag` 的 arena 长度、段偏移、
+/// 输入/bias/输出内容**逐位相同**，只有权重段那 64 个 float 的次序不同。
+/// 网格、线程组大小、dispatch 条数全同。
+///
+/// ## 对拍
+///
+/// 先在生产 `n_conv8_mma`（跑 `build_conv_case` 的 buffer）与 `p_mma_wfrag`
+/// （跑 wfrag buffer）之间比输出段——重排写错了这里就红，省得把一条算错的
+/// 内核量成一个「收益」。
+///
+/// 序：两臂 × 6 个 cin 全交错，偶数轮升序、奇数轮降序，取每例最小。
+#[test]
+fn conv8_mma_wfrag() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+    let probes = super::conv_probe::ProbeSet::new(&ctx.inner.device).expect("编译探针");
+
+    const H: u32 = 136;
+    const W: u32 = 240;
+    const CO: u32 = 64;
+    let cins: [u32; 6] = [32, 64, 128, 256, 512, 1024];
+
+    let cases: Vec<ConvCase> = cins
+        .iter()
+        .map(|&cin| ConvCase {
+            label: "wfrag",
+            h: H,
+            w: W,
+            cin,
+            cout: CO,
+            kh: 1,
+            kw: 1,
+        })
+        .collect();
+    let base: Vec<ConvProbe> = cases
+        .iter()
+        .map(|c| build_conv_case(&ctx.inner.device, c))
+        .collect();
+    let wfrag: Vec<ConvProbe> = cases
+        .iter()
+        .map(|c| build_conv_case_wfrag(&ctx.inner.device, c))
+        .collect();
+
+    // ── 对拍：先证明重排写对了，再谈快慢 ────────────────────────────────
+    let wfrag_pipe = probes.pipe("p_mma_wfrag").expect("取管线");
+    for (i, c) in cases.iter().enumerate() {
+        // 注意 `ConvProbe::groups` 是**标量** `n_conv8` 的旧网格，MMA 两支都不用
+        // 它——网格由 `mm_sg_groups` 现算（与 `plan.rs` 的 MMA 支同式）。
+        let g = mm_sg_groups(H * W, base[i].co4);
+        assert_eq!(g, [510, 1, 1], "cin={} 的网格变了，自变量不唯一", c.cin);
+        refill_out_sentinel(&base[i]);
+        refill_out_sentinel(&wfrag[i]);
+        submit_compute(&ctx.inner.queue, |enc| {
+            ks.dispatch(enc, "n_conv8_mma", &base[i].buf, base[i].p_off, g)
+                .expect("dispatch");
+            super::pipeline::dispatch_with(enc, wfrag_pipe, &wfrag[i].buf, wfrag[i].p_off, g)
+                .expect("dispatch");
+        })
+        .expect("提交");
+        let a = read_out(&base[i]);
+        let b = read_out(&wfrag[i]);
+        let (mut mx, mut scale) = (0f32, 0f32);
+        for (x, y) in a.iter().zip(b.iter()) {
+            mx = mx.max((x - y).abs());
+            scale = scale.max(x.abs());
+        }
+        assert!(
+            mx <= 1e-4 * scale.max(1.0),
+            "cin={} 分片分块布局与生产输出对不上：最大差 {mx}，量级 {scale}",
+            c.cin
+        );
+    }
+    eprintln!("[mb/wfrag] 对拍通过：6 个 cin 上 p_mma_wfrag 与 n_conv8_mma 输出逐位同量级");
+
+    let run = |pr: &ConvProbe, arm: &str, reps: u32| -> f64 {
+        let pipe = probes.pipe(arm).expect("取管线");
+        let g = mm_sg_groups(H * W, pr.co4);
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, g)
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    // best[cin][arm]：0 = p_mma_base（跑普通布局），1 = p_mma_wfrag（跑重排布局）
+    let mut best = vec![[f64::INFINITY; 2]; cases.len()];
+    for round in 0..3 {
+        let mut order: Vec<(usize, usize)> = Vec::new();
+        for i in 0..cases.len() {
+            for a in 0..2 {
+                order.push((i, a));
+            }
+        }
+        if round % 2 == 1 {
+            order.reverse();
+        }
+        for (i, a) in order {
+            let (buf, pr) = if a == 0 {
+                ("p_mma_base", &base[i])
+            } else {
+                ("p_mma_wfrag", &wfrag[i])
+            };
+            let ms = time_dispatch(&|r| run(pr, buf, r)).ms;
+            best[i][a] = best[i][a].min(ms);
+        }
+    }
+
+    eprintln!(
+        "[mb/wfrag] m={} co={CO} 网格 [510,1,1]；base=行距 nDim，wfrag=权重分片连续（行距 8）",
+        H * W
+    );
+    eprintln!(
+        "[mb/wfrag] {:<6} {:>9} {:>9}   {:>8}   {:>10} {:>10}",
+        "cin", "base ms", "wfrag ms", "base/wfrag", "base GF", "wfrag GF"
+    );
+    for (i, &cin) in cins.iter().enumerate() {
+        let (b, w) = (best[i][0], best[i][1]);
+        let gf = |ms: f64| base[i].flops / (ms * 1e6);
+        eprintln!(
+            "[mb/wfrag] {:<6} {:>9.3} {:>9.3}   {:>7.2}×   {:>10.0} {:>10.0}",
+            cin,
+            b,
+            w,
+            b / w,
+            gf(b),
+            gf(w)
+        );
+    }
+}
+
+/// `n_conv8_mma` 的 **A 侧再读是不是 L2 命中**——决定「加宽每线程组的列块」
+/// 这条处方值不值。
+///
+/// ## 背景
+///
+/// A 的字节数恒等于 `FLOPs/32`（`m*cin*4 = m*cin*co4*2/2/co4...`，见下），
+/// 而 **y 网格 = `co4/64`** ⇒ 同一块 A 瓦片被 `co4/64` 个线程组各读一遍。
+/// co4=512 就是 **8 遍**。这 8 遍是 L2 命中还是 DRAM 未命中，决定了两条
+/// 完全不同的处方：
+///
+///   · **L2 命中** ⇒ 宽 co 的形状不吃 DRAM ⇒ 「加宽列块」只赚装载条数
+///     （有限），真正卡的是 L1/LSU 与 MMA 流水；
+///   · **DRAM 未命中** ⇒ 「把一个线程组覆盖的 co 从 64 加宽到 128/256」
+///     直接把 A 的 DRAM 流量按比例砍掉 ⇒ 大处方。
+///
+/// ## 怎么做到单变量
+///
+/// `A 字节 = m*cin*4*(co4/64)`，`out 字节 = m*co4*4`，`FLOPs = m*cin*co4*2`，
+/// `线程组数 = (m/64)*(co4/64)`。取 **`m*co4` 恒定**：
+///
+/// | 臂 | m | cin | co4 | gy | FLOPs | out | 线程组 | A 若按 y 冗余算 |
+/// |---|---|---|---|---|---|---|---|---|
+/// | 窄 | 25920 | 1024 | 64 | 1 | 1.70 G | 6.6 MB | 405 | 106 MB |
+/// | 宽 | 3240 | 1024 | 512 | 8 | 1.70 G | 6.6 MB | 408 | 106 MB |
+///
+/// 两臂的 FLOPs、输出字节、线程组数、**A 的「按 y 冗余计」流量**全都相同；
+/// 唯一不同的是**宽臂那 8 遍再读能不能被 L2 接住**。
+///
+/// ## 判读
+///
+///   * 宽臂 ≈ 窄臂 ⇒ 再读是 DRAM 未命中（L2 没接住）⇒ **加宽列块有肉**；
+///   * 宽臂 ≪ 窄臂 ⇒ L2 接住了 ⇒ 宽 co 的形状本来就不吃 A 的 DRAM，
+///     别在这条路上花力气。
+///
+/// 序：两臂交错，偶数轮升序、奇数轮降序，取每例最小。
+#[test]
+fn conv8_mma_arearead() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // m*co4 恒定 1658880；cin 恒定 1024
+    let cases = [
+        ConvCase {
+            label: "窄 gy=1 co4=64",
+            h: 108,
+            w: 240,
+            cin: 1024,
+            cout: 64,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "宽 gy=8 co4=512",
+            h: 54,
+            w: 60,
+            cin: 1024,
+            cout: 512,
+            kh: 1,
+            kw: 1,
+        },
+    ];
+    let built: Vec<(ConvProbe, [u32; 3])> = cases
+        .iter()
+        .map(|c| {
+            let pr = build_conv_case(&ctx.inner.device, c);
+            let g = mm_sg_groups(c.h * c.w, pr.co4);
+            (pr, g)
+        })
+        .collect();
+
+    // 单变量自检：两臂的 FLOPs / 线程组数 / 输出字节 / A 按冗余计的字节必须相等
+    let (f0, f1) = (built[0].0.flops, built[1].0.flops);
+    let (t0, t1) = (
+        (built[0].1[0] * built[0].1[1]) as f64,
+        (built[1].1[0] * built[1].1[1]) as f64,
+    );
+    assert!((f0 - f1).abs() < f0 * 1e-9, "两臂 FLOPs 不等：{f0} vs {f1}");
+    assert!((t0 - t1).abs() < 4.0, "两臂线程组数不等：{t0} vs {t1}");
+    // A 字节（按 y 冗余计）= m*cin*4*gy；输出 = m*co4*4
+    let ab = |i: usize| {
+        let (pr, g) = &built[i];
+        let m = pr.out_h as f64 * pr.out_w as f64;
+        (
+            m * cases[i].cin as f64 * 4.0 * g[1] as f64 / 1e6,
+            m * pr.co4 as f64 * 4.0 / 1e6,
+        )
+    };
+    let (a0, o0) = ab(0);
+    let (a1, o1) = ab(1);
+    assert!((a0 - a1).abs() < a0 * 1e-6, "两臂 A 流量不等：{a0} vs {a1}");
+    assert!((o0 - o1).abs() < o0 * 1e-6, "两臂输出流量不等：{o0} vs {o1}");
+
+    let run = |pr: &ConvProbe, grid: [u32; 3], reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, grid)
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let mut best = [f64::INFINITY; 2];
+    for round in 0..3 {
+        let order: [usize; 2] = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        for i in order {
+            let (pr, g) = &built[i];
+            let ms = time_dispatch(&|r| run(pr, *g, r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+
+    eprintln!(
+        "[mb/arearead] cin=1024，两组 FLOPs/线程组数/输出字节/按 y 冗余计的 A 字节都相同，只有 gy 不同"
+    );
+    eprintln!(
+        "[mb/arearead] A(按冗余) {a0:.1} MB | 输出 {o0:.1} MB | FLOPs {:.2} G | 线程组 {t0}",
+        f0 / 1e9
+    );
+    for (i, c) in cases.iter().enumerate() {
+        let gf = built[i].0.flops / (best[i] * 1e6);
+        eprintln!(
+            "[mb/arearead] {:<14} grid=[{}, {}, 1] {:>8.3} ms  {:>7.1} GFLOPS  {:>4.1}%峰",
+            c.label,
+            built[i].1[0],
+            built[i].1[1],
+            best[i],
+            gf,
+            gf / 3340.0 * 100.0
+        );
+    }
+    eprintln!(
+        "[mb/arearead] 比值 窄/宽 = {:.2}×；≈1.0 ⇒ 再读是 DRAM 未命中（加宽列块有肉），≫1 ⇒ L2 接住了",
+        best[0] / best[1]
+    );
+}
+
+/// `n_conv8_mma` 的 **batch 标度**：A 侧那 1.09~1.27× 是「停顿没藏住」还是
+/// 「访存通路已经到顶」。
+///
+/// ## 为什么是这一条
+///
+/// 五臂归因（`conv8_mma_load_attribution`）已经钉死：那 1.22× 的余量**全在
+/// A 侧（激活）**，B 侧（权重）单独收窄是 **0.99×**（与 `p_mma_wfrag` 的
+/// 1.00× 相互印证）。于是只剩两种解释，处方完全不同：
+///
+///   · **DRAM 延迟没被藏住**（占用率 / 访存并行度不足）
+///     ⇒ 处方是**提高并行度**（合批、拆 K、缩小线程组），或给 A 做软件预取；
+///   · **A 的访存通路已经饱和**
+///     ⇒ 处方只能是**改访存结构**（协作暂存 / 换布局），加并行度白搭。
+///
+/// `batch` 是唯一能在**不改每线程工作量、不改访存形状、不改指令序列**的
+/// 前提下把常驻线程组数翻倍的旋钮（`build_conv_case_batch` 的头注释）。
+/// 判据：
+///
+///   · **每份时间随 batch 下降** ⇒ 前者，停顿没藏住；
+///   · **每份时间持平**         ⇒ 后者，通路到顶。
+///
+/// 网格按 MMA 的约定在 z 上铺 batch（`b = wg.z`），与标量 `n_conv8` 在 y 上
+/// 铺 batch 不同——`mm_sg_groups` 只给 x/y，z 由这里补。
+///
+/// 序：全部 (cin, batch) 组合交错，偶数轮升序、奇数轮降序，取每例最小。
+#[test]
+fn conv8_mma_batch_scaling() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    const H: u32 = 136;
+    const W: u32 = 240;
+    const CO: u32 = 64;
+    let cins: [u32; 2] = [256, 512];
+    let batches: [u32; 4] = [1, 2, 4, 8];
+
+    let cases: Vec<ConvCase> = cins
+        .iter()
+        .map(|&cin| ConvCase {
+            label: "batch",
+            h: H,
+            w: W,
+            cin,
+            cout: CO,
+            kh: 1,
+            kw: 1,
+        })
+        .collect();
+
+    // combos[(ci, bi)] → (probe, grid)
+    let mut combos: Vec<(usize, usize, ConvProbe, [u32; 3])> = Vec::new();
+    for (ci, c) in cases.iter().enumerate() {
+        for (bi, &b) in batches.iter().enumerate() {
+            let pr = build_conv_case_batch(&ctx.inner.device, c, b, false);
+            let g = mm_sg_groups(H * W, pr.co4);
+            assert_eq!(g[0], 510, "cin={} 的 x 网格变了", c.cin);
+            assert_eq!(g[1], 1, "co=64 时 y 网格应当是 1");
+            combos.push((ci, bi, pr, [g[0], g[1], b]));
+        }
+    }
+
+    let run = |pr: &ConvProbe, grid: [u32; 3], reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, grid)
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let mut best = vec![f64::INFINITY; combos.len()];
+    for round in 0..3 {
+        let mut order: Vec<usize> = (0..combos.len()).collect();
+        if round % 2 == 1 {
+            order.reverse();
+        }
+        for i in order {
+            let (_, _, pr, grid) = &combos[i];
+            let ms = time_dispatch(&|r| run(pr, *grid, r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+
+    eprintln!(
+        "[mb/batch] m={} co={CO}；网格 x=510，batch 铺在 z 上（b = wg.z）",
+        H * W
+    );
+    eprintln!(
+        "[mb/batch] {:<6} {:>6} {:>10} {:>11} {:>10}   {:>9}",
+        "cin", "batch", "总 ms", "每份 ms", "每份 µs/组", "GFLOPS"
+    );
+    for (ci, &cin) in cins.iter().enumerate() {
+        // 以 batch=1 的每份时间为基，后面各档的相对值才是要读的数
+        let base_pi = {
+            let i = combos.iter().position(|(a, b, ..)| *a == ci && *b == 0).unwrap();
+            best[i]
+        };
+        for (bi, &b) in batches.iter().enumerate() {
+            let i = combos.iter().position(|(a, bb, ..)| *a == ci && *bb == bi).unwrap();
+            let ms = best[i];
+            let per = ms / b as f64;
+            let flops = cases[ci].h as f64 * cases[ci].w as f64 * CO as f64 * cin as f64 * 2.0;
+            eprintln!(
+                "[mb/batch] {:<6} {:>6} {:>10.3} {:>11.3} {:>10.3}   {:>9.0}{}",
+                cin,
+                b,
+                ms,
+                per,
+                per * 1000.0 / 510.0,
+                flops / (per * 1e6),
+                if bi == 0 {
+                    String::new()
+                } else {
+                    format!("   = {:.2}× 基", base_pi / per)
+                }
+            );
+        }
     }
 }
 

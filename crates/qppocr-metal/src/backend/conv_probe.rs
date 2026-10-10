@@ -164,6 +164,17 @@ const PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_t16n2", include_str!("probe_p_tile.metal")),
     ("p_peak4", include_str!("probe_p_peak.metal")),
     ("p_peak16", include_str!("probe_p_peak.metal")),
+    // `n_conv8_mma` 的四臂诊断（同一份源码、四个入口）——前三个劈开热循环
+    // 那 25% 的缺口是「装载指令」还是「流量/延迟」，第四个给后半一条**能
+    // 落地**的处方（权重离线重排成分片连续）。见该文件头注释。
+    ("p_mma_base", include_str!("probe_mma_split.metal")),
+    ("p_mma_small", include_str!("probe_mma_split.metal")),
+    ("p_mma_hoist", include_str!("probe_mma_split.metal")),
+    ("p_mma_wfrag", include_str!("probe_mma_split.metal")),
+    ("p_mma_asmall", include_str!("probe_mma_split.metal")),
+    ("p_mma_bsmall", include_str!("probe_mma_split.metal")),
+    ("p_mma_ost16", include_str!("probe_mma_split.metal")),
+    ("p_mma_ost2", include_str!("probe_mma_split.metal")),
 ];
 
 /// 变体内核的管线集（一次编译，反复用）。
