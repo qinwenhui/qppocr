@@ -2275,6 +2275,38 @@ pub(crate) struct Layout {
     pub(crate) static_total: u32,
 }
 
+/// 全局相位旋钮（**实验用**，见 `weight-phase-mod64-sets-mma-band`）。
+///
+/// 「段的起点字节偏移 mod 64 决定带宽档位」这条规律已经落地成两条硬对齐
+/// （`alloc` / `alloc_static` 都抬到 16 word），于是**全场的每个段都落在
+/// 相位 0**。但"0 最快"只在两个操作数上量过（MMA 权重 1.51×、dw 输入
+/// 1.61×），而修后逐内核的收益幅度远超探针预期（det `n_conv8` 20.82 →
+/// 7.45、`n_convt` 7.42 → 0.77）⇒ 幅度是逐内核的、**不能外推**。
+/// 这两个开关把整片区域整体平移 k 个 word，用来判定"全 0"是不是全局最优。
+/// 默认为 0 即现状；A/B 用 `env_ab.sh`。
+///
+/// **2026-10-11 已量：两侧都是 0 最好，旋钮留 0。** 真计划逐内核（img-001,
+/// medium det, 每档 3 轮）：
+/// * 激活 0/4/8/12 → 合计 99.12 / 100.78 / 99.32 / 100.71 ms，其余内核全平；
+///   只有 `n_conv_dw` 有周期 32 B 的弱信号（17.20 / 18.21 / 17.26 / 18.05），
+///   0 已是其中最快的档。
+/// * 静态 0/4/8/12 → 合计 99.17 / 103.35 / 101.14 / 103.25 ms，差全在
+///   `n_conv8_mma`（36.48 / 39.75 / 38.11 / 39.94）⇒ **0 比其余档快 4.5~9.5%**，
+///   与探针（1.51×，相位 0 最快）同向。
+/// 即：相位这条杠杆已经吃干净，剩下的**不是**"0 未必全局最优"。
+static APHASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+static SPHASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+fn phase(var: &str, cell: &'static std::sync::OnceLock<u32>) -> u32 {
+    *cell.get_or_init(|| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(0)
+            % 16
+    })
+}
+
 impl Layout {
     /// 预留 `reserve` 个 word 给静态段（= 上一版计划量出的静态段大小）。
     pub(crate) fn with_reserve(reserve: u32) -> Self {
@@ -2324,7 +2356,11 @@ impl Layout {
                 return off;
             }
         }
-        let off = if self.split { self.cursor.div_ceil(16) * 16 } else { self.cursor };
+        let off = if self.split {
+            self.cursor.div_ceil(16) * 16 + phase("QPPOCR_MB_APHASE", &APHASE)
+        } else {
+            self.cursor
+        };
         self.cursor = off + n;
         self.total = self.total.max(self.cursor);
         off
@@ -2364,7 +2400,7 @@ impl Layout {
         // 这条规律**只在权重这个操作数上出现**：把同样 16 个相位搬到激活段
         // 上只有 1.04×（`aligna` 臂）⇒ 处方只需动静态区。
         // 代价：每块 ≤60 B 填充，全场一百多个静态块合计不到 10 KB。
-        let pad = (16 - self.static_cursor % 16) % 16;
+        let pad = (16 - self.static_cursor % 16) % 16 + phase("QPPOCR_MB_SPHASE", &SPHASE);
         let off = self.static_cursor + pad;
         self.static_cursor = off + n;
         self.static_total += pad + n;
