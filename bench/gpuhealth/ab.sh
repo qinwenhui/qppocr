@@ -22,6 +22,25 @@ shift 3 2>/dev/null || shift $#
 MODELS=$ROOT/models
 LOG=logs/ab_$(date +%Y%m%d_%H%M%S).log
 
+# ── 门禁：两臂必须**真的是两个不同的、带 Metal 的二进制** ──────────────
+# 踩过的坑（2026-10-10）：按习惯 `cargo build --release -p qppocr-cli` 建两臂，
+# **忘了 `--features qppocr/gpu`**（gpu 不是 qppocr 的默认 feature）——建出来的是
+# 没有 Metal 后端的二进制，两臂 **md5 完全相同**。`ab.sh` 只比数字不比二进制，
+# 于是 Δ 恒为 0，而且中位/符号/离散全都自洽，**静默地长得像「这个优化没用」**。
+# 同 [[ab-null-may-be-stale-binary]] 的形态（那边是 env 开关没编进二进制）。
+# 正确命令：cargo build --release -p qppocr-cli --features qppocr/gpu
+for pair in "NEW=$NEW" "OLD=$OLD"; do
+    nm=${pair%%=*}; bin=${pair#*=}
+    [ -x "$bin" ] || { echo "门禁：$nm=$bin 不是可执行文件" >&2; exit 3; }
+    n=$(grep -c -a 'n_conv_dw' "$bin" 2>/dev/null || echo 0)
+    [ "$n" -gt 0 ] || { echo "门禁：$nm=$bin 里没有 Metal 内核标记（n_conv_dw=0）——" >&2
+        echo "      大概是漏了 --features qppocr/gpu，这条 A/B 会量出恒 0。" >&2; exit 3; }
+done
+if [ "$(md5 -q "$NEW")" = "$(md5 -q "$OLD")" ] && [ "${ALLOW_SAME:-0}" != 1 ]; then
+    echo "门禁：两臂 md5 相同（$(md5 -q "$NEW")）——量的是噪声，不是差异。" >&2
+    echo "      确实要量同一份二进制请设 ALLOW_SAME=1。" >&2; exit 3
+fi
+
 # ⚠️ macOS 自带 bash 是 3.2：没有 mapfile；且空数组在 set -u 下取 "${A[@]}"
 # 会报 unbound。所以用 while-read 填数组（下面还要判空）。
 IMGS=()

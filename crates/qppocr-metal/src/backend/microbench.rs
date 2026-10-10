@@ -3550,11 +3550,73 @@ fn conv_dw_variant_scan() {
         ("p_dw_wide4", true),
         ("p_dw_u9", true),
         ("p_dw_u3", true),
+        ("p_dw_interior", true),
+        ("p_dw_incr", true),
+        ("p_dw_intun", true),
+        ("p_dw_intinc", true),
         ("p_dw_now", false),
         ("p_dw_fma", false),
         ("p_dw_noin", false),
         ("p_dw_win", false),
+        ("p_dw_tap1o3", false),
+        ("p_dw_tap2o3", false),
     ];
+
+    // ── `p_dw_interior` 的**派发前**安全证明 ────────────────────────
+    //
+    // 那个内核按「首尾两个 tap 都在界内」判内点，然后走一条**没有 compare**
+    // 的循环体。谓词判宽了 ⇒ `uint` 回绕成天文数字地址 ⇒ 直接读飞 ⇒ GPU
+    // 打瘸（要重启）。所以先把同一算式在 CPU 上对**每个输出位置**暴力跑
+    // 一遍，确认「内点 ⟹ base 的每个 tap 都不会 `continue`」。不成立就
+    // panic，一次 dispatch 都不发。
+    for c in &cases {
+        let (out_h, out_w, pad) = dw_dims(c, false);
+        let (k_h, k_w, s) = (c.kh as i64, c.kw as i64, c.stride as i64);
+        let (inh, inw) = (c.h as i64, c.w as i64);
+        let mut n_inner = 0usize;
+        for oh in 0..out_h as i64 {
+            for ow in 0..out_w as i64 {
+                let ih0 = oh * s - pad as i64;
+                let iw0 = ow * s - pad as i64;
+                // 与 MSL 逐字同形：只判首尾。
+                let inner = ih0 >= 0 && ih0 + k_h - 1 < inh && iw0 >= 0 && iw0 + k_w - 1 < inw;
+                if !inner {
+                    continue;
+                }
+                n_inner += 1;
+                // 暴力复算：base 的逐 tap 判断一次都不能触发。
+                for ky in 0..k_h {
+                    let ih = oh * s + ky - pad as i64;
+                    assert!(
+                        (0..inh).contains(&ih),
+                        "{}：内点判宽了 —— oh={oh} ky={ky} → ih={ih} 越界（{}×{}，pad={pad}）。\
+                         `p_dw_interior` 会算飞地址，禁止派发。",
+                        c.label,
+                        out_h,
+                        out_w
+                    );
+                }
+                for kx in 0..k_w {
+                    let iw = ow * s + kx - pad as i64;
+                    assert!(
+                        (0..inw).contains(&iw),
+                        "{}：内点判宽了 —— ow={ow} kx={kx} → iw={iw} 越界（{}×{}，pad={pad}）。\
+                         `p_dw_interior` 会算飞地址，禁止派发。",
+                        c.label,
+                        out_h,
+                        out_w
+                    );
+                }
+            }
+        }
+        eprintln!(
+            "[mb] ── {} ── 内点证明通过：{}/{} 个位置走无判断路径（{:.1}%）",
+            c.label,
+            n_inner,
+            out_h as usize * out_w as usize,
+            100.0 * n_inner as f64 / (out_h as f64 * out_w as f64)
+        );
+    }
 
     for c in &cases {
         let pr = build_dw_case(&ctx.inner.device, c, false);

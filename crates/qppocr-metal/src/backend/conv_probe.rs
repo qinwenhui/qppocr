@@ -196,6 +196,16 @@ pub(crate) const DW_PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_dw_wide4", include_str!("probe_dw.metal")),
     ("p_dw_noin", include_str!("probe_dw.metal")),
     ("p_dw_win", include_str!("probe_dw.metal")),
+    // 内点/边界双路径。**结果正确**、网格同 base，是 `p_dw_nobc` 的
+    // 可落地形态（`nobc` 只能在无 pad 配置上跑，见 `probe_dw.metal`）。
+    ("p_dw_interior", include_str!("probe_dw.metal")),
+    // 只跑 1/3、2/3 个 tap，**结果故意错**，量时间对 tap 条数的斜率。
+    ("p_dw_tap1o3", include_str!("probe_dw.metal")),
+    ("p_dw_tap2o3", include_str!("probe_dw.metal")),
+    // 内点路径上的两条**缩短地址依赖链**的候选。**结果正确**、网格同 base。
+    ("p_dw_incr", include_str!("probe_dw.metal")),
+    ("p_dw_intun", include_str!("probe_dw.metal")),
+    ("p_dw_intinc", include_str!("probe_dw.metal")),
     // 全展开特化（编译期常量 KH/KW/pad）。**结果正确**，可过 CPU 对拍；
     // 各只在匹配的形状上有意义（`dw_spec_ok` 判）。
     ("p_dw_u9", include_str!("probe_dw.metal")),

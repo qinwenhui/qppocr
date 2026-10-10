@@ -35,6 +35,30 @@
 //   p_dw_fma    地址数学与装载全去、只留 FMA —— **这一档全部可动的量**
 //   p_dw_nobc   去掉边界判断（只在**无 padding** 的配置上跑，见下）
 //
+// 第二轮加的（见 `dw_body` 里 MODE 8/9/10 的注释）：
+//   p_dw_interior 内点/边界双路径 —— `p_dw_nobc` 的可落地形态，位级一致、
+//                 可过对拍、不需要无 pad 配置。**但它在生产内核里是负的**
+//                 （见下），留着当反面样本。
+//   p_dw_tap1o3 / p_dw_tap2o3  只跑 1/3、2/3 个 tap（故意算错）——
+//                 量时间对 **tap 条数** 是否线性，给「换分离式」定价
+//
+// ## ⚠️ 这块探针最重要的产出：**孤立探针的胜势不迁移到生产**
+//
+// `p_dw_interior` 在这个文件里同台量到 **1.12~1.17×**（9×9 那批），位级一致、
+// 过 CPU 对拍 —— 看着是白捡的。把它原样搬进 `shaders/n_conv_dw.metal` 之后，
+// 用**真计划**（medium det，`QPPOCR_GPU_KERNEL_PROF`）三轮交错复现：
+//
+//     Conv.64（9×9, c256, m=51840, grid=12960）  13.80 → **16.38 ms（+19%）**
+//     n_conv_dw 合计                              24.16 → **27.52 ms**
+//     三轮交错：new 26.1/26.1/26.2  vs  old 24.1/24.7/24.6 ms
+//
+// 同一个改写，孤立探针里 +14%，真内核里 −16%。差别只在**周围那份代码**
+// （act/残差/写回的尾部、以及整个内核一起过寄存器分配与取指）——
+// 循环体翻倍的代价盖过了分支的收益。**已回退，生产内核一字未改。**
+//
+// 教训：这条内核上的结论必须用**真计划**复核。探针只能用来**划掉**候选
+// （它说「没用」基本可信），不能用来**拍板**（它说「有用」不算数）。
+//
 // `p_dw_nobc` 在带 padding 的配置上会读越界（ih 为负 → uint 回绕成天文
 // 数字），所以它只在 `build_dw_case(..., no_pad=true)` 那份上跑：pad=0、
 // outH = inH-kH+1，此时每个 tap 恒在界内，删掉判断不会越界。它**不与
@@ -95,6 +119,10 @@ inline void dw_tail(device float4* d, float4 acc, uint P, device const uint* par
 }
 
 // MODE: 0=base 1=nodiv 2=nobc 3=now 4=fma 5=wide4 6=noin 7=win
+//       8=interior（内点/边界双路径，**结果正确**）
+//       9=tap1o3 10=tap2o3（只跑 1/3、2/3 个 tap，**结果故意错**）
+//       11=incr（平铺循环+增量 ky/kx，**结果正确**）
+//       12=intun 13=intinc（内点 + 部分展开 / 增量，**结果正确**）
 template <int MODE>
 inline void dw_body(device float4* d, device const uint* params, uint P, uint gid, uint b) {
     uint in_off = params[P + 0], w_off = params[P + 1], b_off = params[P + 2];
@@ -203,8 +231,105 @@ inline void dw_body(device float4* d, device const uint* params, uint P, uint gi
                 acc += x * w;
             }
         }
-    } else {
+    } else if (MODE == 8 || MODE == 12 || MODE == 13) {
+        // ── 内点 / 边界**双路径**（可落地候选）────────────────────────
+        //
+        // 上轮钉下的唯一可动项是**边界判断**：无 pad 配置上 `p_dw_nobc`
+        // 比 base 快 **1.16×**，但那是「删掉判断」，带 padding 的产线配置
+        // 上不能删 —— 于是上轮把它记成「不可落地」。
+        //
+        // 其实可落地：按**整窗口是否全在界内**一次判掉，内点走一条
+        // 没有那 4 条 compare/branch 的循环体，边界像素原样走 base 那条。
+        // 9×9 pad=4 时内点占 `(H-8)(W-8)/(H·W)`（240×216 → 93%）。
+        //
+        // 与 base **逐位相同**：tap 顺序、`ih/iw/px` 算法、`acc += x*w`
+        // 一字未动，内点上 base 的判断本来就永真（`continue` 从不触发）。
+        // 所以这三条都能过 CPU 对拍，是候选不是诊断变体。
+        //
+        // 内点谓词只判**首尾两个 tap**（`t=0` 与 `t=taps-1`）：行号
+        // `ih = oh*sH + ky - padT` 对 `ky` 单调，故两端都在界内 ⟺ 全部
+        // 在界内。这与 base 里「那 4 条 compare 从来没触发过」**逐位等价**，
+        // 不是保守近似。
+        //
+        // ⚠️ 判宽了（谓词比实际界内更松）会让 `uint` 回绕成天文数字地址、
+        // 直接把 GPU 打瘸。调用方在**派发前**用同一算式在 CPU 上逐个输出
+        // 位置暴力验过「内点 ⟹ 每个 tap 都在界内」，不成立就 panic。
+        //
+        // 12 = 内点 + `#pragma unroll 4`；13 = 内点 + 增量 ky/kx。
+        // 动机：内点路径已经没有分支了，可**时间仍只快了 1.15×**，
+        // 说明剩下的瓶颈是每 tap 那条**地址依赖链**本身（`t/kW` 的倒数
+        // 乘法序列 → ky/kx → ih/iw → px → 地址），而不是它的条数 ——
+        // 上轮把链上任何**单项**拿掉都只值 1.0~1.1×，全拿掉才 4.7×。
+        // 展平或缩短这条链 = 让相邻几次迭代的地址互相独立。
+        uint kH = taps / kW;
+        int ih0 = int(oh) * int(sH) - int(padT);
+        int iw0 = int(ow) * int(sW) - int(padL);
+        bool inner = (ih0 >= 0) && (ih0 + int(kH - 1u) < int(inH))
+                  && (iw0 >= 0) && (iw0 + int(kW - 1u) < int(inW));
+        if (inner) {
+            if (MODE == 13) {
+                uint ky = 0u, kx = 0u;
+                for (uint t = 0u; t < taps; t++) {
+                    int ih = int(oh * sH + ky) - int(padT);
+                    int iw = int(ow * sW + kx) - int(padL);
+                    uint px = uint(ih) * inW + uint(iw);
+                    acc += d[ib + px * cv4 + c4] * d[wb + t * cv4 + c4];
+                    if (++kx == kW) { kx = 0u; ky++; }
+                }
+            } else if (MODE == 12) {
+                #pragma unroll 4
+                for (uint t = 0u; t < taps; t++) {
+                    uint ky = t / kW;
+                    uint kx = t - ky * kW;
+                    int ih = int(oh * sH + ky) - int(padT);
+                    int iw = int(ow * sW + kx) - int(padL);
+                    uint px = uint(ih) * inW + uint(iw);
+                    acc += d[ib + px * cv4 + c4] * d[wb + t * cv4 + c4];
+                }
+            } else {
+                for (uint t = 0u; t < taps; t++) {
+                    uint ky = t / kW;
+                    uint kx = t - ky * kW;
+                    int ih = int(oh * sH + ky) - int(padT);
+                    int iw = int(ow * sW + kx) - int(padL);
+                    uint px = uint(ih) * inW + uint(iw);
+                    acc += d[ib + px * cv4 + c4] * d[wb + t * cv4 + c4];
+                }
+            }
+        } else {
+            for (uint t = 0u; t < taps; t++) {
+                uint ky = t / kW;
+                uint kx = t - ky * kW;
+                int ih = int(oh * sH + ky) - int(padT);
+                int iw = int(ow * sW + kx) - int(padL);
+                if (ih < 0 || ih >= int(inH) || iw < 0 || iw >= int(inW)) continue;
+                uint px = uint(ih) * inW + uint(iw);
+                acc += d[ib + px * cv4 + c4] * d[wb + t * cv4 + c4];
+            }
+        }
+    } else if (MODE == 11) {
+        // 平铺计数循环 + **增量 ky/kx**，边界判断保留。结构与 `p_dw_nodiv`
+        // 的关键区别：那条换成了**嵌套循环**（实测 0.74×），输的可能是
+        // 嵌套结构本身（内层 9 次的循环无法软件流水、寄存器压力上升），
+        // 而不是除法。这条把「除法」与「嵌套」两件事分开量。
+        uint ky = 0u, kx = 0u;
         for (uint t = 0u; t < taps; t++) {
+            int ih = int(oh * sH + ky) - int(padT);
+            int iw = int(ow * sW + kx) - int(padL);
+            if (ih >= 0 && ih < int(inH) && iw >= 0 && iw < int(inW)) {
+                uint px = uint(ih) * inW + uint(iw);
+                acc += d[ib + px * cv4 + c4] * d[wb + t * cv4 + c4];
+            }
+            if (++kx == kW) { kx = 0u; ky++; }
+        }
+    } else {
+        // MODE 9/10：只跑前 1/3、2/3 个 tap（**结果故意错**）。循环体与
+        // base **逐字相同**，只有迭代次数不同 —— 用来量 d(时间)/d(tap)，
+        // 也就是「把 81 个 tap 换成 18 个（分离式 9×1+1×9）能拿到多少」
+        // 的换算尺子。上一轮只知道「削到近乎空循环体值 4.77×」，不知道
+        // 时间对 tap **条数**是不是线性的 —— 这条直接回答。
+        uint ntap = (MODE == 9) ? (taps / 3u) : (MODE == 10) ? (taps * 2u / 3u) : taps;
+        for (uint t = 0u; t < ntap; t++) {
             uint ky = t / kW;
             uint kx = t - ky * kW;
             int ih = int(oh * sH + ky) - int(padT);
@@ -331,3 +456,9 @@ DW_ENTRY(p_dw_fma, 4)
 DW_ENTRY(p_dw_wide4, 5)
 DW_ENTRY(p_dw_noin, 6)
 DW_ENTRY(p_dw_win, 7)
+DW_ENTRY(p_dw_interior, 8)
+DW_ENTRY(p_dw_tap1o3, 9)
+DW_ENTRY(p_dw_tap2o3, 10)
+DW_ENTRY(p_dw_incr, 11)
+DW_ENTRY(p_dw_intun, 12)
+DW_ENTRY(p_dw_intinc, 13)
