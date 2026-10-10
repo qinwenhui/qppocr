@@ -2299,7 +2299,14 @@ impl Layout {
     }
 
     pub(crate) fn alloc(&mut self, n: u32) -> u32 {
-        let n = n.div_ceil(4) * 4; // 16 B 对齐
+        // 激活段也要抬到 **64 B**（静态段那条见 `alloc_static`）：
+        // `n_conv_dw` 的**输入段**起点字节偏移 mod 64 把同形状同网格的派发
+        // 分成四档、幅度 **1.61×**（`conv_dw_w_sweep` 的 `QPPOCR_MB_DWMODE=in`
+        // 臂）——dw 按 NHWC 读、行距 `c_dim*4`（c=256 时 1024 B）是 64 的
+        // 整数倍 ⇒ **整张输入同相**，所以这是全局档位、不是逐行抖动。
+        // 尺寸与起点一起抬：只抬起点的话，`free` 回填的复用块会把相位带回
+        // 错位（复用是常态，det 计划里绝大多数激活段都走复用）。
+        let n = if self.split { n.div_ceil(16) * 16 } else { n.div_ceil(4) * 4 };
         for i in 0..self.free.len() {
             if self.free[i].1 >= n {
                 let off = self.free[i].0;
@@ -2317,14 +2324,16 @@ impl Layout {
                 return off;
             }
         }
-        let off = self.cursor;
-        self.cursor += n;
+        let off = if self.split { self.cursor.div_ceil(16) * 16 } else { self.cursor };
+        self.cursor = off + n;
         self.total = self.total.max(self.cursor);
         off
     }
 
     pub(crate) fn free(&mut self, off: u32, n: u32) {
-        let n = n.div_ceil(4) * 4;
+        // 与 `alloc` 同一条取整规则：复用块的尺寸也必须落在 16 word 上，
+        // 否则「分配时对齐、复用后错位」——复用恰恰是 det 计划里的常态。
+        let n = if self.split { n.div_ceil(16) * 16 } else { n.div_ceil(4) * 4 };
         if n > 0 {
             self.free.push((off, n));
         }

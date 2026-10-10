@@ -1197,7 +1197,21 @@ fn cpu_dw_ref(input: &[f32], weight: &[f32], c: &DwCase, no_pad: bool) -> Vec<f3
 ///
 /// 参数块**逐字段抄 `plan.rs`**（那里是 `n_conv_dw` 的唯一出口），偏移一律
 /// 是 word 下标 —— 内核内部 `>>2` 折成 float4 下标，传字节会整个写飞。
-fn build_dw_case(device: &metal::DeviceRef, c: &DwCase, no_pad: bool) -> ConvProbe {
+/// `ingap`/`wgap`：输入段、权重段前各插多少空 word。**只为量相位**。
+///
+/// `n_conv_dw` 的权重装载和 `n_conv8_mma` 一样吃「起点字节偏移 mod 64」，
+/// 但幅度只有 1.09~1.20×，**解释不了**生产里 dw 家族 24.31 → 17.37 ms
+/// （1.40×，同一二进制重跑离散只有 4%）。dw 的另一个操作数是 NHWC 输入，
+/// 行距 `c_dim*4`（c=256 时 1024 B）是 64 的整数倍 ⇒ **每一行同相**，
+/// 所以输入段起点的相位同样值得单独扫——dw 的读形态（一个 float4 = 同一
+/// 像素的 4 个通道）与 MMA 的激活读完全不同。
+fn build_dw_case(
+    device: &metal::DeviceRef,
+    c: &DwCase,
+    no_pad: bool,
+    ingap: u32,
+    wgap: u32,
+) -> ConvProbe {
     let (out_h, out_w, pad) = dw_dims(c, no_pad);
     let m_dim = out_h * out_w;
     let c_dim = c.c.div_ceil(4) * 4; // cpad4(Co)
@@ -1229,8 +1243,8 @@ fn build_dw_case(device: &metal::DeviceRef, c: &DwCase, no_pad: bool) -> ConvPro
     let n_w = taps * c_dim;
     let n_out = m_dim * c_dim;
     let p_words = 64u32;
-    let in_off_w = 256u32;
-    let w_off_w = in_off_w + n_in;
+    let in_off_w = 256u32 + ingap;
+    let w_off_w = in_off_w + n_in + wgap;
     let b_off_w = w_off_w + n_w;
     let out_off_w = b_off_w + c_dim;
     let total = (out_off_w + n_out + 64) as u64;
@@ -3118,6 +3132,108 @@ fn conv8_mma_w_sweep() {
     }
 }
 
+/// `n_conv_dw` 的**权重段相位扫描**（`conv8_mma_w_sweep` 的 `align` 臂的 dw 版）。
+///
+/// ## 为什么要做
+///
+/// 修「静态块对齐到 64 B」那条时，顺带看到 det 的 dw 家族 **24.31 → 17.33 ms**
+/// （`Conv.64` 单条 14.19 → 8.58，1.65×），比要修的那两条 MMA 涨得还多。
+/// 但 64 B 是**顺手**摆的相位：MMA 那边量过 16 个相位里 ≡0 最快，dw 的
+/// 权重装载形态完全不同（`[tap][c4]`，一个 float4 = 4 个通道该 tap 的权重），
+/// **没有理由同相**。若 dw 的最优相位不是 ≡0，那么在生产里给 dw 那一类
+/// 权重块单独补一小段填充，就能再拿一次。
+///
+/// ## 怎么读
+///
+/// 16 个相位逐臂跑同一内核、同一网格、同一形状，只有权重段起点差 1 word。
+/// 取每臂三轮最小。**只有出现一个幅度明显（>10%）且可复现的谷底**才值得
+/// 动生产布局——相位噪声本身也就几个百分点。
+///
+/// 形状取 `QPPOCR_METAL_PLAN_DUMP` 里 medium det 计划的首恶 `Conv.64`
+/// （9x9 c256 136x240，单条最大的 dw）。
+#[test]
+fn conv_dw_w_sweep() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // **两个形状都要扫**：MMA 那边的相位幅度是**随形状变**的（`co4=768` 是
+    // 1.51×、`co4=1536` 只有 1.07×），所以在一个形状上量到「只有 1.09×」
+    // 不足以否掉「生产 dw 掉 1.4× 是这个相位」——生产的 `Conv.64` 是
+    // m=51840（grid 12960，对应 216x240 输入），下面第一例才是它。
+    let cases = [
+        DwCase { label: "dw 9x9 c256 216x240 (Conv.64 生产网格 grid=12960)", h: 216, w: 240, c: 256, kh: 9, kw: 9, stride: 1 },
+        DwCase { label: "dw 9x9 c256 136x240 (Conv.64 小档)", h: 136, w: 240, c: 256, kh: 9, kw: 9, stride: 1 },
+    ];
+    // `QPPOCR_MB_DWMODE=w`（默认，扫权重段）/ `in`（扫输入段，权重钉死）。
+    let mode = std::env::var("QPPOCR_MB_DWMODE").unwrap_or_else(|_| "w".into());
+    for c in &cases {
+        // 16 个相位各一臂（`*gap = j` ⇒ 该段起点字节偏移 +4j）。
+        let probes: Vec<ConvProbe> = (0..16u32)
+            .map(|j| {
+                if mode == "in" {
+                    build_dw_case(&ctx.inner.device, c, false, j, 0)
+                } else {
+                    build_dw_case(&ctx.inner.device, c, false, 0, j)
+                }
+            })
+            .collect();
+        // 网格必须与生产逐位一致，否则绝对值和相位效应都无从与生产对齐。
+        for pr in &probes {
+            assert_eq!(pr.groups, super::conv_probe::dw_groups_for(pr.out_h * pr.out_w, pr.co4));
+        }
+
+        let run = |pr: &ConvProbe, reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    ks.dispatch(enc, "n_conv_dw", &pr.buf, pr.p_off, pr.groups).expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+
+        let mut best = vec![f64::INFINITY; probes.len()];
+        for round in 0..3 {
+            let asc: Vec<usize> = (0..probes.len()).collect();
+            let order: Vec<usize> = if round % 2 == 0 { asc } else { asc.into_iter().rev().collect() };
+            for i in order {
+                let ms = time_dispatch(&|r| run(&probes[i], r)).ms;
+                best[i] = best[i].min(ms);
+            }
+        }
+        // 被扫那一段的起点：`in` 恒从 256 起（+ingap），`w` 在 `in` 段之后（+wgap）。
+        let base = if mode == "in" {
+            256u32
+        } else {
+            256 + c.h * c.w * c.c.div_ceil(4) * 4
+        };
+        let fastest = best.iter().cloned().fold(f64::INFINITY, f64::min);
+        let slowest = best.iter().cloned().fold(0.0f64, f64::max);
+        eprintln!(
+            "[mb/dws] {} （mode={mode}，扫的是{}段、基线 {base}，grid={:?}；幅度 {:.3}×）",
+            c.label,
+            if mode == "in" { "输入" } else { "权重" },
+            probes[0].groups,
+            slowest / fastest
+        );
+        for (j, &ms) in best.iter().enumerate() {
+            let o = base + j as u32;
+            eprintln!(
+                "[mb/dws]   off={:>9}（+{:>3} B）{:>7.3} ms  {:>6.1} GFLOPS  {:.3}×",
+                o,
+                (o as u64 * 4) % 64,
+                ms,
+                probes[j].flops / (ms * 1e6),
+                ms / fastest
+            );
+        }
+    }
+}
+
 /// `n_conv8_mma` 的**受控 K 扫描**：固定 `m` 与 `co`，只动 `cin`。
 ///
 /// ## 要回答的问题
@@ -4545,7 +4661,7 @@ fn conv_dw_variant_scan() {
     }
 
     for c in &cases {
-        let pr = build_dw_case(&ctx.inner.device, c, false);
+        let pr = build_dw_case(&ctx.inner.device, c, false, 0, 0);
         let m_dim = pr.out_h * pr.out_w;
         // 控制关：网格必须与 `plan.rs` 的 `div256(m_dim * cp / 4)` 逐位一致，
         // 否则线程覆盖不同，绝对值无从与生产对齐。
@@ -4648,7 +4764,7 @@ fn conv_dw_variant_scan() {
     // 只有它俩之间的比值有意义。
     {
         let c0 = &cases[0];
-        let prn = build_dw_case(&ctx.inner.device, c0, true);
+        let prn = build_dw_case(&ctx.inner.device, c0, true, 0, 0);
         let groups = prn.groups;
         let names = ["p_dw_base", "p_dw_nobc"];
         let run = |pipe: &metal::ComputePipelineState, reps: u32| -> f64 {
