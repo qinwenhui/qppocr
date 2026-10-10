@@ -96,22 +96,31 @@ unsafe impl Sync for MetalPlan {}
 ///   ——分区相同才保证「同一偏移处的字节」语义可比。
 ///
 /// 分区相同后逐个 blob 比**内容标识**（`Arc` 指针，出自重排缓存）：
-/// 标识相同 ⇒ 那片字节就是本次要写的内容，跳过。参数块/RN 单元每次新建
-/// （标识必不同）⇒ 照写。
+/// 标识相同 ⇒ 那片字节就是本次要写的内容，跳过。参数块/RN 单元每次新建，
+/// 标识自然不同于**存活**的旧分配 ⇒ 照写。
+///
+/// ⚠️ 但「新建的标识必不同于旧账本里的标识」这句话**只在旧账本里的地址还被
+/// 人占着时成立**。指针是可回收的整数：写下账本的计划一被丢掉（`probe()` 探完
+/// 即弃、缓存淘汰），它那些 `Arc` 地址就会被后续分配接住，于是新参数块会撞上
+/// 旧账本里的同一条 ⇒ 假命中 ⇒ **那一块根本没写**。`Arena::pins` 就是为堵这个
+/// 而存在的（钉住账本里的地址），它的文档里有 2026-10-11 那次丢行的完整形态。
 ///
 /// ⚠️ **`blobs` 的语义是「最后触碰本 arena 的那个计划的静态清单」**，不是
 /// 「上一份计划的」（`plan.rs:1800-1806` 的「静态区只在装载期写一次」只在
 /// **一个计划独占一块 arena** 时成立，而这里会话级共享——Vulkan 侧每个
 /// `Plan` 私有 arena，所以那边没有这个问题）。
 ///
-/// 跨 build 时静态区**从偏移 0 重新分配**（`Layout::alloc_static` 与 `alloc`
-/// 共用 `cursor`，每次 `Layout::new()` 归零），于是 build j 的**激活区**可以
-/// 压在 build i 的**参数块**上——实测 `[1,3,48,384]` 的 6 个参数块有
-/// 1536/1536 字节落在 `4x3x48x256` / `3x3x48x512` / `1x3x48x1024` 的激活区内。
-/// 参数块是**形状相关**的（编码 stride/shape），没有任何布局技巧能让两个
-/// 计划共用同一偏移。所以跨 build 的完整性只能靠**每次执行前重放**，见
-/// `MetalSession::ensure_statics`：build 与 run **都**更新本清单（run 的激活
-/// 写也会压掉别人的静态区，所以 run 同样是一次「触碰」）。
+/// 跨 build 时每个计划的静态区**各自从偏移 0 重新分配**（`Layout::alloc_static`
+/// 只 bump `static_cursor`，每次 `Layout::new()` 归零），于是**同一偏移**在不同
+/// 计划里装着**不同的东西**——实测 rec 各形状的静态分区逐位相同（都是 152 块、
+/// `static_words=1106412`），差的全在参数块的**值**上。参数块是**形状相关**的
+/// （编码 stride/shape），没有任何布局技巧能让两个计划共用同一偏移。所以跨 build
+/// 的完整性只能靠**每次执行前重放**，见 `MetalSession::ensure_statics`。
+///
+/// （旧注释在这里写「build j 的激活区可以压在 build i 的参数块上」，那是
+/// `static_reserve` 引入**之前**的实测：那时两段共用一个 bump。现在激活段从
+/// `reserve`（本会话静态段上界）起，激活写碰不到任何计划的静态区——但这只解决
+/// 了「别的东西写回来」，「同一偏移处是谁的字节」仍要靠每次重放。）
 struct Arena {
     buf: metal::Buffer,
     base: *mut u8,
@@ -119,6 +128,54 @@ struct Arena {
     static_words: u32,
     /// 最后触碰本 arena 的计划写下的静态 blob：(偏移, 字数, 内容标识)
     blobs: Vec<(u32, u32, usize)>,
+    /// **`blobs` 里每个「内容标识」的持有权**——判据成立的前提，缺了它就是
+    /// 2026-10-11 抓到的静默丢行。
+    ///
+    /// `blobs` 拿 `Arc::as_ptr` 当内容标识，可**指针只是个整数**：它唯一标识
+    /// 一份 `Vec`，只在「那份 `Vec` 还活着」时才成立。而写下这套账本的计划随时
+    /// 会被丢掉——`probe()`（`build_plan(shape, 0).map(|_| ())`，探完即弃）、
+    /// `plan_for` 的 FIFO 淘汰、`PlanBuilder::build` 第一趟自查的临时计划，都会
+    /// 释放自己的 blob `Arc`。释放之后**同一地址会被下一次 `Arc::new` 重新分配**
+    /// （同尺寸块，分配器 LIFO），于是新计划的块撞上账本里的旧地址 ⇒ 被判「已在
+    /// 位」⇒ 跳过写入 ⇒ arena 里留的是**别人**的字节。
+    ///
+    /// 实测形态：rec 预热计划（探针建完即弃）的 103 个参数块地址被真实计划接住，
+    /// `n_reduce_fin / ReduceMean.0` 的参数 `m_dim` 停在预热的 256（本形状要 384），
+    /// `[1,3,48,128]` 那一桶里的一行就静默没了（~2.7% 的图）。**签名是账本命中数
+    /// 多出 1**（`命中=85` 而非 84），多出来的那 1 条就是假命中。
+    ///
+    /// 拿着 `Arc` 就等于把地址钉住：只要三元组还在账本里，它指向的 `Vec` 就活着，
+    /// 同地址不可能属于别人 ⇒「标识相同」重新成为**内容相同**的充分条件。
+    /// 代价只是引用计数 +1（权重本就由 `repack_cache` 长存，参数块 KB 级）。
+    pins: Vec<Arc<Vec<u32>>>,
+}
+
+impl Arena {
+    /// 重设账本。`blobs` 与 `pins` **必须同源**（都由同一份 `statics` 派生，
+    /// `recipe` = `statics` 的 `(偏移, 字数, 指针)` 视图）——分开设就是漏钉，
+    /// 见 `pins` 的文档。所有写账本的地方都走这里，别再手写 `g.blobs = …`。
+    fn put_ledger(&mut self, statics: &[(u32, Arc<Vec<u32>>)], recipe: Vec<(u32, u32, usize)>) {
+        debug_assert_eq!(
+            statics.len(),
+            recipe.len(),
+            "账本的样子与钉住的 Arc 必须同源（同一份 statics）"
+        );
+        // 回归开关（`QPPOCR_METAL_LEDGER_UNPIN=1`，**只在同时开着 `STATIC_VERIFY`
+        // 时才生效**）：不钉地址，把 2026-10-11 那类假命中放回来。它的唯一用途是
+        // 证明蹲坑脚本还抓得到——没有它，`flake_param.sh` 报「300 轮干净」就无法
+        // 区分「修好了」和「判据瞎了」。
+        //
+        // 互锁的理由：只有 `STATIC_VERIFY` 会在派发前**拒发**坏计划；单开本开关
+        // 会让错的参数真的进命令缓冲（本仓有「读垃圾参数 → 巨循环 → GPU 打瘸」的先例）。
+        let unpin = std::env::var_os("QPPOCR_METAL_LEDGER_UNPIN").is_some()
+            && std::env::var_os("QPPOCR_METAL_STATIC_VERIFY").is_some();
+        self.pins = if unpin {
+            Vec::new()
+        } else {
+            statics.iter().map(|(_, v)| Arc::clone(v)).collect()
+        };
+        self.blobs = recipe;
+    }
 }
 
 // SAFETY: 同 MetalPlan——base 是 buf 的持久映射指针，存活期不短于 Arena
@@ -617,6 +674,7 @@ impl MetalSession {
                     cap_words: cap as u32,
                     static_words: built.static_words,
                     blobs: Vec::new(),
+                    pins: Vec::new(),
                 })));
             }
             // 取走 arena 的共享句柄：本计划会持有它（账本的判据挂在 arena 上），
@@ -667,16 +725,21 @@ impl MetalSession {
             );
         }
         // 跳过集 = **最后触碰本 arena 的计划**的 (偏移, 字数, 标识)。三项全等
-        // 即「那片字节在位」：它写过同样内容在同一区间，且在其后没有任何写落
-        // 在那上面（它自己的 run 的激活区不与自己的静态区重叠——同 build 内
-        // `alloc_static` 与 `alloc` 不重叠，见 plan.rs 的 `alloc_static`）。
+        // 即「那片字节在位」：它写过同样内容在同一区间，且在其后没有任何写落在
+        // 那上面。
         //
-        // ⚠️ 旧注释写的是「上一份计划……两次计划之间没有任何写落在它上面」，
-        // 那是**假前提**：共享 arena 下别的计划既会写自己的静态区（`Layout`
-        // 每次从偏移 0 重新分配），它 run 时的激活区还会压在别人的参数块上。
-        // 清单本身没错，错的是「跨计划的命中可以无条件信任」这一步——参数块
-        // 标识每次 build 新建，天然被排除在跨 build 跳过之外；权重则由
-        // `ensure_statics` 在每次执行前重新对账。
+        // 「其后没有任何写」这一半现在由构造保证，不再靠约定：激活段的 bump 从
+        // `reserve` 起（`plan.rs` 的 `Layout::with_reserve`，`alloc` 里还有
+        // `debug_assert!(off >= self.reserve)`），而 `reserve` 是**本会话所有形状
+        // 静态段的上界**（`plan_for` 传 `static_reserve`，`build` 自查不满足就重建）
+        // ⇒ 任何计划的激活写都落在 [reserve, …)，碰不到任何计划的静态区
+        // [0, static_words) 。（旧注释说「激活区会压在别人的参数块上」——那是
+        // `static_reserve` 引入**之前**的实测，现已不成立；见 §每形状重置静态段。）
+        //
+        // 剩下的风险全在「标识」这一半：它是个可回收的指针，账本条目所指的
+        // 计划一旦被丢掉，地址就会被后来的分配接住（`probe()` 探完即弃是主要
+        // 来源）⇒ 新参数块撞上旧条目 ⇒ 假命中 ⇒ 那一块**根本没写**。
+        // `Arena::pins` 把账本里的地址钉住，才使「标识全等 ⇒ 内容相同」成立。
         let mut skip: std::collections::HashSet<(u32, u32, usize)> =
             cur.iter().filter(|b| prev.contains(b)).copied().collect();
         if std::env::var_os("QPPOCR_METAL_STATIC_DEBUG").is_some() {
@@ -771,7 +834,10 @@ impl MetalSession {
                 .lock()
                 .map_err(|_| Error::Device("arena 锁中毒".into()))?;
             g.static_words = built.static_words;
-            g.blobs = cur.clone();
+            // 账本与钉住的 Arc 同源落地：`cur` 就是 `statics` 的 (偏移, 字数, 指针)
+            // 视图，钉住 `statics` 即可保证账本里每个地址在条目有效期内都活着
+            // （见 `Arena::pins`——不钉，指针就会被下一次分配复用，假命中）。
+            g.put_ledger(&statics, cur.clone());
         }
         // 静态段占比：`total` 里权重/参数占多少。形状无关的权重如果按形状
         // 各存一份，N 个桶形状就是 N 份——这是「整块 120 MB 而输入才 1 MB」
@@ -971,7 +1037,8 @@ impl MetalSession {
                 );
             }
         }
-        g.blobs = plan.recipe.clone();
+        // 重放完，账本换成本计划的（`pins` 同源钉住，见 `Arena::pins`）。
+        g.put_ledger(&plan.statics, plan.recipe.clone());
         drop(g);
         if wrote > 0 || std::env::var_os("QPPOCR_METAL_STATIC_DEBUG").is_some() {
             eprintln!(
@@ -1154,6 +1221,8 @@ impl DeviceSession for MetalSession {
         // 转投 `run`，所以这道门覆盖全部执行。
         self.ensure_statics(&plan)?;
 
+        // 本 run 的序号（诊断用；提前到这里只为让 memcpy 前后的两次落盘同名配对）。
+        let run_seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
         // real_n 先于提交写入（内核读 params[0] 做早退）。统一内存 CPU
         // 写即设备可见，无 publish 屏障。
         // SAFETY: base 是整块映射；rn_word 是 build 期静态分配。
@@ -1161,9 +1230,33 @@ impl DeviceSession for MetalSession {
             let p = plan.base.add(plan.rn_word as usize * 4) as *mut u32;
             std::ptr::write_volatile(p, n_real as u32);
         }
+        // 诊断开关：把本计划的**动态区** [静态段末, 计划末) 在喂输入之前填成
+        // 给定 u32（`QPPOCR_METAL_FILL_DYN=<十六进制字>`，如 `0` / `3f800000`）。
+        //
+        // 与 `ARENA_FILL` 的区别：那个填**整块**（含静态段、且清空跳过集 ⇒ 强制
+        // 全量静态上传）；这个只填动态区、**一个静态字节都不碰**，也不动跳过集。
+        // 于是它能一刀切开两种「逐轮不同」：若填 0 后症状消失、填 1.0f 后症状
+        // 改变 ⇒ 本计划**读到了自己没写过的动态字节**（那处本该是 0/某个定值）；
+        // 若两个填值都对症状无影响 ⇒ 与字节内容无关，是**派发之间的竞态/时序**。
+        if let Some(fv) = std::env::var("QPPOCR_METAL_FILL_DYN")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        {
+            let start = (plan.static_bytes / 4) as usize;
+            let n = (plan.block_bytes / 4) as usize;
+            // SAFETY: [start, start+n) = [静态段末, 计划末) 在映射内（同上断言）。
+            unsafe {
+                let p = plan.base.add(start * 4) as *mut u32;
+                for i in 0..n {
+                    std::ptr::write_volatile(p.add(i), fv);
+                }
+            }
+        }
         // 输入 memcpy（f32 NCHW 区）
+        let mut in_words = 0usize;
         for (nm, t) in &inputs {
             if nm == &self.input_name {
+                in_words = t.f32.len();
                 // SAFETY: base 持久映射；in_f32_off+len ≤ total（按输入形状分配）。
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -1173,6 +1266,158 @@ impl DeviceSession for MetalSession {
                     );
                 }
                 break;
+            }
+        }
+        // 诊断（`QPPOCR_METAL_IO_DUMP`）：memcpy 之后、dispatch **之前**再落一份输入。
+        // 与 run 之后那份配对比较，把「host 喂进来的就是错的」和「被某个内核覆盖了」
+        // 一刀切开——这是判据，不是猜测。
+        if self.argmax_exit {
+            if let Some(prefix) = std::env::var_os("QPPOCR_METAL_IO_DUMP") {
+                let shape = in_shape
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("x");
+                // SAFETY: in_f32_off + in_words ≤ total_words（memcpy 按输入形状分配）。
+                let pre = unsafe {
+                    std::slice::from_raw_parts(
+                        plan.base.add(plan.in_f32_off as usize * 4),
+                        in_words * 4,
+                    )
+                };
+                let path = format!(
+                    "{}.run{run_seq:03}.{shape}.in_pre",
+                    prefix.to_string_lossy()
+                );
+                if let Err(e) = std::fs::write(&path, pre) {
+                    eprintln!("[io-dump] 写 {path} 失败：{e}");
+                }
+            }
+        }
+
+        // 诊断（`QPPOCR_METAL_STATIC_VERIFY=1`，**纯读、零 GPU 风险**）：派发前把本
+        // 计划的**静态清单逐字与 arena 实际内容比对**。清单里既有权重（`repack_cache`
+        // 的 `Arc`）也有**参数块**（编码 stride/shape/`out_off`/`rows`）；任何一块
+        // 不在位，内核读到的就是**别的计划的参数**——出口会把 `(val,idx)` 写到别人的
+        // 偏移上、或按更小的 `rows` 提前返回 ⇒ 输出区保持上一张张量的残渣 ⇒
+        // 「整行静默消失」（坏轮证据：相对激活区 79484..79515 那 32 字全程等于环境值）。
+        //
+        // 为什么必须看**内容**：`ensure_statics` 的早退判据是 `g.blobs == plan.recipe`、
+        // 跳过集也比 `(偏移, 字数, Arc 指针)`，**全是指针值**。指针可复用（`Vec` 的
+        // `Arc` 一旦 drop，同一地址会分给别的 `Vec`），所以这些判据有假阳性的余地，
+        // 而唯一能证伪的证据是内容。唯一预期的例外是 `rn_word`（表头 word 0）——
+        // host 每 run 按真实行数覆写，内容本就与建成时不同。
+        //
+        // **发现不在位就拒绝派发**（不是只打印）：这份参数块的用途是给内核编址，
+        // 错的参数轻则丢一行、重则让内核按别人的偏移/形状跑成巨循环把 GPU 打瘸
+        // （本仓有先例，见 `bench/gpuhealth/health.sh` 的判据）。既然已经知道它
+        // 是错的，就绝不能再送进命令缓冲。要观察「错的参数怎么走坏下游」的人显式
+        // 加 `QPPOCR_METAL_STATIC_VERIFY_WARN=1` 退回只警告。
+        if std::env::var_os("QPPOCR_METAL_STATIC_VERIFY").is_some() {
+            use std::fmt::Write as _;
+            let g = plan
+                .arena
+                .lock()
+                .map_err(|_| Error::Device("arena 锁中毒".into()))?;
+            let (mut nbad, mut first) = (0usize, String::new());
+            for (off, data) in &plan.statics {
+                let lo = *off as usize;
+                let hi = lo + data.len();
+                let rn = plan.rn_word as usize;
+                if lo <= rn && rn < hi {
+                    continue; // host 每 run 覆写，内容本就与清单不同
+                }
+                // SAFETY: 偏移在本 arena 映射内（同 `ensure_statics`）。
+                let live = unsafe {
+                    std::slice::from_raw_parts(g.base.add(lo * 4) as *const u32, data.len())
+                };
+                if live == data.as_slice() {
+                    continue;
+                }
+                nbad += 1;
+                if nbad <= 3 {
+                    let (mut hv, mut wv) = (String::new(), String::new());
+                    for (i, (a, b)) in live.iter().zip(data.iter()).enumerate() {
+                        if a != b {
+                            let _ = write!(hv, "@{i}:{a:08x} ");
+                            let _ = write!(wv, "@{i}:{b:08x} ");
+                        }
+                    }
+                    // 判据的核心三问：这块的 `Arc` 指针、账本里同 (偏移,字数) 记的
+                    // 指针、以及**三元组是否真的命中账本**。命中 ⇒ 跳过判据踩到了
+                    // 「同一个 `Arc` 地址先后属于两个 `Vec`」（有 free 才有这种复用）；
+                    // 不命中而内容又不对 ⇒ 写完之后被压掉（另一个计划的激活区）。
+                    let id = Arc::as_ptr(data) as usize;
+                    let led = g
+                        .blobs
+                        .iter()
+                        .find(|(o, l, _)| o == off && *l == data.len() as u32);
+                    let own = plan.dispatches.iter().find(|d| d.p_off == *off);
+                    let _ = write!(
+                        first,
+                        "\n       off={off} len={} 本块ptr={id:x} 账本ptr={} 命中账本={} \
+                         归属={} 实[{hv}] 应[{wv}]",
+                        data.len(),
+                        led.map_or_else(|| "-".to_string(), |(_, _, p)| format!("{p:x}")),
+                        led.is_some_and(|(_, _, p)| *p == id),
+                        own.map_or_else(
+                            || "（不是任何 dispatch 的参数块）".to_string(),
+                            |d| format!("{} / {} 网格={:?}", d.kernel, d.node, d.groups)
+                        ),
+                    );
+                }
+            }
+            eprintln!(
+                "[verify] run#{run_seq} {in_shape:?}：静态 {}/{} 块不在位{}",
+                nbad,
+                plan.statics.len(),
+                if first.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ——{first}")
+                }
+            );
+            if nbad > 0 && std::env::var_os("QPPOCR_METAL_STATIC_VERIFY_WARN").is_none() {
+                return Err(Error::Device(format!(
+                    "{in_shape:?} 静态区 {} 块不在位——账本把别的计划的字节当成了本计划的，\
+                     已拒绝派发（参数错会让内核按别人的偏移/形状跑；只警告不拦：\
+                     设 QPPOCR_METAL_STATIC_VERIFY_WARN=1）",
+                    nbad
+                )));
+            }
+        }
+        // 诊断（`QPPOCR_METAL_EXIT_PARAM=1`，纯读）：把 rec 出口节点
+        // （`n_exit3_argmax`）的参数块、网格、输出偏移在**派发前**逐字打出来。
+        // 坏轮若在这块显示的是**别的计划**的 `out_off`/`rows`（如预热计划
+        // `[1,3,64,64]` 的 `rows=8`），那就是「出口把 16 字写去了别处」的直证。
+        if self.argmax_exit && std::env::var_os("QPPOCR_METAL_EXIT_PARAM").is_some() {
+            use std::fmt::Write as _;
+            if let Some(d) = plan.dispatches.iter().find(|d| d.kernel == "n_exit3_argmax") {
+                let blob = plan.statics.iter().find(|(off, _)| *off == d.p_off);
+                let n = blob.map(|(_, v)| v.len()).unwrap_or(6).max(6);
+                let (mut have, mut want) = (String::new(), String::new());
+                // SAFETY: `p_off` 是本计划的静态分配，其后的 6 个字在映射内。
+                unsafe {
+                    let p = plan.base.add(d.p_off as usize * 4) as *const u32;
+                    for i in 0..n {
+                        let _ = write!(have, "{:08x} ", std::ptr::read_unaligned(p.add(i)));
+                    }
+                }
+                if let Some((_, v)) = blob {
+                    for w in v.iter() {
+                        let _ = write!(want, "{w:08x} ");
+                    }
+                }
+                // SAFETY: `rn_word` 是 build 期静态分配（构造上恒 0）。
+                let rn = unsafe {
+                    std::ptr::read_unaligned(plan.base.add(plan.rn_word as usize * 4) as *const u32)
+                };
+                eprintln!(
+                    "[exit-param] run#{run_seq} {in_shape:?} p_off={} out_off={} groups={:?} \
+                     应有[{want}]实有[{have}]rn={rn}（rn 是 host 每 run 覆写的真实行数；\
+                     出口守门 = 行号 >= rn*rpb 才早退）",
+                    d.p_off, d.out_off, d.groups
+                );
             }
         }
 
@@ -1283,7 +1528,6 @@ impl DeviceSession for MetalSession {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|&v| v > 0.0);
-        let run_seq = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
         // 并发（--workers 0）时多个线程的日志会交错，带线程号才能归属。
         let tid = std::thread::current().id();
         // 消融模式下数字一定是错的，每次 run 都喊一声，免得忘了自己在量什么。
@@ -1292,6 +1536,57 @@ impl DeviceSession for MetalSession {
                 "[metal] ⚠ 消融模式：rec 计划（run#{run_seq}）跳过 {stub_rec:?} 的派发，\
                  **本次读数只作计时用、数值无效**"
             );
+        }
+        // 诊断开关（`QPPOCR_METAL_WATCH=<前缀>` + `QPPOCR_METAL_WATCH_WIN=<off:len>[,...]`，
+        // 偏移是**激活区相对**的字下标，与 `IO_DUMP` 同一坐标系）：每提交完一块
+        // （配 `CHUNK=1` 时即每条派发）就把这些窗口读出来追加到 `<前缀>.trace`，
+        // 并在本轮开跑前先落一份 `<前缀>.pre`。
+        //
+        // 用来回答「某个字区间在坏轮里到底有没有被写过」：好轮/坏轮各一条 trace，
+        // **第一条窗口内容不同的派发**就是凶手；若坏轮里某窗口自始至终都等于
+        // `.pre`（环境内容）⇒ 那几十字节**压根没被本计划的任何派发写过**，
+        // 问题就落在「谁本该写它」而不是「谁写坏了它」。
+        let watch = std::env::var_os("QPPOCR_METAL_WATCH").map(|p| {
+            let wins: Vec<(usize, usize)> = std::env::var("QPPOCR_METAL_WATCH_WIN")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|s| {
+                    let (a, b) = s.split_once(':')?;
+                    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+                })
+                .collect();
+            let shape = in_shape
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("x");
+            (format!("{}.run{run_seq:03}.{shape}", p.to_string_lossy()), wins)
+        });
+        /// 把若干「激活区相对字偏移」窗口读成一行十六进制（诊断用，纯读）。
+        unsafe fn watch_line(base: *const u8, sw: usize, wins: &[(usize, usize)]) -> String {
+            use std::fmt::Write as _;
+            let mut s = String::with_capacity(wins.iter().map(|&(_, l)| l * 9 + 1).sum());
+            for &(off, len) in wins {
+                for k in 0..len {
+                    // SAFETY: 调用方保证窗口在映射内。
+                    let w = unsafe {
+                        std::ptr::read_unaligned(base.add((sw + off + k) * 4) as *const u32)
+                    };
+                    let _ = write!(s, "{w:08x} ");
+                }
+                s.push('|');
+            }
+            s
+        }
+        if let (true, Some((prefix, wins))) = (self.argmax_exit, watch.as_ref()) {
+            if !wins.is_empty() {
+                let sw = (plan.static_bytes / 4) as usize;
+                // SAFETY: 窗口都在 [static_words, total_words) 内（Layout 两段分离），
+                // 且此刻还未提交任何 dispatch，无并发写。
+                let line = unsafe { watch_line(plan.base, sw, wins) };
+                let path = format!("{prefix}.pre");
+                let _ = std::fs::write(&path, format!("{line}\n"));
+            }
         }
         let t0 = std::time::Instant::now();
         let (encode_ms, wait_ms) = if let Some(n) = chunk {
@@ -1343,6 +1638,28 @@ impl DeviceSession for MetalSession {
                         std::process::exit(97);
                     }
                 }
+                // 逐块窗口采样（见上面 `QPPOCR_METAL_WATCH` 的说明）。
+                if let (true, Some((prefix, wins))) = (self.argmax_exit, watch.as_ref()) {
+                    if !wins.is_empty() {
+                        let sw = (plan.static_bytes / 4) as usize;
+                        // SAFETY: 同上（窗口在映射内）；本块已 wait 返回，GPU 不再写。
+                        let line = unsafe { watch_line(plan.base, sw, wins) };
+                        let path = format!("{prefix}.trace");
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                        {
+                            let _ = writeln!(
+                                f,
+                                "{lo:>4}..{:<4} {:>22} {line}",
+                                lo + blk.len(),
+                                blk.first().map_or("?", |d| d.kernel),
+                            );
+                        }
+                    }
+                }
             }
             (enc_acc, wait_acc)
         } else {
@@ -1363,6 +1680,52 @@ impl DeviceSession for MetalSession {
             })?
         };
         let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        // 诊断开关：把本计划**跑完之后**的激活区落盘（`QPPOCR_METAL_IO_DUMP=<前缀>`）。
+        //
+        // 与 `QPPOCR_METAL_ARENA_DUMP` 互补：那个只在 build 后、覆盖 [0,total)，
+        // 看不到任何运行期中间量。这个覆盖 [静态段末, 计划末) = 输入 + 全部中间
+        // 激活，用来在「同输入、同程序、却逐轮结果不同」时定位**第一处分歧字节**。
+        // 文件名带 `run_seq` 与形状，多次运行之间可直接 `cmp` 对齐。
+        // 纯读、不碰任何状态；不设变量时零开销。
+        // 只落 **rec 计划**（`argmax_exit`）：det 的激活区大一个量级，全落盘会撑爆。
+        let io_dump = std::env::var_os("QPPOCR_METAL_IO_DUMP");
+        if let (true, Some(prefix)) = (self.argmax_exit, io_dump) {
+            let start = (plan.static_bytes / 4) as usize;
+            let n = (plan.block_bytes / 4) as usize;
+            let shape = in_shape
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("x");
+            let path = format!("{}.run{run_seq:03}.{shape}.bin", prefix.to_string_lossy());
+            // SAFETY: [static_words, total_words) 是激活段（`Layout` 两段分离），
+            // 在映射内；run 已同步结束且全程持执行锁，无并发写。
+            let slice = unsafe { std::slice::from_raw_parts(plan.base.add(start * 4), n * 4) };
+            if let Err(e) = std::fs::write(&path, slice) {
+                eprintln!("[io-dump] 写 {path} 失败：{e}");
+            }
+            // 单独落**输入区**（`in_f32_off`，长度 = 本次 host 张量长度）——
+            // 判别「分歧发生在 rec 内部」还是「host 喂进来的输入本就逐轮不同」。
+            // SAFETY: in_f32_off + in_words ≤ total_words（memcpy 按输入形状分配）。
+            let ins = unsafe {
+                std::slice::from_raw_parts(
+                    plan.base.add(plan.in_f32_off as usize * 4),
+                    in_words * 4,
+                )
+            };
+            let ipath = format!("{path}.in_post");
+            if let Err(e) = std::fs::write(&ipath, ins) {
+                eprintln!("[io-dump] 写 {ipath} 失败：{e}");
+            }
+            eprintln!(
+                "[io-dump] run#{run_seq:03} {in_shape:?} 落盘：static_words={} \
+                 in_f32_off={} in_words={in_words} 激活区 words={} → {}",
+                plan.static_bytes / 4,
+                plan.in_f32_off,
+                plan.block_bytes / 4,
+                path
+            );
+        }
         if std::env::var_os("QPPOCR_GPU_PROF").is_some() {
             let n = plan.dispatches.len();
             eprintln!(
