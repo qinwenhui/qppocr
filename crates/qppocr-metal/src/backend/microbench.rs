@@ -445,7 +445,42 @@ struct ConvCase {
     kw: u32,
 }
 
+/// 步长与 pad。**与 `ConvCase` 分开**是因为后者有 59 处字面量，多 6 个字段
+/// 就是 59 处机械改动；而绝大多数用例走的是同一套（stride 1 + 对称 pad），
+/// 用 [`ConvGeom::sym`] 生成即可，只有 stride / 非对称 pad 的新用例需要显式写。
+#[derive(Clone, Copy)]
+struct ConvGeom {
+    sh: u32,
+    sw: u32,
+    pt: u32,
+    pl: u32,
+    pb: u32,
+    pr: u32,
+}
+
+impl ConvGeom {
+    /// 生产里 k×k 那一族的老约定：stride 1、四边 pad 都是 (k-1)/2。
+    fn sym(c: &ConvCase) -> Self {
+        Self {
+            sh: 1,
+            sw: 1,
+            pt: c.kh / 2,
+            pl: c.kw / 2,
+            pb: (c.kh - 1) - c.kh / 2,
+            pr: (c.kw - 1) - c.kw / 2,
+        }
+    }
+
+    /// 输出空间尺寸：`floor((in + padT + padB - k)/s) + 1`。
+    fn out_hw(self, c: &ConvCase) -> (u32, u32) {
+        let h = (c.h + self.pt + self.pb - c.kh) / self.sh + 1;
+        let w = (c.w + self.pl + self.pr - c.kw) / self.sw + 1;
+        (h, w)
+    }
+}
+
 /// 把 NCHW 索引写成 NHWC 下标，做一次朴素卷积（对拍基准）。
+/// stride 1 + 对称 pad 的简写——见 [`cpu_conv_nhwc_geom`]。
 fn cpu_conv_nhwc(
     input: &[f32],
     weight: &[f32],
@@ -453,8 +488,22 @@ fn cpu_conv_nhwc(
     out_h: u32,
     out_w: u32,
 ) -> Vec<f32> {
+    cpu_conv_nhwc_geom(input, weight, c, ConvGeom::sym(c), out_h, out_w)
+}
+
+/// 同 [`cpu_conv_nhwc`]，但步长与 pad 由 `g` 给。**这是「值」的唯一真值源**
+/// ——MMA / edge 两 pass 的数值断言都比它。
+fn cpu_conv_nhwc_geom(
+    input: &[f32],
+    weight: &[f32],
+    c: &ConvCase,
+    g: ConvGeom,
+    out_h: u32,
+    out_w: u32,
+) -> Vec<f32> {
     let (cin, cout, kh, kw) = (c.cin as usize, c.cout as usize, c.kh as usize, c.kw as usize);
-    let (pt, pl) = ((kh / 2) as i64, (kw / 2) as i64);
+    let (sh, sw) = (g.sh as i64, g.sw as i64);
+    let (pt, pl) = (g.pt as i64, g.pl as i64);
     let (ih_max, iw_max) = (c.h as i64, c.w as i64);
     // weight 输入是 [cout][cin][kh][kw]（ONNX 布局）
     let mut out = vec![0f32; out_h as usize * out_w as usize * cout];
@@ -462,7 +511,7 @@ fn cpu_conv_nhwc(
     // 内层只剩 ic 的点积），但去掉两层边界判断与除法。**rec 的 CTC 头
     // 分类层**（216×1 c120→18712，485 M MAC）走的是这里——通用循环跑
     // 一遍要几十秒，变体扫描里每个变体都要对拍一次，根本扫不动。
-    if kh == 1 && kw == 1 && pt == 0 && pl == 0 && cin == c.cin as usize {
+    if kh == 1 && kw == 1 && pt == 0 && pl == 0 && sh == 1 && sw == 1 && cin == c.cin as usize {
         for oh in 0..out_h as usize {
             for ow in 0..out_w as usize {
                 let irow = &input[(oh * out_w as usize + ow) * cin..][..cin];
@@ -486,8 +535,8 @@ fn cpu_conv_nhwc(
                 for ic in 0..cin {
                     for ky in 0..kh {
                         for kx in 0..kw {
-                            let ih = oh as i64 + ky as i64 - pt;
-                            let iw = ow as i64 + kx as i64 - pl;
+                            let ih = oh as i64 * sh + ky as i64 - pt;
+                            let iw = ow as i64 * sw + kx as i64 - pl;
                             if ih < 0 || iw < 0 || ih >= ih_max || iw >= iw_max {
                                 continue;
                             }
@@ -517,7 +566,13 @@ struct ConvProbe {
     out_off_w: u32,
     out_h: u32,
     out_w: u32,
+    /// 输入空间尺寸（覆盖几何的列上界要用 `inW`，不是 `outW`——stride≠1
+    /// 时两者不同）。
+    in_h: u32,
+    in_w: u32,
     co4: u32,
+    /// 本用例的步长与 pad（写进了参数块，也决定覆盖几何）。
+    geom: ConvGeom,
     /// 对拍素材（NHWC 输入、ONNX 布局权重）。
     input: Vec<f32>,
     weight: Vec<f32>,
@@ -566,10 +621,21 @@ use qppocr_gpu::nhwc::f32_to_f16_bits;
 /// 注意这是**唯一**不靠「砍掉某样东西」来做的实验：`p_wconst`/`p_wsmall`/
 /// `p_fmaonly` 全都同时改了延迟与字节，只能证伪不能定位。
 fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, half_w: bool) -> ConvProbe {
+    build_conv_case_geom(device, c, ConvGeom::sym(c), batch, half_w)
+}
+
+/// 同 [`build_conv_case_batch`]，但步长与 pad 由 `g` 给（写进参数块的
+/// P+12..P+15 四词，与 `plan.rs` 的 `ParamBlock` 逐字段同义）。
+fn build_conv_case_geom(
+    device: &metal::DeviceRef,
+    c: &ConvCase,
+    g: ConvGeom,
+    batch: u32,
+    half_w: bool,
+) -> ConvProbe {
     assert!(batch >= 1, "batch 至少 1");
-    let (pt, pl) = (c.kh / 2, c.kw / 2);
-    let out_h = (c.h + 2 * pt - c.kh) + 1;
-    let out_w = (c.w + 2 * pl - c.kw) + 1;
+    let (pt, pl) = (g.pt, g.pl);
+    let (out_h, out_w) = g.out_hw(c);
     let m_dim = out_h * out_w;
     let co4 = c.cout.div_ceil(4) * 4; // nDim（Co 补齐到 4）
     let ci4 = c.cin.div_ceil(4) * 4; // Cin 补齐到 4
@@ -640,8 +706,8 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
             ci4 / 4,       // cin4v
             taps,          // taps
             c.kw,          // kW
-            1,             // sH
-            1,             // sW
+            g.sh,          // sH
+            g.sw,          // sW
             pt,            // padT
             pl,            // padL
             0,             // act
@@ -696,7 +762,10 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
         out_off_w,
         out_h,
         out_w,
+        in_h: c.h,
+        in_w: c.w,
         co4,
+        geom: g,
         input,
         weight,
     }
@@ -722,13 +791,73 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
 /// 保证行组不跨行，`2*gL <= gh` 保证中带头尾不重叠（重叠 = 同一行组枚举
 /// 两次 = **写两次**，静默错）。
 fn edge_groups(pr: &ConvProbe, k: u32) -> [u32; 3] {
+    edge_groups_geom(pr, k, k)
+}
+
+/// mma3 的线程组网格——与内核里 `xblk`/`nfb` 的解码区间逐字一致。
+fn cv_groups(cv: &KxkTestCover, nch: u32) -> [u32; 3] {
+    [(cv.nfb + u32::from(cv.has_tail)) * nch, cv.ny, 1]
+}
+
+/// 覆盖几何的**第三份独立拷贝**（另两份在 `qppocr-gpu/src/plan.rs` 的
+/// `KxkCover::new`、`shaders/n_conv8_mma3.metal` 的 `mma3_body` 与
+/// `shaders/n_conv8.metal` 的 `conv8_body<EDGE>`）。**故意的**：三份不一致
+/// 时测试就该红，而不是让探针量到一个和生产不同的网格、把「内核慢」和
+/// 「网格算错」混成一个数。
+///
+/// 语义见 `KxkCover` 的文档：内点 ⟺ 乘上步长之后仍落在
+/// `[pad, in-1-(k-1)+pad]` 里。
+struct KxkTestCover {
+    /// 内点行闭区间。
+    y_lo: u32,
+    y_hi: u32,
+    /// 单点安全列闭区间。
+    x_lo: u32,
+    x_hi: u32,
+    /// 整块数与尾块标志。
+    nfb: u32,
+    has_tail: bool,
+    /// 内点行数 / 每行行组数 / 中带头尾行组数。
+    ny: u32,
+    gh: u32,
+    gl: u32,
+    gr: u32,
+}
+
+fn kxk_cover_test(pr: &ConvProbe, kh: u32, kw: u32) -> KxkTestCover {
+    let g = pr.geom;
     assert!(pr.out_w % 4 == 0, "紧凑网格门禁 outW%4（outW={}）", pr.out_w);
-    let pad = k / 2;
+    let y_lo = g.pt.div_ceil(g.sh);
+    let y_hi = (pr.in_h - 1 - (kh - 1) + g.pt) / g.sh;
+    let x_lo = g.pl.div_ceil(g.sw);
+    let x_hi = (pr.in_w - 1 - (kw - 1) + g.pl) / g.sw;
+    assert!(y_hi >= y_lo && y_hi <= pr.out_h - 1, "行内点区间非法");
+    assert!(x_hi >= x_lo + 63, "列上铺不出一个 64 整块（x_lo={x_lo} x_hi={x_hi}）");
+    let nfb = (x_hi - 63 - x_lo) / 64 + 1;
+    let has_tail = x_lo + 64 * nfb - 1 < x_hi;
     let gh = pr.out_w / 4;
-    let gl = (pad + 3) / 4;
-    assert!(2 * gl <= gh, "紧凑网格门禁 2*gL<=gh（gL={gl} gh={gh}）");
+    let gl = x_lo.div_ceil(4);
+    let gr = (pr.out_w - 1 - x_hi).div_ceil(4);
+    assert!(gl + gr <= gh, "紧凑网格门禁 gL+gR<=gh（gL={gl} gR={gr} gh={gh}）");
+    KxkTestCover {
+        y_lo,
+        y_hi,
+        x_lo,
+        x_hi,
+        nfb,
+        has_tail,
+        ny: y_hi - y_lo + 1,
+        gh,
+        gl,
+        gr,
+    }
+}
+
+fn edge_groups_geom(pr: &ConvProbe, kh: u32, kw: u32) -> [u32; 3] {
+    let cv = kxk_cover_test(pr, kh, kw);
     let nh = (pr.co4 / 4) / 2;
-    let tiles = (2 * (pad * gh) + (pr.out_h - 2 * pad) * 2 * gl) * nh;
+    let n_bot = pr.out_h - 1 - cv.y_hi;
+    let tiles = ((cv.y_lo + n_bot) * cv.gh + cv.ny * (cv.gl + cv.gr)) * nh;
     // 上界对拍：紧凑网格必须是**全平面网格**的子集再被筛掉一些。`pr.groups`
     // 是 `build_conv_case` 按旧的 `ceil(m/4)*nh` 算的，公式来源不同 ⇒ 这条
     // 断言是有内容的（枚举式写错量级会当场红）。
@@ -888,7 +1017,20 @@ fn build_dw_case(device: &metal::DeviceRef, c: &DwCase, no_pad: bool) -> ConvPro
         out_off_w,
         out_h,
         out_w,
+        in_h: c.h,
+        in_w: c.w,
         co4: c_dim,
+        // depthwise 的 pad 是对称的（`pad` 同时给了 padT/padL，参数块里也只
+        // 有这两词），步长取 DwCase 自己的。这里只是为了填满 `ConvProbe`
+        // ——dw 用例不走 k×k 覆盖几何那条路。
+        geom: ConvGeom {
+            sh: c.stride,
+            sw: c.stride,
+            pt: pad,
+            pl: pad,
+            pb: pad,
+            pr: pad,
+        },
         input,
         weight,
     }
@@ -1332,68 +1474,101 @@ fn conv8_mma3_matches_cpu() {
     let Some(ctx) = open_or_skip() else { return };
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
-    // (outH, outW, cin, cout, k, 说明)。**后四例专打 32 通道块那一档**
-    // （`n_conv8_mma3_n32`）：det 的 CSP 三连 Conv.111/114/117 就是 Co=32
-    // Ci=32 落在 240×216 上，空间门全过、只被旧的 `Co%64` 判据挡住。
+    // 用例分两族，**同一个断言体跑**：
     //
-    // **全部 outW ≡ 0 (mod 4)**：边框补算改紧凑网格后加了这条门禁（行组 =
-    // 连续 4 个 x，不跨行是枚举与平面映射不错位的前提）。原来的「尾 1 列」
-    // 用例（outW=67）因此**不再可达**——对称 pad + stride1 下 `outW≡0 mod 4`
-    // 蕴含 `tail = inner_w mod 64 = (outW-k+1) mod 64` 必为偶数（`k-1` 是
-    // 偶数）。最小可达尾是 2，第 4 例就是它。
-    let cases: [(u32, u32, u32, u32, u32, &str); 9] = [
-        (16, 132, 32, 64, 3, "nfb=2 尾2"),
-        (32, 96, 64, 128, 3, "nfb=1 双通道块 尾30"),
-        (9, 200, 32, 64, 3, "nfb=3 奇行数 尾6"),
-        (16, 68, 32, 64, 3, "nfb=1 **最小尾 2 列**"),
-        (16, 132, 32, 64, 5, "5×5 **无尾块**"),
-        (16, 132, 32, 32, 3, "**N32** Co=32 尾2"),
-        (32, 96, 32, 96, 3, "**N32** Co=96=3×32 尾30"),
-        (16, 68, 32, 32, 3, "**N32** Co=32 最小尾"),
-        (24, 200, 32, 32, 7, "**N32** Co=32 7×7 尾2"),
+    //   · **对称 pad + stride1**（前 9 例，历史用例）：走的是旧式覆盖矩形，
+    //     作用是钉住「泛化是逐位等价的」。**其中后四例专打 32 通道块那一档**
+    //     （`n_conv8_mma3_n32`）：det 的 CSP 三连 Conv.111/114/117 就是
+    //     Co=32 Ci=32 落在 240×216 上。
+    //   · **stride≠1 / 非对称 pad**（后 5 例，新增）：det 头部三条的真实
+    //     形状——`Conv.1/2` 是 2×2 SAME（pads `(0,1,0,1)` ⇒ `gL=0 gR=1`）、
+    //     `Conv.3` 是 3×3 stride2。这三条此前被「步长 1 + 对称 pad」两条
+    //     判据挡在 MMA 之外，合计 13.3 ms ≈ `n_conv8` 总时的 61%。
+    //
+    // **全部 outW ≡ 0 (mod 4)**：紧凑网格门禁（行组 = 连续 4 个 x，不跨行
+    // 是枚举与平面映射不错位的前提）。对称 pad + stride1 下 `outW≡0 mod 4`
+    // 蕴含 `tail = inner_w mod 64` 必为偶数，最小可达尾是 2。
+    let mk = |h, w, cin, cout, k, note| {
+        let c = ConvCase { label: "mma3", h, w, cin, cout, kh: k, kw: k };
+        let g = ConvGeom::sym(&c);
+        (c, g, note)
+    };
+    let strided = |h, w, cin, cout, k, g, note| {
+        let c = ConvCase { label: "mma3", h, w, cin, cout, kh: k, kw: k };
+        (c, g, note)
+    };
+    let cases: Vec<(ConvCase, ConvGeom, &str)> = vec![
+        // ── 对称 pad + stride1（回归）──
+        mk(16, 132, 32, 64, 3, "nfb=2 尾2"),
+        mk(32, 96, 64, 128, 3, "nfb=1 双通道块 尾30"),
+        mk(9, 200, 32, 64, 3, "nfb=3 奇行数 尾6"),
+        mk(16, 68, 32, 64, 3, "nfb=1 **最小尾 2 列**"),
+        mk(16, 132, 32, 64, 5, "5×5 **无尾块**"),
+        mk(16, 132, 32, 32, 3, "**N32** Co=32 尾2"),
+        mk(32, 96, 32, 96, 3, "**N32** Co=96=3×32 尾30"),
+        mk(16, 68, 32, 32, 3, "**N32** Co=32 最小尾"),
+        mk(24, 200, 32, 32, 7, "**N32** Co=32 7×7 尾2"),
+        // ── stride≠1 / 非对称 pad ──
+        strided(
+            64, 132, 64, 64, 2,
+            ConvGeom { sh: 1, sw: 1, pt: 0, pl: 1, pb: 1, pr: 0 },
+            "**2×2 SAME** pads(0,1,0,1) gL=0 gR=1",
+        ),
+        strided(
+            64, 136, 64, 64, 3,
+            ConvGeom { sh: 2, sw: 2, pt: 1, pl: 1, pb: 1, pr: 1 },
+            "**3×3 stride2** 对称 pad1 gR=0",
+        ),
+        strided(
+            64, 136, 32, 32, 3,
+            ConvGeom { sh: 2, sw: 2, pt: 0, pl: 1, pb: 1, pr: 0 },
+            "**N32 3×3 stride2** pads(0,1,1,0)",
+        ),
+        strided(
+            65, 129, 32, 64, 2,
+            ConvGeom { sh: 1, sw: 1, pt: 0, pl: 0, pb: 0, pr: 0 },
+            "**2×2 无 pad ⇒ 边框空集**",
+        ),
+        strided(
+            67, 143, 32, 64, 4,
+            ConvGeom { sh: 2, sw: 2, pt: 1, pl: 1, pb: 2, pr: 2 },
+            "**4×4 stride2** 非对称 pads(1,1,2,2)",
+        ),
     ];
 
-    for (h, w, cin, cout, k, note) in cases {
-        let c = ConvCase { label: "mma3", h, w, cin, cout, kh: k, kw: k };
-        let pr = build_conv_case(&ctx.inner.device, &c);
+    for (c, geom, note) in cases {
+        let k = c.kh;
+        let pr = build_conv_case_geom(&ctx.inner.device, &c, geom, 1, false);
         let (out_h, out_w, co4) = (pr.out_h, pr.out_w, pr.co4);
-        let (pad, ci4, taps) = (k / 2, c.cin.div_ceil(4) * 4, k * k);
-        let nfb = (out_w - (k - 1)) / 64;
-        let nrows = out_h - (k - 1);
-        // 通道块宽 64/32 二选一——与 plan.rs 那支**同一判据**（这里是它的
-        // 第 N 份拷贝，见下面覆盖矩形那段的自述）。
+        let (ci4, taps) = (c.cin.div_ceil(4) * 4, k * k);
+        // 覆盖几何——**第三份独立拷贝**（见 `kxk_cover_test`）。
+        let cv = kxk_cover_test(&pr, k, k);
+        // 通道块宽 64/32 二选一——与 plan.rs 那支**同一判据**。
         let ncols = if co4 % 64 == 0 { 64 } else { 32 };
         let nch = co4 / ncols;
         let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
-        assert!(
-            nfb >= 1 && nrows >= 1 && co4 % 32 == 0 && (ci4 % 8) == 0,
-            "用例本身不满足内核契约：nfb={nfb} nrows={nrows} co4={co4} ci4={ci4}"
-        );
+        assert!(co4 % 32 == 0 && (ci4 % 8) == 0, "用例不满足通道门：co4={co4} ci4={ci4}");
 
-        // 段布局重算（与 build_conv_case_batch 同式）+ 自检：公式漂了就先炸在
+        // 段布局重算（与 build_conv_case_geom 同式）+ 自检：公式漂了就先炸在
         // 这里，而不是让下面读到别的段上。
-        let n_in = h * w * ci4;
+        let n_in = c.h * c.w * ci4;
         let n_w = taps * ci4 * co4;
         let out_off_w = 256u32 + n_in + n_w + co4; // 参数块 64 起、输入 256 起
         assert_eq!(out_off_w, pr.out_off_w, "段布局重算与构造函数不一致");
 
-        // 覆盖矩形（MMA 写这些像素，edge 写其余）。**三份公式中的第三份**：
-        // 生产在 plan.rs，内核在 MSL，这里再硬编码一份做交叉验证。x 上摊到
-        // **内点列全宽**（尾块吃掉了余数），不是 64 的整数倍。
-        let (y_lo, y_hi) = (pad, pad + nrows - 1);
-        let (x_lo, x_hi) = (pad, pad + (out_w - (k - 1)) - 1);
+        let (y_lo, y_hi) = (cv.y_lo, cv.y_hi);
+        let (x_lo, x_hi) = (cv.x_lo, cv.x_hi);
 
-        let want = cpu_conv_nhwc(&pr.input, &pr.weight, &c, out_h, out_w);
+        let want = cpu_conv_nhwc_geom(&pr.input, &pr.weight, &c, geom, out_h, out_w);
 
-        // 两 pass 都用 `build_conv_case` 写好的**标准参数块**——本内核与
+        // 两 pass 都用 `build_conv_case_geom` 写好的**标准参数块**——本内核与
         // `n_conv8_edge` 共用一套布局（见 n_conv8_mma3.metal 文件头），所以
         // 这里一个参数词都不用碰。这一步本身就是那条共享契约的验证。
 
         // ── pass A：只派 MMA（含尾块），要求「内点全对 + 边框原封不动」──
-        let inner_w = out_w - (k - 1);
-        let tail = inner_w - nfb * 64;
-        let nx = nfb + if tail > 0 { 1 } else { 0 };
-        let groups = [nx * nch, nrows, 1];
+        // 尾块真正写出去的列数 = 覆盖端之后再有多少列；无尾块时为 0。
+        let tail = x_hi.saturating_sub(x_lo + 64 * cv.nfb - 1);
+        let groups = cv_groups(&cv, nch);
         submit_compute(&ctx.inner.queue, |enc| {
             ks.dispatch(enc, kname, &pr.buf, pr.p_off, groups).expect("dispatch");
         })
@@ -1406,9 +1581,9 @@ fn conv8_mma3_matches_cpu() {
                 if inside {
                     covered += 1;
                 }
-                for n in 0..cout {
+                for n in 0..c.cout {
                     let g = got[((y * out_w + x) * co4 + n) as usize];
-                    let wn = want[((y * out_w + x) * cout + n) as usize];
+                    let wn = want[((y * out_w + x) * c.cout + n) as usize];
                     if inside {
                         worst_in = worst_in.max((g - wn).abs());
                     } else if g != 7.0 {
@@ -1429,20 +1604,24 @@ fn conv8_mma3_matches_cpu() {
         );
 
         // ── pass B：只派 edge（**紧凑网格**），要求「边框全对 + 内点原封不动」──
-        let eg = edge_groups(&pr, k);
+        // 边框是**空集**时生产不发这条 dispatch（空网格没定义，见 plan.rs 那一支），
+        // 这里也必须跳过——否则测的就不是生产行为。
+        let eg = edge_groups_geom(&pr, k, k);
         refill_out_sentinel(&pr);
-        submit_compute(&ctx.inner.queue, |enc| {
-            ks.dispatch(enc, "n_conv8_edge", &pr.buf, pr.p_off, eg).expect("dispatch");
-        })
-        .expect("提交");
+        if eg[0] != 0 {
+            submit_compute(&ctx.inner.queue, |enc| {
+                ks.dispatch(enc, "n_conv8_edge", &pr.buf, pr.p_off, eg).expect("dispatch");
+            })
+            .expect("提交");
+        }
         let got = read_out(&pr);
         let (mut worst_out, mut stray_in) = (0f32, 0u32);
         for y in 0..out_h {
             for x in 0..out_w {
                 let inside = y >= y_lo && y <= y_hi && x >= x_lo && x <= x_hi;
-                for n in 0..cout {
+                for n in 0..c.cout {
                     let g = got[((y * out_w + x) * co4 + n) as usize];
-                    let wn = want[((y * out_w + x) * cout + n) as usize];
+                    let wn = want[((y * out_w + x) * c.cout + n) as usize];
                     if inside {
                         if g != 7.0 {
                             stray_in += 1;
@@ -1465,10 +1644,13 @@ fn conv8_mma3_matches_cpu() {
 
         let border = out_h * out_w - covered;
         eprintln!(
-            "[mb] conv8_mma3 对拍 {note:<22} ({out_h}×{out_w} c{cin}->{cout} k{k} 尾块 {tail} 列): \
+            "[mb] conv8_mma3 对拍 {note:<34} ({out_h}×{out_w} c{cin}->{cout} k{k} s{sh} 尾 {tail}): \
              内点 {covered} px 误差 {worst_in:.3e}、边框 {border} px 误差 {worst_out:.3e}、\
              越界写 0/0｜edge 网格 {} → {} 组（紧凑/全平面）",
-            pr.groups[0], eg[0]
+            pr.groups[0], eg[0],
+            cin = c.cin,
+            cout = c.cout,
+            sh = geom.sh,
         );
     }
 }

@@ -1,4 +1,4 @@
-// 稠密 kxk conv（k>1，NHWC f32，stride 1、对称 pad）——simdgroup_matrix MMA 版。
+// 稠密 kxk conv（k>1，NHWC f32，**任意 stride / pad**）——simdgroup_matrix MMA 版。
 //
 // # 为什么要有这个内核
 //
@@ -28,23 +28,30 @@
 // 未绑定的 BIF0 page fault 那条致瘸路径）。
 //
 // 处方：**一个块只覆盖一行内的 64 个连续输出 x**。这样对固定的 (y,t)，
-//   输入下标 = (y+ky-padT)*inW + (x+dx-padL)
-//            = [常量] + i          （i = x - x0 ∈ [0,64)）
-// 是 i 的**一次函数**，A 瓦片的 64 行正好是平面上连续的 64 个像素
-// （行 stride = kf = 每像素通道数）——一条 `simdgroup_load` 就够，零 gather。
+//   输入下标 = (y*sH+ky-padT)*inW + (x*sW+kx-padL)
+//            = [常量] + i*sW       （i = x - x0 ∈ [0,64)）
+// 是 i 的**一次函数**，A 瓦片的 64 行正好是**同一行内等距的 64 个像素**
+// （行 stride = sW*kf = 步长 × 每像素通道数）——一条 `simdgroup_load` 就够，
+// 零 gather。**stride 只改这个 stride，不改结构**：`simdgroup_load` 接受任意
+// 行 stride，所以 stride≠1 并不需要 im2col/gather（竞品 `mm_ic_sg` 那套）。
 // 权重侧零重排的理由同 `n_conv8_mma`（taps 布局 [tap][k][n] 就是 K×N 行主序）。
 //
 // # 只收「全内点块」——越界这一条是硬约束，不是优化
 //
-// 计划层只把**满足下式**的块派给本内核（内点行 × 内点列）：
+// 计划层只把**满足下式**的块派给本内核（内点行 × 块安全的列）：
 //
-//   y ∈ [padT, outH-1-(kH-1-padT)]
-//   x ∈ [padL, padL + inner_w)，inner_w = outW - (kW-1)
+//   y ∈ [yd_lo, yd_hi]，yd_lo = ceil(padT/sH)、yd_hi = (inH-1-(kH-1)+padT)/sH
+//   x0 ∈ [xa, xb-63]，xa = ceil(padL/sW)、xb = (inW-1-(kW-1)+padL)/sW
 //
-// 于是对任意 tap，读到的输入下标都落在 [0, inH*inW) 内——**由数学保证**，
-// 不需要任何对齐/担保，也绝不触碰输入平面之外（`n_conv8_mma` 那条「尾块读
-// 到 arena 里别的段」的推理在这里不适用也不需要）。真正的边框（两行整行 +
-// 两列整列）由 `n_conv8_edge` 补，两者写的是**互不相交**的输出像素。
+// 于是对任意 tap、任意 i ∈ [0,64)，读到的输入下标都落在 [0, inH*inW) 内
+// ——**由数学保证**，不需要任何对齐/担保，也绝不触碰输入平面之外（
+// `n_conv8_mma` 那条「尾块读到 arena 里别的段」的推理在这里不适用也不需要）。
+// 真正的边框由 `n_conv8_edge` 补，两者写的是**互不相交**的输出像素。
+//
+// stride1 + 对称 pad 时这组端点退化成 `[padT, padT+nrows-1]` 与
+// `[padL, padL+inner_w-1]`（旧式），所以那次泛化对既有形状**逐位等价**；
+// 新放开的只有 stride≠1 与非对称 pad。**三份拷贝必须一致**：这里、
+// `n_conv8.metal` 的 `conv8_body<EDGE>`、`plan.rs` 的 `KxkCover::new`。
 //
 // # 行尾余数：为什么值得一个「读重叠、写裁掉」的尾块
 //
@@ -195,13 +202,15 @@ static void mma3_body(
     device const float* f32v = (device const float*)d;
     device float* of = (device float*)d;
 
-    // 与 `n_conv8` 同一套参数字（见文件头）；sH/sW（P+12/P+13）不读——
-    // 启用门保证它们是 1。
+    // 与 `n_conv8` 同一套参数字（见文件头）。
     uint in_off = params[P + 0], w_off = params[P + 1], b_off = params[P + 2];
     uint out_off = params[P + 3];
     uint mDim = params[P + 4], nDim = params[P + 5], outW = params[P + 6];
     uint inW = params[P + 7], inH = params[P + 8], cin4v = params[P + 9];
     uint taps = params[P + 10], kW = params[P + 11];
+    // sH/sW 现在**要读了**（P+12/P+13）：覆盖几何与 A 瓦片的行 stride 都
+    // 由它们决定。见下面「覆盖几何」那段。
+    uint sH = params[P + 12], sW = params[P + 13];
     uint padT = params[P + 14], padL = params[P + 15];
     uint act = params[P + 16];
     float c1 = as_type<float>(params[P + 17]);
@@ -217,21 +226,41 @@ static void mma3_body(
     uint xblk = wg.x / nch;                // 本线程组的空间块
 
     uint kf = cin4v * 4u;                  // 每像素通道数（= K 的长度）
-    uint y = wg.y + padT;                  // 本块的输出行（内点行）
 
-    // 内点列 [padL, padL+inner_w)：前 nfb 块 64 列起步，最后一块（只在
-    // inner_w%64 != 0 时存在）锚在**最后 64 个内点列**上、写掩码裁到尾部。
-    // 读重叠写在文件头「行尾余数」一节；写入始终无重叠。
-    uint inner_w = outW - (kW - 1u);
-    uint nfb = inner_w / 64u;
-    uint tail = inner_w - nfb * 64u;        // 行尾余数（0 或 1..63）
+    // ── 覆盖几何（三份一致的第 2 份：plan.rs 的 `KxkCover::new`、
+    //    n_conv8.metal 的 `conv8_body<EDGE>` 里那段）───────────────
+    //
+    // 内点 ⟺ 对任意 tap 读到的输入下标都在平面内：
+    //   y*sH + ky - padT ∈ [0, inH)   ∀ky ∈ [0,kH)
+    //   x*sW + kx - padL ∈ [0, inW)   ∀kx ∈ [0,kW)
+    // 下界一侧是 `y*sH ≥ padT`，上界一侧是 `y*sH ≤ inH-1-(kH-1)+padT`；
+    // 两边都是「乘 sH 后比较」，同除 sH 取整即得闭区间端点。
+    // **stride1 + 对称 pad 时逐项退化成旧式**（`yd_lo = padT`、
+    // `xb = padL + inner_w - 1`、`nfb = inner_w/64`、`i_lo = 64 - tail`），
+    // 所以这次泛化对既有形状是逐位等价的，新放开的只有 stride≠1 与非对称
+    // pad（det 的 Conv.1/2 是 2×2 SAME、Conv.3 是 3×3 stride2）。
+    //
+    // 行方向的**上界不在这里出现**：内点行数 `ny` 由网格的 y 维给出，
+    // 本内核只认起点。（`kH = taps/kW` 也不读——它只参与上界的推导。）
+    uint yd_lo = (padT + sH - 1u) / sH;                    // 内点行起点
+    uint xa = (padL + sW - 1u) / sW;                       // 单点安全列下界
+    uint xb = (inW - 1u - (kW - 1u) + padL) / sW;          // 单点安全列上界
+    uint y = yd_lo + wg.y;                  // 本块的输出行（内点行）
+
+    // 内点列 [xa, xb]：整块 64 列的起点还要求 `x0 ≤ xb-63`（**整块读**都在
+    // 界内，不只是单点）。前 nfb 块从 `xa` 起步，最后一块（只在铺不满时
+    // 存在）锚在 `xb-63` 上、写掩码裁到尾部。读重叠写在文件头「行尾余数」
+    // 一节；写入始终无重叠。计划层的网格公式与这里逐字一致。
+    uint xb_blk = xb - 63u;                 // ≥ xa（启用门保证 xb ≥ xa+63）
+    uint nfb = (xb_blk - xa) / 64u + 1u;
+    uint cover_end = xa + 64u * nfb - 1u;   // 整块已覆盖的最大输出 x
     uint x0, i_lo;
     if (xblk < nfb) {
-        x0 = padL + xblk * 64u;
+        x0 = xa + xblk * 64u;
         i_lo = 0u;
-    } else {                                // 尾块（xblk == nfb，仅在 tail>0 时被派发）
-        x0 = padL + inner_w - 64u;          // ≥ padL，因为 nfb ≥ 1
-        i_lo = 64u - tail;                  // 只写 [i_lo, 64)
+    } else {                                // 尾块（xblk == nfb，仅在 cover_end < xb 时被派发）
+        x0 = xb_blk;                        // ≥ xa，因为 nfb ≥ 1
+        i_lo = (cover_end + 1u) - x0;       // 只写 [i_lo, 64)，且 ≤ 64
     }
     uint n0 = nblk * NCOLS;                // 本块的输出通道起点
 
@@ -248,17 +277,21 @@ static void mma3_body(
         for (uint j = 0u; j < NB; j++)
             acc[i][j] = simdgroup_float8x8(0.0f);
 
-    // taps 外层、K 内层（步长 8）。A 的 64 行 = 平面上从 abase 起的 64 个
-    // 连续像素（行 stride = kf）：横向绕行在内点块上不可能发生，见文件头。
+    // taps 外层、K 内层（步长 8）。A 的 64 行 = 本块 64 个输出 x 各自在
+    // **同一行 (y*sH+ky-padT)** 上读到的那个像素；相邻输出 x 的输入相隔
+    // `sW` 个像素 ⇒ A 的**行 stride = sW*kf**（stride1 时退化成 kf）。
+    // `simdgroup_load` 接受任意行 stride，所以 stride≠1 不需要 gather。
+    // 横向绕行（读到上一行/下一行的像素）在内点块上不可能发生——见文件头。
     for (uint t = 0u; t < taps; t++) {
         uint ky = t / kW;
         uint kx = t - ky * kW;
-        uint abase = ib + ((y + ky - padT) * inW + (x0 + kx - padL)) * kf;
+        uint abase = ib + ((y * sH + ky - padT) * inW + (x0 * sW + kx - padL)) * kf;
         uint wbase = wb + t * kf * nDim;   // [tap][k][n]，行 stride = nDim
+        uint astep = sW * kf;              // A 的行 stride（输出 x 的一步）
         for (uint kb = 0u; kb < kf; kb += 8u) {
             simdgroup_float8x8 a0, a1;
-            simdgroup_load(a0, f32v + abase + sr * kf + kb, kf);
-            simdgroup_load(a1, f32v + abase + (sr + 8u) * kf + kb, kf);
+            simdgroup_load(a0, f32v + abase + sr * astep + kb, astep);
+            simdgroup_load(a1, f32v + abase + (sr + 8u) * astep + kb, astep);
             // **只装 NB 个分片**（不是恒装 4 个再挑着用）：NCOLS=32 时多装的那
             // 两个会越过本通道块、在最后一个块上直接越出权重段——那正是
             // 「未绑定/越界读 → 静默打瘸」那条路的形状。省下的也确实是 ALU。

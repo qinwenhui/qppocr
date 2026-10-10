@@ -181,6 +181,8 @@ static inline void conv8_body(
     //
     // 非 EDGE 实例化下整段是编译期死代码（`EDGE` 是模板常量）。
     uint y_lo = 0u, y_hi = 0u, x_lo = 0u, x_hi = 0u, e_tiles = 0u, M_e = 0u;
+    // 中带每行的头/尾行组数、下台行数（只在 EDGE 下有意义）。
+    uint gL = 0u, gR = 0u, n_bot = 0u;
     // ── 紧凑网格（EDGE 专用）────────────────────────────────────────────
     //
     // 第一版让 edge 复用 `n_conv8` 的原网格（铺满整张输出平面）再逐 tile
@@ -212,17 +214,27 @@ static inline void conv8_body(
     // 门禁另加两条：`outW % 4 == 0`（行组不跨行，否则枚举与平面映射错位）、
     // `2*gL <= gh`（中带头尾不重叠，否则同一行组被枚举两次＝写两次）。
     uint gh = outW >> 2;                  // 每行行组数
-    uint gL = (padL + 3u) >> 2;           // 头/尾各铺几个行组
     if (EDGE) {
+        // 覆盖几何（**三份一致的第 3 份**：`n_conv8_mma3.metal` 的
+        // `mma3_body`、`plan.rs` 的 `KxkCover::new`）。推导见那两处：
+        // 内点 ⟺ 乘上步长之后仍落在 `[pad, in-1-(k-1)+pad]` 里。
+        // stride1 + 对称 pad 时逐项退化成旧式（`padT`/`padT+nrows-1`/
+        // `padL`/`padL+inner_w-1`、`gL == gR`），所以既有形状逐位不变。
         uint outH = mDim / outW;          // 输出平面恒 outH*outW 个像素
         uint kH = taps / kW;
-        y_lo = padT;
-        y_hi = padT + (outH - (kH - 1u)) - 1u;
-        x_lo = padL;
-        x_hi = padL + (outW - (kW - 1u)) - 1u;
-        // 紧凑瓦片数（`nh = nDim >> 3`，与下面那个 `nv >> 1` 恒等）。
-        M_e = (outH - 2u * padT) * 2u * gL;
-        e_tiles = (2u * (padT * gh) + M_e) * (nDim >> 3u);
+        y_lo = (padT + sH - 1u) / sH;
+        y_hi = (inH - 1u - (kH - 1u) + padT) / sH;
+        x_lo = (padL + sW - 1u) / sW;
+        x_hi = (inW - 1u - (kW - 1u) + padL) / sW;
+        // 中带头/尾**各自的**行组数——非对称 pad 下两者不再相等（det 的
+        // Conv.1/2 是 pad (0,1)：`gL = 0`、`gR = 1`）。
+        gL = (x_lo + 3u) >> 2;
+        gR = (outW - 1u - x_hi + 3u) >> 2;
+        n_bot = outH - 1u - y_hi;
+        // 紧凑瓦片数（`nh = nDim >> 3`，与下面那个 `nv >> 1` 恒等）：
+        // 上台整行 + 中带头尾 + 下台整行。与 `KxkCover::edge_tiles` 同式。
+        M_e = (y_hi - y_lo + 1u) * (gL + gR);
+        e_tiles = ((y_lo + n_bot) * gh + M_e) * (nDim >> 3u);
     }
 
     uint b = wg.y;
@@ -258,21 +270,21 @@ static inline void conv8_body(
             uint rg = gid / nh;
             n4 = (gid % nh) * 2u;
             n4b = n4 + 1u;
-            uint T = padT * gh;
+            uint T = y_lo * gh;
             uint y, r;
             if (rg < T) {                          // 上台：整行，rg 直接是行内序号
                 y = rg / gh;
                 r = rg - y * gh;
-            } else if (rg < T + M_e) {             // 中带：每行头 gL + 尾 gL
+            } else if (rg < T + M_e) {             // 中带：每行头 gL + 尾 gR
                 uint q = rg - T;
-                uint per = 2u * gL;
-                y = padT + q / per;
+                uint per = gL + gR;
+                y = y_lo + q / per;
                 uint s = q - (q / per) * per;
-                r = (s < gL) ? s : (gh - gL + (s - gL));
+                r = (s < gL) ? s : (gh - gR + (s - gL));
             } else {                               // 下台：整行
                 uint q = rg - T - M_e;
                 uint yy = q / gh;
-                y = (mDim / outW) - padT + yy;
+                y = (mDim / outW) - n_bot + yy;
                 r = q - yy * gh;
             }
             m0 = y * outW + r * 4u;

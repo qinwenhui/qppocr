@@ -239,11 +239,17 @@ pub struct PlanBuilder<'a> {
     ///
     /// ## 启用判据（不满足则回落 `n_conv8`/`n_conv8h`）
     ///
-    /// - `kh==kw>=2 && sh==sw==1`：瓦片映射要求方形 k×k、步长 1；
-    /// - **对称 pad**（`2*padT==2*padB==kh-1`、左右同理）：内点行/列的范围
-    ///   与「读下标必在平面内」的证明都建立在这条上，且它等价于
-    ///   `outH==inH && outW==inW`；
-    /// - `outW-(kw-1) >= 64`：内点列宽至少一个块，尾块锚点 `x0>=padL` 也靠它；
+    /// - `kh==kw>=2`：瓦片映射要求方形 k×k（A 瓦片的行距 `sW*kf` 与列
+    ///   偏移都要方形，见内核头注释）；
+    /// - **`sH>=1 && sW>=1`**：步长任意。A 瓦片行距就是 `sW*kf`，
+    ///   `simdgroup_load` 收任意行距 ⇒ **stride≠1 不需要 im2col/gather**
+    ///   （这正是竞品 `mm_ic_sg` 那一层在我们这里可以省掉的原因）；
+    /// - **pad 上界放宽到 `padT>=0 && padL>=0`**：不再要求对称。内点矩形
+    ///   取 `yd_lo=ceil(padT/sH)`、`xa=ceil(padL/sW)` 下界 + 输出空间的
+    ///   自然上界，读下标仍在平面内；`outH==inH && outW==inW` 只是对称
+    ///   pad + stride 1 的特例，不再是启用条件；
+    /// - `outW-(kw-1) >= 64` ⇒ `xb>=xa+63`：内点列宽至少一个块，尾块锚点
+    ///   `x0>=xa` 也靠它；
     /// - `cpad4(Cin)%8==0`：K 步长 8 不越界；
     /// - **`cpad4(Co)%32==0`**：通道块宽按 `Co%64==0 ? 64 : 32` 二选一
     ///   （`n_conv8_mma3` / `n_conv8_mma3_n32`）。**32 这一档不是锦上添花**：
@@ -256,6 +262,132 @@ pub struct PlanBuilder<'a> {
     ///
     /// 与 `conv1x1_mma` 同款：Vulkan 的 GLSL 侧没有这两个内核。
     pub conv_kxk_mma: bool,
+}
+
+/// `n_conv8_mma3` 与 `n_conv8_edge` 共用的一张**覆盖几何**（全部是输出坐标）。
+///
+/// 语义：`n_conv8_mma3` 写「内点行 × 块安全列」，`n_conv8_edge` 写补集。
+/// 两者**互不相交、并起来是全平面**。这是本设计唯一的耦合面，算式在
+/// **三处**各写一份（这里、`n_conv8_mma3.metal` 的 `mma3_body`、
+/// `n_conv8.metal` 的 `conv8_body<EDGE>`），对不上就是「漏算/算两遍」的
+/// 静默错——`microbench::conv8_mma3_matches_cpu` 拿第三份硬编码交叉验证。
+///
+/// 对称 pad + stride 1 时逐项退化成旧式（`yd_lo = padT`、
+/// `xb = padL + inner_w - 1`、`gl == gr`），所以那次泛化**对既有形状
+/// 是逐位等价的**，新增的只有 stride≠1 与非对称 pad 这两类。
+pub(crate) struct KxkCover {
+    /// 内点行起点（输出 y）；内点行 = `[yd_lo, yd_lo + ny)`。
+    pub yd_lo: u32,
+    /// 内点行数 ≥ 1。
+    pub ny: u32,
+    /// 整块数（起点 `xa + 64*j`，j ∈ [0, nfb)）。
+    pub nfb: u32,
+    /// 尾块是否存在（1/0）：`xa + 64*nfb - 1 < xb` 时锚在 `xb-63`、
+    /// 只写后半段。
+    pub has_tail: u32,
+    /// 每行行组数 `outW/4`。
+    pub gh: u32,
+    /// 中带每行**头/尾**各铺几个 4 宽行组（覆盖 `[0,xa)` 与 `(xb,outW)`）。
+    pub gl: u32,
+    pub gr: u32,
+    /// 输出平面行数 `outH`。
+    pub out_h: u32,
+}
+
+impl KxkCover {
+    /// 画布上的全部 mma3 线程组（不含 edge）。网格公式与 `mma3_body` 里
+    /// 的 `xblk`/`nfb` 解码逐字一致。
+    pub fn mma_groups(&self, nch: u32, nb: u32) -> [u32; 3] {
+        [(self.nfb + self.has_tail) * nch, self.ny, nb]
+    }
+
+    /// 紧凑网格的 edge 瓦片数（**替换** `n_conv8` 的 `ceil(m/4)*nh`）。
+    /// 三段之并：上台整行 + 中带头尾 + 下台整行。
+    pub fn edge_tiles(&self, n_dim: u32) -> u32 {
+        let n_top = self.yd_lo;
+        let n_bot = self.out_h - 1 - (self.yd_lo + self.ny - 1);
+        let rows = n_top * self.gh + self.ny * (self.gl + self.gr) + n_bot * self.gh;
+        rows * (n_dim >> 3)
+    }
+
+    /// 计算覆盖几何；`None` = 不满足启用条件（内点铺不出一个 64 块、
+    /// 左右边框行组会重叠、或行/列内点为空）。
+    ///
+    /// 推导（`y` 是输出行、`x` 是输出列；`sH/sW` 步长，`padT/padL` 左/上 pad）：
+    ///
+    /// ```text
+    /// 内点 ⟺ 对任意 tap，读到的输入下标都在界内
+    ///   y*sH + ky - padT ∈ [0, inH)  ∀ky ∈ [0, kH)
+    ///   x*sW + kx - padL ∈ [0, inW)  ∀kx ∈ [0, kW)
+    /// ```
+    ///
+    /// 上界一侧是 `y*sH ≤ inH-1-(kH-1)+padT`，下界一侧是 `y*sH ≥ padT`。
+    /// 两边都是「乘 sH 之后比较」，所以各自除以 `sH` 取整就得到闭区间端点。
+    /// stride 1 + 对称 pad 时 `inH-1-(kH-1)+padT = outH-1-padT`，正是旧式。
+    ///
+    /// 行方向上**不需要**再夹一次 `outH`：`yd_hi = floor((inH-kH+padT)/sH)`
+    /// 与 `outH-1 = floor((inH+padT+padB-kH)/sH)` 是同形式，`padB ≥ 0` 使
+    /// 前者单调不大于后者。列方向同理（用 `inW`/`outW`）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        in_h: u32,
+        in_w: u32,
+        out_h: u32,
+        out_w: u32,
+        kh: u32,
+        kw: u32,
+        s_h: u32,
+        s_w: u32,
+        pad_t: u32,
+        pad_l: u32,
+    ) -> Option<Self> {
+        let yd_lo = pad_t.div_ceil(s_h);
+        // 先按 i64 算，避免 `inH < kH` 时 u32 下溢成天文数字。
+        let y_num = in_h as i64 - 1 - (kh as i64 - 1) + pad_t as i64;
+        if y_num < 0 {
+            return None;
+        }
+        let yd_hi = y_num as u32 / s_h;
+        // 上界那一段的推理保证 `yd_hi ≤ outH-1`（`outH-1` 与 `yd_hi` 是同形式
+        // 的 `floor((inH+pad-（k-1))/s)`，差一个 `padB ≥ 0`），这里显式断言
+        // 而不是夹——夹住会把「推理错了」变成「少写一行」的静默错。
+        if yd_hi < yd_lo || yd_hi > out_h - 1 {
+            return None;
+        }
+        let ny = yd_hi - yd_lo + 1;
+
+        let xa = pad_l.div_ceil(s_w);
+        let x_num = in_w as i64 - 1 - (kw as i64 - 1) + pad_l as i64;
+        if x_num < 0 {
+            return None;
+        }
+        let xb = x_num as u32 / s_w;
+        // 整块 64 列还要求起点 `x0 ≤ xb-63`；铺不出一个整块就不值当。
+        if xb < xa + 63 {
+            return None;
+        }
+        let nfb = (xb - 63 - xa) / 64 + 1;
+        let cover_end = xa + 64 * nfb - 1;
+        let has_tail = u32::from(cover_end < xb);
+
+        let gh = out_w / 4;
+        let gl = xa.div_ceil(4);
+        let gr = (out_w - 1 - xb).div_ceil(4);
+        // 中带头尾行组不能重叠（重叠 = 同一行组枚举两次 = 写两次，静默错）。
+        if gl + gr > gh {
+            return None;
+        }
+        Some(Self {
+            yd_lo,
+            ny,
+            nfb,
+            has_tail,
+            gh,
+            gl,
+            gr,
+            out_h,
+        })
+    }
 }
 
 impl PlanBuilder<'_> {
@@ -1090,42 +1222,44 @@ impl PlanBuilder<'_> {
                         && pads.1 == 0
                         && cpad4(ws[1]) % 8 == 0
                         && cpad4(ws[0]) % 64 == 0;
-                    // k×k（k>1）：方块、步长 1、**对称 pad**（四个 pad 都必须
-                    // 是 (k-1)/2）时走 `n_conv8_mma3`。对称 pad 是硬条件而非
-                    // 装饰：内核「读到的一定在平面内」的证明、以及内点行/列
-                    // 的矩形公式都建立在 `outH==inH && outW==inW` 上——这里把
-                    // 那条等式显式写出来（它由对称 pad 蕴含），免得以后有人
-                    // 只看 pad 条件就以为更宽的 pad 也能走。
-                    let kxk = self.conv_kxk_mma
+                    // k×k（k>1）：方块 k×k 走 `n_conv8_mma3`。**不再要求步长 1
+                    // 与对称 pad**——覆盖几何由 [`KxkCover`] 现算，那组算式在
+                    // stride1 + 对称 pad 下逐项退化成旧式，所以既有形状的行为
+                    // 一字未变；新放开的正是 det 头部那三条：
+                    // Conv.1/2（2×2 SAME，pad 非对称 (0,1)）与 Conv.3（3×3
+                    // stride2）。三条合计 13.3 ms ≈ `n_conv8` 总时的 61%，
+                    // 而 `n_conv8` 只有 ~1050 GFLOPS（MMA 同形状 2.2~3.3 TFLOPS）。
+                    //
+                    // `kh == kw` 仍是硬条件：内核用 `kH = taps/kW` 反推行数，
+                    // A 瓦片的行 stride 也只由 `sW` 与通道数决定。
+                    let cover = if self.conv_kxk_mma
                         && !fp16
                         && kh == kw
                         && kh >= 2
-                        && sh == 1
-                        && sw == 1
-                        && 2 * pads.0 == kh as i64 - 1
-                        && 2 * pads.2 == kh as i64 - 1
-                        && 2 * pads.1 == kw as i64 - 1
-                        && 2 * pads.3 == kw as i64 - 1
-                        && xs[2] == out_shape[2]
-                        && xs[3] == out_shape[3]
+                        && sh >= 1
+                        && sw >= 1
+                        && pads.0 >= 0
+                        && pads.1 >= 0
                         && cpad4(ws[1]) % 8 == 0
                         && cpad4(ws[0]) % 32 == 0
-                        && ow as i64 - (kw as i64 - 1) >= 64
-                        // **高方向必须有内点行**：`oh < kh` 时内核里的
-                        // `mDim/outW - (kH-1)`、这里的 `nrows`、以及 edge 的
-                        // `outH-2*padT` 全是 u32 减法 ⇒ 下溢成天文数字 ⇒ 网格
-                        // 与循环界一起飞出去（y 维 `nrows` 甚至会直接进 dispatch
-                        // 的 grid）。宽度方向的同款下溢由上面那条 `>= 64` 挡住，
-                        // 高度方向一直没有对应门禁——真实模型里都够高，但这条
-                        // 判据不该依赖「模型够大」。
-                        && oh as i64 - (kh as i64 - 1) >= 1
-                        // 边框补算的紧凑网格要求（见 n_conv8.metal 的
-                        // 「紧凑网格」）：行组 = 一行内连续 4 个 x，`outW%4!=0`
-                        // 时行组会跨行、枚举与平面映射错位；`2*gL>gh` 时中带
-                        // 头尾重叠、同一行组被枚举两次＝**写两次**（静默错）。
                         && ow % 4 == 0
-                        && 2 * ((pads.1 as u32 + 3) / 4) <= ow / 4;
-                    if kxk {
+                    {
+                        KxkCover::new(
+                            xs[2] as u32,
+                            xs[3] as u32,
+                            oh,
+                            ow,
+                            kh as u32,
+                            kw as u32,
+                            sh as u32,
+                            sw as u32,
+                            pads.0 as u32,
+                            pads.1 as u32,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(cv) = cover {
                         // 两条 dispatch、**两块内容相同的参数**（理由见
                         // `PlanBuilder::conv_kxk_mma`）。网格公式与内核逐字
                         // 一致：`n_conv8_mma3` 无 grid-stride 循环 ⇒ 用裸
@@ -1137,30 +1271,32 @@ impl PlanBuilder<'_> {
                         // `nDim / NCOLS`，所以两份仍然逐字对应）。
                         let co4 = cpad4(ws[0]);
                         let ncols = if co4 % 64 == 0 { 64 } else { 32 };
-                        let inner_w = ow - (kw as u32 - 1);
-                        let nrows = oh - (kh as u32 - 1);
                         let nch = co4 / ncols;
-                        let nx = inner_w / 64 + u32::from(inner_w % 64 != 0);
                         let kname = if ncols == 64 {
                             "n_conv8_mma3"
                         } else {
                             "n_conv8_mma3_n32"
                         };
-                        // edge 用**紧凑网格**（只铺真正含边框像素的行组），
-                        // 公式与内核逐字一致（第 N 份拷贝，改了要同步改）：
-                        //   gh = outW/4；gL = ceil(padL/4)
-                        //   tiles = (2*(padT*gh) + nrows*2*gL) * nh
-                        // 旧式 `m_dim.div_ceil(4)*(nv/2)` 铺满整张平面 ——
-                        // 每个空 tile 仍要付 6~8 次整数除法才早退，实测
-                        // Conv.121 的 edge 1.75 ms 里绝大部分是这份空转。
-                        let gh = ow / 4;
-                        let gl = (pads.1 as u32 + 3) / 4;
-                        let e_tiles =
-                            (2 * (pads.0 as u32 * gh) + nrows * 2 * gl) * (nv / 2);
-                        Ok(vec![
-                            (kname, pb.clone(), [nx * nch, nrows, nb]),
-                            ("n_conv8_edge", pb, [capped(e_tiles), nb, 1]),
-                        ])
+                        // edge 用**紧凑网格**（只铺真正含边框像素的行组）。
+                        // 三段之并与 `KxkCover::edge_tiles` 同式。旧式
+                        // `m_dim.div_ceil(4)*(nv/2)` 铺满整张平面 —— 每个空
+                        // tile 仍要付 6~8 次整数除法才早退，实测 Conv.121 的
+                        // edge 1.75 ms 里绝大部分是这份空转。
+                        let e_tiles = cv.edge_tiles(co4);
+                        let mma = (kname, pb.clone(), cv.mma_groups(nch, nb));
+                        // **边框可能是空集**——`2×2`/pad 0/stride 1 这类形状下
+                        // `yd_lo == 0`、`y_hi == outH-1`、`x_lo == 0`、
+                        // `x_hi == outW-1`，三段全空（这是泛化之后才可达的：
+                        // 旧的对称-pad 门把 `k>=3` 且 `pad>=1` 钉死了，那时
+                        // 上下台恒非空）。空网格派发是没定义的，直接不发。
+                        if e_tiles == 0 {
+                            Ok(vec![mma])
+                        } else {
+                            Ok(vec![
+                                mma,
+                                ("n_conv8_edge", pb, [capped(e_tiles), nb, 1]),
+                            ])
+                        }
                     } else if mma {
                         let co4 = cpad4(ws[0]);
                         Ok(vec![(
