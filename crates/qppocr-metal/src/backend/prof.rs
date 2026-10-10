@@ -123,7 +123,34 @@ pub(crate) fn sample_kernels(
         return Err(Error::Device("计划 arena 为空，无法剖析".into()));
     }
     let mut out = Vec::with_capacity(n);
-    for idx in 0..n {
+    // `QPPOCR_GPU_KERNEL_PROF_ONLY="85,88"`：**只剖这几条，按给定次序**。
+    //
+    // 这条剖析器逐条独立重放（每条自己的命令缓冲、条间插屏障），但默认按
+    // 计划次序扫完全部 185 条 ⇒「同参数两个派发差 1.3×」这种指控里，
+    // 「这条派发本身慢」与「它在扫描里排得靠后（热/时钟/前几条的余波）」
+    // 分不开。只留这两条、并把它俩的**先后对调**再跑一次，次序这个自变量
+    // 就被翻过来了：结论跟着**索引**走 ⇒ 是派发自己的性质；跟着**位置**走
+    // ⇒ 是扫描伪影。
+    //
+    // 注意倒着扫全部（曾试过）会把结果弄坏：重放会**重写 arena**，而计划里
+    // 的激活段是复用地址的（`Conv.58` 的 out 就是 `Conv.50` 的 out）⇒ 逆序
+    // 重放让某些条读到被改过的输入，最终出口节点打出 0 行。正序重放与真实
+    // 执行同序，才是安全的。
+    // **前置臂**：把列出的索引先剖一遍，随后照常正序扫全场。于是同一条派发
+    // 在一轮里被量两次——一次在「刚跑完真实执行、还没重放过别人」的干净
+    // arena 上，一次在它自然的位置上。两次若一致 ⇒ 扫描上下文无关。
+    // （只剖这几条而跳过全场会**弄坏结果**：重放会重写 arena 且激活段复用
+    // 地址，跳过一批后出口节点读到被改过的输入，实测打出 0 行。）
+    let order: Vec<usize> = match std::env::var("QPPOCR_GPU_KERNEL_PROF_ONLY") {
+        Ok(s) => s
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .filter(|&i| i < n)
+            .chain(0..n)
+            .collect(),
+        Err(_) => (0..n).collect(),
+    };
+    for idx in order {
         let d = &plan.dispatches[idx];
         let (ms, reps, base) = time_one(queue, ks, plan, idx)?;
         let ms = if ms.is_finite() && ms > 0.0 { ms } else { 0.0 };

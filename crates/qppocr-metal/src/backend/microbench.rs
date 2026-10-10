@@ -739,6 +739,74 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
     build_conv_case_geom(device, c, ConvGeom::sym(c), batch, half_w)
 }
 
+/// 同 [`build_conv_case`]，但在**输出段之前**插入 `gap` 个空 word。
+///
+/// 唯一变化的自由度是地址：段长、段间次序、每个张量的内容、参数块的全部
+/// 字段（含 `out_off` 本身要改的那个值——它记录的是真实偏移，内核按它寻址）
+/// 都逐位对齐。于是「吞吐随时间随地址摆动」这件事被单独拎出来量。
+fn build_conv_case_gap(device: &metal::DeviceRef, c: &ConvCase, gap: u32) -> ConvProbe {
+    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, false, LayoutK::tight(gap, false))
+}
+
+/// 段布局旋钮。**只在探针里用**：生产布局由 `qppocr-gpu/src/plan.rs` 的
+/// 生命周期分配器决定，这里是为了把它的两个可变量单独拎出来当自变量。
+#[derive(Clone, Copy)]
+struct LayoutK {
+    /// 输出段前插多少空 word。
+    gap: u32,
+    /// 是否写 `r_off`（写出 `out = conv + r` 的残差段，紧接 bias 段之后）。
+    with_res: bool,
+    /// 显式段偏移 `[in, w, b, r, out]`（word）与**缓冲总长**。`None` = 紧排。
+    ///
+    /// 紧排是「段挨着段」的紧凑布局（总长 ~17 MB）；给定时按生产的**绝对**
+    /// 地址摆段、缓冲也开到生产那么大（~115 MB）——于是「段被摆在收割 140 MB
+    /// arena 的哪几处」这件事本身成了自变量。见 [`conv8_mma_prod_geom`]。
+    at: Option<([u32; 5], u32)>,
+}
+
+impl LayoutK {
+    /// 紧排布局（历史的默认）。
+    fn tight(gap: u32, with_res: bool) -> Self {
+        LayoutK { gap, with_res, at: None }
+    }
+}
+
+/// 带残差段的探针：`r` 段紧接 bias、`out` 段在 `r` 之后隔 `gap` 个 word。
+///
+/// **为什么需要它**（2026-10-11）：生产里 `Conv.55/58` 参数块逐字节相同、
+/// 网格相同，只差地址，却稳定差 1.31×（先后对调、前置臂/自然位两次都复现）。
+/// 而把 `out` 段在 33 MB 范围内平移的 [`conv8_mma_layout_gap`] 是**平的**
+/// （离散 2%）⇒ 单纯「输出段在哪」不是原因。剩下没被控过的变量只剩残差段：
+/// 生产里 `Conv.55` 的 `r` 与 `out` 紧邻（`out − r = m·co`），`Conv.58` 的
+/// 隔开 2.67 倍。本探针把这两档搭出来。
+fn build_conv_case_res(device: &metal::DeviceRef, c: &ConvCase, gap: u32, with_res: bool) -> ConvProbe {
+    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, false, LayoutK::tight(gap, with_res))
+}
+
+/// 按**显式绝对偏移**摆段的探针（布局见 [`LayoutK::at`]）。
+///
+/// 用途见 [`conv8_mma_prod_geom`]：把生产 `[1,3,48,1344]` 计划里 `Conv.55` 与
+/// `Conv.58` 的真实地址几何原样搬进来。两者段长相同、内容同族、参数块除偏移
+/// 外逐位相同，生产却差 1.29×；本探针回答「这个差是几何本身，还是探针看不见
+/// 的东西（arena 总长、别处的内容、别的派发的余波）」。
+fn build_conv_case_at(
+    device: &metal::DeviceRef,
+    c: &ConvCase,
+    at: [u32; 5],
+    total_w: u32,
+    with_res: bool,
+) -> ConvProbe {
+    build_conv_case_geom_w(
+        device,
+        c,
+        ConvGeom::sym(c),
+        1,
+        false,
+        false,
+        LayoutK { gap: 0, with_res, at: Some((at, total_w)) },
+    )
+}
+
 /// 权重按**分片分块（fragment-blocked）**铺的探针（`p_mma_wfrag` 用）。
 ///
 /// 与 `build_conv_case` **逐字节同布局**：arena 总长、`in_off`/`w_off`/`b_off`/
@@ -753,7 +821,7 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
 ///
 /// 前置：`ci4 % 8 == 0 && co4 % 8 == 0`（生产门禁 `cpad4 % 8` / `% 64` 已保证）。
 fn build_conv_case_wfrag(device: &metal::DeviceRef, c: &ConvCase) -> ConvProbe {
-    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, true)
+    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, true, LayoutK::tight(0, false))
 }
 
 /// 同 [`build_conv_case_batch`]，但步长与 pad 由 `g` 给（写进参数块的
@@ -765,7 +833,7 @@ fn build_conv_case_geom(
     batch: u32,
     half_w: bool,
 ) -> ConvProbe {
-    build_conv_case_geom_w(device, c, g, batch, half_w, false)
+    build_conv_case_geom_w(device, c, g, batch, half_w, false, LayoutK::tight(0, false))
 }
 
 /// [`build_conv_case_geom`] 的本体。`w_frag` 是**唯一**多出来的自由度：为真时
@@ -777,6 +845,7 @@ fn build_conv_case_geom_w(
     batch: u32,
     half_w: bool,
     w_frag: bool,
+    k: LayoutK,
 ) -> ConvProbe {
     assert!(batch >= 1, "batch 至少 1");
     let (pt, pl) = (g.pt, g.pl);
@@ -851,18 +920,33 @@ fn build_conv_case_geom_w(
     // 参数块占 word 64..64+21；张量必须让开，否则输入第一段就把
     // taps/cin4v 覆盖成浮点位型——内核会按天文数字循环，直接挂死。
     let p_words = 64u32;
-    let in_off_w = 256u32;
-    let w_off_w = in_off_w + n_in;
-    let b_off_w = w_off_w + n_w;
-    let out_off_w = b_off_w + co4;
-    let total = (out_off_w + n_out + 64) as u64;
+    // `k.at` 给定 = 按生产计划的**绝对**偏移摆段、缓冲开到生产那么大；
+    // 否则紧排（`k.gap` 只在输出段前插空白，`k.with_res` 在 bias 之后插一段
+    // 长度同输出的残差段）。三种都只改地址，段长与内容一字不改。
+    let (in_off_w, w_off_w, b_off_w, r_off_w, out_off_w, total) = match k.at {
+        Some(([i, wt, b, r, o], tot)) => {
+            assert!(p_words + 21 <= i, "显式布局里参数块会与 in 段交叠");
+            assert!(tot as u64 >= o as u64 + n_out as u64, "显式布局的缓冲总长装不下 out 段");
+            (i, wt, b, r, o, tot as u64)
+        }
+        None => {
+            let in_off_w = 256u32;
+            let w_off_w = in_off_w + n_in;
+            let b_off_w = w_off_w + n_w;
+            let r_off_w = b_off_w + co4;
+            let res_words = if k.with_res { n_out } else { 0 };
+            let out_off_w = r_off_w + res_words + k.gap;
+            (in_off_w, w_off_w, b_off_w, r_off_w, out_off_w, (out_off_w + n_out + 64) as u64)
+        }
+    };
     let buf = device.new_buffer(total * 4, metal::MTLResourceOptions::StorageModeShared);
 
     let base = buf.contents() as *mut u32;
     // SAFETY: `base` 是 Shared 存储的非空基址，缓冲按 `total` 个 word 分配。
-    // 段布局按 word 依次相接：params[64..85] → in[256..] → w → b → out，
-    // 每段起点都是上一段起点加其长度，故所有下标 < total；参数块（≤85）
-    // 与输入段（≥256）之间留的空隙是刻意的，见 `in_off_w` 处注释。
+    // 紧排时段按 word 依次相接（params[64..85] → in[256..] → w → b → [r] → out，
+    // 每段起点是上一段加其长度，故下标 < total；参数块与输入段之间留的空隙是
+    // 刻意的，见 `in_off_w` 处注释）；`k.at` 给定时段偏移由调用方保证落在
+    // `total` 内（`at` 的 assert 已把参数块与 `in`/`out` 的重叠挡掉）。
     unsafe {
         // 参数块（word 视图）
         let p = base.add(p_words as usize);
@@ -891,7 +975,7 @@ fn build_conv_case_geom_w(
             0,             // c1
             0,             // c2
             0,             // c3
-            0xFFFF_FFFF,   // r_off = OFF_NONE
+            if k.with_res { r_off_w } else { 0xFFFF_FFFF }, // r_off
         ];
         for (i, v) in words.iter().enumerate() {
             *p.add(i) = *v;
@@ -917,6 +1001,16 @@ fn build_conv_case_geom_w(
         let op = base.add(out_off_w as usize) as *mut f32;
         for i in 0..n_out as usize {
             *op.add(i) = 7.0;
+        }
+        // 残差段（`k.with_res`）：长度同输出、紧接 bias 之后，寻址与输出逐字段
+        // 一致（`b*mDim*nDim + m*nDim + n`，见 `n_conv8_mma.metal` 尾声）。
+        // 内容必须显式写好：`new_buffer` 不清零，未写的 float 可能是 NaN 位型，
+        // 会把「残差加法的成本」与「NaN 走的路」混成一个自变量。
+        if k.with_res {
+            let rp = base.add(r_off_w as usize) as *mut f32;
+            for i in 0..n_out as usize {
+                *rp.add(i) = rnd();
+            }
         }
     }
 
@@ -2441,6 +2535,20 @@ fn conv8_mma_throughput() {
         // 这里把 co 补到 18816（多 0.55% 的活）让两臂同台 —— 量的正是
         // 「这一个节点搬进 MMA 能拿回多少」，也是放宽门禁前的定价。
         ConvCase { label: "rec head m147 c192->18712", h: 147, w: 1, cin: 192, cout: 18816, kh: 1, kw: 1 },
+        // ── `Conv.54/55/57/58` 的形状对（2026-10-11 加）───────────────────
+        //
+        // 生产里这两对是**互为镜像**的 1×1 层：同样 `2·m·cin·co` FLOP，
+        // 只是把 K 与 N 的角色对调。实测（img-002 medium 那份 185 条计划，
+        // 逐条剖析，`QPPOCR_GPU_KERNEL_PROF_ALL`）：
+        //   Conv.54 c768→1536 m1008 0.959 ms → 2480 GFLOPS
+        //   Conv.55 c1536→768 m1008 1.429 ms → 1664
+        //   Conv.57 c768→1536 m1008 1.054 ms → 2256
+        //   Conv.58 c1536→768 m1008 1.881 ms → 1264
+        // 而两条的**参数块逐字节相同**（只差偏移），所以这不是尾声、不是形状
+        // 之外的东西——本对探针就是问：这个 1.5~1.9× 在孤立环境里复现吗。
+        // 复现 ⇒ 是这条形状本身的性质，与谁挨着谁无关。
+        ConvCase { label: "pair c768->1536 m1008 k1", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 },
+        ConvCase { label: "pair c1536->768 m1008 k1", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 },
     ];
 
     for c in &cases {
@@ -2482,6 +2590,530 @@ fn conv8_mma_throughput() {
         eprintln!(
             "[mb] {:<26} base {:>7.3} ms ({:>6.1} GFLOPS) → mma {:>7.3} ms ({:>6.1} GFLOPS) = {:.2}×  [grid {:?} → {:?}]",
             c.label, a, gf(a), b, gf(b), a / b, pr.groups, mma_groups
+        );
+    }
+}
+
+/// `n_conv8_mma` 的**纯地址扫描**：形状、张量内容、参数块字段全不动，只把
+/// 输出段在缓冲里往后挪。
+///
+/// ## 要回答的问题
+///
+/// 生产里 `Conv.55` 与 `Conv.58` 的形状/网格/**参数块逐字节相同**（`in/w/r/out`
+/// 四个偏移词以外全部相等，已用 `QPPOCR_METAL_PLAN_DUMP_FULL` 逐字对过），
+/// 却稳定差 1.3×（img-002 medium 那份 185 条计划，逐条剖析；两天、两趟复现）。
+/// 两者**唯一**的结构差别是地址排布：13 份计划里一条不差地
+///   `Conv.55`：`out_off − r_off` = `m·co`（残差与输出紧邻）
+///   `Conv.58`：`out_off − r_off` = `2.67·m·co`（隔开）
+/// 若地址真能摆动吞吐，本探针就该复现同样的量级；若摆不动，那条 1.3× 就
+/// 只能归给测量上下文（重放序、arena 状态），与内核和其参数无关。
+///
+/// ## 读法
+///
+/// 各档**交错**跑（偶数轮升序、奇数轮降序），取每档最小——本机「一轮里先跑
+/// 的那条快 6~15%」（见 `ab-order-effect-swamps-small-gains`），沿一个方向扫
+/// 会把漂移记进斜率。离散度本身就是读数：各档若一致，说明地址不是自变量。
+///
+/// **每一档都重开一个 buffer**（偏移变了，缓冲总长随之变，基址由驱动给），
+/// 所以这里量的是「段落在这块缓冲的哪里」，不是绝对物理地址——后者探针控
+/// 不了，别把结论说过头。
+#[test]
+fn conv8_mma_layout_gap() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // 与生产那两条同形：`pair c1536->768 m1008`。间隔按 word 给。
+    let slow = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    let mirror = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
+    // 786432 word = 3 MB = 本形状的 `m·co`；`Conv.55/58` 的差正好是 1.67 个它。
+    let gaps: [u32; 6] = [0, 262144, 786432, 2097152, 4194304, 8388608];
+
+    let run = |pr: &ConvProbe, reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let probes: Vec<ConvProbe> = gaps
+        .iter()
+        .map(|&gp| build_conv_case_gap(&ctx.inner.device, &slow, gp))
+        .collect();
+    let mut best = vec![f64::INFINITY; probes.len()];
+    for round in 0..3 {
+        let asc: Vec<usize> = (0..probes.len()).collect();
+        let order: Vec<usize> = if round % 2 == 0 {
+            asc
+        } else {
+            asc.into_iter().rev().collect()
+        };
+        for i in order {
+            let pr = &probes[i];
+            let ms = time_dispatch(&|r| run(pr, r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+    eprintln!("[mb/gap] c1536->768 m1008 k1（与生产 Conv.58/55 同形），只动 out 段偏移");
+    let base = best[0];
+    for (i, &gp) in gaps.iter().enumerate() {
+        let ms = best[i];
+        let gf = probes[i].flops / (ms * 1e6);
+        eprintln!(
+            "[mb/gap]   gap={:>8} word ({:>5.1} MB) {:>7.3} ms {:>7.1} GFLOPS  相对 gap=0 {:.3}×",
+            gp,
+            gp as f64 * 4.0 / 1e6,
+            ms,
+            gf,
+            ms / base
+        );
+    }
+    // 镜像形状做同一把尺子：它是生产里「没残差的那一半」，各档应当同样平。
+    let mpr = build_conv_case(&ctx.inner.device, &mirror);
+    let mms = time_dispatch(&|r| run(&mpr, r)).ms;
+    eprintln!(
+        "[mb/gap] 镜像 c768->1536（gap 由构造给定）{:>7.3} ms {:>7.1} GFLOPS",
+        mms,
+        mpr.flops / (mms * 1e6)
+    );
+}
+
+/// `n_conv8_mma` 的**残差段**对照臂：同形状、同内容、只差「有没有残差段」与
+/// 「残差段离输出多远」。
+///
+/// ## 要回答的问题（任务 #39）
+///
+/// 生产里 `Conv.55` 与 `Conv.58` 的参数块 21 词里只有 4 个偏移不同、网格
+/// 逐字相同，却在逐内核剖析里稳定差 1.31×——先后对调（`PROF_ONLY="85,88"`
+/// vs `"88,85"`）、以及前置臂（干净 arena）与自然位两次都复现。两条候选已
+/// 被证伪：
+/// - **尾声 act/bias/模块**：两条参数块里 `act/c1/c2/c3` 逐位相同；
+/// - **输出段地址**：[`conv8_mma_layout_gap`] 把 `out` 平移 33 MB，全档离散 2%。
+///
+/// 剩下没被控过的自由度只有**残差段**：两条都有 `r_off`，但 `Conv.55` 的
+/// `r` 与 `out` 紧邻（`out − r` = 1.00 × `m·co`），`Conv.58` 隔开
+/// 2.67 × `m·co`（这个比例在全部 14 份计划里逐份成立）。本探针把这两档搭出来。
+///
+/// **纪律**：探针只能否证、不能拍板。无论正负，结论只用来排除或聚焦；真要
+/// 落地必须回生产按 `ab.sh` 交错对拍。
+#[test]
+fn conv8_mma_residual() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // 与生产那两条同形：`Conv.55/58`（1536->768，21×48）。
+    let slow = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    let mirror = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
+    // `m·co` = 1008 × 768 = 774144 word。生产两档：紧邻（+0）与 +5/3·m·co
+    // （即 `out − r` = 2.67·m·co）。5/3 是先除后乘，避免 `mco*5` 溢出前的取整差。
+    let mco = 1008u32 * 768;
+    let far_gap = mco / 3 * 5;
+
+    let run = |pr: &ConvProbe, reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let arms: [(&str, ConvProbe); 3] = [
+        ("无残差      ", build_conv_case_res(&ctx.inner.device, &slow, 0, false)),
+        ("残差紧邻 1.00×", build_conv_case_res(&ctx.inner.device, &slow, 0, true)),
+        ("残差远隔 2.67×", build_conv_case_res(&ctx.inner.device, &slow, far_gap, true)),
+    ];
+    let mut best = vec![f64::INFINITY; arms.len()];
+    for round in 0..3 {
+        let asc: Vec<usize> = (0..arms.len()).collect();
+        let order: Vec<usize> = if round % 2 == 0 {
+            asc
+        } else {
+            asc.into_iter().rev().collect()
+        };
+        for i in order {
+            let pr = &arms[i].1;
+            let ms = time_dispatch(&|r| run(pr, r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+    let base = best[0];
+    eprintln!("[mb/res] c1536->768 m1008 k1（与生产 Conv.55/58 同形），唯一自变量=残差段");
+    for (i, (label, pr)) in arms.iter().enumerate() {
+        let ms = best[i];
+        eprintln!(
+            "[mb/res]   {label} {:>7.3} ms {:>7.1} GFLOPS  相对无残差 {:.3}×",
+            ms,
+            pr.flops / (ms * 1e6),
+            ms / base
+        );
+    }
+    // 尺子：生产里 `Conv.54/57` 是「同形状、无残差」的另一半，用镜像形状再
+    // 钉一次「形状本身」的贡献（isolated 已知 c768->1536 ≈ 0.99 ms）。
+    let mpr = build_conv_case(&ctx.inner.device, &mirror);
+    let mms = time_dispatch(&|r| run(&mpr, r)).ms;
+    eprintln!(
+        "[mb/res] 镜像 c768->1536 无残差 {:>7.3} ms {:>7.1} GFLOPS",
+        mms,
+        mpr.flops / (mms * 1e6)
+    );
+}
+
+/// 把生产计划 `[1,3,48,1344]`（185 条）里**四条邻接派发的真实地址几何**
+/// 原样搬进探针。
+///
+/// ## 要回答的问题
+///
+/// 生产逐内核剖析（今天复现）：`Conv.54` 0.967 / `Conv.55` 1.462 /
+/// `Conv.57` 1.050 / `Conv.58` 1.892 ms，四条的 `m/cin/co` 只有两档
+/// （768→1536 与 1536→768），网格逐字相同，参数块除 4 个偏移外逐位相同。
+/// 已知（隔离探针，`conv8_mma_throughput`）同形状同参数的基线是
+/// **1536→768 1.165 / 768→1536 0.985 ms** ⇒ `Conv.54/57` ≈ 基线（1.0×），
+/// 而 `Conv.55` 1.25×、`Conv.58` 1.62×。已经证伪的候选：
+/// 尾声 act/bias（参数逐位同）、`out` 段地址（[`conv8_mma_layout_gap`] 平移
+/// 33 MB 全平）、残差段与输出的距离（[`conv8_mma_residual`] 两档只差 0.5%）。
+///
+/// **没被控过的**只剩「段被摆在 115 MB arena 的哪几处」与「arena 本身多大」
+/// ——紧排探针的 arena 只有 17 MB。本测试把生产的绝对偏移与总长照搬：
+///
+/// | 派发 | m | in | w | r | out | 生产实测 |
+/// |---|---|---|---|---|---|---|
+/// | Conv.54 | 1008 | 25246848 | 9610832 | — | 27311232 | 0.967 |
+/// | Conv.55 | 1008 | 27311232 | 10792040 | 25246848 | 26020992 | 1.462 |
+/// | Conv.57 | 1008 | 21118080 | 11980180 | — | 27311232 | 1.050 |
+/// | Conv.58 | 1008 | 27311232 | 13161388 | 21118080 | 23182464 | 1.892 |
+///
+/// 四条的总长都是 `28859520` word（115.4 MB）。**复现出来 ⇒ 几何（或 arena
+/// 尺寸）就是原因，下一步二分；复现不出来 ⇒ 原因在探针看不见的地方**（别的
+/// 派发留下的缓存状态、计划里其余 181 条的余波），这条线索该收摊。
+#[test]
+fn conv8_mma_prod_geom() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    // m = 3×336 = 1008 = 21×48（段长逐字节相同，只是空间形状不同）。
+    let wide = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
+    let bott = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    const TOTAL: u32 = 28859520; // 生产计划里这四条的总长（word）
+
+    let run = |pr: &ConvProbe, reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let arms: [(&str, ConvProbe); 4] = [
+        (
+            "Conv.54 生产几何",
+            build_conv_case_at(&ctx.inner.device, &wide, [25246848, 9610832, 10790480, 0, 27311232], TOTAL, false),
+        ),
+        (
+            "Conv.55 生产几何",
+            build_conv_case_at(&ctx.inner.device, &bott, [27311232, 10792040, 11971688, 25246848, 26020992], TOTAL, true),
+        ),
+        (
+            "Conv.57 生产几何",
+            build_conv_case_at(&ctx.inner.device, &wide, [21118080, 11980180, 13159828, 0, 27311232], TOTAL, false),
+        ),
+        (
+            "Conv.58 生产几何",
+            build_conv_case_at(&ctx.inner.device, &bott, [27311232, 13161388, 14341036, 21118080, 23182464], TOTAL, true),
+        ),
+    ];
+    let mut best = vec![f64::INFINITY; arms.len()];
+    for round in 0..3 {
+        let asc: Vec<usize> = (0..arms.len()).collect();
+        let order: Vec<usize> = if round % 2 == 0 {
+            asc
+        } else {
+            asc.into_iter().rev().collect()
+        };
+        for i in order {
+            let pr = &arms[i].1;
+            let ms = time_dispatch(&|r| run(pr, r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+    eprintln!("[mb/geo] 生产四条的无残差谱系；紧排基线 c1536->768 1.165 / c768->1536 0.985 ms");
+    for (i, (label, pr)) in arms.iter().enumerate() {
+        let ms = best[i];
+        eprintln!(
+            "[mb/geo]   {label} {:>7.3} ms {:>7.1} GFLOPS",
+            ms,
+            pr.flops / (ms * 1e6)
+        );
+    }
+}
+
+/// [`conv8_mma_prod_geom`] 复现成功后的**单字段二分**：形状固定
+/// （1536→768, m=1008, res=true），从 `Conv.58` 的几何出发，每次只把一个
+/// 字段换成 `Conv.55` 的值，看哪一格吃掉那 0.455 ms。
+///
+/// 生产两档的字段（word）：
+///
+/// | 字段 | Conv.55（1.435） | Conv.58（1.890） |
+/// |---|---|---|
+/// | in | 27311232 | 27311232（相同） |
+/// | w | 10792040 | 13161388 |
+/// | r | 25246848 | 21118080 |
+/// | out | 26020992 | 23182464 |
+///
+/// 另加两臂把 `in` 也换掉（`Conv.54` 的 25246848 / `Conv.57` 的 21118080），
+/// 因为「宽形状」那一对（0.977 vs 1.045）只差 `in`/`w` 的落点。
+/// 权重段在生产里是**静态区**（跨计划固定偏移），所以这几档 `w` 的差异对
+/// 整个模型是常量——找到「落在哪就慢」的规律才有可能去改分配器。
+#[test]
+fn conv8_mma_prod_bisect() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let bott = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    const TOTAL: u32 = 28859520;
+    // `b` 恒取 `w + n_w`（生产的静态块就是「权重 + bias + 参数块」紧排）。
+    const N_W: u32 = 1536 * 768;
+    let b_of = |w: u32| w + N_W;
+
+    // (标签, in, w, r, out)
+    let geoms: [(&str, [u32; 4]); 7] = [
+        ("A55 全 55      ", [27311232, 10792040, 25246848, 26020992]),
+        ("B58 全 58      ", [27311232, 13161388, 21118080, 23182464]),
+        ("w → 55 的      ", [27311232, 10792040, 21118080, 23182464]),
+        ("r → 55 的      ", [27311232, 13161388, 25246848, 23182464]),
+        ("out → 55 的    ", [27311232, 13161388, 21118080, 26020992]),
+        ("in → 25246848（54）", [25246848, 13161388, 21118080, 23182464]),
+        ("in → 21118080（57）", [21118080, 13161388, 21118080, 23182464]),
+    ];
+
+    let run = |pr: &ConvProbe, reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    let probes: Vec<(&str, ConvProbe)> = geoms
+        .iter()
+        .map(|&(label, [i, w, r, o])| {
+            (label, build_conv_case_at(&ctx.inner.device, &bott, [i, w, b_of(w), r, o], TOTAL, true))
+        })
+        .collect();
+    let mut best = vec![f64::INFINITY; probes.len()];
+    for round in 0..3 {
+        let asc: Vec<usize> = (0..probes.len()).collect();
+        let order: Vec<usize> = if round % 2 == 0 {
+            asc
+        } else {
+            asc.into_iter().rev().collect()
+        };
+        for i in order {
+            let ms = time_dispatch(&|r| run(&probes[i].1, r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+    let base = best[0]; // A55
+    eprintln!("[mb/bis] c1536->768 m1008 res=true，同 arena（115.4 MB），每次只换一个字段");
+    for (i, (label, pr)) in probes.iter().enumerate() {
+        eprintln!(
+            "[mb/bis]   {label} {:>7.3} ms {:>7.1} GFLOPS  相对 A55 {:.3}×",
+            best[i],
+            pr.flops / (best[i] * 1e6),
+            best[i] / base
+        );
+    }
+}
+
+/// [`conv8_mma_prod_bisect`] 把 1.31× 钉在**权重段地址**上之后的刻画：扫 `w`
+/// 的落点。
+///
+/// 四个激活段全部钉在 `Conv.55` 的几何（in=27311232, r=25246848,
+/// out=26020992），只把 `w` 从 `10792040`（快，1.43 ms）往 `13161388`
+/// （慢，1.87 ms）方向按 4 KB 步长挪 —— 两档相差 2369348 word（9.04 MB），
+/// 且两处的 **64 KB 页内偏移不同**（45472 vs 20144 字节），所以先按 4 KB
+/// 扫一个 64 KB 周期，看「页内偏移」是不是自变量。每臂同时打印页内偏移。
+///
+/// 若确实成规律，处方在计划分配器侧：静态权重的落点是可以整体平移的
+/// （权重是离线重排出来的，与激活段无关），把每个权重块对齐到「好格」即可。
+#[test]
+fn conv8_mma_w_sweep() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let bott = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    const TOTAL: u32 = 28859520;
+    const N_W: u32 = 1536 * 768;
+    // 激活段钉死在 Conv.55 的几何。
+    let (in_w, r_w, out_w) = (27311232u32, 25246848u32, 26020992u32);
+    let w0 = 10792040u32;
+
+    let run = |pr: &ConvProbe, reps: u32| -> f64 {
+        let t = Instant::now();
+        submit_compute(&ctx.inner.queue, |enc| {
+            for _ in 0..reps {
+                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
+                    .expect("dispatch");
+                let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                enc.memory_barrier_with_resources(&res);
+            }
+        })
+        .expect("提交");
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
+    // **三遍**，靠 `QPPOCR_MB_WMODE` 切：
+    //  - `fine`：4 KB 步长扫满一个 64 KB 周期（结论：平，±1.2%）⇒ 缓存组号
+    //    不用 bit12..15；
+    //  - `coarse`：1 MB 步长扫 −4..+11 MB（覆盖 `Conv.58` 的 13161388）
+    //    （结论：**也平**，1.418~1.448；只有恰好 13161388 是 1.90）；
+    //  - `dup`：把几个地址各放两份并打印**缓冲基址** —— 每臂各自
+    //    `new_buffer(115 MB)`，基址若不同，则「同偏移两臂」的差就是**分配
+    //    运气**而不是地址几何；基址相同才说明前一版的单字段二分成立。
+    let mode = std::env::var("QPPOCR_MB_WMODE").unwrap_or_else(|_| "coarse".into());
+    // `dup` 已证**确定可复现**（同地址两臂分别 1.441/1.454 与 1.898/1.903，
+    // 基址逐臂 +115.4 MB 连续），且 `w=13162384`（只差 3984 B）掉到 1.229。
+    // `near` 因此在 13161388 附近做 512 B 步长的刻画，并把 **bias 段单独掰开**
+    // （之前每臂 `b = w + n_w` 恒同步，分不清是 w 还是 b）：
+    // 每臂 `(w, b)` 显式给出。
+    let ws: Vec<u32> = match mode.as_str() {
+        "fine" => (0..=16u32).map(|j| w0 + j * 1024).chain([13161388, 13261388]).collect(),
+        "dup" => vec![w0, 13161388, w0, 13161388, 13151336, 13151336, 10793064, 13162384],
+        _ => (-4i32..=11)
+            .map(|j| (w0 as i64 + j as i64 * 262144) as u32)
+            .chain([13161388])
+            .collect(),
+    };
+    // `near` 专用：`(w, b)` 对。上一轮已用三组解耦臂证明 **`b` 完全无关**
+    // （w 钉死 13161388、b 换到 14330984 / 14342032，读数仍是 1.905~1.907），
+    // 且 `w` 在 **13161900（1.883）与 13162384（1.253，三臂一致）之间有离散跳变**。
+    // 这里按 512 B 步长把跳变扫出来：`w = W58 + j*128`，`j = 0..=20`。
+    const B58: u32 = 14341036; // Conv.58 的 b（= w + n_w）
+    const W58: u32 = 13161388;
+    let near: Vec<(u32, u32)> = (0..=20u32).map(|j| (W58 + j * 128, B58 + j * 128)).collect();
+    // `align`：把已测的所有点按 `w mod 16`（word，= 64 B）归类后浮现的规律 ——
+    // ≡12（48 B）全是最慢 1.85~1.91，≡8（32 B）全是 1.44，唯一个 ≡0（64 B）
+    // 的是 1.25。4 KB 与 1 MB 两个扫描之所以全平，正是因为两个步长都是 16 的
+    // 倍数、从未换过相位。这里把 16 个相位一次测全（b 钉死，已证无关）。
+    let align: Vec<(u32, u32)> = (0..16u32).map(|j| (W58 + j, B58)).collect();
+    // `alignw`：把同一条相位规律换到**另一个形状**上验证。行距由 `co4` 决定
+    // （1536 → 6144 B，仍是 128 B 整数倍），激活段用 `Conv.57` 的
+    // `in=21118080 / out=27311232`、无残差。只对 `co4=768` 成立就不算规律。
+    let wide = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
+    let alignw: Vec<(u32, u32)> =
+        (0..16u32).map(|j| (11980180 + j, 11980180 + j + 768 * 1536)).collect();
+    // `aligna`：把 16 个相位换到**激活段**上。`co4=1536` 那一档里 B 的行距是
+    // 6144 B、A 的是 3072 B —— 而 `co4=768` 那档恰好反过来（B 3072 / A 6144），
+    // 且大摆幅只出现在「3072 B 行距」的那个操作数上。所以「敏感的是 3072 B
+    // 行距的操作数」这一假说预测：换 `in` 的相位会看到大摆幅（而不是 7%）。
+    // 若成立，处方不止要动静态布局，还要把激活段的分配抬到 64 B 对齐。
+    let (case, with_res, varies_in, geoms): (&ConvCase, bool, bool, Vec<[u32; 5]>) =
+        match mode.as_str() {
+            "near" => (
+                &bott,
+                true,
+                false,
+                near.iter().map(|&(w, b)| [in_w, w, b, r_w, out_w]).collect(),
+            ),
+            "align" => (
+                &bott,
+                true,
+                false,
+                align.iter().map(|&(w, b)| [in_w, w, b, r_w, out_w]).collect(),
+            ),
+            "alignw" => (
+                &wide,
+                false,
+                false,
+                (0..16u32)
+                    .map(|j| {
+                        let w = 11980180 + j;
+                        [21118080, w, w + 768 * 1536, 0, 27311232]
+                    })
+                    .collect(),
+            ),
+            "aligna" => (
+                &wide,
+                false,
+                true,
+                (0..16u32)
+                    .map(|j| [21118080 + j, 11980192, 11980192 + 768 * 1536, 0, 27311232])
+                    .collect(),
+            ),
+            _ => (
+                &bott,
+                true,
+                false,
+                ws.iter().map(|&w| [in_w, w, w + N_W, r_w, out_w]).collect(),
+            ),
+        };
+    let probes: Vec<ConvProbe> = geoms
+        .iter()
+        .map(|&g| build_conv_case_at(&ctx.inner.device, case, g, TOTAL, with_res))
+        .collect();
+    let mut best = vec![f64::INFINITY; probes.len()];
+    for round in 0..3 {
+        let asc: Vec<usize> = (0..probes.len()).collect();
+        let order: Vec<usize> = if round % 2 == 0 {
+            asc
+        } else {
+            asc.into_iter().rev().collect()
+        };
+        for i in order {
+            let ms = time_dispatch(&|r| run(&probes[i], r)).ms;
+            best[i] = best[i].min(ms);
+        }
+    }
+    eprintln!(
+        "[mb/ws] {} （mode={mode}，{}）",
+        case.label,
+        if varies_in {
+            "只挪激活段，权重/bias 钉死"
+        } else {
+            "激活段钉死，只挪权重/bias 段"
+        }
+    );
+    for (i, g) in geoms.iter().enumerate() {
+        let pr = &probes[i];
+        let (i_off, w_off, b_off) = (g[0], g[1], g[2]);
+        eprintln!(
+            "[mb/ws]   in={:>9}(+{:>5} B) w={:>9}(+{:>5} B) b={:>9} 基址={:>12} {:>7.3} ms {:>7.1} GFLOPS",
+            i_off,
+            (i_off as u64 * 4) % 64,
+            w_off,
+            (w_off as u64 * 4) % 64,
+            b_off,
+            pr.buf.contents() as usize,
+            best[i],
+            pr.flops / (best[i] * 1e6)
         );
     }
 }

@@ -2347,9 +2347,18 @@ impl Layout {
             self.static_total += n;
             return off;
         }
-        let off = self.static_cursor;
-        self.static_cursor += n;
-        self.static_total += n;
+        // 块的**起点**决定它在内核里的读带宽档位。`n_conv8_mma` 的权重装载
+        // 实测：起点字节偏移 mod 64 把同形状同网格的派发分成四档
+        // （1.25 / 1.45 / 1.75 / 1.90 ms，64 B 整数倍那档最快），幅度最大
+        // 1.51×——`Conv.55` 与 `Conv.58` 两个形状完全相同的派发差 1.3×、
+        // 差的就是这个相位（`conv8_mma_w_sweep` 的 `align` 臂）。
+        // 这条规律**只在权重这个操作数上出现**：把同样 16 个相位搬到激活段
+        // 上只有 1.04×（`aligna` 臂）⇒ 处方只需动静态区。
+        // 代价：每块 ≤60 B 填充，全场一百多个静态块合计不到 10 KB。
+        let pad = (16 - self.static_cursor % 16) % 16;
+        let off = self.static_cursor + pad;
+        self.static_cursor = off + n;
+        self.static_total += pad + n;
         self.total = self.total.max(self.static_cursor);
         off
     }

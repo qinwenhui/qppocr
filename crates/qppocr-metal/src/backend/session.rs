@@ -893,6 +893,11 @@ impl MetalSession {
             // 各步布局见 shader 头部；`n_conv8`/`n_conv` 同构，`n_conv_dw` 不同。
             let pubs: std::collections::HashMap<u32, &Vec<u32>> =
                 built.uploads.iter().map(|(o, v)| (*o, &**v)).collect();
+            // 参数块**逐字**转储（`QPPOCR_METAL_PLAN_DUMP_FULL=1`）：上面那行是
+            // 我挑着打的字段，而「两个派发长得一样却差 1.47×」这种指控，只要
+            // 有一个我没打的字段不同就会被误判成「参数相同」——比如 P+6/7/8
+            // （outW/inW/inH，内核按它算行地址）。全打出来才能否证。
+            let full = std::env::var_os("QPPOCR_METAL_PLAN_DUMP_FULL").is_some();
             for (i, d) in built.dispatches.iter().enumerate() {
                 let extra = pubs
                     .get(&d.p_off)
@@ -907,13 +912,34 @@ impl MetalSession {
                         match d.kernel {
                             "n_conv8" | "n_conv" | "n_conv8_mma" | "n_conv8_mma3"
                             | "n_conv8_mma3_n32" | "n_conv8_edge" => format!(
-                                "  cin={:<4} co={:<4} taps={} ({}x{})  m={}",
+                                // 尾声三项（`P+16` act / `P+2` bias / `P+20` 残差，
+                                // `OFF_NONE=0xffffffff`）：形状/网格完全相同的两个
+                                // 派发差 1.47×（`Conv.55` vs `Conv.58`）时，这三项
+                                // 是**头号嫌疑**，所以先打出来否证它——事后证明确实
+                                // 不是它（三项逐字相同），根因是下面那个 `w%64B`。
+                                "  cin={:<4} co={:<4} taps={} ({}x{})  m={}  尾: act={} \
+                                 bias={} res={}  偏: in={} w={} r={} out={}（w%64B={}）（块={}）",
                                 g(9) * 4,
                                 g(5),
                                 g(10),
                                 g(10) / g(11).max(1),
                                 g(11),
-                                g(4)
+                                g(4),
+                                g(16),
+                                g(2) != u32::MAX,
+                                g(20) != u32::MAX,
+                                g(0),
+                                g(1),
+                                g(20),
+                                g(3),
+                                // 权重块**起点字节偏移 mod 64**：这个相位把同
+                                // 形状同网格的 `n_conv8_mma` 派发分成四档（1.25
+                                // / 1.45 / 1.75 / 1.90 ms，≡0 最快，幅度 1.51×）
+                                // ——`Conv.55` vs `Conv.58` 差 1.47× 就是它。
+                                // 曾经这里打的是 `% 16`，恒为 0（任何 float4
+                                // 偏移都是 16 的倍数），白打了一格。
+                                (g(1) * 4) % 64,
+                                d.p_off
                             ),
                             "n_conv_dw" => format!(
                                 "  c={:<4} taps={} ({}x{})  m={}",
@@ -941,6 +967,14 @@ impl MetalSession {
                             _ => String::new(),
                         }
                     });
+                let extra = if full {
+                    match pubs.get(&d.p_off) {
+                        Some(p) => format!("{extra}\n         P={p:x?}"),
+                        None => extra,
+                    }
+                } else {
+                    extra
+                };
                 // `nid` = 图节点序号，**与 `node` 名后缀无关**（后者是 ONNX 名字，
                 // 形如 `Conv.20`，编号来自算子计数器不是图序）。逐内核剖析器打的
                 // `node#N` 用的就是 `d.node_idx`，不带 `nid` 就**无法**把剖析出的
@@ -1167,9 +1201,18 @@ impl MetalSession {
             eprintln!("[prof]   {k:<18} {sum:>8.2} ms  {n:>4} 条  单条最大 {mx:>7.2} ms");
         }
         // 最贵的 20 条明细（节点名 + 序号 + 网格）。
+        //
+        // `QPPOCR_GPU_KERNEL_PROF_ALL=1` 放开到全部：排掉 20 名之后的条目在看
+        // 「慢是这条独有的还是这一族都慢」时是必需的——只留 top-20 时，
+        // 快的那一半整段不入镜，任何「谁比谁慢」的结论都缺对照臂。
         let mut top = rows.clone();
         top.sort_by(|a, b| b.ms.partial_cmp(&a.ms).unwrap());
-        for r in top.iter().take(20) {
+        let keep = if std::env::var_os("QPPOCR_GPU_KERNEL_PROF_ALL").is_some() {
+            top.len()
+        } else {
+            20
+        };
+        for r in top.iter().take(keep) {
             eprintln!(
                 "[prof]   · {:<16} {:>7.3} ms  node#{:<4} {:<24} grid={:?} reps={}",
                 r.kernel, r.ms, r.node_idx, r.node, r.groups, r.reps
