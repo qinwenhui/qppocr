@@ -25,6 +25,8 @@ bench/gpuhealth/__pycache__/
 /models.zip
 /logs/
 bench/gpuhealth/corpus100/
+bench/gpuhealth/gen100/
+bench/gpuhealth/fonts_cjk/
 bench/gpuhealth/evidence/
 # logs 里是原始跑批输出，不进仓库；但**分析结论**（*.md）要留下。
 bench/gpuhealth/logs/*
