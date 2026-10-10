@@ -2435,6 +2435,12 @@ fn conv8_mma_throughput() {
         // rec 1×1（行批次，m 小）
         ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
         ConvCase { label: "rec 6x208 c192->384 k1", h: 6, w: 208, cin: 192, cout: 384, kh: 1, kw: 1 },
+        // rec 的 CTC 分类头（`MatMul.12`，out=[1,147,18710]，cin=192 co=18712）：
+        // rec 设备端 `n_conv8` 的 87%（剖析值 41.5/47.8 ms），单条最大 1.886 ms。
+        // **真实 co=18712 掉在 1×1 MMA 门外**（18712 % 64 = 24）⇒ 落回 `n_conv8`。
+        // 这里把 co 补到 18816（多 0.55% 的活）让两臂同台 —— 量的正是
+        // 「这一个节点搬进 MMA 能拿回多少」，也是放宽门禁前的定价。
+        ConvCase { label: "rec head m147 c192->18712", h: 147, w: 1, cin: 192, cout: 18816, kh: 1, kw: 1 },
     ];
 
     for c in &cases {
