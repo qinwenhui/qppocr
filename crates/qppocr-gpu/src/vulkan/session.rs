@@ -708,6 +708,9 @@ impl VulkanSession {
             conv_kxk_mma: false,
             // Metal 独有（GLSL 侧无此内核）。见 `PlanBuilder::conv_t_tile`。
             conv_t_tile: false,
+            // Metal 独有（GLSL 侧无 `n_head_argmax`），Vulkan 恒 false，
+            // 仍走 `n_softmax` + `n_exit3_argmax`。见 `PlanBuilder::head_fuse`。
+            head_fuse: false,
         }
         .build(
             &self.input_name,

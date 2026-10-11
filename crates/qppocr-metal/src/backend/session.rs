@@ -243,6 +243,10 @@ pub(crate) struct MetalSession {
     ///
     /// 见 [`conv_t_tile`] 与 `plan.rs::PlanBuilder::conv_t_tile` 的启用判据。
     pub(crate) conv_t_tile: bool,
+    /// rec 头融合出口（`QPPOCR_METAL_HEAD_FUSE`，默认 **true**）：
+    /// `Softmax + argmax 出口` 并成一条 `n_head_argmax`，逐位等价。见
+    /// [`head_fuse`]。
+    pub(crate) head_fuse: bool,
     /// 执行串行锁：每 run 重编码 + 同步等待不支持并发在飞（deferred
     /// 流水是 P4 的性能项；trait 默认的同步 run_deferred 语义等价）。
     run_lock: Mutex<()>,
@@ -397,6 +401,27 @@ fn conv_t_tile() -> bool {
     )
 }
 
+/// rec 头的融合出口（`QPPOCR_METAL_HEAD_FUSE`，默认 **true**）。
+///
+/// 开着时图末尾的 `Softmax → argmax 出口` 并成一条 `n_head_argmax`——对
+/// logits 做完 softmax 再取 argmax。**不动语义**：`val` 仍是归一后的最大
+/// 概率、`idx` 仍在归一后的值上取首个严格最大，与原来两条 dispatch 的
+/// 组合逐位一致（证明在该 .metal 的头注释里）。判据见
+/// `plan.rs::PlanBuilder::head_fuse`。
+///
+/// **过账证据**：裸内核对拍 `head_argmax_raw`（3 形状，val/idx 全 0 分歧）；
+/// small/tiny 各 100 图端到端**逐位一致**；small A/B 三次交错中位
+/// Δtotal **−4.35 / −4.25 / −2.50 ms**（符号 6/6、5/6、7/8，Δdet 对照
+/// 均在 ±0.5 内）。置 `0`/`off` 关掉，供 A/B 对照。
+///
+/// ⚠️ `n_head_argmax` 是 **Metal 独有**内核，Vulkan 侧恒 false。
+fn head_fuse() -> bool {
+    !matches!(
+        std::env::var("QPPOCR_METAL_HEAD_FUSE").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
 impl MetalSession {
     pub(crate) fn new(
         ctx: Arc<super::Inner>,
@@ -447,6 +472,7 @@ impl MetalSession {
             conv1x1_mma: conv1x1_mma(),
             conv_kxk_mma: conv_kxk_mma(),
             conv_t_tile: conv_t_tile(),
+            head_fuse: head_fuse(),
             run_lock: Mutex::new(()),
             // ⚠ 这个预算是**每会话一份**，而 det / rec / cls 是三个会话
             //（各自 new 一次）。所以 `QPPOCR_GPU_KERNEL_PROF=3` 不是
@@ -582,6 +608,9 @@ impl MetalSession {
             conv_kxk_mma: self.conv_kxk_mma,
             // ConvTranspose 的空间分块版（默认开）。见 [`conv_t_tile`]。
             conv_t_tile: self.conv_t_tile,
+            // rec 头融合出口（默认开，置 `QPPOCR_METAL_HEAD_FUSE=0` 关）。
+            // 见 [`PlanBuilder::head_fuse`]。
+            head_fuse: self.head_fuse,
         }
         .build(&self.input_name, in_shape, static_reserve)?;
 

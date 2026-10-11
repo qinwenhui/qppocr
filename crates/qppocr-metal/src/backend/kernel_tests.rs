@@ -1364,3 +1364,100 @@ fn softmax_raw() {
         assert_eq!(bad, 0, "n_softmax [{rows},{cols}] 对拍失败");
     }
 }
+
+/// `n_head_argmax` 裸内核：要求**逐位**等于「`n_softmax` 参考 + exit3 的
+/// argmax 规则」的组合——`val` 是同一位型、`idx` 是同一个下标。
+///
+/// 参考直接复用 [`softmax_ref`]（已复刻 8-lane 顺序和），argmax 规则照
+/// `n_exit3_argmax`：**首个严格最大、平局取最小下标**。
+///
+/// 形状覆盖：`[64,8]`（cols < 256，线程只跑一轮、多线程空转）、
+/// `[5,603]`（cols 非 8 的倍数 ⇒ 走到标量尾段）、`[96,4096]`（宽行 +
+/// 多 simdgroup，接近真机 rec 头的 2339 轮 lane 链）。
+#[test]
+fn head_argmax_raw() {
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    for (rows, cols) in [(64usize, 8usize), (5usize, 603usize), (96usize, 4096usize)] {
+        let cpad = cols.div_ceil(4) * 4;
+        let mut seed = 0xfeed_face_1234_5678_u64 ^ (rows as u64 * 31 + cols as u64);
+        let src: Vec<f32> = (0..rows * cpad)
+            .map(|_| lcg(&mut seed) * 20.0 - 10.0)
+            .collect();
+        let prob = softmax_ref(&src, rows, cols, cpad);
+        let mut want_val = vec![0f32; rows];
+        let mut want_idx = vec![0u32; rows];
+        for r in 0..rows {
+            let row = &prob[r * cpad..r * cpad + cols];
+            let (mut bv, mut bi) = (row[0], 0usize);
+            for (j, &v) in row.iter().enumerate() {
+                if v > bv {
+                    bv = v;
+                    bi = j;
+                }
+            }
+            want_val[r] = bv;
+            want_idx[r] = bi as u32;
+        }
+
+        let in_off = 4usize; // word 0 是 real_n 槽
+        let out_off = in_off + rows * cpad;
+        let pbase = out_off + rows * 2 + 8;
+        let (buf, mut m) = Words::new(&ctx.inner.device, pbase + 32);
+
+        m[0] = 0; // real_n 不限
+        for (i, v) in src.iter().enumerate() {
+            m[in_off + i] = v.to_bits();
+        }
+        let p = pbase;
+        m[p] = in_off as u32;
+        m[p + 1] = out_off as u32;
+        m[p + 2] = rows as u32;
+        m[p + 3] = cols as u32;
+        m[p + 4] = cpad as u32;
+        m[p + 5] = rows as u32; // rpb：real_n=0 时无意义
+
+        submit_compute(&ctx.inner.queue, |enc| {
+            ks.dispatch(enc, "n_head_argmax", &buf, p as u32, [rows as u32, 1, 1])
+                .expect("dispatch n_head_argmax");
+        })
+        .expect("submit");
+
+        let mut bad_val = 0usize;
+        let mut bad_idx = 0usize;
+        for r in 0..rows {
+            let gv = f32::from_bits(m[out_off + r * 2]);
+            let gi = f32::from_bits(m[out_off + r * 2 + 1]).to_bits();
+            if gv.to_bits() != want_val[r].to_bits() {
+                if bad_val == 0 {
+                    eprintln!(
+                        "[metal] n_head_argmax [{rows},{cols}] 首处 val 分歧 row={r} \
+                         gpu={:.9e}({:08x}) cpu={:.9e}({:08x})",
+                        gv,
+                        gv.to_bits(),
+                        want_val[r],
+                        want_val[r].to_bits()
+                    );
+                }
+                bad_val += 1;
+            }
+            if gi != want_idx[r] {
+                if bad_idx == 0 {
+                    eprintln!(
+                        "[metal] n_head_argmax [{rows},{cols}] 首处 idx 分歧 row={r} \
+                         gpu={gi} cpu={}",
+                        want_idx[r]
+                    );
+                }
+                bad_idx += 1;
+            }
+        }
+        eprintln!(
+            "[metal] n_head_argmax rows={rows} cols={cols} val 分歧 {bad_val}/{rows} \
+             idx 分歧 {bad_idx}/{rows}"
+        );
+        assert_eq!(bad_idx, 0, "n_head_argmax [{rows},{cols}] idx 对拍失败");
+        assert_eq!(bad_val, 0, "n_head_argmax [{rows},{cols}] val 对拍失败");
+    }
+}

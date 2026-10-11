@@ -79,6 +79,13 @@ const SHADERS: &[(&str, &str)] = &[
         include_str!("../../shaders/n_exit3_argmax.metal"),
     ),
     ("n_softmax", include_str!("../../shaders/n_softmax.metal")),
+    // rec 头的融合出口（Metal 独有，Vulkan 侧仍走 n_softmax +
+    // n_exit3_argmax）：一条内核对 logits 做完 softmax 与 argmax，逐位
+    // 等于原来两条 dispatch 的组合。见该 .metal 头注释。
+    (
+        "n_head_argmax",
+        include_str!("../../shaders/n_head_argmax.metal"),
+    ),
     ("n_attn_mm", include_str!("../../shaders/n_attn_mm.metal")),
     (
         "n_transpose_nd",

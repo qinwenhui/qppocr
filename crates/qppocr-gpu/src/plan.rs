@@ -304,6 +304,30 @@ pub struct PlanBuilder<'a> {
     /// 与 `conv1x1_mma` 同款：Vulkan 的 GLSL 侧没有 `n_convt4w`，开了会
     /// 派发到不存在的内核（硬失败，非静默降级）。
     pub conv_t_tile: bool,
+    /// **rec 头融合出口**（`QPPOCR_METAL_HEAD_FUSE`，默认 **true**）：
+    /// 图输出是 rank-3 的 `Softmax` 时，把 `Softmax → argmax 出口`
+    /// 并成**一条** Metal 独有内核 `n_head_argmax`——它对 logits 做完
+    /// softmax 再取 argmax，**逐位等于**原来那两条 dispatch 的组合
+    /// （见 `shaders/n_head_argmax.metal` 的头注释）。
+    ///
+    /// ## 为什么挖这里
+    ///
+    /// rec 头是 `MatMul.12(120→18712) → Add(偏置) → Softmax → argmax`，
+    /// 而设备端逐内核剖析里**只有头这一小段**是逐元素/归约类的重灾区：
+    /// 最宽那份计划（2 行 × w=1024）15.71 ms 里 `n_softmax` 单条 **1.84 ms**
+    /// （`Softmax.2`，out=[2,128,18710]）+ `n_exit3_argmax` 0.19 —— 而整条
+    /// softmax 只喂一个 argmax。竞品 `SimdPaddleOCR` 的 Metal 路径连最后
+    /// 这个 Softmax 节点**都不执行**（`RunInternalSkipFinalSoftmax`，其注释
+    /// "Softmax is monotonic, so class selection used logits"）；我们不必
+    /// 走到"跳掉 softmax"那一步（那会把 `val` 从最大概率变成最大 logit，
+    /// **置信度不真**），融合就能拿到大部分收益。
+    ///
+    /// ## 与 Vulkan 的关系
+    ///
+    /// `n_head_argmax` 在 Metal 侧独有；Vulkan 恒 false（走
+    /// `n_softmax` + `n_exit3_argmax`）。若误开，Vulkan 会派发到不存在的
+    /// 内核——硬失败，非静默降级（与 `conv1x1_mma` 同款）。
+    pub head_fuse: bool,
 }
 
 /// `n_conv8_mma3` 与 `n_conv8_edge` 共用的一张**覆盖几何**（全部是输出坐标）。
@@ -718,6 +742,10 @@ impl PlanBuilder<'_> {
         let mut pending_exits: Vec<(String, String, u32)> = Vec::new();
         // argmax 出口的图输出名（读回长度/形状按 [N,T,2] 覆写）
         let mut argmax_outs: std::collections::HashSet<String> = Default::default();
+        // head_fuse 融合出口：图输出名 → (val,idx) 对区域偏移。在**节点环
+        // 里**就分配好了（那时才知道输入平面的 rc），所以 exit 环见到它
+        // 直接认领，不再发 n_exit3_argmax。见 `PlanBuilder::head_fuse`。
+        let mut head_fused: HashMap<String, u32> = HashMap::new();
         // 每张量的存储形状 (rows, cols)——cols 是连续维。
         // rank-4 conv 族 = (N*H*W, Cpad)；MatMul 尾部 = (M, Npad)；
         // Squeeze/Unsqueeze/Transpose(0,2,1) 是存储恒等（别名）。
@@ -857,6 +885,65 @@ impl PlanBuilder<'_> {
                 pending_exits.push((n.inputs[0].clone(), out.clone(), 4));
                 continue;
             }
+            // **head_fuse**（见 `PlanBuilder::head_fuse`）：图输出是 rank-3 的
+            // Softmax 时，整条 `Softmax → argmax 出口` 并成**一条** Metal
+            // 独有内核 `n_head_argmax`——它对 logits 做完 softmax 再取
+            // argmax，**逐位等于**原来那两条的组合。
+            //
+            // 判据里 `argmax_exit` 是硬条件——不发 softmax 却仍要把
+            // [T×18710] 概率原样交回主机就是错的（cls 那种 rank-2 输出不
+            // 走这支）。下面 `sole_reader` 是**就地覆写**的前提：内核把 exp
+            // 写回 logits 平面，所以那个平面既不能是图输出、也不能有本节点
+            // 之外的读者。
+            if self.head_fuse
+                && self.argmax_exit
+                && n.op_type == "Softmax"
+                && is_output(&out)
+                && table
+                    .values
+                    .get(&out)
+                    .is_some_and(|v| v.shape.len() == 3)
+            {
+                let src = n.inputs[0].clone();
+                let sole_reader = !self.graph.outputs.contains(&src)
+                    && self
+                        .graph
+                        .nodes
+                        .iter()
+                        .filter(|m| m.inputs.iter().any(|i| *i == src))
+                        .count()
+                        == 1;
+                if sole_reader {
+                    if let (Some(&src_off), Some(&(rows, cpad))) = (offs.get(&src), rc.get(&src))
+                    {
+                        let real_cols =
+                            *table.values[&out].shape.last().unwrap_or(&1) as u32;
+                        let rpb = (rows / table.values[&out].shape[0].max(1) as u32).max(1);
+                        // (val, idx) 2 word/行——与 exit3 argmax 同布局
+                        let pairs_off = layout.alloc(rows * 2);
+                        let mut pb = ParamBlock::new();
+                        pb.u(src_off).u(pairs_off).u(rows).u(real_cols).u(cpad).u(rpb);
+                        let p_off = layout.alloc_static(pb.len_words());
+                        params.push((p_off, Arc::new(pb.words().to_vec())));
+                        recs.push(Rec {
+                            kernel: "n_head_argmax",
+                            node: n.name.clone(),
+                            node_idx,
+                            out_off: pairs_off,
+                            out_n: rows * 2,
+                            p_off,
+                            groups: [rows, 1, 1],
+                            ins: vec![(src.clone(), src_off, 0)],
+                            in_shapes: vec![shape_of(&table, &src)],
+                            out_shape: table.values[&out].shape.clone(),
+                        });
+                        head_fused.insert(out.clone(), pairs_off);
+                        // 输入**不释放**：内核就地覆写它、且它是这条 dispatch
+                        // 的输入——与 Sigmoid 融合那支同理，常驻到计划结束。
+                        continue;
+                    }
+                }
+            }
             // 输出区域先占（参数要引用它）。按 NHWC-f32 word 数（含
             // Cpad4 padding）。
             let out_n = numel(&table, &out);
@@ -956,6 +1043,13 @@ impl PlanBuilder<'_> {
                 exit_order.push(name.clone());
             }
             for name in exit_order {
+                // head_fuse：节点环里已经把 (val, idx) 写进 pairs 区了，
+                // 这里只认领偏移，不再发 dispatch（也就不用再造 src/rc）。
+                if let Some(&pre) = head_fused.get(&name) {
+                    offs.insert(name.clone(), pre);
+                    argmax_outs.insert(name.clone());
+                    continue;
+                }
                 let (src_name, act) = pending_exits
                     .iter()
                     .find(|(_, n, _)| *n == name)
