@@ -1190,10 +1190,28 @@ impl Engine {
             let (ch, cw) = (self.cfg.cls_height, self.cfg.cls_width);
             // cls 也用同一套扇出：按 `cls_batch` 行一组切批，批间扇出、批内
             // 串行。cls 画布固定 48×192，批起来只是把 N 填进批次维。
-            // GPU：批内并行由设备吃掉，下限 8（cls_batch=1 是 CPU 的取舍，
+            // GPU：批内并行由设备吃掉，下限 32（cls_batch=1 是 CPU 的取舍，
             // 批化在 CPU 上 4.12→11.95ms 被回退，GPU 反向——逐行提交纯亏）。
+            //
+            // **下限 32（2026-10-11 由 8 抬到 32）**：每多切一批就多付一个
+            // 设备端地板（cls 计划 104 条 dispatch，1 次 run 约 2.4~3.2 ms，
+            // 而 run 内从 2 行加到 8 行只贵 ~0.4 ms ⇒ 地板是大头）。
+            // 语料统计（corpus100 small，每图 6~17 行）：per=8 → 1.73 run/图、
+            // per=16 → 1.02、**per=32 → 1.00（饱和）**。直测（一图一进程，
+            // 交错 3 轮 × 5 图）：cls 段 **3.17 → 2.44 ms/图**，3/3 同号。
+            // `bench` 端到端 A/B 同号但落在噪声里（−1.40/−0.40/+1.00）。
+            //
+            // **逐位不变**：批维不参与任何归约，且**不补齐**（只把真实行填进
+            // 批次维，没有空行白算）⇒ 与 per=8 的 322 行输出逐位一致
+            // （含置信度 4 位小数，`grain_acc.py` 一图一进程对拍）。
+            // 顺带：per 越大**计划形状越少**（10 行图：per=8 要 (8)+(2) 两个
+            // 形状，per=32 只要 (10)）。`QPPOCR_CLS_BATCH` 覆写整条表达式。
             let per = if !cls.prefers_host_parallelism() {
-                self.cfg.cls_batch.max(8)
+                std::env::var("QPPOCR_CLS_BATCH")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or_else(|| self.cfg.cls_batch.max(32))
             } else {
                 self.cfg.cls_batch.max(1)
             };
