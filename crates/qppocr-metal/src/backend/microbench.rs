@@ -1472,8 +1472,8 @@ fn conv8_mma_matches_cpu() {
 
     // (h, w, cin, cout, 说明)：m_dim = h*w。
     //
-    // **两条实例化都要过**（NCOLS=64 走 `n_conv8_mma`，NCOLS=32 走
-    // `n_conv8_mma_n32`）：Co=96（3×32 列块）是 rec 的 Conv.4/9/12/15/47
+    // **三条实例化都要过**（NCOLS=64 走 `n_conv8_mma`，NCOLS=32 走
+    // `n_conv8_mma_n32`，`<64,4>` 那档走 `n_conv8_mma_sg4`）：Co=96（3×32 列块）是 rec 的 Conv.4/9/12/15/47
     // 与 det 的 CSP 支线的真实形状，`96%64=32` ⇒ 只能进 32 那一档。
     // 这一档的 NSG=4/128 线程是个独立耦合面（`threads_per_group` 少写一条
     // 就会让线程认领到不存在的 simdgroup、越界写 `ost`），所以必须单列用例。
@@ -1507,20 +1507,32 @@ fn conv8_mma_matches_cpu() {
             pr.co4.div_ceil(ncols),
             1,
         ];
-        submit_compute(&ctx.inner.queue, |enc| {
-            ks.dispatch(enc, kname, &pr.buf, pr.p_off, groups)
-                .expect("dispatch");
-        })
-        .expect("提交");
-        let worst = conv_error(&pr, &c);
-        eprintln!(
-            "[mb] {kname:<16} 对拍 {note:<28} ({h}×{w} c{cin}->{cout} k1): 最大误差 {worst:.3e}"
-        );
-        assert!(
-            worst < 1e-4,
-            "{kname} 与 CPU 卷积不符（{note}）：最大误差 {worst:.3e}——\
-             simdgroup_load/MMA 的布局假设错了，或 NCOLS/NSG 与线程组尺寸脱钩"
-        );
+        // **第三档也要过**（`n_conv8_mma_sg4` = `<64,4>`，128 线程、`acc[4][4]`）：
+        // 它与 `n_conv8_mma` 同网格、同参数块，只差线程组切分——所以同一个
+        // `groups` 直接喂进去就是那条「切过去只换名与线程数」的主张的验证。
+        // 它只在 64 列块上成立（NB=4 要求 nDim 是 64 的倍数）。
+        let mut names: [&str; 2] = [kname, kname];
+        let mut n_names = 1usize;
+        if ncols == 64 {
+            names[1] = "n_conv8_mma_sg4";
+            n_names = 2;
+        }
+        for &kname in &names[..n_names] {
+            submit_compute(&ctx.inner.queue, |enc| {
+                ks.dispatch(enc, kname, &pr.buf, pr.p_off, groups)
+                    .expect("dispatch");
+            })
+            .expect("提交");
+            let worst = conv_error(&pr, &c);
+            eprintln!(
+                "[mb] {kname:<20} 对拍 {note:<28} ({h}×{w} c{cin}->{cout} k1): 最大误差 {worst:.3e}"
+            );
+            assert!(
+                worst < 1e-4,
+                "{kname} 与 CPU 卷积不符（{note}）：最大误差 {worst:.3e}——\
+                 simdgroup_load/MMA 的布局假设错了，或 NCOLS/NSG 与线程组尺寸脱钩"
+            );
+        }
         std::hint::black_box(&mut pr);
     }
 }
@@ -2700,6 +2712,114 @@ fn conv8_mma_throughput() {
             c.label, a, gf(a), b, gf(b), a / b, pr.groups, mma_groups
         );
     }
+}
+
+/// `n_conv8_mma` 的**两条 64 列块切法对拍**：`<64,8>`（256 线程、`acc[2][4]`、
+/// 每 MMA 装载数 **0.75**）vs `<64,4>`（128 线程、`acc[4][4]`、**0.50**）。
+///
+/// ## 为什么这条探针算数
+///
+/// 两条实例化是**同一份源码、同一个模板、只差两行模板实参**——量的是
+/// **同一个程序**，不是剥壳版的热循环（见
+/// [[probe-wins-dont-transfer-to-production]]：决定性的是探针有没有剥壳）。
+/// 网格公式、参数块、`ost` 尺寸（16 KB）也逐字相同，所以这条的结论
+/// **可以直接迁移到生产**。
+///
+/// ## 结果（2026-10-12）：**否证，0.33×**
+///
+/// 8 个形状全部 0.30~0.41×、中位 **0.331×**——一致地慢 3 倍。数值与
+/// `<64,8>` **逐位相同**（`conv8_mma_matches_cpu` 四条 64 列用例的最大误差
+/// 也逐位相同）⇒ 不是算错，是纯粹的吞吐崩。
+///
+/// **判别式是累加分片数**：8 片的 `<64,8>`/`<32,4>` 都赢，16 片的这档崩。
+/// 每 lane 累加器 16 → 32 个寄存器、a/b 再加 12 → 16（合计 48 vs 28）⇒
+/// 越过寄存器预算落进溢出。**别用「驻留 warp 数」解释**——`mma3_n32`
+/// 同样 NSG 8→4、暂存不缩，却赢了 1.20~1.41×，该模型当场被否。
+///
+/// 这条候选的教训正是「表格上很美」：0.50 装载/MMA 比 0.75 好看，实测打崩。
+/// 形状全取真实重头 1×1 层且 `cpad4(Co) % 64 == 0`（`<64,4>` 的适用域）。
+/// 奇偶轮换序 + 取最小轮，抵消本机「先跑那条快 6~15%」的次序效应。
+#[test]
+fn conv8_mma_nsg4_scan() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
+
+    let cases = [
+        // det medium 重头 1×1（2.1 GFLOP）：大 m、小 K、中 N
+        ConvCase { label: "det m32640 c128->256 k1", h: 136, w: 240, cin: 128, cout: 256, kh: 1, kw: 1 },
+        // det 34x60：同一 m、K/N 互为镜像（生产里这对稳定差 1.5~1.9×）
+        ConvCase { label: "det 34x60 c1024->512 k1", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
+        ConvCase { label: "det 34x60 c512->1024 k1", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
+        // det 全分辨率、通道很窄（NR=4 却只有 2 个 K 步，K 循环极短）
+        ConvCase { label: "det m32640 c32->64 k1", h: 136, w: 240, cin: 32, cout: 64, kh: 1, kw: 1 },
+        // rec 行批次：m 很小（408 / 1248 行 ⇒ 7 / 20 个行块）
+        ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
+        ConvCase { label: "rec 6x208 c192->384 k1", h: 6, w: 208, cin: 192, cout: 384, kh: 1, kw: 1 },
+        // det/rec 都有的镜像对（m=1008）
+        ConvCase { label: "pair c768->1536 m1008 k1", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 },
+        ConvCase { label: "pair c1536->768 m1008 k1", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 },
+    ];
+
+    let mut ratios = Vec::new();
+    for c in &cases {
+        let pr = build_conv_case(&ctx.inner.device, c);
+        // 两条实例化适用域相同（都是 64 列块），网格公式也相同。
+        assert!(
+            c.cin % 8 == 0 && pr.co4 % 64 == 0,
+            "{} 不满足 `<64,4>` 的适用条件（nDim 必须是 64 的倍数）",
+            c.label
+        );
+        let groups = mm_sg_groups(c.h * c.w, pr.co4);
+
+        let run = |pr: &ConvProbe, name: &str, reps: u32| -> f64 {
+            let t = Instant::now();
+            submit_compute(&ctx.inner.queue, |enc| {
+                for _ in 0..reps {
+                    ks.dispatch(enc, name, &pr.buf, pr.p_off, groups)
+                        .expect("dispatch");
+                    let res: [&metal::ResourceRef; 1] = [&pr.buf];
+                    enc.memory_barrier_with_resources(&res);
+                }
+            })
+            .expect("提交");
+            t.elapsed().as_secs_f64() * 1000.0
+        };
+
+        // a = `<64,8>`（现役），b = `<64,4>`（候选）。奇偶轮换、各取最小轮。
+        let (mut a, mut b) = (f64::INFINITY, f64::INFINITY);
+        for i in 0..3 {
+            let (x, y) = if i % 2 == 0 {
+                (
+                    time_dispatch(&|r| run(&pr, "n_conv8_mma", r)),
+                    time_dispatch(&|r| run(&pr, "n_conv8_mma_sg4", r)),
+                )
+            } else {
+                let y = time_dispatch(&|r| run(&pr, "n_conv8_mma_sg4", r));
+                let x = time_dispatch(&|r| run(&pr, "n_conv8_mma", r));
+                (x, y)
+            };
+            a = a.min(x.ms);
+            b = b.min(y.ms);
+        }
+        let gf = |ms: f64| pr.flops / (ms * 1e6);
+        eprintln!(
+            "[mb] {:<26} <64,8> {:>7.3} ms ({:>6.1} GFLOPS) → <64,4> {:>7.3} ms ({:>6.1} GFLOPS) = {:.2}×  [grid {:?}]",
+            c.label, a, gf(a), b, gf(b), a / b, groups
+        );
+        ratios.push(a / b);
+    }
+
+    // 汇总：中位数是主判据（个别形状的尾部可能反向，见 `pair` 那对）。
+    ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let med = ratios[ratios.len() / 2];
+    eprintln!(
+        "[mb] ==== `<64,4>` / `<64,8>` 中位 {:.3}×（{} 个形状，最小 {:.3}、最大 {:.3}）====",
+        med,
+        ratios.len(),
+        ratios[0],
+        ratios[ratios.len() - 1]
+    );
 }
 
 /// `n_conv8_mma` 的**纯地址扫描**：形状、张量内容、参数块字段全不动，只把

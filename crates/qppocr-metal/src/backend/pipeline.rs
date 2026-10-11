@@ -51,6 +51,15 @@ const SHADERS: &[(&str, &str)] = &[
         "n_conv8_mma_n32",
         include_str!("../../shaders/n_conv8_mma.metal"),
     ),
+    // 第三档 `<64,4>`：与 `n_conv8_mma` 同走 64 通道块，但线程组 128、
+    // 每 simdgroup 瓦片 32×32（`acc[4][4]`，每 MMA 装载数 0.75 → 0.50）。
+    // ⚠️ **已否证（0.33×，8 形状全负），计划层永不派发。** 注册在这里只是
+    // 让 `microbench::conv8_mma_nsg4_scan` 有对象可量——**删掉它那条扫描
+    // 与对拍会一起失效**。见该 .metal 头注释「第三档」一节。
+    (
+        "n_conv8_mma_sg4",
+        include_str!("../../shaders/n_conv8_mma.metal"),
+    ),
     // 同一份源码两个入口：`n_conv8_mma3`（64 通道块）与 `n_conv8_mma3_n32`
     // （32 通道块，收 Co 是 32 倍数但不是 64 倍数的那批 conv）。网格公式、
     // 参数块、覆盖矩形两条完全一致，只有 NCOLS 模板参数不同——见该 .metal
@@ -128,9 +137,11 @@ const THREADS_PER_GROUP: u64 = 256;
 fn threads_per_group(name: &str) -> u64 {
     match name {
         // NCOLS=32 的两族都是 4 个 simdgroup = 128 线程（NCOLS=64 那族是
-        // 默认的 256）。**少一条这里就是静默算错**——见
-        // `n_conv8_mma.metal` 模板上那条 NSG 耦合警告。
-        "n_conv8_mma3_n32" | "n_conv8_mma_n32" => 128,
+        // 默认的 256）；`n_conv8_mma_sg4` 是 **NCOLS=64 但 NSG=4** 的第三档，
+        // 同为 128 线程（该档已被否证、计划层不派发，但扫描测试要按正确的
+        // 线程数跑——写错了量的就是另一个程序）。**少一条这里就是静默算错**
+        // ——见 `n_conv8_mma.metal` 模板上那条 NSG 耦合警告。
+        "n_conv8_mma3_n32" | "n_conv8_mma_n32" | "n_conv8_mma_sg4" => 128,
         _ => THREADS_PER_GROUP,
     }
 }
