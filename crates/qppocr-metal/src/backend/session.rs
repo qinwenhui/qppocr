@@ -242,6 +242,10 @@ pub(crate) struct MetalSession {
     /// `Softmax + argmax 出口` 并成一条 `n_head_argmax`，逐位等价。见
     /// [`head_fuse`]。
     pub(crate) head_fuse: bool,
+    /// depthwise 瓦片暂存版（`QPPOCR_METAL_DW_TILE`，默认 **true**）：
+    /// 大 tap 的 dw 走 `n_conv_dw_tile`（线程组暂存输入窗与权重）。见
+    /// [`dw_tile`] 与 `plan.rs::PlanBuilder::dw_tile` 的判据。
+    pub(crate) dw_tile: bool,
     /// 执行串行锁：每 run 重编码 + 同步等待不支持并发在飞（deferred
     /// 流水是 P4 的性能项；trait 默认的同步 run_deferred 语义等价）。
     run_lock: Mutex<()>,
@@ -417,6 +421,27 @@ fn head_fuse() -> bool {
     )
 }
 
+/// depthwise 的线程组瓦片暂存版（`QPPOCR_METAL_DW_TILE`，默认 **true**）。
+///
+/// 开着时**大 tap 的** depthwise 走 `n_conv_dw_tile`（16×16 输出瓦片 ×
+/// 一个 c4 组一个线程组，输入窗与权重先搬进线程组内存）。判据与依据见
+/// `plan.rs::PlanBuilder::dw_tile`；**3×3 及以下仍走 `n_conv_dw`**——那两条
+/// 实测 0.78×/0.86×（已贴着 DRAM 下界，暂存只是多一层来回）。
+///
+/// **过账证据**：探针 `p_dw_tile` 三形状 1.76~1.86×（见
+/// `conv_dw_variant_scan`）。逐位性由结构保证（累加次序与 base 同序、
+/// 越界 tap 加的是 ±0.0 而 `acc` 取值域里没有 -0.0），证明在
+/// `shaders/n_conv_dw_tile.metal` 头注释里——所以判据与 `head_fuse` 同级，
+/// 可以直接要求 tiny/small 逐位不变。
+///
+/// ⚠️ `n_conv_dw_tile` 是 **Metal 独有**内核，Vulkan 侧恒 false。
+fn dw_tile() -> bool {
+    !matches!(
+        std::env::var("QPPOCR_METAL_DW_TILE").as_deref(),
+        Ok("0") | Ok("off") | Ok("false")
+    )
+}
+
 impl MetalSession {
     pub(crate) fn new(
         ctx: Arc<super::Inner>,
@@ -467,6 +492,7 @@ impl MetalSession {
             conv_kxk_mma: conv_kxk_mma(),
             conv_t_tile: conv_t_tile(),
             head_fuse: head_fuse(),
+            dw_tile: dw_tile(),
             run_lock: Mutex::new(()),
             // ⚠ 这个预算是**每会话一份**，而 det / rec / cls 是三个会话
             //（各自 new 一次）。所以 `QPPOCR_GPU_KERNEL_PROF=3` 不是
@@ -605,6 +631,9 @@ impl MetalSession {
             // rec 头融合出口（默认开，置 `QPPOCR_METAL_HEAD_FUSE=0` 关）。
             // 见 [`PlanBuilder::head_fuse`]。
             head_fuse: self.head_fuse,
+            // depthwise 瓦片暂存版（默认开，置 `QPPOCR_METAL_DW_TILE=0` 关）。
+            // 见 [`PlanBuilder::dw_tile`]。
+            dw_tile: self.dw_tile,
         }
         .build(&self.input_name, in_shape, static_reserve)?;
 
@@ -964,7 +993,7 @@ impl MetalSession {
                                 (g(1) * 4) % 64,
                                 d.p_off
                             ),
-                            "n_conv_dw" => format!(
+                            "n_conv_dw" | "n_conv_dw_tile" => format!(
                                 // 段偏移也要打：dw 的权重块**同样**吃 64 B 相位
                                 // （修对齐后 det 的 dw 家族 24.3 → 17.3 ms，
                                 // `Conv.64` 单条 14.2 → 8.6），不打印就没法把

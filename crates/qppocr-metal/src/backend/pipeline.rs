@@ -61,6 +61,13 @@ const SHADERS: &[(&str, &str)] = &[
         include_str!("../../shaders/n_conv8_mma3.metal"),
     ),
     ("n_conv_dw", include_str!("../../shaders/n_conv_dw.metal")),
+    // depthwise 的线程组瓦片暂存版（Metal 独有，探针 1.76~1.86×，只在
+    // 9×9 一类的大 tap 上派发；3×3 实测更慢所以判据里排掉）。见该文件
+    // 头注释与 `PlanBuilder::dw_tile`。
+    (
+        "n_conv_dw_tile",
+        include_str!("../../shaders/n_conv_dw_tile.metal"),
+    ),
     ("n_convt", include_str!("../../shaders/n_convt.metal")),
     // 2×2/s2 的空间分块版（探针 3.45×，见该文件头注释）。只在
     // `PlanBuilder::conv_t_tile` 为真且几何/并行度满足时派发。

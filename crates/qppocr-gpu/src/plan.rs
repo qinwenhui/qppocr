@@ -339,6 +339,65 @@ pub struct PlanBuilder<'a> {
     /// `n_softmax` + `n_exit3_argmax`）。若误开，Vulkan 会派发到不存在的
     /// 内核——硬失败，非静默降级（与 `conv1x1_mma` 同款）。
     pub head_fuse: bool,
+    /// **depthwise 的线程组瓦片暂存版**（`QPPOCR_METAL_DW_TILE`，默认
+    /// **true**）：走 `n_conv_dw_tile`，一个线程组包一个 16×16 输出瓦片 ×
+    /// 一个 c4 组，输入窗与权重先搬进线程组内存，热循环里再没有运行期
+    /// 除法、没有 `ih/iw` 的乘加与两个 compare+分支、没有 `px*cv4+c4` 的
+    /// 设备地址数学。
+    ///
+    /// ## 挖这里的依据
+    ///
+    /// `n_conv_dw` 在 medium det 里 17.27 ms（det 的 17.6%），而它**严格
+    /// 正比于 c·m·taps**、恒定在 ~251 GFLOPS（fp32 峰值的 7.5%）。三轮探针
+    /// （`logs/n_conv_dw_dig_20261010.md` + `conv_dw_variant_scan` 的第三轮）
+    /// 钉下：`p_dw_fma`（只留 FMA）= 4.66× ⇒ 钱在「每 tap 那十几条整数/
+    /// 分支指令」**整段**上，不在带宽、也不在某一条指令上（逐项去掉输入
+    /// 装载 1.01×、权重装载 1.05×、边界判断 1.15×）；而所有**把循环体变大**
+    /// 的结构改动全部更慢（`nodiv` 0.74×、`u9` 0.72×、`wide4` 0.84×、
+    /// `intun` 0.59×）。瓦片暂存是唯一同时**把循环体变小**的结构。
+    ///
+    /// ## 实测（探针 `p_dw_tile`，`conv_dw_variant_scan`）
+    ///
+    /// ```text
+    /// 9×9 c256 136×240（det 首恶 Conv.64）  5.324 → 2.863 ms   1.86×
+    /// 9×9 c256  68×120（Conv.62）           1.339 → 0.761      1.76×
+    /// 9×9 c64  136×240（Conv.69）           1.325 → 0.713      1.86×
+    /// 3×3 c128 136×240                      0.365 → 0.466      0.78×  ← 更慢
+    /// 3×3 c512  34×60                       0.098 → 0.113      0.86×  ← 更慢
+    /// ```
+    ///
+    /// 3×3 更慢**可解释**：那两条的 DRAM 下界就是 0.36 ms —— 已经贴着访存
+    /// 天花板，暂存只是多一层来回。**所以启用判据里必须排除小 tap**
+    /// （`taps >= 25`，见下），这条不是保守，是实测分界。
+    ///
+    /// ## 与 `n_conv_dw` 的关系：逐位相同
+    ///
+    /// 累加次序一字未改（都是 `t` 行主序），每个在界 tap 的乘数与 base 逐字
+    /// 同式；越界 tap 由 base 的 `continue` 变成加 `0.0*w`，而 `acc` 从 `+0.0`
+    /// 起步、IEEE 加法只有「两个 -0.0 相加」才得 -0.0 ⇒ `acc` 取值域里没有
+    /// -0.0 ⇒ `acc + ±0.0 == acc` 恒成立。完整证明在
+    /// `shaders/n_conv_dw_tile.metal` 的头注释。
+    ///
+    /// ## 启用判据
+    ///
+    /// `kh == kw && 5 <= kw <= 9 && sH == 1 && sW == 1 && cpad4(C) >= 4`。
+    /// 网格随之换成 `dw_tile_grid`（**与 base 的 `div256(m*cv4)` 完全不同**，
+    /// 改一处必须改另一处）。内核自带同款形状自锁，判据写错只是算出旧结果，
+    /// 不会读飞。
+    ///
+    /// `n_conv_dw_tile` 在 Metal 侧独有；Vulkan 恒 false（走 `n_conv_dw`）。
+    /// 若误开，Vulkan 会派发到不存在的内核——硬失败，非静默降级。
+    pub dw_tile: bool,
+}
+
+/// `n_conv_dw_tile` 的网格：一个线程组 = 一个 16×16 输出瓦片 × 一个 c4 组，
+/// 恒 256 线程（`DW_TILE²`）。故 `groups[0] = tilesX·tilesY·(cdim/4)`、
+/// `groups[1] = 批`。**与 `n_conv_dw` 的 `div256(m·cv4)` 不是一套**。
+pub(crate) fn dw_tile_grid(m_dim: u32, out_w: u32, c_dim: u32) -> [u32; 3] {
+    let out_h = m_dim / out_w.max(1);
+    let tiles_x = out_w.div_ceil(16);
+    let tiles_y = out_h.div_ceil(16);
+    [tiles_x * tiles_y * (c_dim / 4), 1, 1]
 }
 
 /// `n_conv8_mma3` 与 `n_conv8_edge` 共用的一张**覆盖几何**（全部是输出坐标）。
@@ -1541,7 +1600,27 @@ impl PlanBuilder<'_> {
                         .f(c2)
                         .f(c3)
                         .u(r_off);
-                    Ok(vec![("n_conv_dw", pb, [div256(m_dim * cp / 4), nb, 1])])
+                    // 瓦片暂存版（见 `PlanBuilder::dw_tile`）：**只收大 tap**。
+                    // 判据是实测分界不是保守估计——3×3 那两条已经贴着 DRAM
+                    // 下界（0.365 ms vs 0.36 ms），暂存只会多一层来回（0.78×）。
+                    // 方形是瓦片的自然前提（`stW`/`stH` 各按一边算），stride 1
+                    // 是「瓦片内相邻输出共用输入」的前提，缺一不可。
+                    let kh_us = ws[2] as usize;
+                    let dw_tile = self.dw_tile
+                        && kh_us == kw
+                        && (5..=9).contains(&kw)
+                        && sh == 1
+                        && sw == 1
+                        && cp >= 4;
+                    if dw_tile {
+                        Ok(vec![(
+                            "n_conv_dw_tile",
+                            pb,
+                            crate::plan::dw_tile_grid(m_dim, ow, cp),
+                        )])
+                    } else {
+                        Ok(vec![("n_conv_dw", pb, [div256(m_dim * cp / 4), nb, 1])])
+                    }
                 } else {
                     Err(Error::Graph(format!(
                         "n_ 路径：Conv group={group} 不支持（仅 group=1 或 depthwise），节点 {}",

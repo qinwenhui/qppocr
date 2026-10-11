@@ -704,6 +704,9 @@ impl VulkanSession {
             // Metal 独有（GLSL 侧无 `n_head_argmax`），Vulkan 恒 false，
             // 仍走 `n_softmax` + `n_exit3_argmax`。见 `PlanBuilder::head_fuse`。
             head_fuse: false,
+            // Metal 独有（GLSL 侧无 `n_conv_dw_tile`），Vulkan 恒 false，
+            // 仍走 `n_conv_dw`。见 `PlanBuilder::dw_tile`。
+            dw_tile: false,
         }
         .build(
             &self.input_name,
