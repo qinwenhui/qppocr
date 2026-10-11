@@ -78,9 +78,27 @@
 // 尾块只在 `inner_w % 64 != 0` 时铺（计划层决定），所以余数为 0 的形状一格
 // 都不多。尾块在**行尾**上，网格里是 `wg.x` 的最后 `nch` 个值。
 //
+// # 尾块（N 方向不满一个列块）
+//
+// 上面那条尾块在**行方向**（空间）；这里这条在**通道方向**，与
+// `n_conv8_mma.metal` 的 1×1 版是同一件事、同一套做法，理由逐字相同，
+// 见那边的「尾块」一节。要点只有三条：
+//
+// - `nch` 取上取整，最后一块允许 `n0 + NCOLS > nDim`；
+// - 该块的 B 分片（`simdgroup_load(b[j], ..., n0 + sn + j*8u, nDim)`）会读
+//   到权重行尾之后——落点要么是同一张表的下一行（k < kf-1，有限值），
+//   要么是段尾，由重排侧垫的 `nhwc::MMA_W_TAIL` 个 0 兜住（`plan.rs`）；
+// - 越读的产物**只落在 acc 的 `n >= nDim` 那几列**，尾声按 `n < nDim`
+//   掩码丢掉——掩码必须在读 `ost[e]` 与索引 bias 之前。
+//
+// `NCOLS == 64` 那条实例化永远走不到这里（计划层只在 `nDim % 64 == 0`
+// 时才选它），所以尾块的实际最大越读量按 `NCOLS = 32` 算：
+// 最后一块基 `(nch-1)*32`、`sn` 最大 16、`j*8` 最大 8、再加 8 宽 →
+// 最多越过行尾 31 个 float ≤ `MMA_W_TAIL`。
+//
 // # 网格
 //
-//   groups = [nx * nch, outH-(taps/kW - 1), batch]，nch = nDim/64，
+//   groups = [nx * nch, outH-(taps/kW - 1), batch]，nch = ceil(nDim/NCOLS)，
 //   **nx = nfb + (inner_w % 64 != 0)**（余数为 0 时没有尾块）。
 //   **通道块在 wg.x 里变化最快**（`wg.x % nch`）——相邻线程组取同一片 A
 //   （A 是 DRAM 大头），权重小得多且本就 L2 常驻。
@@ -128,9 +146,9 @@
 //     内存，要在两次 dispatch 之间改它就是「编码期 CPU 写 GPU 正在读的
 //     缓冲」——数据竞争，不是慢一点的问题。
 //   · 于是两条必须**读同一块参数**。这里需要的每个字段（mDim/outW/inW/
-//     inH/nDim/cin4v/taps/kW/padT/padL/act/c1..c3/r_off）标准块里都有，
-//     `outH` 还能由 `mDim/outW` 导出（输出平面恒为 outH*outW），sH/sW 由
-//     启用门保证恒为 1 而**不被本内核读取**。所以共享是可行的。
+//     inH/nDim/cin4v/taps/kW/sH/sW/padT/padL/act/c1..c3/r_off）标准块里
+//     都有，`outH` 还能由 `mDim/outW` 导出（输出平面恒为 outH*outW）。
+//     所以共享是可行的。
 //   · 权重/输入/输出的字节语义与 `n_conv8` 完全一致（同一份 repack 布局、
 //     同一个 arena），两支持同一张权重表。
 //
@@ -157,8 +175,10 @@
 // 那条实例化因此**卡在装载发射槽**上；处方是把它的 simdgroup 从 8 个减到 4 个
 // （行方向每 sg 16 → 32），瓦片不变、比值回到 0.75，实测 1.26×。
 //
-// 计划层按 `Co%64==0 ? 64 : 32` 选内核名（`co4%32 != 0` 时回落 `n_conv8`）。
-// 两条都是本模板的实例化，瓦片映射/覆盖矩形/尾块/边框的推理**逐字共用**。
+// 计划层按 `Co%64==0 ? 64 : 32` 选内核名（`co4%8 != 0` 时回落 `n_conv8`；
+// `%32 != 0` 但不为 0 余数的那几档走 32 列块 + 通道尾块掩码，见「尾块
+// （N 方向）」一节）。两条都是本模板的实例化，瓦片映射/覆盖矩形/尾块/
+// 边框的推理**逐字共用**。
 #include <metal_stdlib>
 using namespace metal;
 
@@ -260,7 +280,11 @@ static void mma3_body(
     uint b = wg.z;
     if (params[0] != 0u && b >= params[0]) return; // 批上限早退（同 n_conv8）
 
-    uint nch = nDim / NCOLS;               // 通道块数（nDim 是 NCOLS 的倍数）
+    // 通道块数：**上取整**，最后一块允许不满（`nDim % NCOLS != 0`）。
+    // 与 `n_conv8_mma.metal` 的 1×1 版同一个做法：不满块的 B 分片会越读
+    // 权重行尾，落点只有「下一行」与「段尾尾垫」两种，产物一律落在
+    // `n >= nDim` 那几列、由尾声掩码丢掉（见文件头「尾块」一节）。
+    uint nch = (nDim + NCOLS - 1u) / NCOLS;
     uint nblk = wg.x % nch;                // 本线程组的通道块（变化最快）
     uint xblk = wg.x / nch;                // 本线程组的空间块
 
@@ -356,6 +380,10 @@ static void mma3_body(
         if (i < i_lo) continue; // 尾块：与前一档重叠的那几列不写（见文件头）
         uint j = e % NCOLS;     // 输出通道偏移（本通道块内）
         uint n = n0 + j;
+        // 列尾掩码：`nDim % NCOLS != 0` 时最后一块不满，`n >= nDim` 那几列
+        // 的 acc 被越读到的权重污染了——**必须在读 ost[e] 之前挡掉**
+        // （bias 那行还直接拿 n 去索引，越界）。见文件头「尾块」一节。
+        if (n >= nDim) continue;
         float v = ost[e];
         if (b_off != OFF_NONE) v += f32v[(b_off >> 2) * 4u + n];
         v = act1(v, act, c1, c2, c3);

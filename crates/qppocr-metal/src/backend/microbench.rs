@@ -1569,13 +1569,13 @@ fn conv8_mma3_throughput() {
         let nrows = pr.out_h - (k - 1);
         // 通道块宽与 plan.rs 同一判据（第 N 份拷贝，测试里就是要独立一份）。
         let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
-        let nch = pr.co4 / ncols;
+        let nch = pr.co4.div_ceil(ncols); // 上取整（通道尾块，见 plan.rs 同支）
         let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
         // 契约检查：不满足就是**门外**（计划层不会派发这种形状），打印后跳过。
         // 后两条是边框紧凑网格的门禁（plan.rs 逐字同款）——把它们也算进契约，
         // 否则这里会量到一种生产根本不派发的配置。
         let gl = (k / 2 + 3) / 4;
-        if nfb < 1 || c.cin % 8 != 0 || pr.co4 % 32 != 0 || pr.out_w % 4 != 0 || 2 * gl > pr.out_w / 4 {
+        if nfb < 1 || c.cin % 8 != 0 || pr.co4 % 8 != 0 || pr.out_w % 4 != 0 || 2 * gl > pr.out_w / 4 {
             eprintln!(
                 "[mb] {:<26} 门外：nfb={nfb} cin={} co4={} outW={} 2gL={}（计划层会回落 n_conv8）",
                 c.label, c.cin, pr.co4, pr.out_w, 2 * gl
@@ -1700,7 +1700,8 @@ fn conv8_mma3_load_attribution() {
         let pr = build_conv_case(&ctx.inner.device, c);
         let k = c.kh;
         let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
-        let nch = pr.co4 / ncols;
+        // 本组的形状全是 co4 ∈ {32,64}，整除/上取整同值；照抄 plan.rs 的式子。
+        let nch = pr.co4.div_ceil(ncols);
         let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
         let inner_w = pr.out_w - (k - 1);
         let nfb = inner_w / 64;
@@ -1964,16 +1965,23 @@ fn conv8_mma3_matches_cpu() {
     let Some(ctx) = open_or_skip() else { return };
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
-    // 用例分两族，**同一个断言体跑**：
+    // 用例分三族，**同一个断言体跑**：
     //
     //   · **对称 pad + stride1**（前 9 例，历史用例）：走的是旧式覆盖矩形，
     //     作用是钉住「泛化是逐位等价的」。**其中后四例专打 32 通道块那一档**
     //     （`n_conv8_mma3_n32`）：det 的 CSP 三连 Conv.111/114/117 就是
     //     Co=32 Ci=32 落在 240×216 上。
-    //   · **stride≠1 / 非对称 pad**（后 5 例，新增）：det 头部三条的真实
+    //   · **stride≠1 / 非对称 pad**（中 5 例）：det 头部三条的真实
     //     形状——`Conv.1/2` 是 2×2 SAME（pads `(0,1,0,1)` ⇒ `gL=0 gR=1`）、
     //     `Conv.3` 是 3×3 stride2。这三条此前被「步长 1 + 对称 pad」两条
     //     判据挡在 MMA 之外，合计 13.3 ms ≈ `n_conv8` 总时的 61%。
+    //   · **通道尾块**（`cpad4(Co) % 32 != 0`，中 5 例）：判据从 `%32`
+    //     放宽到 `%8` 后新收的 Co=24/40/48 那几档，打的是 B 分片越过权重
+    //     行尾之后的落点 + `n < nDim` 掩码。
+    //   · **非方形 k**（`kh != kw`，后 6 例，最新）：`kh==kw` 这条旧判据
+    //     拆掉后新收的 det 六对（1×7/7×1/5×1/1×5/3×1/1×3）。打的是
+    //     `ky = t/kW` 的解码，以及 `kH=1`/`kW=1` 两种**边框退化**——
+    //     见用例表里那一段的说明。
     //
     // **全部 outW ≡ 0 (mod 4)**：紧凑网格门禁（行组 = 连续 4 个 x，不跨行
     // 是枚举与平面映射不错位的前提）。对称 pad + stride1 下 `outW≡0 mod 4`
@@ -1985,6 +1993,14 @@ fn conv8_mma3_matches_cpu() {
     };
     let strided = |h, w, cin, cout, k, g, note| {
         let c = ConvCase { label: "mma3", h, w, cin, cout, kh: k, kw: k };
+        (c, g, note)
+    };
+    // 非方形：`kh`/`kw` 分开给，pad 由 [`ConvGeom::sym`] 各算一份
+    // （`pH = kh/2`、`pW = kw/2`）——正是 det 那六对 1×7/7×1/5×1/1×5/3×1/1×3
+    // 的形态（ONNX SAME：kH=1 那对 `padT=padB=0`，kW=1 那对 `padL=padR=0`）。
+    let rect = |h, w, cin, cout, kh, kw, note| {
+        let c = ConvCase { label: "mma3", h, w, cin, cout, kh, kw };
+        let g = ConvGeom::sym(&c);
         (c, g, note)
     };
     let cases: Vec<(ConvCase, ConvGeom, &str)> = vec![
@@ -2024,20 +2040,62 @@ fn conv8_mma3_matches_cpu() {
             ConvGeom { sh: 2, sw: 2, pt: 1, pl: 1, pb: 2, pr: 2 },
             "**4×4 stride2** 非对称 pads(1,1,2,2)",
         ),
+        // ── 通道尾块（`cpad4(Co) % 32 != 0`）——
+        //
+        // 判据从 `%32` 放宽到 `%8` 后新收进来的形状（det 的 Conv. 里有
+        // Co=24/48 那几档）。**这一族打的是 B 分片越过权重行尾之后的落点**：
+        // 越读到的是别的 k 的权重或段尾的 `nhwc::MMA_W_TAIL` 个 0，产物只
+        // 落进 `n >= nDim` 的列——本族任何一例的 `worst_in` 飘起来，都说明
+        // 那条掩码或那段尾垫没兜住。
+        //
+        // 第一例的第二块只剩 8 列（`40 = 32 + 8`）：本行 B 分片的列偏移最大
+        // 24（`sn=16` + `j*8=8`），加 8 列宽 ⇒ 越过行尾 `64 - nDim = 24` 个
+        // float，是全族最接近尾垫上限 32 的一档（一般式的上界是 31，见内核
+        // 头注释「尾块（N 方向）」）。
+        mk(16, 68, 32, 40, 3, "**Co=40=32+8** 第二块只 8 列、越读最深"),
+        mk(16, 132, 32, 48, 3, "**Co=48=32+16** 尾块半满"),
+        mk(16, 132, 32, 24, 3, "**Co=24** 单块 32 列只填 24"),
+        mk(24, 200, 32, 8, 7, "**Co=8** 单块只填 8（最极端不满）"),
+        strided(
+            64, 136, 32, 48, 3,
+            ConvGeom { sh: 2, sw: 2, pt: 1, pl: 1, pb: 1, pr: 1 },
+            "**Co=48 + 3×3 stride2** 尾块×步长",
+        ),
+        // ── 非方形 k（`kh != kw`）——det 那六对的形态 ──
+        //
+        // 这一族打的三件事，每一件都能单独把结果打歪：
+        //   · `ky = t/kW`、`kx = t-ky*kW` 的解码（权重表是 `[tap][k][n]`，
+        //     tap 的最快变化维是 **kx 不是 ky**；弄反了错值仍有限、不越界，
+        //     只能靠数值对上否掉）；
+        //   · **kH=1 那两例**（`padT=padB=0` ⇒ `y_lo=0`、`y_hi=outH-1`）：
+        //     内点行铺满整幅图 ⇒ 边框集合退化成「只有左右两条竖带」，
+        //     上/下台行数为 0（这是方形族**永远走不到**的一支，方形 k 的
+        //     `padT>=1` 让上台恒非空）；
+        //   · **kW=1 那两例**（`padL=padR=0` ⇒ `x_lo=0`、`x_hi=outW-1`）：
+        //     反向退化——边框只剩上/下两条横带，`gL=gR=0`（中带瓦片数 = 0）。
+        //   两例都要求 `outW % 4 == 0` 且 `outW ≥ 64`（列内点至少一个 64 块）。
+        rect(64, 132, 32, 64, 1, 7, "**1×7** kH=1 padT=0 上台空、边框只剩左右"),
+        rect(64, 132, 32, 64, 7, 1, "**7×1** kW=1 padL=0 中带空、边框只剩上下"),
+        rect(64, 136, 32, 64, 3, 1, "**3×1** kW=1 窄列"),
+        rect(64, 136, 32, 48, 1, 3, "**1×3 + Co=48** 非方形×通道尾块"),
+        rect(64, 200, 32, 32, 5, 1, "**N32 5×1** 非方形×32 列块"),
+        rect(64, 200, 32, 32, 1, 5, "**N32 1×5** 非方形×32 列块"),
     ];
 
     for (c, geom, note) in cases {
-        let k = c.kh;
         let pr = build_conv_case_geom(&ctx.inner.device, &c, geom, 1, false);
         let (out_h, out_w, co4) = (pr.out_h, pr.out_w, pr.co4);
-        let (ci4, taps) = (c.cin.div_ceil(4) * 4, k * k);
+        // `kh`/`kw` **分开传**（非方形族）：`taps`、覆盖几何、边框网格三处
+        // 都只认这一对，内核里 `ky = t/kW`、`kx = t-ky*kW` 也是分开的。
+        let (ci4, taps) = (c.cin.div_ceil(4) * 4, c.kh * c.kw);
         // 覆盖几何——**第三份独立拷贝**（见 `kxk_cover_test`）。
-        let cv = kxk_cover_test(&pr, k, k);
-        // 通道块宽 64/32 二选一——与 plan.rs 那支**同一判据**。
+        let cv = kxk_cover_test(&pr, c.kh, c.kw);
+        // 通道块宽 64/32 二选一——与 plan.rs 那支**同一判据**；`nch` 上取整
+        // （`co4 % ncols != 0` 时最后一块不满，见内核头注释「尾块（N 方向）」）。
         let ncols = if co4 % 64 == 0 { 64 } else { 32 };
-        let nch = co4 / ncols;
+        let nch = co4.div_ceil(ncols);
         let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
-        assert!(co4 % 32 == 0 && (ci4 % 8) == 0, "用例不满足通道门：co4={co4} ci4={ci4}");
+        assert!(co4 % 8 == 0 && (ci4 % 8) == 0, "用例不满足通道门：co4={co4} ci4={ci4}");
 
         // 段布局重算（与 build_conv_case_geom 同式）+ 自检：公式漂了就先炸在
         // 这里，而不是让下面读到别的段上。
@@ -2098,7 +2156,7 @@ fn conv8_mma3_matches_cpu() {
         // ── pass B：只派 edge（**紧凑网格**），要求「边框全对 + 内点原封不动」──
         // 边框是**空集**时生产不发这条 dispatch（空网格没定义，见 plan.rs 那一支），
         // 这里也必须跳过——否则测的就不是生产行为。
-        let eg = edge_groups_geom(&pr, k, k);
+        let eg = edge_groups_geom(&pr, c.kh, c.kw);
         refill_out_sentinel(&pr);
         if eg[0] != 0 {
             submit_compute(&ctx.inner.queue, |enc| {
@@ -2136,12 +2194,14 @@ fn conv8_mma3_matches_cpu() {
 
         let border = out_h * out_w - covered;
         eprintln!(
-            "[mb] conv8_mma3 对拍 {note:<34} ({out_h}×{out_w} c{cin}->{cout} k{k} s{sh} 尾 {tail}): \
+            "[mb] conv8_mma3 对拍 {note:<34} ({out_h}×{out_w} c{cin}->{cout} k{kh}×{kw} s{sh} 尾 {tail}): \
              内点 {covered} px 误差 {worst_in:.3e}、边框 {border} px 误差 {worst_out:.3e}、\
              越界写 0/0｜edge 网格 {} → {} 组（紧凑/全平面）",
             pr.groups[0], eg[0],
             cin = c.cin,
             cout = c.cout,
+            kh = c.kh,
+            kw = c.kw,
             sh = geom.sh,
         );
     }

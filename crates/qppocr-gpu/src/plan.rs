@@ -260,13 +260,15 @@ pub struct PlanBuilder<'a> {
     /// - `outW-(kw-1) >= 64` ⇒ `xb>=xa+63`：内点列宽至少一个块，尾块锚点
     ///   `x0>=xa` 也靠它；
     /// - `cpad4(Cin)%8==0`：K 步长 8 不越界；
-    /// - **`cpad4(Co)%32==0`**：通道块宽按 `Co%64==0 ? 64 : 32` 二选一
+    /// - **`cpad4(Co)%8==0`**：通道块宽按 `Co%64==0 ? 64 : 32` 二选一
     ///   （`n_conv8_mma3` / `n_conv8_mma3_n32`）。**32 这一档不是锦上添花**：
     ///   端到端剖析（`kxk_scan.py`）显示 medium det 的 k×k 家族 15 条里有
     ///   **12 条 Co=32**（CSP 三连 Co=32 Ci=32），其中 Conv.111/114/117 在
     ///   240×216、空间门全过——第一版只收 64 时**整张图只有 1 条 conv 点火**
     ///   （Conv.121）。挡住的从来不是几何，是通道块宽。两条实例化的网格
     ///   公式/覆盖矩形**逐字相同**，只有 NCOLS 不同，见内核头注释。
+    ///   `Co%64!=0` 且 `Co%32!=0`（即 24/48 这类）走 32 列块 + 通道尾块掩码，
+    ///   与 `conv1x1_mma` 同款（`nhwc::MMA_W_TAIL` 兜住 B 分片越读）。
     /// - `!weight_f16`：MMA 内核读的是 f32 权重（与 1×1 同）。
     ///
     /// 与 `conv1x1_mma` 同款：Vulkan 的 GLSL 侧没有这两个内核。
@@ -371,7 +373,9 @@ pub(crate) struct KxkCover {
 
 impl KxkCover {
     /// 画布上的全部 mma3 线程组（不含 edge）。网格公式与 `mma3_body` 里
-    /// 的 `xblk`/`nfb` 解码逐字一致。
+    /// 的 `xblk`/`nfb` 解码逐字一致。`nch` 由调用方按
+    /// `cpad4(Co).div_ceil(NCOLS)` 算好（内核里同式）——**上取整**，
+    /// 最后一块允许不满一个列块。
     pub fn mma_groups(&self, nch: u32, nb: u32) -> [u32; 3] {
         [(self.nfb + self.has_tail) * nch, self.ny, nb]
     }
@@ -1375,26 +1379,39 @@ impl PlanBuilder<'_> {
                         && pads.1 == 0
                         && cpad4(ws[1]) % 8 == 0
                         && cpad4(ws[0]) % 8 == 0;
-                    // k×k（k>1）：方块 k×k 走 `n_conv8_mma3`。**不再要求步长 1
-                    // 与对称 pad**——覆盖几何由 [`KxkCover`] 现算，那组算式在
-                    // stride1 + 对称 pad 下逐项退化成旧式，所以既有形状的行为
+                    // k×k（**不是 1×1**）：走 `n_conv8_mma3`。**不再要求方形、
+                    // 也不再要求步长 1 与对称 pad**——覆盖几何由 [`KxkCover`]
+                    // 现算，那组算式在 stride1 + 对称 pad 下逐项退化成旧式，
+                    // 所以既有形状的行为
                     // 一字未变；新放开的正是 det 头部那三条：
                     // Conv.1/2（2×2 SAME，pad 非对称 (0,1)）与 Conv.3（3×3
                     // stride2）。三条合计 13.3 ms ≈ `n_conv8` 总时的 61%，
                     // 而 `n_conv8` 只有 ~1050 GFLOPS（MMA 同形状 2.2~3.3 TFLOPS）。
                     //
-                    // `kh == kw` 仍是硬条件：内核用 `kH = taps/kW` 反推行数，
-                    // A 瓦片的行 stride 也只由 `sW` 与通道数决定。
+                    // **`kh != kw` 也收**（det 的 1×7/7×1/5×1/1×5/3×1/1×3 六对，
+                    // 240×216 与 120×108 两档共 12 条 dispatch、实测 3.80 ms）。
+                    // 这条判据是旧版遗留的：当年 `mma3_body` 用 `kH = taps/kW`
+                    // 自己推行数，方形是前提；现在**行方向的上下界全在
+                    // [`KxkCover`] 里按 `kh`/`kW` 各算一份**，内核只认内点行的
+                    // 起点（`y = yd_lo + wg.y`）、行数由网格的 y 维给出，
+                    // `kH` 一个字都不读。A 瓦片的行 stride 是 `sW*kf`、横向读的
+                    // 上下界也只含 `kW`/`padL`（见 `n_conv8_mma3.metal` 文件头），
+                    // 与 `kh` 无关。`n_conv8_edge` 那边同理（`kH = taps/kW` 现算）。
+                    // 判据是「**不是 1×1**」而不是「两维都 ≥2」：det 的
+                    // 1×7/1×5/1×3（kH=1）同样在门外——`conv1x1_mma` 那一支要求
+                    // `kh==kw==1`，放不进；而 kH=1 对 `mma3_body` 毫无特殊性
+                    // （`ky` 恒为 0，内点行就是整个输出行，`ny` 由网格给）。
                     let cover = if self.conv_kxk_mma
                         && !fp16
-                        && kh == kw
-                        && kh >= 2
+                        && !(kh == 1 && kw == 1)
+                        && kh >= 1
+                        && kw >= 1
                         && sh >= 1
                         && sw >= 1
                         && pads.0 >= 0
                         && pads.1 >= 0
                         && cpad4(ws[1]) % 8 == 0
-                        && cpad4(ws[0]) % 32 == 0
+                        && cpad4(ws[0]) % 8 == 0
                         && ow % 4 == 0
                     {
                         KxkCover::new(
@@ -1421,10 +1438,15 @@ impl PlanBuilder<'_> {
                         //
                         // 通道块宽 64/32 二选一（内核是同一模板的两条实例化，
                         // 网格公式只差 `nch` 这个除数——内核里同样是
-                        // `nDim / NCOLS`，所以两份仍然逐字对应）。
+                        // `ceil(nDim / NCOLS)`，所以两份仍然逐字对应）。
+                        //
+                        // `co4 % 32 != 0` 时最后一块**不满**：`div_ceil` 起
+                        // 网格、内核尾声按 `n < nDim` 掩码，越读的权重由
+                        // `nhwc::MMA_W_TAIL` 兜住——与 1×1 那条同款，见
+                        // `n_conv8_mma3.metal` 头注释「尾块（N 方向）」一节。
                         let co4 = cpad4(ws[0]);
                         let ncols = if co4 % 64 == 0 { 64 } else { 32 };
-                        let nch = co4 / ncols;
+                        let nch = co4.div_ceil(ncols);
                         let kname = if ncols == 64 {
                             "n_conv8_mma3"
                         } else {
