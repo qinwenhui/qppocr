@@ -72,14 +72,22 @@ done
 echo
 echo "── 配对差值（new − old，负 = new 更快）───────────────────────────"
 printf '%s\n' "${ROWS[@]}" | awk '
+# ROWS 一条 = "<轮> <臂> <total> <det> <line> <wall>"。
+# ⚠️ 索引陷阱（2026-10-11 踩了两次，记在这里）：下面 `r[...]` 存的是
+# `$3" "$4" "$5" "$6`——**字符串从 1 重新编号**，所以再 split 出来是
+#   a[1]=total  a[2]=det  a[3]=line  a[4]=wall
+# 而不是 a[3]=total。原版取 a[2]/a[3]/a[4] 恰好是 det/line/**wall**：
+# 前两列对，第三列的标题「total」其实是 wall（本轮 66.4 是 total、
+# 68.7 是 wall，差的就是模型装载与收尾）。修成 a[1]/a[2]/a[3]。
 { r[$1"_"$2]=$3" "$4" "$5" "$6; if ($1>maxr) maxr=$1 }
 END {
-  printf "%-6s %9s %9s %9s\n", "round", "det", "line", "total"
+  printf "%-6s %9s %9s %9s\n", "round", "total", "det", "line"
   for (i=1;i<=maxr;i++) {
     split(r[i"_new"], a, " "); split(r[i"_old"], b, " ")
     if (a[1]=="") continue
-    printf "%-6d %+9.2f %+9.2f %+9.2f\n", i, a[2]-b[2], a[3]-b[3], a[4]-b[4]
-    n++; d[n,1]=a[2]-b[2]; d[n,2]=a[3]-b[3]; d[n,3]=a[4]-b[4]
+    printf "%-6d %+9.2f %+9.2f %+9.2f\n", i, a[1]-b[1], a[2]-b[2], a[3]-b[3]
+    n++; d[n,1]=a[1]-b[1]; d[n,2]=a[2]-b[2]; d[n,3]=a[3]-b[3]
+    ctl[n]=b[1]                       # 对照臂（old）自己的 total，供漂移门禁用
   }
   for (c=1;c<=3;c++) {
     for (i=1;i<=n;i++) v[i]=d[i,c]
@@ -88,7 +96,35 @@ END {
     s=0; for (i=1;i<=n;i++) s+=v[i]
     mean[c]=s/n
   }
-  printf "\n中位配对差值  det %+.2f   line %+.2f   total %+.2f  (n=%d)\n", med[1], med[2], med[3], n
-  printf "均值配对差值  det %+.2f   line %+.2f   total %+.2f\n", mean[1], mean[2], mean[3]
+  printf "\n中位配对差值  total %+.2f   det %+.2f   line %+.2f  (n=%d)\n", med[1], med[2], med[3], n
+  printf "均值配对差值  total %+.2f   det %+.2f   line %+.2f\n", mean[1], mean[2], mean[3]
+
+  # ── 漂移门禁（与 env_ab.sh 同款，2026-10-11 补）──────────────────────
+  # 本机在带宽照样达标的同时会整体爬升（同一天 small 70→155 ms）。判据只
+  # 看**对照臂（old）自己的离散**，**绝不按 Δ 筛轮**——按 Δ 筛是挑噪声。
+  lo=ctl[1]; for (i=2;i<=n;i++) if (ctl[i]<lo) lo=ctl[i]
+  hi=ctl[1]; for (i=2;i<=n;i++) if (ctl[i]>hi) hi=ctl[i]
+  spread = (lo>0) ? hi/lo : 0
+  printf "\n对照臂（old）基线：最冷 %.1f ms、最热 %.1f ms（%.2f×）\n", lo, hi, spread
+  if (spread <= 1.15) {
+    printf "✅ 漂移门禁：对照臂离散 %.2f× ≤ 1.15 ⇒ 上面的中位数可用。\n", spread
+  } else {
+    nc=0
+    for (i=1;i<=n;i++) if (ctl[i] <= lo*1.10) { nc++; kt[nc]=d[i,1]; kd[nc]=d[i,2]; kl[nc]=d[i,3]; kr[nc]=i }
+    printf "⚠️  漂移门禁：对照臂离散 %.2f× > 1.15 ⇒ **本轮已漂移，上面的中位数不可用作结论**。\n", spread
+    if (nc >= 2) {
+      for (c2=1;c2<=3;c2++) {
+        for (i=1;i<=nc;i++) { v[i] = (c2==1)?kt[i]:((c2==2)?kd[i]:kl[i]) }
+        for (i=1;i<=nc;i++) for (j=i+1;j<=nc;j++) if (v[i]>v[j]) { t=v[i]; v[i]=v[j]; v[j]=t }
+        km[c2] = (nc%2) ? v[(nc+1)/2] : (v[nc/2]+v[nc/2+1])/2
+      }
+      printf "    只留「old ≤ 最冷轮 ×1.10」的 %d/%d 轮（轮号", nc, n
+      for (i=1;i<=nc;i++) printf " %d", kr[i]
+      printf "）：\n    稳定轮 Δtotal 中位 = %+.2f ms   Δdet = %+.2f   Δline = %+.2f\n", km[1], km[2], km[3]
+      printf "    —— 报结论用这一行，别用上面那行。\n"
+    } else {
+      printf "    稳定轮只剩 %d 个 ⇒ **本轮整个弃用**，等机身凉下来重跑。\n", nc
+    }
+  }
 }'
 echo "日志：$LOG"

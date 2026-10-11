@@ -4427,6 +4427,182 @@ fn threads_per_group_sweep() {
     }
 }
 
+/// 造一块 head 探针用的 arena（布局与 `plan.rs` 的 head_fuse 逐字对应）。
+///
+/// 返回 `(buf, p_off, out_off)`。`in_off = 4`（word 0 是 real_n 槽，0 =
+/// 不限），数据在 `in_off..in_off+rows*cpad`，输出对 `out_off..`。
+fn head_arena(
+    device: &metal::DeviceRef,
+    rows: usize,
+    cols: usize,
+    cpad: usize,
+    seed: u64,
+) -> (metal::Buffer, u32, u32) {
+    let in_off = 4usize;
+    let out_off = in_off + rows * cpad;
+    let pbase = out_off + rows * 2 + 8;
+    let words = pbase + 32;
+    let buf = device.new_buffer(
+        (words * 4) as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    // SAFETY: 缓冲独占、长度就是 words；映射持久，测试内无别名并发。
+    unsafe {
+        let base = buf.contents() as *mut u32;
+        for i in 0..words {
+            *base.add(i) = 0;
+        }
+        // 与 `kernel_tests::lcg` 同款（那边是私有 fn，兄弟模块取不到）：
+        // 确定性 ±20 的 logits。取值本身不影响时间——exp1 与 argmax 都无
+        // 数据相关分支。
+        let mut s = seed;
+        for i in 0..rows * cpad {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let v = ((s >> 33) as f32 / (1u64 << 31) as f32) * 40.0 - 20.0;
+            *base.add(in_off + i) = v.to_bits();
+        }
+        let p = base.add(pbase);
+        *p = in_off as u32;
+        *p.add(1) = out_off as u32;
+        *p.add(2) = rows as u32;
+        *p.add(3) = cols as u32;
+        *p.add(4) = cpad as u32;
+        *p.add(5) = rows as u32; // rpb：real_n=0 时无意义
+    }
+    (buf, pbase as u32, out_off as u32)
+}
+
+/// `n_head_argmax` 的**线程组大小**扫描（`probe_head.metal`，见文件头注释）。
+///
+/// 真形状：small 档 rec 的四份计划，`QPPOCR_GPU_KERNEL_PROF` 的
+/// `grid=[rows,1,1]` = **160 / 168 / 112 / 256**，`cols = 18710`
+/// （`plan.rs` 的 `[T×18710]`；与同计划 `n_channel Add.204 grid=[2924,1,1]`
+/// 互证：160×18712/4/256 = 2924 ✓）。plan1 的 `rows=160` ⇒ **整卡只有 160
+/// 个线程组**在搬 18712 列 × 4 趟。
+///
+/// 变体只改线程组大小，**位级安全**：max 与 argmax 的结合律/平局规则与划分
+/// 无关（见 `probe_head.metal` 头注释），phase 3 的 8 条 lane 链一字不动。
+/// 所以先拿 `p_h_t256` 的输出当基准断言其余变体逐位相等，再量时间。
+#[test]
+fn head_argmax_tg_sweep() {
+    let _g = gpu_guard();
+    let Some(ctx) = open_or_skip() else { return };
+    let device = &ctx.inner.device;
+    let queue = &ctx.inner.queue;
+    let probes = super::conv_probe::ProbeSet::from_list(
+        device,
+        super::conv_probe::HEAD_PROBE_SHADERS,
+    )
+    .expect("编译 head 探针");
+    // 断言位级相同的变体：换线程组大小（归约序变但 max/argmax 与序无关）
+    // 与链展开（加法次序一字不改）。`p_h_s*` / `p_h_noexp` 故意不等，只量时间。
+    let names = [
+        "p_h_t256",
+        "p_h_t512",
+        "p_h_t1024",
+        "p_h_u4",
+        "p_h_u8",
+        "p_h_u16",
+        "p_h_u32",
+        "p_h_u64",
+    ];
+    let cols = 18710usize;
+    let cpad = cols.div_ceil(4) * 4;
+    let shapes = [160usize, 168, 112, 256];
+
+    // ── 位级：所有变体应与 256 组输出逐位相同 ──
+    let mut nbad = 0usize;
+    for rows in shapes {
+        let mut want: Option<Vec<u32>> = None;
+        for (vi, name) in names.iter().enumerate() {
+            let (buf, p_off, out_off) = head_arena(device, rows, cols, cpad, 0xabcd_1234);
+            submit_compute(queue, |enc| {
+                dispatch_with_tg(
+                    enc,
+                    probes.pipe(name).expect("取管线"),
+                    &buf,
+                    p_off,
+                    [rows as u32, 1, 1],
+                    super::conv_probe::head_probe_tg(name),
+                )
+                .expect("dispatch");
+            })
+            .expect("提交");
+            // SAFETY: out_off + rows*2 在分配内（见 head_arena 的 pbase 计算）。
+            let got: Vec<u32> = unsafe {
+                let base = buf.contents() as *const u32;
+                (0..rows * 2).map(|i| *base.add(out_off as usize + i)).collect()
+            };
+            match &want {
+                None => want = Some(got),
+                Some(w) => {
+                    let d = w.iter().zip(&got).filter(|(a, b)| a != b).count();
+                    if d > 0 {
+                        eprintln!("[head] ⚠️ rows={rows} {name} 与 t256 有 {d} 处位级分歧");
+                    }
+                    nbad += d;
+                    assert_eq!(d, 0, "rows={rows} {name} 线程组大小扫描不是位级不变");
+                }
+            }
+            let _ = vi;
+        }
+    }
+    eprintln!(
+        "[head] 位级：{} 个变体 × {} 个形状全部与 t256 逐位一致（分歧 {nbad}）",
+        names.len(),
+        shapes.len()
+    );
+
+    // ── 时间 ──
+    // 列 = 变体。`s1/s2/s3` 是**前缀**（只跑前 k 个阶段），所以列间差
+    // 就是那一阶段的成本；`noexp` 只换 exp1 多项式。
+    let timed = [
+        "p_h_t256",
+        "p_h_t512",
+        "p_h_t1024",
+        "p_h_s1",
+        "p_h_s2",
+        "p_h_s3",
+        "p_h_noexp",
+        "p_h_u4",
+        "p_h_u8",
+        "p_h_u16",
+        "p_h_u32",
+        "p_h_u64",
+    ];
+    eprintln!("[head] n_head_argmax 扫描（cols={cols}，cpad={cpad}）");
+    eprint!("[head] {:>5}", "rows");
+    for name in timed {
+        eprint!(" {:>9}", &name[4..]);
+    }
+    eprintln!();
+    for rows in shapes {
+        eprint!("[head] {:>5}", rows);
+        for name in timed {
+            let (buf, p_off, _out_off) = head_arena(device, rows, cols, cpad, 0xabcd_1234);
+            let pipe = probes.pipe(name).expect("取管线");
+            let tg = super::conv_probe::head_probe_tg(name);
+            let run = |r: u32| -> f64 {
+                let t = Instant::now();
+                submit_compute(queue, |enc| {
+                    for _ in 0..r {
+                        dispatch_with_tg(enc, pipe, &buf, p_off, [rows as u32, 1, 1], tg)
+                            .expect("dispatch");
+                        let res: [&metal::ResourceRef; 1] = [&buf];
+                        enc.memory_barrier_with_resources(&res);
+                    }
+                })
+                .expect("提交");
+                t.elapsed().as_secs_f64() * 1000.0
+            };
+            eprint!(" {:>9.3}", time_dispatch(&run).ms);
+        }
+        eprintln!();
+    }
+}
+
 /// 把「墙钟 = 内核」与「墙钟 = 内核 + 逐条 barrier」劈开。
 ///
 /// `mem_bandwidth_sweep` 量到 trivial relu 只有 ~2 GB/s，但同一个 GPU 上

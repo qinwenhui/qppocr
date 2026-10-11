@@ -247,6 +247,40 @@ pub(crate) const CT_PROBE_SHADERS: &[(&str, &str)] = &[
     ("p_ct_tap4w4", include_str!("probe_convt.metal")),
 ];
 
+/// `n_head_argmax` 的**线程组大小**扫描（`probe_head.metal`，见该文件头注释）。
+///
+/// **单开一张表**：参数块语义（`params[P+0..6]` = in/out/rows/cols/cpad/rpb）
+/// 与网格（`[rows, 1, 1]`）都和别组不同，而且**线程组大小本身就是变体**
+/// ——派发时必须用 `dispatch_with_tg(..., head_probe_tg(name))`，
+/// `KernelSet::dispatch` 那个固定 256 的口径量不了这组。
+pub(crate) const HEAD_PROBE_SHADERS: &[(&str, &str)] = &[
+    ("p_h_t256", include_str!("probe_head.metal")),
+    ("p_h_t512", include_str!("probe_head.metal")),
+    ("p_h_t1024", include_str!("probe_head.metal")),
+    // 阶段归因（`STAGES` 编译期早退；只有 s4 = t256 的结果成立）。
+    ("p_h_s1", include_str!("probe_head.metal")),
+    ("p_h_s2", include_str!("probe_head.metal")),
+    ("p_h_s3", include_str!("probe_head.metal")),
+    // exp1 多项式本身的成本（换恒等函数，只量时间）。
+    ("p_h_noexp", include_str!("probe_head.metal")),
+    // phase 3 的 8 条 lane 链按 U 展开（**位级安全**，只是把地址无关的
+    // 装载先发出去、加法次序一字不改）。
+    ("p_h_u4", include_str!("probe_head.metal")),
+    ("p_h_u8", include_str!("probe_head.metal")),
+    ("p_h_u16", include_str!("probe_head.metal")),
+    ("p_h_u32", include_str!("probe_head.metal")),
+    ("p_h_u64", include_str!("probe_head.metal")),
+];
+
+/// 变体 `p_h_t<N>` 的线程组大小（直接喂 `dispatch_with_tg` 的 `tg`）。
+pub(crate) fn head_probe_tg(name: &str) -> u64 {
+    match name {
+        "p_h_t512" => 512,
+        "p_h_t1024" => 1024,
+        _ => 256,
+    }
+}
+
 /// `n_convt` 探针的网格（工作组数）。必须与内核里 `tiles` 的算法一致。
 ///
 /// `m_dim` = `outH*outW`；`co4` = `cpad4(Co)`（含 pad，与 `plan.rs` 同）。

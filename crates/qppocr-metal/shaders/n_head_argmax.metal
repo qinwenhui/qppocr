@@ -24,6 +24,24 @@
 // {k, k+8, k+16, …} 的串行和），谁算都一样 ⇒ 拆给 8 个线程，墙钟 ~8×，
 // **位级结果一字不差**。再往下拆就改序了，所以 8 是这条路的并行度上限。
 //
+// ## 为什么还要按 U=32 展开（第二阶段归因，2026-10-11）
+// 拆成 8 线程之后，这一趟仍是**每线程一条串行依赖装载**：q=2338 个地址，
+// 一次只有一个在飞。阶段归因（rows=160）：只跑到阶段 3 是 0.664 ms，再过
+// 一遍 argmax 只到 0.753 —— 而 argmax 同样搬一趟 18712 个数、256 线程只花
+// 0.089 ms。**同样一趟数据，8 个线程要 0.435 ms、它只到 ~33 GB/s（不到本机
+// 90 GB/s 的一半），256 个线程到 ~97 GB/s** ⇒ 卡的是访存延迟（MLP=1）不是
+// 带宽。
+//
+// 处方：把 U 条**地址无关**的装载先发出去，再按原顺序累加。依赖链仍是
+// `(((l+a0)+a1)+a2)…` —— 一个加法都没少、次序一字没改 ⇒ 逐位相同。
+// 实测展开倍数（rows=160，孤立探针，8 变体 × 4 形状位级全 0 分歧）：
+//   U=1 0.664 → U=4 0.522 → U=8 0.460 → U=16 0.429 → **U=32 0.395** → U=64 0.388
+// 取 **U=32**：整条内核 0.753 → 0.395 ms（**1.91×**），再往上只多 2% 而
+// 寄存器预算翻倍。展开后本阶段**已被另外三趟完全遮住**（s1 0.122 + exp
+// 0.183 + argmax 0.089 = 0.394 ≈ 整条 0.395），剩下的地板就是「四趟访存」。
+//
+// 探针在 `src/backend/probe_head.metal`（只在本模块测试里编译，不进计划）。
+//
 // 与 `qppocr-gpu/shaders/*.comp` **无对应文件**（Metal 独有，Vulkan 侧
 // 仍走 n_softmax + n_exit3_argmax）——所以改这里不会与 Vulkan 脱钩。
 //
@@ -51,6 +69,37 @@ float exp1(float x) {
     p = fma(p, r, 1.0);
     int ki = int(kf) + 127;
     return as_type<float>(uint(ki) << 23) * p;
+}
+
+// phase 3 的 8 条 lane 链，按 `U` 展开（`U==1` 是历史逐字版本，留作对照）。
+// `a[U]` 只把 U 个**地址无关**的装载提前发出，累加仍按 u 递增 —— 见文件头
+// 「为什么还要按 U=32 展开」。
+template <int U>
+static inline float chain_sum(device const float* data, uint base, uint q, uint lid)
+{
+    float l = 0.0;
+    uint t = 0u;
+    if (U == 1) {
+        for (; t < q; t++) {
+            l += data[base + t * 8u + lid];
+        }
+    } else {
+        for (; t + uint(U) <= q; t += uint(U)) {
+            float a[U];
+            #pragma unroll
+            for (int u = 0; u < U; u++) {
+                a[u] = data[base + (t + uint(u)) * 8u + lid];
+            }
+            #pragma unroll
+            for (int u = 0; u < U; u++) {
+                l += a[u];
+            }
+        }
+        for (; t < q; t++) {
+            l += data[base + t * 8u + lid];
+        }
+    }
+    return l;
 }
 
 kernel void n_head_argmax(
@@ -113,11 +162,7 @@ kernel void n_head_argmax(
     //    softmax_row_vec 的 lane 序）。链内仍是同一个串行和 ⇒ 逐位不变。
     uint q = cols >> 3;
     if (lid < 8u) {
-        float l = 0.0;
-        for (uint t = 0u; t < q; t++) {
-            l += data[base + t * 8u + lid];
-        }
-        red[lid] = l;
+        red[lid] = chain_sum<32>(data, base, q, lid);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0u) {
