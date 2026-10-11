@@ -181,12 +181,6 @@ pub(crate) struct VulkanSession {
     /// 成 (grain,W桶)，计划全命中。与 `DeviceSession::batch_grain` 同源
     /// （mod.rs 按模型角色设置；引擎按 trait 值分批）。
     pub(crate) batch_grain: i32,
-    /// 宽度精确模式（无注意力 mask 的 rec——SVTR 注意力头）：桶宽右零
-    /// 填充经注意力混入真步概率，**模型本身对填充不 invariant**（CPU
-    /// 实证 small 932/1036 掉 46 行；small_rec_padding_invariance 守卫）
-    /// ——true 时 bucket_grain=1（精确宽，同宽行仍合批）。纯卷积 rec
-    /// （tiny）实证填充不变，维持 64 桶。
-    pub(crate) exact_width: bool,
     /// rec 会话的 CTC argmax 出口：rank-3 概率输出不走 n_exit3 全量
     /// 拷贝，改 n_exit3_argmax 每时间步写 (val, idx) 对——读回从
     /// T×V×4 B/行（~3 MB）降到 8 B/行。本机 clflush 读回 ~1 ms/MB，
@@ -244,7 +238,6 @@ impl VulkanSession {
             arena_pool: std::sync::Arc::new(Mutex::new(Vec::new())),
             static_reserve: std::sync::atomic::AtomicU32::new(0),
             batch_grain: 1,
-            exact_width: false,
             argmax_exit: false,
             plan_budget_mb: 2048,
             ctx,
@@ -2017,16 +2010,21 @@ impl DeviceSession for VulkanSession {
         // rec 每行一个裸宽 → 每形状一次 ~10ms 计划重建（曾把全 GPU 的
         // rec 拖到 2× CPU）。64 桶把语料宽度塌缩到 ~20 个形状，重建
         // 只付一次；右侧零填充的额外计算远小于重建税。
-        // 例外：无注意力 mask 的模型（exact_width）填充会改真步输出
-        // （非「额外计算」而是「错值」）——退小粒度对齐。
         //
-        // **粒度 32（2026-10-11 由 8 放大，与 Metal 侧同款，用户拍板）**：
-        // 8 px 桶几乎不重合 ⇒ rec 的「一行一次 run、每次 run 一个 ~2.27 ms
-        // 设备端地板」付满（见 `bench/gpuhealth/logs/rec_grain_20261011.md`）。
-        // 证据是 **Metal 侧**实测（本机无 Vulkan 设备）：small grain8→32
-        // 共 1041 行识别文本逐字符一致、0 丢行，Δline −6.05 ms。两侧保持
-        // 同粒度，避免同一份输入在两个后端分到不同的批。
-        if self.exact_width { 32 } else { 64 }
+        // **粒度 64（2026-10-11 由 32 放大，与 Metal 侧同款，用户拍板）**：
+        // 动机是「合批」——rec 一行一次 run，每次 run 有一个 ~2.27 ms 的
+        // 设备端地板（见 `bench/gpuhealth/logs/rec_grain_20261011.md`），
+        // 64 桶把 img-001 的 rec run 数从 6 压到 4。
+        //
+        // 证据是 **Metal 侧**实测（本机无 Vulkan 设备），读两份日志：
+        // * 速度：`env_ab.sh` 交错 small 健康态 Δtotal −2.8/−3.1/−1.1/−3.25
+        //   ms、对照列 Δdet ≈ +0.00（9 轮同号）⇒ ~3 ms/图；
+        // * 精度：`grain_acc.py` 一图一进程、small 全语料 1041 行逐行对拍，
+        //   32→64 **7 行变化、0 处新增错字**（4 行纯空格位置、1 行改对、
+        //   2 行低置信度乱码行）；128/256 则提速归零且出现真错字，故停 64。
+        //
+        // 两侧保持同粒度，避免同一份输入在两个后端分到不同的批。
+        64
     }
 
     fn batch_grain(&self) -> i32 {

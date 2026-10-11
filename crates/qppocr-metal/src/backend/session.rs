@@ -208,11 +208,6 @@ pub(crate) struct MetalSession {
     /// 成 (grain,W桶)，计划全命中。与 `DeviceSession::batch_grain` 同源
     /// （mod.rs 按模型角色设置；引擎按 trait 值分批）。
     pub(crate) batch_grain: i32,
-    /// 宽度精确模式（无注意力 mask 的 rec）：桶宽右零填充经注意力混入
-    /// 真步概率（模型对填充不 invariant，CPU 实证掉行）——true 时
-    /// bucket_grain=1（精确宽，同宽行仍合批）。纯卷积 rec（tiny）填充
-    /// 不变，维持 64 桶。
-    pub(crate) exact_width: bool,
     /// rec 会话的 CTC argmax 出口：rank-3 概率输出改 n_exit3_argmax 每
     /// 时间步写 (val, idx) 对——读回从 T×V×4 B/行降到 8 B/行。引擎按
     /// `rec_argmax_pairs` 探测并走 ctc_decode_pairs。
@@ -455,7 +450,6 @@ impl MetalSession {
             // 权重重排有缓存）→ 小预算；env 覆写。
             plan_budget_mb: 384,
             batch_grain: 1,
-            exact_width: false,
             argmax_exit: false,
             weight_f16: {
                 let on = weight_f16();
@@ -1870,27 +1864,36 @@ impl DeviceSession for MetalSession {
 
     fn bucket_grain(&self) -> i32 {
         // rec 每行一个裸宽 → 每形状一次计划重建。64 桶把语料宽度塌缩
-        // 到少数形状（右侧零填充的额外计算远小于重建税）；例外：
-        // exact_width 模型填充会改真步输出（非「额外计算」而是「错值」）
-        // ——退小粒度对齐。
+        // 到少数形状（右侧零填充的额外计算远小于重建税）。
         //
-        // **粒度 32（2026-10-11 由 8 放大，用户拍板）**。理由是「合批」
-        // 而不只是「少几个形状」：rec 是**一行一次 run**，而每次 run 有
-        // 一个 ~2.27 ms 的设备端地板（173 条互相依赖的 dispatch，见
-        // `bench/gpuhealth/logs/rec_grain_20261011.md` 的 `t = 2.271 +
-        // 0.005966·w`，n=1776）。同宽两行合批只花 1.45× 而分开跑花 2×
-        // ⇒ **每合一次省下的就是整整一个地板**；8 px 桶几乎不重合
-        // （1922 次 run 只有 7% 合了批），32 px 才合得动。
+        // **粒度 64（2026-10-11 由 32 放大，用户拍板）**。动机不只是
+        // 「少几个形状」，而是「合批」：rec 是**一行一次 run**，而每次
+        // run 有一个 ~2.27 ms 的设备端地板（173 条互相依赖的 dispatch，
+        // 见 `bench/gpuhealth/logs/rec_grain_20261011.md` 的
+        // `t = 2.271 + 0.005966·w`，n=1776）。同宽两行合批只花 1.45×
+        // 而分开跑花 2× ⇒ **每合一次省下的就是整整一个地板**：8 px 桶
+        // 几乎不重合（1922 次 run 只有 7% 合了批），32 才合得动，64 再
+        // 把 img-001 的 rec run 数从 6 压到 4。
         //
-        // 代价：窄行最多填 31 px。实测（`grain_acc.py`，一图一进程）——
-        // small grain8→32 共 1041 行、medium 未单测，**识别文本逐字符
-        // 一致、0 丢行**，只有置信度第 4 位小数在动；同配置跑两遍的对照
-        // 臂也是 0 差异。端到端 small Δline −6.05 ms（4/4 负、Δdet
-        // +0.00），medium grain 64 时 −8.95。
-        // **没选 64**：窄行（w=96）会填到 128（相对 +33%），与
-        // `n_kernel_tests::small_rec_pad_*` 那条「填充会改输出」的守卫
-        // 测试用的 24→32 同量级；32 更保守而收益已拿到大半。
-        if self.exact_width { 32 } else { 64 }
+        // 32→64 读数（`env_ab.sh` 交错，small，workers 1，健康态
+        // ~70.5 ms/图）：Δtotal −2.8 / −3.1 / −1.1 / −3.25 ms，对照列
+        // Δdet ≈ +0.00（两批共 9 轮同号）⇒ **~3 ms/图**。机理独立可算：
+        // 代价模型对 img-001 预测 6 run→4 run = −3.4 ms，与实测对上。
+        //
+        // 代价（`grain_acc.py`，一图一进程，small 全语料 1041 行，32-vs-64
+        // 逐行文本对拍）：**7 行变化，0 处新增错字** —— 4 行是纯空格
+        // 位置（`温度 28C`↔`温度28C` 这类 `rec_space_gap` 启发式，本来就
+        // 随分桶抖）、1 行改**对**了（`PaddIe0CR`→`Paddle0CR`）、2 行在
+        // 低置信度乱码行上（两侧都是乱码，无信息损失）。
+        //
+        // 与填充不不变性的关系：注意力 rec（动态 B MatMul）**确实**对
+        // 右零填充不 invariant（`n_kernel_tests::small_rec_pad_*` 的
+        // 24→32 守卫：填充会改真步输出）——所以这个旋钮不是免费的，
+        // 上面那 7 行就是它的真实代价，已量大且性质良性。**再往上就不是
+        // 这个性质了**：128 / 256 两档提速归零（44.6 ms vs 64 的 41.2）
+        // 而文本差 21 / 43 行、并出现真错字（识別/檢測）⇒ 停在 64。
+        // 纯卷积 rec（tiny）填充不变，本来就是 64，不受本改动影响。
+        64
     }
 
     fn batch_grain(&self) -> i32 {

@@ -180,16 +180,6 @@ impl DeviceContext for MetalContext {
                 initializers,
             )));
         }
-        // rec：动态 B MatMul = 注意力头——无注意力 mask 的模型对桶宽右
-        // 零填充**不 invariant**（填充步经注意力混入真步概率；CPU 实证
-        // 掉行）——退精确宽。纯卷积 rec（tiny）实证填充不变，维持 64 桶。
-        let exact_width = opts.model == ModelRole::Rec
-            && graph.nodes.iter().any(|n| {
-                n.op_type == "MatMul"
-                    && n.inputs
-                        .get(1)
-                        .is_some_and(|b| !initializers.contains_key(b))
-            });
         let mut session = session::MetalSession::new(self.inner.clone(), graph, initializers)?;
         // 覆盖面探针：算子支持与形状无关，试建一次小计划——不支持时
         // stderr 声明后退回 CPU 会话（非静默降级）。探针留在缓存（真
@@ -242,7 +232,6 @@ impl DeviceContext for MetalContext {
             //（全量 T×V 回读）——用来把「GPU 归约选错」与「logits 本身不同」
             // 分开定位。
             session.argmax_exit = std::env::var_os("QPPOCR_METAL_NO_ARGMAX").is_none();
-            session.exact_width = exact_width;
         }
         Ok(Arc::new(session))
     }

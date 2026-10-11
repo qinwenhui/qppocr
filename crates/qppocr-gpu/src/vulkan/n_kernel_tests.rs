@@ -3104,12 +3104,13 @@ fn small_rec_padding_invariance() {
         first
     );
     // 断言（声明=断言）：**不不变性是预期行为**——动态 B MatMul 的注意力
-    // rec 桶宽右零填充会改真步输出（引擎因此对这类模型启用 exact_width/
-    // bucket_grain=1，见 mod.rs open_bytes_with）。若某日此断言失败
-    // （填充变成无害），可重新评估 exact_width 的形状税是否可退。
+    // rec 桶宽右零填充会改真步输出。这正是 rec 的桶宽粒度（见
+    // `bucket_grain`）**不是免费旋钮**的原因：2026-10-11 把该粒度从 32
+    // 抬到 64 换 ~3 ms/图，代价就是这条不不变性兑现的 7/1041 行文本变化。
+    // 若某日此断言失败（填充变成无害），可重新评估粒度还能不能再放大。
     assert!(
         nbad > 0,
-        "small rec 已对右零填充不变——exact_width（精确宽）的形状税可能可退役"
+        "small rec 已对右零填充不变——桶宽粒度还有放大的余地（见 bucket_grain）"
     );
 }
 

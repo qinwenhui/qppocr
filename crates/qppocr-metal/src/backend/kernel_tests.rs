@@ -805,7 +805,7 @@ fn rec_session_end_to_end() {
 /// 实测端到端 12 图的**逐字符**对拍里 small 档 rec 有 33% 的行与 CPU 不同
 /// （tiny 档与 cls/det 均逐位一致），所以这里把它单拉出来量。
 ///
-/// 形状取真实语料桶宽（48×216），批维 1（引擎 exact_width 下的常态）。
+/// 形状取真实语料桶宽（48×216），批维 1（引擎 rec 桶宽粒度下的常态）。
 #[test]
 fn rec_small_end_to_end() {
     let Some(ctx) = open_or_skip() else { return };
