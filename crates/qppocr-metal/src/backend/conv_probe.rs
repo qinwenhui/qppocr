@@ -228,6 +228,10 @@ pub(crate) const DW_PROBE_SHADERS: &[(&str, &str)] = &[
     // 各只在匹配的形状上有意义（`dw_spec_ok` 判）。
     ("p_dw_u9", include_str!("probe_dw.metal")),
     ("p_dw_u3", include_str!("probe_dw.metal")),
+    // 第三轮：**线程组瓦片暂存**。**网格与所有其它变体都不同**（一线程组一个
+    // 16×16 输出瓦片 × 一个 c4 组），见 `dw_groups_for_tile`；且只在
+    // `kW,kH ≤ 9 && stride == 1` 上成立（`dw_spec_ok`）。语义**结果正确**。
+    ("p_dw_tile", include_str!("probe_dw.metal")),
 ];
 
 /// `n_convt` 探针（`probe_convt.metal`，见该文件的头注释）。
@@ -322,10 +326,16 @@ pub(crate) const MM_TG_PROBE_SHADERS: &[(&str, &str)] =
 
 /// `p_dw_u9`/`p_dw_u3` 只对「参数与其模板常量逐位相符」的形状成立 ——
 /// 拿 u9 去跑 3×3 会读到常量算出的错地址，输出全错。
+///
+/// `p_dw_tile` 的线程组瓦片是**编译期定长** `(16+8)²`，所以只在
+/// `kW,kH ≤ 9` 且 **stride == 1** 时地址不会越出数组（stride≥2 时
+/// `stW = 16·s + k − 1` 会超过 24）。判宽了就是读飞地址直接把 GPU 打瘸，
+/// 所以这里必须拦死，`p_dw_tile` 侧还有一份 `dw_tile_ok` 互锁。
 pub(crate) fn dw_spec_ok(name: &str, kh: u32, kw: u32, pad: u32, stride: u32) -> bool {
     match name {
         "p_dw_u9" => (kh, kw, pad, stride) == (9, 9, 4, 1),
         "p_dw_u3" => (kh, kw, pad, stride) == (3, 3, 1, 1),
+        "p_dw_tile" => kh <= 9 && kw <= 9 && stride == 1,
         _ => true,
     }
 }
@@ -388,4 +398,13 @@ pub(crate) fn dw_groups_for(m_dim: u32, c_dim: u32) -> [u32; 3] {
 /// `p_dw_wide4` 的网格：一线程 4 个通道块，故线程数 = `mDim * cv4 / 4`。
 pub(crate) fn dw_groups_for_wide(m_dim: u32, c_dim: u32) -> [u32; 3] {
     [(m_dim * (c_dim / 16)).div_ceil(256), 1, 1]
+}
+
+/// `p_dw_tile` 的网格：一线程组包一个 **16×16 输出瓦片 × 一个 c4 组**，
+/// 每组恒 256 线程（16×16）。故组数 = `tilesX · tilesY · (cDim/4)`。
+pub(crate) fn dw_groups_for_tile(m_dim: u32, out_w: u32, c_dim: u32) -> [u32; 3] {
+    let out_h = m_dim / out_w.max(1);
+    let tiles_x = out_w.div_ceil(16);
+    let tiles_y = out_h.div_ceil(16);
+    [tiles_x * tiles_y * (c_dim / 4), 1, 1]
 }

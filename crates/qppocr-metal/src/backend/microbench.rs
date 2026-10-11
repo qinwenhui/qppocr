@@ -4877,6 +4877,9 @@ fn conv_dw_variant_scan() {
         ("p_dw_win", false),
         ("p_dw_tap1o3", false),
         ("p_dw_tap2o3", false),
+        // 第三轮：线程组瓦片暂存（**网格不同**，见 `dw_groups_for_tile`）。
+        // 结果应与 CPU 一致 —— 它只换了热循环的取数来源，没改累加次序。
+        ("p_dw_tile", true),
     ];
 
     // ── `p_dw_interior` 的**派发前**安全证明 ────────────────────────
@@ -4956,7 +4959,12 @@ fn conv_dw_variant_scan() {
             .copied()
             .filter(|(n, _)| super::conv_probe::dw_spec_ok(n, c.kh, c.kw, pad0, c.stride))
             .collect();
-        let grid_of = |n: &str| if n == "p_dw_wide4" { wide } else { pr.groups };
+        let tile = super::conv_probe::dw_groups_for_tile(m_dim, pr.out_w, pr.co4);
+        let grid_of = |n: &str| match n {
+            "p_dw_wide4" => wide,
+            "p_dw_tile" => tile,
+            _ => pr.groups,
+        };
 
         let run = |pipe: &metal::ComputePipelineState, grid: [u32; 3], reps: u32| -> f64 {
             let t = Instant::now();
