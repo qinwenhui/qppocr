@@ -1115,25 +1115,55 @@ impl Engine {
                 (g > 1).then_some(g)
             })
             .unwrap_or_else(|| self.rec.bucket_grain());
+        // 行的**原始**宽（未取整）——分组判据用原始宽，img_w 取整只影响
+        // 计划形状。
+        let raw_w = |r: f32| -> i32 { (img_h as f32 * r) as i32 };
         let bucket_w = |r: f32| -> i32 {
-            let w = (img_h as f32 * r) as i32;
+            let w = raw_w(r);
             if rec_grain > 1 {
                 (w + rec_grain - 1) / rec_grain * rec_grain
             } else {
                 w
             }
         };
+        // ── 分组判据：绝对桶（旧）vs 相对跨度（新，默认）────────────────
+        //
+        // 旧的 `bucket_w(a) == bucket_w(b)` 要求两行落进**同一个 32 px
+        // 桶**，而桶边界是任意的：224 和 256 是相邻两桶 ⇒ 永远合不了，
+        // 尽管只差 32 px。实测（`QPPOCR_GPU_PROF=1` 的 `[metal] run#`）
+        // 一行一 run 的图里 10 行要跑 **9 次**，每个 run 付一次 ~2.3 ms
+        // 的设备端地板（173 条 dispatch 的启动延迟，见
+        // `bench/gpuhealth/logs/rec_grain_20261011.md`）。
+        //
+        // 新判据改成**相对跨度**：组内 `max(w) - min(w) <= grain` 就继续
+        // 并进来，批宽 = 组内最大宽。行的宽是有序的（order 按比例排序），
+        // 所以跨度就是 `w[end] - w[beg]`。
+        //
+        // **填充上界与旧判据完全相同**（都是 ≤ grain px，因为组宽取组内
+        // 最大值、组内最小者至少差 grain 内），但能多合：上面那张图的 9
+        // 个桶变成 {224,256,256}{288}{384,416}{448}{896}{992,1024} 六组。
+        //
+        // `QPPOCR_REC_BUCKET=1` 退回旧判据（A/B 用；也是唯一需要它的场合
+        // ——两者填充上界同量级，新判据只是不再被桶边界挡住）。
+        let legacy_bucket = std::env::var_os("QPPOCR_REC_BUCKET").is_some();
         let mut beg = 0usize;
         while beg < order.len() {
             let mut end = beg + 1;
-            if rec_grain > 1 {
-                // 桶宽分组：同桶行合批（GPU 批内并行近零成本、计划形状
-                // 塌缩成少数桶；桶间零填充 ≤ grain 列）。order 按比例排序，
-                // 同桶行连续。CPU（grain=1）维持原比例分组不动。
+            if rec_grain > 1 && legacy_bucket {
+                // 旧：同桶行合批。order 按比例排序，同桶行连续。
                 let wb = bucket_w(wh_ratio[order[beg]]);
                 while end < order.len()
                     && end - beg < per_batch
                     && bucket_w(wh_ratio[order[end]]) == wb
+                {
+                    end += 1;
+                }
+            } else if rec_grain > 1 {
+                // 新：组内跨度 ≤ grain 就并（批宽 = 组内最大宽）。
+                let w0 = raw_w(wh_ratio[order[beg]]);
+                while end < order.len()
+                    && end - beg < per_batch
+                    && raw_w(wh_ratio[order[end]]) - w0 <= rec_grain
                 {
                     end += 1;
                 }
