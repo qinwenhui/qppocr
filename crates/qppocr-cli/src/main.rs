@@ -425,13 +425,16 @@ fn process_one(engine: &Engine, o: &Options, path: &Path) -> Result<Outcome, Err
     // 要写 `}}`），拆开就一目了然。
     json.push_str(&format!(
         ", \"num_boxes\": {}, \"num_merged\": {}, \"num_decluttered\": {}, \
-         \"num_det_retried\": {}, \"num_flipped\": {}, \"num_unread\": {}",
+         \"num_det_retried\": {}, \"num_flipped\": {}, \"num_unread\": {}, \
+         \"num_cls_retry\": {}, \"num_cls_retry_flipped\": {}",
         res.num_boxes,
         res.num_merged,
         res.num_decluttered,
         res.num_det_retried,
         res.num_flipped,
         res.num_unread,
+        res.num_cls_retry,
+        res.num_cls_retry_flipped,
     ));
     json.push('}');
 

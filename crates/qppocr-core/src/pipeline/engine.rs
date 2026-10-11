@@ -96,10 +96,32 @@ pub struct OcrResult {
     pub num_det_retried: usize,
     /// 翻正行数。
     pub num_flipped: usize,
+    /// 走「方向第二意见」重读的行数（cls 存疑 且 首读低置信）。
+    pub num_cls_retry: usize,
+    /// 其中**翻转版更自信因而改用了翻转版**的行数。
+    pub num_cls_retry_flipped: usize,
     /// 空文本行数。
     pub num_unread: usize,
     /// 分阶段毫秒。
     pub timings: Timings,
+}
+
+/// 这一行要不要取「方向第二意见」——两个条件**同时**成立：
+///
+/// 1. `cls_conf_max < cls_thresh`：分类器**存疑**（两类最大概率没到门）。
+///    注意这不是「判错了」，是「倾向某一边但不敢拍板」。
+/// 2. `first_conf < retry_conf`：该行**首次解码置信度低**，读出来就不像话。
+///
+/// 条件 1 单独用是不够的：同一段概率区间里混着该翻和不该翻的行，`p1`
+/// 完全交错，**任何门都分不开**（gen100/small 的 `[0.65,0.90)` 里是 6 对 5）。
+/// 条件 2 才是真正的判据——rec 自己的置信度把两边切在 0.53~0.72 与
+/// 0.98~1.00 之间，实测 13/13 无重叠；顺带它把代价锁死在「已经读坏了的行」。
+///
+/// 推导、两臂实测与被否证的备选（单纯降 `cls_thresh`）：
+/// `bench/gpuhealth/logs/cls_retry/SUMMARY.md`。
+#[inline]
+fn wants_cls_retry(cls_conf_max: f32, cls_thresh: f32, first_conf: f32, retry_conf: f32) -> bool {
+    retry_conf > 0.0 && cls_conf_max < cls_thresh && first_conf < retry_conf
 }
 
 /// 分阶段计时（字段名即 JSON 导出约定）。
@@ -1046,6 +1068,18 @@ impl Engine {
         // 的线程里先做 cls 再做 rec——分类结论直接用于该行的裁剪与旋转，
         // 不需要跨线程回写 `crops`（core 是 forbid(unsafe_code)）。
         let mut flipped = vec![false; crops.len()];
+        // 方向分类器对每行的把握（两类最大概率）。没有 cls 时恒 1.0
+        //（= 不存在方向疑问，第二意见不会触发）。见 `cls_retry_conf`。
+        let mut cls_conf = vec![1.0f32; crops.len()];
+        // `QPPOCR_CLS_THRESH` 覆写。**img-028 的形态**：三条 180° 行里
+        // 一条 p1=0.9956 翻对了，另两条 p1=0.7075 / 0.6876 —— 分类器
+        // **倾向是对的**（p1 > p0），只是没跨过 0.9 的门 ⇒ 原样喂进 rec
+        // 吐出 `'n ono nnd dern n n ne n2'`。这个门到底是保护还是误杀，
+        // 只能扫出来看：降门会不会把 GT-0 的行翻错。见 acc_cls.py。
+        let thresh = match std::env::var("QPPOCR_CLS_THRESH") {
+            Ok(v) => v.trim().parse::<f32>().unwrap_or(self.cfg.cls_thresh),
+            Err(_) => self.cfg.cls_thresh,
+        };
 
         // ---- 按长宽比排序（ppocr 减少批内 padding 浪费）----
         let mut order: Vec<usize> = (0..crops.len()).collect();
@@ -1219,7 +1253,9 @@ impl Engine {
                 .step_by(per)
                 .map(|b| (b, (b + per).min(crops.len())))
                 .collect();
-            let cls_fn = |b: usize, e: usize| -> Result<Vec<bool>> {
+            // 返回 `(是否翻转, 两类最大概率)`。第二项是给下面的「第二意见」
+            // 用的：`max(p0,p1) < cls_thresh` 就是「分类器倾向某一边但没到门」。
+            let cls_fn = |b: usize, e: usize| -> Result<Vec<(bool, f32)>> {
                 let n = e - b;
                 let stride = 3 * (ch as usize) * (cw as usize);
                 let mut buf = F32Buf::with_zeroed(n * stride);
@@ -1242,9 +1278,33 @@ impl Engine {
                     },
                 )])?;
                 let o = &out[0]; // [n, 2]
+                // `QPPOCR_CLS_DEBUG=1`：逐行打印分类器读数。**这就是当初
+                // 找到根因的工具**——`img-028` 的两条 180° 行给的是
+                // `p1=0.7075 / 0.6876`，「倾向对但没到门」，于是倒置裁切
+                // 原样进了 rec。整套 `bench/gpuhealth/cls_sweep.py` /
+                // `cls_thresh_ab.py` 都靠这一行输出。
+                if std::env::var("QPPOCR_CLS_DEBUG").is_ok() {
+                    for k in 0..n {
+                        let c = &crops[b + k];
+                        let (p0, p1) = (o.f32[k * 2], o.f32[k * 2 + 1]);
+                        let ratio = c.w as f32 / c.h.max(1) as f32;
+                        eprintln!(
+                            "[cls] 行{} 裁{}x{} ({:.2}:1) p0={:.4} p1={:.4} 判定={} 存疑={}",
+                            b + k,
+                            c.w,
+                            c.h,
+                            ratio,
+                            p0,
+                            p1,
+                            p1 > p0 && p1 >= thresh,
+                            p0.max(p1) < thresh
+                        );
+                    }
+                }
                 Ok((0..n)
                     .map(|k| {
-                        o.f32[k * 2 + 1] > o.f32[k * 2] && o.f32[k * 2 + 1] >= self.cfg.cls_thresh
+                        let (p0, p1) = (o.f32[k * 2], o.f32[k * 2 + 1]);
+                        (p1 > p0 && p1 >= thresh, p0.max(p1))
                     })
                     .collect())
             };
@@ -1260,8 +1320,11 @@ impl Engine {
                 }
                 out
             };
-            let decisions: Vec<bool> = decisions.into_iter().flatten().collect();
-            for (i, &flip) in decisions.iter().enumerate() {
+            let decisions: Vec<(bool, f32)> = decisions.into_iter().flatten().collect();
+            // 分类器对该行的把握（两类最大概率）。`< cls_thresh` ⇒ 存疑，
+            // 是下面「第二意见」的准入条件之一。
+            cls_conf = decisions.iter().map(|&(_, c)| c).collect();
+            for (i, &(flip, _)) in decisions.iter().enumerate() {
                 if flip {
                     flipped[i] = true;
                     res.num_flipped += 1;
@@ -1273,11 +1336,15 @@ impl Engine {
         let t_ri = now(); // ★ 重新起表：cls 的墙钟不能算进 rec
         // 打包+提交（异步）：GPU 批间流水的前半——pack(k+1) 与 GPU(k)
         // 执行重叠；CPU 会话的 run_deferred 默认实现 = 同步 run（语义等价）。
-        let rec_stage = |beg: usize,
-                         end: usize|
+        // `ord` 是要跑的行号（主路径 = `order` 的一段，第二意见 = 那一小撮
+        // 重试行）；`src` 是**实际喂给 rec 的裁切**（第二意见会把它换成
+        // 翻转版），`flp` 与之配套记录该行此刻是否被翻转（决定 `rotation`
+        // 与每字坐标的逆变换）。
+        let rec_stage = |ord: &[usize],
+                         src: &[std::borrow::Cow<'_, Image>]|
          -> Result<(Box<dyn crate::device::DeferredRun + Send>, i32)> {
             let mut max_wh_ratio = self.cfg.rec_min_width as f32 / img_h as f32;
-            for &i in &order[beg..end] {
+            for &i in ord {
                 max_wh_ratio = max_wh_ratio.max(wh_ratio[i]);
             }
             let mut img_w = (img_h as f32 * max_wh_ratio) as i32;
@@ -1285,15 +1352,15 @@ impl Engine {
                 img_w = (img_w + rec_grain - 1) / rec_grain * rec_grain;
             }
 
-            let bsz = end - beg;
+            let bsz = ord.len();
             // 批维 = 真实行数（bsz）：**不补齐**。补齐只在所有内核都读
             // real_n 早退时才免费，而折进网格的算子按补齐量白算——Metal
             // 实测付 8 倍。形状多样性靠桶宽分组（rec_grain）压，不靠补齐。
             // CPU 会话批维即行数，同理。
             let mut batch_f32 = F32Buf::with_zeroed(bsz * 3 * (img_h as usize) * (img_w as usize));
             let t_pack = std::time::Instant::now();
-            for (k, &i) in order[beg..end].iter().enumerate() {
-                let c = &line_crop[i];
+            for (k, &i) in ord.iter().enumerate() {
+                let c = &src[i];
                 pack_crop(
                     c,
                     img_h,
@@ -1324,11 +1391,12 @@ impl Engine {
         // 解码（纯 CPU，与设备无关）：argmax 对或概率矩阵 → 文本/置信度/
         // 每字坐标。img_w 是该批的打包宽（时间步→列映射要用）。
         let rec_decode = |out: Vec<Tensor>,
-                          beg: usize,
-                          end: usize,
+                          ord: &[usize],
+                          src: &[std::borrow::Cow<'_, Image>],
+                          flp: &[bool],
                           img_w: i32|
          -> Result<Vec<RecLineOut>> {
-            let mut batch_lines = Vec::with_capacity(end - beg);
+            let mut batch_lines = Vec::with_capacity(ord.len());
             let o = &out[0]; // [B, T, C]（或 GPU argmax 出口的 [B, T, 2] 对）
             let t_len = o.shape[1] as usize;
             // GPU argmax 出口：每时间步 (val, idx) 对，解码语义与概率
@@ -1347,14 +1415,14 @@ impl Engine {
                 }
             }
             let want_gaps = self.cfg.rec_space_gap > 0.0;
-            for (k, &i) in order[beg..end].iter().enumerate() {
+            for (k, &i) in ord.iter().enumerate() {
                 let (mut text, conf, marks) = if pairs {
                     ctc_decode_pairs(&o.f32[k * t_len * 2..], t_len, &self.charset)
                 } else {
                     ctc_decode(&o.f32[k * t_len * c_len..], t_len, c_len, &self.charset)
                 };
                 // 时间步 → 裁剪图 x 的左缘（像素空格与每字坐标共用这套映射）。
-                let cr = &line_crop[i];
+                let cr = &src[i];
                 let cols: Vec<i32> = if cr.w > 0 && cr.h > 0 {
                     let pad_only = crop_pads(cr, img_h, self.cfg.rec_pad_min_h);
                     let content_w = if pad_only {
@@ -1400,7 +1468,7 @@ impl Engine {
                     &cols,
                     &spaces,
                     cr.w,
-                    flipped[i],
+                    flp[i],
                     &boxes[i].pts,
                     &to_image,
                 );
@@ -1415,17 +1483,19 @@ impl Engine {
         };
         // 收账+解码（两路共用）：GPU 的 complete = 等信号+读回。
         let rec_collect = |staged: (Box<dyn crate::device::DeferredRun + Send>, i32),
-                           beg: usize,
-                           end: usize|
+                           ord: &[usize],
+                           src: &[std::borrow::Cow<'_, Image>],
+                           flp: &[bool]|
          -> Result<Vec<RecLineOut>> {
             let (deferred, img_w) = staged;
             let out = deferred.complete()?;
-            rec_decode(out, beg, end, img_w)
+            rec_decode(out, ord, src, flp, img_w)
         };
         // 串行兼容路：CPU 会话 / 分片并行路径用（deferred 默认=同步）。
         let rec_fn = |beg: usize, end: usize| -> Result<Vec<RecLineOut>> {
-            let staged = rec_stage(beg, end)?;
-            rec_collect(staged, beg, end)
+            let (ord, src, flp) = (&order[beg..end], &line_crop[..], &flipped[..]);
+            let staged = rec_stage(ord, src)?;
+            rec_collect(staged, ord, src, flp)
         };
         // ★ 两种并行的切法只能二选一（池不支持嵌套 fork）：**行间并行**
         //   （一批一个线程、批内串行，即 `run_batches`）还是**行内并行**
@@ -1441,7 +1511,7 @@ impl Engine {
             //（实测批均 ~1ms 对 ~4ms GPU）。同桶连续批 = 同一计划
             //（输入/输出区同址）：先收账在飞批再提交，防写穿。
             let mut outs: Vec<Vec<RecLineOut>> = Vec::with_capacity(batches.len());
-            /// 在飞批：(staged 句柄+打包宽, beg, end, 桶宽)
+            /// 在飞批：(staged 句柄, order 区间 lo, hi)
             struct Pending(
                 Option<(Box<dyn crate::device::DeferredRun + Send>, i32)>,
                 usize,
@@ -1453,14 +1523,24 @@ impl Engine {
                 // 自动分流影子计划（独立 arena/CB，零共享）——批 k+1 提交
                 // 与 GPU(k) 重叠，收账 k-1 与 GPU(k) 重叠（真正的批间流水；
                 // 旧的防写穿串行化曾把 rec_infer 拖成批串行和）。
-                let staged = rec_stage(b, e)?;
+                let staged = rec_stage(&order[b..e], &line_crop)?;
                 if let Some(p) = pending.take() {
-                    outs.push(rec_collect(p.0.unwrap(), p.1, p.2)?);
+                    outs.push(rec_collect(
+                        p.0.unwrap(),
+                        &order[p.1..p.2],
+                        &line_crop,
+                        &flipped,
+                    )?);
                 }
                 pending = Some(Pending(Some(staged), b, e));
             }
             if let Some(p) = pending.take() {
-                outs.push(rec_collect(p.0.unwrap(), p.1, p.2)?);
+                outs.push(rec_collect(
+                    p.0.unwrap(),
+                    &order[p.1..p.2],
+                    &line_crop,
+                    &flipped,
+                )?);
             }
             outs
         } else if shards > 1 {
@@ -1481,11 +1561,129 @@ impl Engine {
                 to_image(&boxes[i].pts, &mut lines[i].pts);
             }
         }
+
+        // ---- 方向存疑的行取「第二意见」----
+        // 先决条件两条，缺一不可：
+        //   ① `cls` 对该行**存疑**——两类最大概率没到 `cls_thresh`。这不是
+        //      「判错了」，是「倾向某一边但不敢拍板」。GT-180 的行从没低过
+        //      p1=0.65，可硬门 0.9 还是漏翻了 6 行（gen100/small 实测）。
+        //   ② 该行**首次解码置信度低**——读出来就不像话。
+        // 判据为什么不能只靠 ①：同一段概率区间里混着 6 行该翻（GT-180）和
+        // 5 行不该翻（GT-0/±90），p1 完全交错，**任何门都分不开**。而 rec
+        // 自己的置信度把它们切得很干净：13/13 无例外，读错的方向 0.53~0.72、
+        // 读对的方向 0.98~1.00。所以判据从「分类器有多自信」换成「识别器
+        // 读出来像不像话」。
+        // 条件 ② 顺带把代价锁死：只对**已经读坏了**的行多跑一次 rec。
+        // 工具与实测：`bench/gpuhealth/cls_sweep.py` / `cls_thresh_ab.py`。
+        let retry_conf = match std::env::var("QPPOCR_CLS_RETRY") {
+            Ok(v) => v.trim().parse::<f32>().unwrap_or(self.cfg.cls_retry_conf),
+            Err(_) => self.cfg.cls_retry_conf,
+        };
+        if retry_conf > 0.0 {
+            let retry: Vec<usize> = (0..lines.len())
+                .filter(|&i| {
+                    wants_cls_retry(cls_conf[i], thresh, lines[i].confidence, retry_conf)
+                })
+                .collect();
+            if !retry.is_empty() {
+                // 翻转版裁切：本来翻了就取原图，本来没翻就转 180°。
+                // 另起 `src`/`flp` 而不改 `line_crop`/`flipped`——主路径的
+                // 结果（`lines[i].pts` 等）已经写好了，这里只是做取舍。
+                //
+                // 注：**今天 `flipped[i]` 在这里恒为 false**——`cls_conf[i]`
+                // 是两类最大概率，`< cls_thresh` 蕴含 `p1 < cls_thresh`，
+                // 而翻判定要求 `p1 >= cls_thresh`，两者互斥（对任意
+                // `cls_thresh` 都成立，不只是 0.9）。也就是说第二意见
+                // **只在「分类器说不翻」的行上触发**，正是 8 条实测全中的
+                // 那一批。仍按两向写，是为了将来决策规则变了不至于静默错。
+                let mut src: Vec<std::borrow::Cow<'_, Image>> =
+                    crops.iter().map(std::borrow::Cow::Borrowed).collect();
+                for &i in &retry {
+                    src[i] = if flipped[i] {
+                        std::borrow::Cow::Borrowed(&crops[i])
+                    } else {
+                        std::borrow::Cow::Owned(rotate_image(&crops[i], 180))
+                    };
+                }
+                let mut flp = flipped.clone();
+                for &i in &retry {
+                    flp[i] = !flp[i];
+                }
+                res.num_cls_retry += retry.len();
+                let staged = rec_stage(&retry, &src)?;
+                let outs2 = rec_collect(staged, &retry, &src, &flp)?;
+                for lo in outs2 {
+                    let i = lo.idx;
+                    // **只在更自信时才采纳**——这一条就是安全性来源：
+                    // 翻转版若不比原版像话，一切照旧，绝不会把读对的行改坏。
+                    if lo.confidence > lines[i].confidence {
+                        lines[i].chars = lo.chars;
+                        lines[i].text = lo.text;
+                        lines[i].confidence = lo.confidence;
+                        lines[i].rotation = if flp[i] { 180 } else { 0 };
+                        if flp[i] {
+                            res.num_flipped += 1;
+                        } else {
+                            res.num_flipped -= 1;
+                        }
+                        flipped[i] = flp[i];
+                        res.num_cls_retry_flipped += 1;
+                    }
+                }
+            }
+        }
         res.timings.total_ms = t_start.elapsed_ms();
 
         // 读不出的框保留不丢（见 TextLine::text 文档）
         res.num_unread = lines.iter().filter(|l| l.text.is_empty()).count();
         res.lines = lines;
         Ok(res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wants_cls_retry;
+
+    // 三个输入都取自 gen100/small 的实测（`cls_sweep.py` 的表 +
+    // `cls_thresh_ab.py` 的两臂置信度），门取默认 0.9 / 0.85。
+
+    #[test]
+    fn 存疑且首读低置信才取第二意见() {
+        // img-028 行3：cls 存疑（p1=0.7075 没到 0.9），首读 garbage 0.7195
+        assert!(wants_cls_retry(0.7075, 0.9, 0.7195, 0.85));
+        // img-052 行11：存疑 0.8339，首读 0.6067
+        assert!(wants_cls_retry(0.8339, 0.9, 0.6067, 0.85));
+    }
+
+    #[test]
+    fn 首读读得好就不动它() {
+        // img-054 行1：cls 也存疑（0.7828），但首读 0.9897 —— **这是最关键
+        // 的一条**：不带条件 2 的话这行会被翻倒，把读对的改成垃圾。
+        assert!(!wants_cls_retry(0.7828, 0.9, 0.9897, 0.85));
+        // img-096 行3：存疑 0.7811、首读 0.9929
+        assert!(!wants_cls_retry(0.7811, 0.9, 0.9929, 0.85));
+    }
+
+    #[test]
+    fn 分类器自信时不取第二意见() {
+        // 置信度 ≥ 门 ⇒ 分类器已经拍了板，不管 rec 读出什么。
+        assert!(!wants_cls_retry(0.9956, 0.9, 0.1, 0.85));
+        assert!(!wants_cls_retry(0.98, 0.9, 0.1, 0.85));
+    }
+
+    #[test]
+    fn 关掉开关就一行都不碰() {
+        let off = 0.0;
+        assert!(!wants_cls_retry(0.5, 0.9, 0.0, off));
+        assert!(!wants_cls_retry(0.5, 0.9, 0.84, off));
+    }
+
+    #[test]
+    fn 边界都是严格小于() {
+        // 恰好等于门 ⇒ 不算存疑（与 cls 判定里的 `>= thresh` 互斥，不重叠）
+        assert!(!wants_cls_retry(0.9, 0.9, 0.5, 0.85));
+        // 首读恰好等于 retry_conf ⇒ 不重试
+        assert!(!wants_cls_retry(0.5, 0.9, 0.85, 0.85));
     }
 }
