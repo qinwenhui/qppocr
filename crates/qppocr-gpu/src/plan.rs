@@ -207,7 +207,13 @@ pub struct PlanBuilder<'a> {
     /// - `kh==kw==1 && sh==sw==1 && pad==0`：输出位置与输入像素一一对应，
     ///   A 无 gather；
     /// - `cpad4(Cin) % 8 == 0`：K 步长 8 不越界；
-    /// - `cpad4(Co) % 64 == 0`：64 列块不越界。
+    /// - `cpad4(Co) % 32 == 0`：列块不越界。`%64==0` 走 `n_conv8_mma`，
+    ///   `%32` 但不 `%64` 走 `n_conv8_mma_n32`（32 列块、128 线程）。
+    ///
+    /// **为什么会放开到 `%32`**：`%64` 这条把 rec/det 里成片的真实层挡在
+    /// 门外——**Co=96**（`cpad4(96)=96`，`96%64=32`）是 rec 的
+    /// Conv.4/9/12/15/47 与 det 的 CSP 支线，而 96 = 3×32 正落在 32 列块上。
+    /// 与 `conv_kxk_mma` 的 `n_conv8_mma3_n32` 是同一个理由、同一套做法。
     ///
     /// 与 `weight_f16` 同款：**两边必须同步**——Vulkan 的 GLSL 侧没有
     /// `n_conv8_mma`，开了会派发到不存在的内核（硬失败，非静默降级）。
@@ -1357,7 +1363,7 @@ impl PlanBuilder<'_> {
                         && pads.0 == 0
                         && pads.1 == 0
                         && cpad4(ws[1]) % 8 == 0
-                        && cpad4(ws[0]) % 64 == 0;
+                        && cpad4(ws[0]) % 32 == 0;
                     // k×k（k>1）：方块 k×k 走 `n_conv8_mma3`。**不再要求步长 1
                     // 与对称 pad**——覆盖几何由 [`KxkCover`] 现算，那组算式在
                     // stride1 + 对称 pad 下逐项退化成旧式，所以既有形状的行为
@@ -1434,12 +1440,19 @@ impl PlanBuilder<'_> {
                             ])
                         }
                     } else if mma {
+                        // 通道块宽 64/32 二选一（内核是同一模板的两条实例化，
+                        // 网格公式只差 `ncols` 这个除数与线程组大小——内核里
+                        // 同样是 `nDim / NCOLS` 与 `tid>>5`，所以两份仍然逐字
+                        // 对应）。**线程组大小必须跟着切**：`_n32` 是 128 线程，
+                        // 见 `pipeline.rs::threads_per_group`。
                         let co4 = cpad4(ws[0]);
-                        Ok(vec![(
-                            "n_conv8_mma",
-                            pb,
-                            [m_dim.div_ceil(64), co4 / 64, nb],
-                        )])
+                        let ncols = if co4 % 64 == 0 { 64 } else { 32 };
+                        let kname = if ncols == 64 {
+                            "n_conv8_mma"
+                        } else {
+                            "n_conv8_mma_n32"
+                        };
+                        Ok(vec![(kname, pb, [m_dim.div_ceil(64), co4 / ncols, nb])])
                     } else if use8 {
                         let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
                         Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1])])

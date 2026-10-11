@@ -27,7 +27,8 @@
 //
 // - `taps == 1 && kW == 1 && sH == sW == 1 && padT == padL == 0`
 //   （1×1 无 pad：输出位置 m 与输入像素 m 一一对应，A 无 gather）；
-// - `nDim % 64 == 0`（64 列块不越界；nDim 是补 4 后的 Co，float 元素数）；
+// - `nDim % 64 == 0` 或 `nDim % 32 == 0`（列块不越界；nDim 是补 4 后的 Co，
+//   float 元素数）。两条选不同入口，见下面「两档」一节；
 // - `cin4v % 2 == 0`（kf % 8 == 0：K 步长 8 不越界；Cin%8==0 即满足）。
 //
 // M 方向尾块会读 m >= mDim 的输入（越界行只进被丢弃的累加器，且落在
@@ -35,12 +36,29 @@
 //
 // # 网格（与 n_conv8 的 `ceil(m/4)*nh` 完全不同，计划层单算）
 //
-//   groups = [ceil(mDim/64), ceil(nDim/64), batch]，线程组恒 256 线程。
-//   x = 64 行块，y = 64 列块（批从 n_conv8 的 wg.y 挪到 wg.z）。
+//   groups = [ceil(mDim/64), ceil(nDim/NCOLS), batch]。
+//   x = 64 行块，y = NCOLS 列块（批从 n_conv8 的 wg.y 挪到 wg.z）。
 //
-// 线程组内：8 个 simdgroup，sgid 认领 16 行 × 32 列
-// （`(sgid>>1)*16 + {0,8}` 行 × `(sgid&1)*32 + {0,8,16,24}` 列），
-// `acc[2][4]` 共 512 元素/simdgroup，8 个合起来覆盖 64×64。
+// 线程组内：NSG 个 simdgroup，sgid 认领 RPSG 行 × NCOLS/2 列，
+// `acc[NR][NB]` 共 8 个分片/simdgroup，NSG 个合起来覆盖 64×NCOLS。
+//
+// # 两档：NCOLS=64/NSG=8（256 线程）与 NCOLS=32/NSG=4（128 线程）
+//
+// **为什么不只有 64 那一档**：`nDim % 64 == 0` 这条判据把 rec/det 里成片的
+// 真实层挡在门外——rec 的 Conv.4/9/12/15/47 与 det 的 CSP 支线都是 **Co=96**
+// （`cpad4(96)=96`，`96%64=32`），它们合计占 `n_conv8` 总时的大头，却只能
+// 走标量内核。Co=96 是 3 个 32 列块，正落在 NCOLS=32 这一档上。
+// 这与 `n_conv8_mma3` 早就有 `_n32` 实例化是**同一个理由、同一套做法**：
+// 除 NCOLS/NSG 两行参数与由它们派生的四处（nch / sn / 分片数 / 尾声步长）外，
+// 两条实例化的推理逐字共用——改一处两条同时改。
+//
+// 与 `n_conv8_mma3_n32` 同款的两点副作用：① `ost` 从 16 KB 降到 8 KB/组，
+// 每核可驻留的线程组数翻倍；② 线程组 128 而非 256。B 分片在 NCOLS=32 时
+// 每条只被 NR=4 个行分片复用（NCOLS=64 时是 2 个复用 4 条）——单条 MMA 的
+// 装载比变差，但瓦片更小、驻留更多。**实测这两档都赢**（`small` 档端到端
+// A/B 4 轮中位 −2.40 ms/图；逐内核归因：det `n_conv8` 8.35→5.20、`_n32`
+// 只花 1.96 = **1.61×**，rec 14.78→11.56、`_n32` 花 1.60 = **2.01×**，
+// 100 图 1041 行文本/框逐位不变）。
 //
 // # 参数块语义：与 n_conv8 逐字段一致（P+0..20），零改动。
 
@@ -93,19 +111,38 @@ float act1(float v, uint act, float c1, float c2, float c3) {
     return v;
 }
 
-kernel void n_conv8_mma(
-    device float4* d [[buffer(0)]],
-    device const uint* params [[buffer(1)]],
-    constant uint& p_off [[buffer(3)]],
-    uint3 tid3 [[thread_position_in_threadgroup]],
-    uint3 wg [[threadgroup_position_in_grid]])
+// NCOLS = 输出通道块宽（64 或 32）；NSG = 本线程组里 simdgroup 的个数
+// （8 → 256 线程，4 → 128 线程）。两档的理由见文件头「两档」一节。
+//
+// `ost`（分片落地的 threadgroup 暂存）**必须由内核入口声明、以指针传进来**：
+// MSL 硬规则——`threadgroup` 变量只能在 `kernel` 函数里声明（"variables in
+// the threadgroup address space cannot be declared in a non-qualified
+// function"）。于是各入口声明自己那份 `float[64*NCOLS]`，尺寸耦合由入口的
+// static_assert 守住。
+//
+// ⚠️ **NSG 必须与宿主侧的线程组尺寸一致**（`pipeline.rs::threads_per_group`）。
+// 内核按 `tid>>5` 认 simdgroup，线程组给大了就会有线程认领到不存在的 sg、
+// 去写 `ost` 的界外行——静默算错。这道耦合由 `conv8_mma_matches_cpu`
+// 那条 CPU 对拍兜住（它对两条实例化都跑）。
+template <uint NCOLS, uint NSG>
+static void mma1_body(
+    device float4* d,
+    device const uint* params,
+    uint P,
+    uint tid,
+    uint3 wg,
+    threadgroup float* ost)
 {
-    // 带属性的内核参数必须同为标量或同为同宽向量（MSL 硬约束），故 tid 走 uint3。
-    uint tid = tid3.x;
+    // 分片数：每 16 个通道一个 8x8 分片列。
+    constexpr uint NB = NCOLS / 16u;          // 64 -> 4，32 -> 2
+    // 行方向：64 行像素均分给 NSG/2 个行组，每组再切成 8 行的分片。
+    constexpr uint RPSG = 64u / (NSG / 2u);   // 每 simdgroup 的行数（8 -> 16，4 -> 32）
+    constexpr uint NR = RPSG / 8u;            // 每 simdgroup 的行分片数（8 -> 2，4 -> 4）
+    constexpr uint NTH = NSG * 32u;           // 线程组大小（8 -> 256，4 -> 128）
+
     device const float* f32v = (device const float*)d;
     device float* of = (device float*)d;
 
-    uint P = p_off;
     uint in_off = params[P + 0], w_off = params[P + 1], b_off = params[P + 2];
     uint out_off = params[P + 3];
     uint mDim = params[P + 4], nDim = params[P + 5];
@@ -122,59 +159,51 @@ kernel void n_conv8_mma(
     uint nv = nDim >> 2;        // float4 列数（列 stride 用）
     uint kf = cin4v * 4u;        // K 的 float 元素数（行 stride 用）
 
-    uint m0 = wg.x * 64u;       // 64 行基（输出位置）
-    uint n0 = wg.y * 64u;       // 64 列基（输出通道，float 元素）
+    uint m0 = wg.x * 64u;         // 64 行基（输出位置）
+    uint n0 = wg.y * NCOLS;       // NCOLS 列基（输出通道，float 元素）
 
-    uint sgid = tid >> 5;       // 8 个 simdgroup / 线程组
-    uint sm = m0 + (sgid >> 1) * 16u;   // 本 simdgroup 的 16 行基
-    uint sn = n0 + (sgid & 1u) * 32u;  // 本 simdgroup 的 32 列基
+    uint sgid = tid >> 5;         // NSG 个 simdgroup / 线程组
+    uint sm = m0 + (sgid >> 1) * RPSG;        // 本 simdgroup 的行基
+    uint sn = n0 + (sgid & 1u) * (NCOLS / 2u); // 本 simdgroup 的 NCOLS/2 列基
 
     uint ib = (in_off >> 2) * 4u + b * inH * inW * kf;  // 输入段 float 基
     uint wb = (w_off >> 2) * 4u;                        // 权重段 float 基
     uint ob = (out_off >> 2) * 4u + b * mDim * nDim;    // 输出段 float 基
 
-    simdgroup_float8x8 acc[2][4];
-    for (uint i = 0u; i < 2u; i++)
-        for (uint j = 0u; j < 4u; j++)
+    simdgroup_float8x8 acc[NR][NB];
+    for (uint i = 0u; i < NR; i++)
+        for (uint j = 0u; j < NB; j++)
             acc[i][j] = simdgroup_float8x8(0.0f);
 
-    // 热循环：K 步长 8。每步 2 条 A 装载 + 4 条 B 装载 + 8 条 MMA，
-    // 服务 16 行 × 32 列 × 8 K = 4096 MAC —— load:FMA 从 n_conv8 的
-    // 12:8 掉到 6:4096（SIMD 协作装载，每 lane 只搬自己分片）。
+    // 热循环：K 步长 8。每步 NR 条 A 装载 + NB 条 B 装载 + NR*NB 条 MMA，
+    // 服务 64 行 × NCOLS 列 × 8 K —— load:FMA 从 n_conv8 的 12:8 掉到
+    // 6:4096（SIMD 协作装载，每 lane 只搬自己分片）。
     for (uint kb = 0u; kb < kf; kb += 8u) {
-        simdgroup_float8x8 a0, a1;
-        simdgroup_load(a0, f32v + ib + sm * kf + kb, kf);
-        simdgroup_load(a1, f32v + ib + (sm + 8u) * kf + kb, kf);
-        simdgroup_float8x8 b0, b1, b2, b3;
+        simdgroup_float8x8 a[NR], b[NB];
+        for (uint i = 0u; i < NR; i++)
+            simdgroup_load(a[i], f32v + ib + (sm + i * 8u) * kf + kb, kf);
         // 权重 [k][n] k-主序（行 stride = nDim float），无需转置。
-        simdgroup_load(b0, f32v + wb + kb * nDim + sn, nDim);
-        simdgroup_load(b1, f32v + wb + kb * nDim + sn + 8u, nDim);
-        simdgroup_load(b2, f32v + wb + kb * nDim + sn + 16u, nDim);
-        simdgroup_load(b3, f32v + wb + kb * nDim + sn + 24u, nDim);
-        simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
-        simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
-        simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
-        simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
-        simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
-        simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
-        simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
-        simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
+        for (uint j = 0u; j < NB; j++)
+            simdgroup_load(b[j], f32v + wb + kb * nDim + sn + j * 8u, nDim);
+        for (uint i = 0u; i < NR; i++)
+            for (uint j = 0u; j < NB; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
     }
 
-    // 尾声：分片落 threadgroup（16 KB/组），再 256 线程逐元素做
-    // bias/act/残差/写回。语义与 n_conv8 的尾声逐字段对齐（bias 加在
-    // 通道、act 逐元素、残差按 (m,n) 读、写回带 m 掩码）。
-    threadgroup float ost[64u * 64u];
-    uint r0 = (sgid >> 1) * 16u;   // 相对本 64×64 块的行基
-    uint c0 = (sgid & 1u) * 32u;   // 列基
-    for (uint i = 0u; i < 2u; i++)
-        for (uint j = 0u; j < 4u; j++)
-            simdgroup_store(acc[i][j], ost + (r0 + i * 8u) * 64u + c0 + j * 8u, 64u);
+    // 尾声：分片落 threadgroup（NCOLS=64 -> 16 KB/组，32 -> 8 KB/组），再
+    // NTH 线程逐元素做 bias/act/残差/写回。语义与 n_conv8 的尾声逐字段对齐
+    // （bias 加在通道、act 逐元素、残差按 (m,n) 读、写回带 m 掩码）。
+    // 暂存区由入口声明（见上面那条 MSL 规则），尺寸 = 64*NCOLS。
+    uint r0 = (sgid >> 1) * RPSG;   // 相对本 64×NCOLS 块的行基
+    uint c0 = (sgid & 1u) * (NCOLS / 2u);   // 列基
+    for (uint i = 0u; i < NR; i++)
+        for (uint j = 0u; j < NB; j++)
+            simdgroup_store(acc[i][j], ost + (r0 + i * 8u) * NCOLS + c0 + j * 8u, NCOLS);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint e = tid; e < 64u * 64u; e += 256u) {
-        uint m = m0 + (e >> 6);
-        uint n = n0 + (e & 63u);
+    for (uint e = tid; e < 64u * NCOLS; e += NTH) {
+        uint m = m0 + (e / NCOLS);
+        uint n = n0 + (e % NCOLS);
         if (m >= mDim) continue;
         float v = ost[e];
         if (b_off != OFF_NONE) v += f32v[(b_off >> 2) * 4u + n];
@@ -183,4 +212,34 @@ kernel void n_conv8_mma(
             v += f32v[(r_off >> 2) * 4u + b * mDim * nDim + m * nDim + n];
         of[ob + m * nDim + n] = v;
     }
+}
+
+// 两条实例化。计划层按 `cpad4(Co)%64==0 ? 64 : 32` 选名（见 plan.rs）。
+// 网格公式、参数块对两条完全一致——**只有通道块宽与线程组大小不同**。
+kernel void n_conv8_mma(
+    device float4* d [[buffer(0)]],
+    device const uint* params [[buffer(1)]],
+    constant uint& p_off [[buffer(3)]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 wg [[threadgroup_position_in_grid]])
+{
+    threadgroup float ost[64u * 64u];
+    static_assert(sizeof(ost) == 64u * 64u * sizeof(float), "暂存区尺寸");
+    // 带属性的内核参数必须同为标量或同为同宽向量（MSL 硬约束），故 tid 走 uint3。
+    // 8 个 simdgroup = **256 线程**（`pipeline.rs::threads_per_group` 的默认档）。
+    mma1_body<64u, 8u>(d, params, p_off, tid3.x, wg, ost);
+}
+
+kernel void n_conv8_mma_n32(
+    device float4* d [[buffer(0)]],
+    device const uint* params [[buffer(1)]],
+    constant uint& p_off [[buffer(3)]],
+    uint3 tid3 [[thread_position_in_threadgroup]],
+    uint3 wg [[threadgroup_position_in_grid]])
+{
+    // 8 KB/组（NCOLS=64 那支是 16 KB）：通道块宽减半，暂存区跟着减半。
+    threadgroup float ost[64u * 32u];
+    static_assert(sizeof(ost) == 64u * 32u * sizeof(float), "暂存区尺寸");
+    // **4 个 simdgroup = 128 线程**，不是 256（见文件头「两档」一节）。
+    mma1_body<32u, 4u>(d, params, p_off, tid3.x, wg, ost);
 }

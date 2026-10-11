@@ -41,7 +41,16 @@ const SHADERS: &[(&str, &str)] = &[
     ("n_conv8", include_str!("../../shaders/n_conv8.metal")),
     ("n_conv8h", include_str!("../../shaders/n_conv8.metal")),
     ("n_conv8_edge", include_str!("../../shaders/n_conv8.metal")),
+    // 同一份源码两个入口：`n_conv8_mma`（64 通道块）与 `n_conv8_mma_n32`
+    // （32 通道块，收 Co 是 32 倍数但不是 64 倍数的那批 1×1 conv）。与
+    // `n_conv8_mma3` 的双实例化是同一套做法，只有 NCOLS/NSG 模板参数不同
+    // ——见该 .metal 头注释「两档」一节。同样：一份源码两个入口，编译不过
+    // 一起消失。
     ("n_conv8_mma", include_str!("../../shaders/n_conv8_mma.metal")),
+    (
+        "n_conv8_mma_n32",
+        include_str!("../../shaders/n_conv8_mma.metal"),
+    ),
     // 同一份源码两个入口：`n_conv8_mma3`（64 通道块）与 `n_conv8_mma3_n32`
     // （32 通道块，收 Co 是 32 倍数但不是 64 倍数的那批 conv）。网格公式、
     // 参数块、覆盖矩形两条完全一致，只有 NCOLS 模板参数不同——见该 .metal
@@ -111,7 +120,10 @@ const THREADS_PER_GROUP: u64 = 256;
 /// 兜底是 `conv8_mma3_matches_cpu` 那条 CPU 对拍（它自带独立硬编码的覆盖几何）。
 fn threads_per_group(name: &str) -> u64 {
     match name {
-        "n_conv8_mma3_n32" => 128,
+        // NCOLS=32 的两族都是 4 个 simdgroup = 128 线程（NCOLS=64 那族是
+        // 默认的 256）。**少一条这里就是静默算错**——见
+        // `n_conv8_mma.metal` 模板上那条 NSG 耦合警告。
+        "n_conv8_mma3_n32" | "n_conv8_mma_n32" => 128,
         _ => THREADS_PER_GROUP,
     }
 }

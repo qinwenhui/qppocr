@@ -1459,35 +1459,47 @@ fn conv8_mma_matches_cpu() {
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
     // (h, w, cin, cout, 说明)：m_dim = h*w。
-    let cases: [(u32, u32, u32, u32, &str); 4] = [
+    //
+    // **两条实例化都要过**（NCOLS=64 走 `n_conv8_mma`，NCOLS=32 走
+    // `n_conv8_mma_n32`）：Co=96（3×32 列块）是 rec 的 Conv.4/9/12/15/47
+    // 与 det 的 CSP 支线的真实形状，`96%64=32` ⇒ 只能进 32 那一档。
+    // 这一档的 NSG=4/128 线程是个独立耦合面（`threads_per_group` 少写一条
+    // 就会让线程认领到不存在的 simdgroup、越界写 `ost`），所以必须单列用例。
+    let cases: [(u32, u32, u32, u32, &str); 7] = [
         (8, 8, 64, 64, "满块 64 行 × 64 列"),
         (4, 8, 64, 64, "尾掩码 32 行（<64）"),
         (16, 16, 128, 128, "多块 256 行 × 2 列块"),
         (5, 7, 32, 64, "怪形状 35 行 × 64 列"),
+        (8, 8, 32, 96, "**N32** Co=96=3×32 列块"),
+        (4, 32, 192, 96, "**N32** Co=96 尾掩码 128 行"),
+        (16, 144, 48, 96, "**N32** Co=96 多行块（rec 的真实形状）"),
     ];
 
     for (h, w, cin, cout, note) in cases {
         let c = ConvCase { label: "mma", h, w, cin, cout, kh: 1, kw: 1 };
         let mut pr = build_conv_case(&ctx.inner.device, &c);
-        // MMA 网格与 n_conv8 不同：x = 64 行块，y = 64 列块，z = 批。
+        // MMA 网格与 n_conv8 不同：x = 64 行块，y = NCOLS 列块，z = 批。
+        // 通道块宽与内核名成对选（与 `plan.rs` 那一支同一个判据）。
+        let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
+        let kname = if ncols == 64 { "n_conv8_mma" } else { "n_conv8_mma_n32" };
         let groups = [
             (h * w).div_ceil(64),
-            pr.co4.div_ceil(64),
+            pr.co4.div_ceil(ncols),
             1,
         ];
         submit_compute(&ctx.inner.queue, |enc| {
-            ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, groups)
+            ks.dispatch(enc, kname, &pr.buf, pr.p_off, groups)
                 .expect("dispatch");
         })
         .expect("提交");
         let worst = conv_error(&pr, &c);
         eprintln!(
-            "[mb] conv8_mma 对拍 {note:<22} ({h}×{w} c{cin}->{cout} k1): 最大误差 {worst:.3e}"
+            "[mb] {kname:<16} 对拍 {note:<28} ({h}×{w} c{cin}->{cout} k1): 最大误差 {worst:.3e}"
         );
         assert!(
             worst < 1e-4,
-            "n_conv8_mma 与 CPU 卷积不符（{note}）：最大误差 {worst:.3e}——\
-             simdgroup_load/MMA 的布局假设错了"
+            "{kname} 与 CPU 卷积不符（{note}）：最大误差 {worst:.3e}——\
+             simdgroup_load/MMA 的布局假设错了，或 NCOLS/NSG 与线程组尺寸脱钩"
         );
         std::hint::black_box(&mut pr);
     }
