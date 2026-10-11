@@ -51,6 +51,14 @@ for t in $TIERS; do
     done
     med_c=$(printf '%s\n' "${C[@]}" | sort -n | awk '{v[NR]=$1} END{print (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}')
     med_o=$(printf '%s\n' "${O[@]}" | sort -n | awk '{v[NR]=$1} END{print (NR%2)?v[(NR+1)/2]:(v[NR/2]+v[NR/2+1])/2}')
-    awk -v t="$t" -v c="$med_c" -v o="$med_o" \
-        'BEGIN{printf "%-8s %10.1f %10.1f %9.2fx\n", t, c, o, o/c}'
+    # 漂移列：每臂**自己**在几对之间的 max/min。这个脚本没有对照臂，所以
+    # 判据只能用「两边一起漂」这个签名——本机的爬升是同相位的（见脚本头
+    # 那段 +52% 的实测），两臂离散都大 ⇒ 中位数不可用作结论。
+    # 2026-10-11 实测踩到：tiny/medium 三对方向一致可信，而 small 三对比值
+    # 0.97/0.80/1.11 自己就散了（我们 72→87→130、竞品 74→108→116），
+    # 中位 0.80 报出去就是虚的。
+    sp_c=$(printf '%s\n' "${C[@]}" | sort -n | awk 'NR==1{lo=$1} {hi=$1} END{printf "%.2f", hi/lo}')
+    sp_o=$(printf '%s\n' "${O[@]}" | sort -n | awk 'NR==1{lo=$1} {hi=$1} END{printf "%.2f", hi/lo}')
+    awk -v t="$t" -v c="$med_c" -v o="$med_o" -v sc="$sp_c" -v so="$sp_o" \
+        'BEGIN{printf "%-8s %10.1f %10.1f %9.2fx   臂内漂移 竞%s× 我%s×%s\n", t, c, o, o/c, sc, so, ((sc+0>1.30||so+0>1.30)?"  ⚠️ 本轮已漂移":"  ✅")}'
 done

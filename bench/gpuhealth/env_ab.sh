@@ -9,6 +9,8 @@
 #   * 看**中位配对差**，不看绝对值；
 #   * Δ 若单向同号，那是污染不是噪声——用控制列（此处由调用方自己看 det）
 #     判断，别用中位数把单向漂移吃进去。
+#   * **漂移门禁**（见下）：A 臂自己一轮内爬升 >1.15× 时，脚本会把漂移轮剔掉
+#     再报一次中位数。判据只看 A 臂，不看 Δ——按 Δ 筛轮次等于挑合意的噪声。
 set -uo pipefail
 cd "$(dirname "$0")"
 N=${1:?图数}; R=${2:?轮数}; shift 2
@@ -83,16 +85,49 @@ for ln in open(sys.argv[1]):
     rows[(int(p[0]),p[1])]=[float(x) for x in p[2].split()]
 print(f"变体 B = env {sys.argv[2]}")
 print(f"{'轮':>3} {'A tot':>9} {'B tot':>9} {'Δtot':>8} {'Δdet':>7} {'Δline':>8} {'Δimg/s':>8}")
-dt=[];dd=[];dl=[];ds=[]
+per=[]
 for r in sorted({k[0] for k in rows}):
     if (r,'A') not in rows or (r,'B') not in rows: continue
     a,b=rows[(r,'A')],rows[(r,'B')]
     if len(a)<5 or len(b)<5: continue
-    dt.append(b[0]-a[0]); dd.append(b[1]-a[1]); dl.append(b[2]-a[2]); ds.append(b[4]-a[4])
+    per.append((r,a[0],b[0]-a[0],b[1]-a[1],b[2]-a[2],b[4]-a[4]))
     print(f"{r:>3} {a[0]:>9.1f} {b[0]:>9.1f} {b[0]-a[0]:>+8.2f} {b[1]-a[1]:>+7.2f} {b[2]-a[2]:>+8.2f} {b[4]-a[4]:>+8.2f}")
-if dt:
-    m=lambda v: st.median(v)
+if per:
+    m=st.median
+    dt=[x[2] for x in per]; dd=[x[3] for x in per]; dl=[x[4] for x in per]; ds=[x[5] for x in per]
     print(f"\n中位配对差：Δtotal = {m(dt):+.2f} ms   Δdet = {m(dd):+.2f}   Δline = {m(dl):+.2f}   Δimg/s = {m(ds):+.2f}")
     print(f"符号：Δtotal 负 {sum(1 for x in dt if x<0)}/{len(dt)}，正 {sum(1 for x in dt if x>0)}/{len(dt)}；离散 {max(dt)-min(dt):.1f} ms")
+
+    # ── 漂移门禁（2026-10-11 加的，因为又双叒被吃了一次）──────────────────
+    #
+    # `health.sh` 判的是**带宽 ≥60 GB/s**，而本机在带宽照样达标的同时会整体
+    # 爬升：同一天里 small 从 70 爬到 155 ms（+123%）、medium 从 255 到 480。
+    # 这是 [[sequential-cross-binary-compare-is-drift]] 记的持续负载爬升，
+    # 不是回归、不是致瘸，所以 health.sh 拦不住（它测的是另一件事）。
+    #
+    # 后果：把漂移轮算进中位数，要么把真效应吃成 0、要么把冷热差记成优化。
+    #
+    # 处方：**用 A 臂自己的离散给轮次分类，基准取本轮最冷的一轮**（漂移是
+    # 单调向上爬的，越早越冷；我们一律以冷态为准，见各 log 的「健康态」）。
+    # 只按 A 筛、**绝不按 Δ 筛** —— 按 Δ 筛等于从噪声里挑合意的样本，那是
+    # 把 [[ab-variance-must-be-two-sided]] 的教训反过来犯。
+    Aall=[x[1] for x in per]
+    lo=min(Aall)
+    spread=(max(Aall)/lo) if lo>0 else float('inf')
+    keep=[x for x in per if x[1] <= lo*1.10]
+    print(f"\nA 臂基线：最冷 {lo:.1f} ms、最热 {max(Aall):.1f} ms（{spread:.2f}×）")
+    if spread <= 1.15:
+        print(f"✅ 漂移门禁：A 臂离散 {spread:.2f}× ≤ 1.15 ⇒ 上面的中位数可用。")
+    else:
+        print(f"⚠️  漂移门禁：A 臂离散 {spread:.2f}× > 1.15 ⇒ **本轮已漂移，上面的中位数不可用作结论**。")
+        if len(keep) >= 2:
+            kt=[x[2] for x in keep]; kdd=[x[3] for x in keep]; kl=[x[4] for x in keep]
+            print(f"    只留「A ≤ 最冷轮 ×1.10」的 {len(keep)}/{len(per)} 轮（轮号 {[x[0] for x in keep]}）：")
+            print(f"    稳定轮 Δtotal 中位 = {m(kt):+.2f} ms   Δdet = {m(kdd):+.2f}   Δline = {m(kl):+.2f}"
+                  f"   符号 负{sum(1 for x in kt if x<0)}/正{sum(1 for x in kt if x>0)}"
+                  f"   离散 {max(kt)-min(kt):.1f}")
+            print(f"    —— 报结论用这一行，别用上面那行。")
+        else:
+            print(f"    稳定轮只剩 {len(keep)} 个 ⇒ **本轮整个弃用**，等机身凉下来重跑。")
 PY
 rm -f "$TSV"
