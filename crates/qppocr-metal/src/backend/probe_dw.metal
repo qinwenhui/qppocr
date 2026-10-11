@@ -593,3 +593,171 @@ kernel void p_dw_tile(
     }
     dw_tail(d, acc, P, params, b_off, r_off, act, c1, c2, c3, ob, oy * outW + ox, cv4, c4, b);
 }
+
+// ── 第三轮续：瓦片版还能往哪走（`p_dw_tile9` / `p_dw_tilew`）──────────
+//
+// `p_dw_tile` 是 1.86×，但离 `p_dw_fma` 还有 **2.55×**（473 vs 1207 GFLOPS）。
+// 热循环每轮是「2 次线程组装载 + 1 次 FMA」，所以剩下这 2.55× 只可能出在
+// 那两条装载上。两个互相独立的疑点，各做一个变体：
+//
+//   `p_dw_tile9`：K 烤成编译期常量 9 并全展开。`kW`/`kH` 现在是**运行期**
+//     的，于是每轮都要算一次 `(ly0+dy)*stW + lx0+dx` 与 `dy*kW+dx` 两条
+//     乘加（外加循环判断）；烤死之后这 81 个下标全变成「一个基址 + 立即
+//     数」，装载也可能被流水化。代价是只对 9×9 成立。
+//
+//   `p_dw_tilew`：权重**不进线程组**，热循环里从设备内存读。权重在瓦片版
+//     里是「全组同地址」的广播装载，本来就不贵（前两轮量过：去掉权重装载
+//     只值 1.05×）；而搬进 `shW` 要付 prologue（81 次全组装载）与一次
+//     barrier 里的写可见性。如果这条更快，说明 `shW` 那一段是净亏 ——
+//     与 memory `mma-conv8-weights-are-free-parallelism-is-dead` 同款。
+//
+// 自变量仍然只有一个（K 是否编译期 / 权重在哪一级存储），其余与 `p_dw_tile`
+// 逐字相同。
+#define DW_TILE9_K 9
+
+kernel void p_dw_tile9(
+    device float4* d [[buffer(0)]],
+    device const uint* params [[buffer(1)]],
+    constant uint& p_off [[buffer(3)]],
+    uint3 wg [[threadgroup_position_in_grid]],
+    uint3 tp3 [[thread_position_in_threadgroup]])
+{
+    uint tid = tp3.x;
+    threadgroup float4 shTile[(DW_TILE + DW_MAXK - 1) * (DW_TILE + DW_MAXK - 1)];
+    threadgroup float4 shW[DW_TILE9_K * DW_TILE9_K];
+
+    uint P = p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1], b_off = params[P + 2];
+    uint out_off = params[P + 3];
+    uint mDim = params[P + 4], cDim = params[P + 5], outW = params[P + 6];
+    uint inW = params[P + 7], inH = params[P + 8];
+    uint taps = params[P + 9], kW = params[P + 10];
+    uint sH = params[P + 11], sW = params[P + 12];
+    uint padT = params[P + 13], padL = params[P + 14];
+    uint act = params[P + 15];
+    float c1 = as_type<float>(params[P + 16]);
+    float c2 = as_type<float>(params[P + 17]);
+    float c3 = as_type<float>(params[P + 18]);
+    uint r_off = params[P + 19];
+
+    uint b = wg.y;
+    if (params[0] != 0u && b >= params[0]) return;
+    // 这条变体只在 9×9 s1 成立；判宽了就是读飞（`dw_spec_ok` 是唯一约定）。
+    if (kW != DW_TILE9_K || taps != DW_TILE9_K * DW_TILE9_K || sH != 1u || sW != 1u) return;
+
+    uint cv4 = cDim >> 2;
+    uint outH = mDim / outW;
+    uint tilesX = (outW + DW_TILE - 1u) / DW_TILE;
+    uint g = wg.x;
+    uint c4 = g % cv4;
+    uint tile = g / cv4;
+    uint tx = tile % tilesX, ty = tile / tilesX;
+
+    uint stW = DW_TILE + DW_TILE9_K - 1u;
+    uint stH = DW_TILE + DW_TILE9_K - 1u;
+    int iyT = int(ty * DW_TILE) - int(padT);
+    int ixT = int(tx * DW_TILE) - int(padL);
+    uint ib = (in_off >> 2) + b * inH * inW * cv4;
+    uint wb = w_off >> 2;
+    uint ob = (out_off >> 2) + b * mDim * cv4;
+
+    for (uint e = tid; e < stW * stH; e += 256u) {
+        uint iy = e / stW, ix = e - iy * stW;
+        int gy = iyT + int(iy), gx = ixT + int(ix);
+        float4 v = float4(0.0);
+        if (gy >= 0 && uint(gy) < inH && gx >= 0 && uint(gx) < inW) {
+            v = d[ib + (uint(gy) * inW + uint(gx)) * cv4 + c4];
+        }
+        shTile[e] = v;
+    }
+    for (uint e = tid; e < DW_TILE9_K * DW_TILE9_K; e += 256u) shW[e] = d[wb + e * cv4 + c4];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint ox = tx * DW_TILE + (tid & (DW_TILE - 1u));
+    uint oy = ty * DW_TILE + (tid >> 4);
+    if (ox >= outW || oy >= outH) return;
+    uint lx0 = (tid & (DW_TILE - 1u));
+    uint ly0 = (tid >> 4);
+
+    float4 acc = float4(0.0);
+    #pragma unroll
+    for (uint dy = 0u; dy < DW_TILE9_K; dy++) {
+        #pragma unroll
+        for (uint dx = 0u; dx < DW_TILE9_K; dx++) {
+            acc += shW[dy * DW_TILE9_K + dx] * shTile[(ly0 + dy) * stW + lx0 + dx];
+        }
+    }
+    dw_tail(d, acc, P, params, b_off, r_off, act, c1, c2, c3, ob, oy * outW + ox, cv4, c4, b);
+}
+
+kernel void p_dw_tilew(
+    device float4* d [[buffer(0)]],
+    device const uint* params [[buffer(1)]],
+    constant uint& p_off [[buffer(3)]],
+    uint3 wg [[threadgroup_position_in_grid]],
+    uint3 tp3 [[thread_position_in_threadgroup]])
+{
+    uint tid = tp3.x;
+    threadgroup float4 shTile[(DW_TILE + DW_MAXK - 1) * (DW_TILE + DW_MAXK - 1)];
+
+    uint P = p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1], b_off = params[P + 2];
+    uint out_off = params[P + 3];
+    uint mDim = params[P + 4], cDim = params[P + 5], outW = params[P + 6];
+    uint inW = params[P + 7], inH = params[P + 8];
+    uint taps = params[P + 9], kW = params[P + 10];
+    uint sH = params[P + 11], sW = params[P + 12];
+    uint padT = params[P + 13], padL = params[P + 14];
+    uint act = params[P + 15];
+    float c1 = as_type<float>(params[P + 16]);
+    float c2 = as_type<float>(params[P + 17]);
+    float c3 = as_type<float>(params[P + 18]);
+    uint r_off = params[P + 19];
+
+    uint b = wg.y;
+    if (params[0] != 0u && b >= params[0]) return;
+
+    uint cv4 = cDim >> 2;
+    uint outH = mDim / outW;
+    uint kH = taps / kW;
+    uint tilesX = (outW + DW_TILE - 1u) / DW_TILE;
+    uint g = wg.x;
+    uint c4 = g % cv4;
+    uint tile = g / cv4;
+    uint tx = tile % tilesX, ty = tile / tilesX;
+
+    uint stW = DW_TILE * sW + kW - 1u;
+    uint stH = DW_TILE * sH + kH - 1u;
+    int iyT = int(ty * DW_TILE * sH) - int(padT);
+    int ixT = int(tx * DW_TILE * sW) - int(padL);
+    uint ib = (in_off >> 2) + b * inH * inW * cv4;
+    uint wb = w_off >> 2;
+    uint ob = (out_off >> 2) + b * mDim * cv4;
+
+    for (uint e = tid; e < stW * stH; e += 256u) {
+        uint iy = e / stW, ix = e - iy * stW;
+        int gy = iyT + int(iy), gx = ixT + int(ix);
+        float4 v = float4(0.0);
+        if (gy >= 0 && uint(gy) < inH && gx >= 0 && uint(gx) < inW) {
+            v = d[ib + (uint(gy) * inW + uint(gx)) * cv4 + c4];
+        }
+        shTile[e] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint ox = tx * DW_TILE + (tid & (DW_TILE - 1u));
+    uint oy = ty * DW_TILE + (tid >> 4);
+    if (ox >= outW || oy >= outH) return;
+    uint lx0 = (tid & (DW_TILE - 1u)) * sW;
+    uint ly0 = (tid >> 4) * sH;
+
+    // 权重直接读设备内存：地址在全组内**同一个**（c4 固定、t 随循环推进），
+    // 所以每次是一个广播装载，而不是 256 路 gather。
+    float4 acc = float4(0.0);
+    for (uint dy = 0u; dy < kH; dy++) {
+        for (uint dx = 0u; dx < kW; dx++) {
+            acc += d[wb + (dy * kW + dx) * cv4 + c4] * shTile[(ly0 + dy) * stW + lx0 + dx];
+        }
+    }
+    dw_tail(d, acc, P, params, b_off, r_off, act, c1, c2, c3, ob, oy * outW + ox, cv4, c4, b);
+}

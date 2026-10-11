@@ -232,6 +232,10 @@ pub(crate) const DW_PROBE_SHADERS: &[(&str, &str)] = &[
     // 16×16 输出瓦片 × 一个 c4 组），见 `dw_groups_for_tile`；且只在
     // `kW,kH ≤ 9 && stride == 1` 上成立（`dw_spec_ok`）。语义**结果正确**。
     ("p_dw_tile", include_str!("probe_dw.metal")),
+    // 第三轮续：瓦片版的两个疑点各一个变体（K 烤成编译期 / 权重不进线程组）。
+    // 网格与 `p_dw_tile` 完全相同。
+    ("p_dw_tile9", include_str!("probe_dw.metal")),
+    ("p_dw_tilew", include_str!("probe_dw.metal")),
 ];
 
 /// `n_convt` 探针（`probe_convt.metal`，见该文件的头注释）。
@@ -335,7 +339,10 @@ pub(crate) fn dw_spec_ok(name: &str, kh: u32, kw: u32, pad: u32, stride: u32) ->
     match name {
         "p_dw_u9" => (kh, kw, pad, stride) == (9, 9, 4, 1),
         "p_dw_u3" => (kh, kw, pad, stride) == (3, 3, 1, 1),
-        "p_dw_tile" => kh <= 9 && kw <= 9 && stride == 1,
+        "p_dw_tile" | "p_dw_tilew" => kh <= 9 && kw <= 9 && stride == 1,
+        // `p_dw_tile9` 的 K 是编译期常量 9 —— 判宽的后果与 `p_dw_u9` 同款
+        // （读到常量算出的错地址，输出全错且可能读飞）。
+        "p_dw_tile9" => (kh, kw, stride) == (9, 9, 1),
         _ => true,
     }
 }

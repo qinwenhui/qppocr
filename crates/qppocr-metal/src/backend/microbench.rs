@@ -4849,6 +4849,13 @@ fn conv_dw_variant_scan() {
         // 3x3 那批条数多（Conv.5/10/13/…），单条小但铺满整个骨干。
         DwCase { label: "dw 3x3 c128 136x240 (Conv.5)", h: 136, w: 240, c: 128, kh: 3, kw: 3, stride: 1 },
         DwCase { label: "dw 3x3 c512  34x60 ", h: 34, w: 60, c: 512, kh: 3, kw: 3, stride: 1 },
+        // 5x5 那档：判据 `5..=9` 把它收进来了，但探针从没量过 —— det 里真有
+        // 两条（Conv.21 c64 / Conv.27 c128），形状照抄 PLAN_DUMP。
+        //   ⚠️ `DwCase::h/w` 是**输入**分辨率，且 k=5,p=2,s=1 时
+        //   out = (in + 4 - 5) + 1 = in —— 想凑出 out=4 就要填 in=4，
+        //   按 3x3 的直觉去「补两圈 pad」会得到另一个形状（已踩过）。
+        DwCase { label: "dw 5x5 c64   4x32  (Conv.21)", h: 4, w: 32, c: 64, kh: 5, kw: 5, stride: 1 },
+        DwCase { label: "dw 5x5 c128  2x32  (Conv.27)", h: 2, w: 32, c: 128, kh: 5, kw: 5, stride: 1 },
     ];
     let probes = super::conv_probe::ProbeSet::from_list(
         &ctx.inner.device,
@@ -4880,6 +4887,8 @@ fn conv_dw_variant_scan() {
         // 第三轮：线程组瓦片暂存（**网格不同**，见 `dw_groups_for_tile`）。
         // 结果应与 CPU 一致 —— 它只换了热循环的取数来源，没改累加次序。
         ("p_dw_tile", true),
+        ("p_dw_tile9", true),
+        ("p_dw_tilew", true),
     ];
 
     // ── `p_dw_interior` 的**派发前**安全证明 ────────────────────────
@@ -4962,7 +4971,7 @@ fn conv_dw_variant_scan() {
         let tile = super::conv_probe::dw_groups_for_tile(m_dim, pr.out_w, pr.co4);
         let grid_of = |n: &str| match n {
             "p_dw_wide4" => wide,
-            "p_dw_tile" => tile,
+            "p_dw_tile" | "p_dw_tile9" | "p_dw_tilew" => tile,
             _ => pr.groups,
         };
 
