@@ -2015,9 +2015,15 @@ impl DeviceSession for VulkanSession {
         // rec 拖到 2× CPU）。64 桶把语料宽度塌缩到 ~20 个形状，重建
         // 只付一次；右侧零填充的额外计算远小于重建税。
         // 例外：无注意力 mask 的模型（exact_width）填充会改真步输出
-        // （非「额外计算」而是「错值」）——退小粒度对齐（8px：填充 ≤7，
-        // 注意力混入窗口极小，GT 实测与逐像素精确无差；形状数大减）。
-        if self.exact_width { 8 } else { 64 }
+        // （非「额外计算」而是「错值」）——退小粒度对齐。
+        //
+        // **粒度 32（2026-10-11 由 8 放大，与 Metal 侧同款，用户拍板）**：
+        // 8 px 桶几乎不重合 ⇒ rec 的「一行一次 run、每次 run 一个 ~2.27 ms
+        // 设备端地板」付满（见 `bench/gpuhealth/logs/rec_grain_20261011.md`）。
+        // 证据是 **Metal 侧**实测（本机无 Vulkan 设备）：small grain8→32
+        // 共 1041 行识别文本逐字符一致、0 丢行，Δline −6.05 ms。两侧保持
+        // 同粒度，避免同一份输入在两个后端分到不同的批。
+        if self.exact_width { 32 } else { 64 }
     }
 
     fn batch_grain(&self) -> i32 {
