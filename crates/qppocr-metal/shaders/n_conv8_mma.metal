@@ -27,12 +27,31 @@
 //
 // - `taps == 1 && kW == 1 && sH == sW == 1 && padT == padL == 0`
 //   （1×1 无 pad：输出位置 m 与输入像素 m 一一对应，A 无 gather）；
-// - `nDim % 64 == 0` 或 `nDim % 32 == 0`（列块不越界；nDim 是补 4 后的 Co，
-//   float 元素数）。两条选不同入口，见下面「两档」一节；
+// - `nDim % 8 == 0`（nDim 是补 4 后的 Co，float 元素数）：B 分片的列宽是 8，
+//   这是能整对齐的下限。`nDim % 64 == 0` 走 64 列块，否则走 32 列块——
+//   两条入口见下面「两档」一节；
 // - `cin4v % 2 == 0`（kf % 8 == 0：K 步长 8 不越界；Cin%8==0 即满足）。
 //
 // M 方向尾块会读 m >= mDim 的输入（越界行只进被丢弃的累加器，且落在
 // arena 内——输出段跟在输入段之后，无 fault 风险），写回按 m < mDim 掩码。
+//
+// # 尾块（N 方向不满一个列块）
+//
+// `nDim` 不是列块宽的整数倍时，最后一块的 B 分片会读到权重行尾**之后**。
+// 这不是 bug，是刻意的：越读落点只有两种，都安全——
+//
+// - 行内越读（k < kf-1）：落到同一张权重表的下一行。值是别的 k 的权重，
+//   有限，且**只影响 acc 里 n >= nDim 那些列**；
+// - 表尾越读（k = kf-1）：落到权重段之后。这一段由重排侧垫了
+//   `nhwc::MMA_W_TAIL` 个 0（见 `plan.rs` 那处 `w_tail`），恒为定值。
+//
+// 于是越读的产物一律不参与真输出：尾声按 `n < nDim` 掩码，**掩掉的正
+// 是被污染的那几列**，其余列读到的权重元素逐个正确（B 分片元素 (i,l)
+// 就是行 kb+i 的第 `sn+j*8+l` 个元素）。这也是为什么这条不需要改行
+// stride、不需要新参数、也不动下游任何一处。
+//
+// 权重段尾巴那 32 个 0 是**布局透明**的：它只追加在 blob 末尾，任何合法
+// 下标处的字节一字不变，所以同一份 `w_off` 仍可被 `n_conv8` 原样读。
 //
 // # 网格（与 n_conv8 的 `ceil(m/4)*nh` 完全不同，计划层单算）
 //
@@ -156,7 +175,6 @@ static void mma1_body(
     uint b = wg.z;
     if (params[0] != 0u && b >= params[0]) return; // 批上限早退（同 n_conv8）
 
-    uint nv = nDim >> 2;        // float4 列数（列 stride 用）
     uint kf = cin4v * 4u;        // K 的 float 元素数（行 stride 用）
 
     uint m0 = wg.x * 64u;         // 64 行基（输出位置）
@@ -204,7 +222,12 @@ static void mma1_body(
     for (uint e = tid; e < 64u * NCOLS; e += NTH) {
         uint m = m0 + (e / NCOLS);
         uint n = n0 + (e % NCOLS);
+        // 两道掩码：m 挡行尾（尾部瓦片读进来的越界输入只进被丢的累加器），
+        // n 挡列尾（列块不满时 B 分片越读到的权重只进这几列）——见文件头
+        // 「尾块」一节。`n >= nDim` 时 ost[e] 是被污染的，故掩码必须在
+        // 读 ost 之前。
         if (m >= mDim) continue;
+        if (n >= nDim) continue;
         float v = ost[e];
         if (b_off != OFF_NONE) v += f32v[(b_off >> 2) * 4u + n];
         v = act1(v, act, c1, c2, c3);

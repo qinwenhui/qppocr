@@ -915,7 +915,11 @@ fn build_conv_case_geom_w(
     };
 
     let n_in = c.h * c.w * ci4 * batch;
-    let n_w = taps * ci4 * co4; // 权重**不随 batch 增长**（各份共用一份）
+    let n_w_data = taps * ci4 * co4; // 权重**不随 batch 增长**（各份共用一份）
+    // 与生产侧 `plan.rs` 同款尾垫（`nhwc::MMA_W_TAIL`）：`n_conv8_mma*` 在
+    // 列块不满时会读到权重行尾之后。`k.at` 给定时段偏移是显式写死的、后面
+    // 紧跟的 bias 段恒为定值，越读落在那儿同样安全，故只在紧排布局里垫。
+    let n_w = n_w_data + if k.at.is_none() { qppocr_gpu::nhwc::MMA_W_TAIL as u32 } else { 0 };
     let n_out = m_dim * co4 * batch;
     // 参数块占 word 64..64+21；张量必须让开，否则输入第一段就把
     // taps/cin4v 覆盖成浮点位型——内核会按天文数字循环，直接挂死。
@@ -986,13 +990,21 @@ fn build_conv_case_geom_w(
             // 权重存 fp16：同一逻辑序（`[t][ci4][co4]`）、同一元素下标，
             // 只是每个值占 2 B。整段先清零（`new_buffer` 不清零，尾部的
             // 闲置区必须确定，否则 NaN 会经未定义路径影响计时），再把
-            // `n_w` 个 half 写进段的前半。
+            // `n_w_data` 个 half 写进段的前半。
             let w16: Vec<u16> = w_store.iter().map(|&v| f32_to_f16_bits(v)).collect();
             let wp = base.add(w_off_w as usize) as *mut u16;
             std::ptr::write_bytes(wp, 0, n_w as usize);
-            std::ptr::copy_nonoverlapping(w16.as_ptr(), wp, n_w as usize);
+            std::ptr::copy_nonoverlapping(w16.as_ptr(), wp, n_w_data as usize);
         } else {
-            std::ptr::copy_nonoverlapping(w_store.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+            let wdst = base.add(w_off_w as usize) as *mut f32;
+            std::ptr::copy_nonoverlapping(w_store.as_ptr(), wdst, n_w_data as usize);
+            // 尾垫必须显式清零：`new_buffer` 不清零，越读到任意位型
+            // （含 NaN）虽然只落在被掩码的列上，但测试要的是确定性。
+            std::ptr::write_bytes(
+                wdst.add(n_w_data as usize),
+                0,
+                (n_w - n_w_data) as usize,
+            );
         }
         // bias 清零（b_off 有效但全 0）
         std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, co4 as usize);
@@ -1465,7 +1477,7 @@ fn conv8_mma_matches_cpu() {
     // 与 det 的 CSP 支线的真实形状，`96%64=32` ⇒ 只能进 32 那一档。
     // 这一档的 NSG=4/128 线程是个独立耦合面（`threads_per_group` 少写一条
     // 就会让线程认领到不存在的 simdgroup、越界写 `ost`），所以必须单列用例。
-    let cases: [(u32, u32, u32, u32, &str); 7] = [
+    let cases: [(u32, u32, u32, u32, &str); 11] = [
         (8, 8, 64, 64, "满块 64 行 × 64 列"),
         (4, 8, 64, 64, "尾掩码 32 行（<64）"),
         (16, 16, 128, 128, "多块 256 行 × 2 列块"),
@@ -1473,6 +1485,14 @@ fn conv8_mma_matches_cpu() {
         (8, 8, 32, 96, "**N32** Co=96=3×32 列块"),
         (4, 32, 192, 96, "**N32** Co=96 尾掩码 128 行"),
         (16, 144, 48, 96, "**N32** Co=96 多行块（rec 的真实形状）"),
+        // 以下四条 `cpad4(Co) % 32 != 0`：走「尾块」那条路（列块不满 ⇒
+        // 尾声 `n < nDim` 掩码 + `nhwc::MMA_W_TAIL` 尾垫）。**这组才是
+        // 判据从 `%32` 放到 `%8` 之后真正新覆盖的形状**，Co=24 尤其常见
+        // （det 的 CSP 支线），MatMul.12 则是剩余 `n_conv8` 里最大的一条。
+        (8, 8, 32, 24, "**尾块** Co=24 = 3 个 8 列分片"),
+        (16, 144, 96, 48, "**尾块** Co=48 多行块"),
+        (8, 17, 120, 360, "**尾块** Co=360（120→360 真实形状）"),
+        (2, 68, 120, 18712, "**尾块** MatMul.12 真实形状（120→18712）"),
     ];
 
     for (h, w, cin, cout, note) in cases {
@@ -2022,7 +2042,9 @@ fn conv8_mma3_matches_cpu() {
         // 段布局重算（与 build_conv_case_geom 同式）+ 自检：公式漂了就先炸在
         // 这里，而不是让下面读到别的段上。
         let n_in = c.h * c.w * ci4;
-        let n_w = taps * ci4 * co4;
+        // 权重段 = 数据 + `MMA_W_TAIL` 尾垫（`build_conv_case_geom_w` 里
+        // 紧排布局那一支同式）——尾垫是生产侧也有的，漏掉这条自检就漂 32。
+        let n_w = taps * ci4 * co4 + qppocr_gpu::nhwc::MMA_W_TAIL as u32;
         let out_off_w = 256u32 + n_in + n_w + co4; // 参数块 64 起、输入 256 起
         assert_eq!(out_off_w, pr.out_off_w, "段布局重算与构造函数不一致");
 
@@ -2825,6 +2847,11 @@ fn conv8_mma_residual() {
 /// 四条的总长都是 `28859520` word（115.4 MB）。**复现出来 ⇒ 几何（或 arena
 /// 尺寸）就是原因，下一步二分；复现不出来 ⇒ 原因在探针看不见的地方**（别的
 /// 派发留下的缓存状态、计划里其余 181 条的余波），这条线索该收摊。
+///
+/// ⚠️ **下面那些绝对偏移取自 `MMA_W_TAIL` 之前的一次计划 dump**：现在每个
+/// conv 权重块尾巴多垫 128 B（见 [`qppocr_gpu::nhwc::MMA_W_TAIL`]），生产
+/// 静态区的落点整体后移。探针仍然自洽（同一份偏移喂给所有臂），但**不要再
+/// 拿这里的数字去对当前生产的 `偏: w=...`**——要重新 dump。
 #[test]
 fn conv8_mma_prod_geom() {
     let _g = gpu_guard();

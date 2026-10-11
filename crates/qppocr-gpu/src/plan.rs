@@ -207,13 +207,16 @@ pub struct PlanBuilder<'a> {
     /// - `kh==kw==1 && sh==sw==1 && pad==0`：输出位置与输入像素一一对应，
     ///   A 无 gather；
     /// - `cpad4(Cin) % 8 == 0`：K 步长 8 不越界；
-    /// - `cpad4(Co) % 32 == 0`：列块不越界。`%64==0` 走 `n_conv8_mma`，
-    ///   `%32` 但不 `%64` 走 `n_conv8_mma_n32`（32 列块、128 线程）。
+    /// - `cpad4(Co) % 8 == 0`：B 分片列宽 8 的整对齐下限。`%64==0` 走
+    ///   `n_conv8_mma`（64 通道块），否则走 `n_conv8_mma_n32`（32 通道块、
+    ///   128 线程）——**列块不满时靠尾声 `n < nDim` 掩码 + 权重段尾垫
+    ///   （`nhwc::MMA_W_TAIL`）兜住**，见 `n_conv8_mma.metal` 的「尾块」一节。
     ///
-    /// **为什么会放开到 `%32`**：`%64` 这条把 rec/det 里成片的真实层挡在
-    /// 门外——**Co=96**（`cpad4(96)=96`，`96%64=32`）是 rec 的
-    /// Conv.4/9/12/15/47 与 det 的 CSP 支线，而 96 = 3×32 正落在 32 列块上。
-    /// 与 `conv_kxk_mma` 的 `n_conv8_mma3_n32` 是同一个理由、同一套做法。
+    /// **为什么一路放到 `%8`**：这条判据每松一格就有一批真实层被放进来。
+    /// `%64` → `%32` 放进来的是 **Co=96**（rec 的 Conv.4/9/12/15/47 与 det
+    /// 的 CSP 支线）；`%32` → `%8` 放进来的是 **Co=24/48/120/240/360/18712**
+    /// ——其中 `MatMul.12`（120→18712）单条 3.85 ms，是 `n_conv8` 剩余时的
+    /// 最大一项。放宽的代价只是列块尾部的掩码与 128 B 尾垫，数值不变。
     ///
     /// 与 `weight_f16` 同款：**两边必须同步**——Vulkan 的 GLSL 侧没有
     /// `n_conv8_mma`，开了会派发到不存在的内核（硬失败，非静默降级）。
@@ -1309,11 +1312,19 @@ impl PlanBuilder<'_> {
                         w_offs,
                         self.repack_cache,
                         |t| {
-                            if fp16 {
+                            let mut d = if fp16 {
                                 nhwc::repack_conv_w_f16(&t.f32, co, ci, kh, kw)
                             } else {
                                 repack_conv_w(&t.f32, co, ci, kh, kw)
-                            }
+                            };
+                            // MMA 尾垫（见 `nhwc::MMA_W_TAIL`）：列块不满时
+                            // B 分片会读到权重段之后，垫 0 兜住。**布局透明**
+                            // ——只在末尾追加，任何合法下标处的字节一字不变，
+                            // 所以 `n_conv8` 仍能读同一份 `w_off`。对非 MMA
+                            // 节点纯属白垫 128 B，换「内核选择与权重布局之间
+                            // 不必再有一份同步状态」。
+                            d.resize(d.len() + nhwc::MMA_W_TAIL, 0);
+                            d
                         },
                     )?;
                     let b_off = self.n_bias_off(n, ws[0], layout, uploads, w_offs)?;
@@ -1363,7 +1374,7 @@ impl PlanBuilder<'_> {
                         && pads.0 == 0
                         && pads.1 == 0
                         && cpad4(ws[1]) % 8 == 0
-                        && cpad4(ws[0]) % 32 == 0;
+                        && cpad4(ws[0]) % 8 == 0;
                     // k×k（k>1）：方块 k×k 走 `n_conv8_mma3`。**不再要求步长 1
                     // 与对称 pad**——覆盖几何由 [`KxkCover`] 现算，那组算式在
                     // stride1 + 对称 pad 下逐项退化成旧式，所以既有形状的行为
@@ -1445,6 +1456,11 @@ impl PlanBuilder<'_> {
                         // 同样是 `nDim / NCOLS` 与 `tid>>5`，所以两份仍然逐字
                         // 对应）。**线程组大小必须跟着切**：`_n32` 是 128 线程，
                         // 见 `pipeline.rs::threads_per_group`。
+                        //
+                        // `co4 % 64 == 0` 时整除，否则退 32 列块且**最后一块
+                        // 不满**——靠 `div_ceil` 起网格、内核尾声按 `n < nDim`
+                        // 掩码，越读的权重由 `nhwc::MMA_W_TAIL` 兜住。见
+                        // `n_conv8_mma.metal` 头注释「尾块」一节。
                         let co4 = cpad4(ws[0]);
                         let ncols = if co4 % 64 == 0 { 64 } else { 32 };
                         let kname = if ncols == 64 {
@@ -1452,7 +1468,7 @@ impl PlanBuilder<'_> {
                         } else {
                             "n_conv8_mma_n32"
                         };
-                        Ok(vec![(kname, pb, [m_dim.div_ceil(64), co4 / ncols, nb])])
+                        Ok(vec![(kname, pb, [m_dim.div_ceil(64), co4.div_ceil(ncols), nb])])
                     } else if use8 {
                         let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
                         Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1])])
@@ -1819,11 +1835,14 @@ impl PlanBuilder<'_> {
                                 dst[i] = src[i * nn];
                             }
                         }
-                        if fp16 {
+                        let mut d = if fp16 {
                             nhwc::repack_conv_w_f16(&w_t, nn, k, 1, 1)
                         } else {
                             nhwc::repack_conv_w(&w_t, nn, k, 1, 1)
-                        }
+                        };
+                        // 与 Conv 分支同款 MMA 尾垫（见 `nhwc::MMA_W_TAIL`）。
+                        d.resize(d.len() + nhwc::MMA_W_TAIL, 0);
+                        d
                     },
                 )?;
                 let mut pb = ParamBlock::new();
@@ -1848,7 +1867,31 @@ impl PlanBuilder<'_> {
                     .f(1.0)
                     .f(0.5)
                     .u(OFF_NONE);
-                if use8 {
+                // 常量 B 的 MatMul 在计划层**就是一条 1×1 conv**：A=[m,k]
+                // 按 NHWC 存（inH=1、inW=m）、权重转置成 [nn,k] 再按
+                // `repack_conv_w` 落 k-主序（行 stride = `cols` = cpad4(nn)）
+                // ——参数块的 taps/kW/sH/sW/padT/padL 逐字段与 1×1 conv 相同。
+                // 所以 `n_conv8_mma` 那三条硬约束在这里逐条成立时同样能走。
+                //
+                // **这条分支曾经被漏掉**：`conv1x1_mma` 的判据只写在 `"Conv"`
+                // 那一支里，于是整个 120→\* 家族（rec 的 CTC 头 `MatMul.12`
+                // 120→18712、以及 120→120/240/360）一直走标量 `n_conv8`。
+                // MatMul.12 单条 3.85 ms、只跑到 ~158 GFLOPS，是 `n_conv8`
+                // 剩余时里最大的一项。
+                let mma = self.conv1x1_mma
+                    && !fp16
+                    && use8
+                    && nhwc::cpad4(k as i64) % 8 == 0
+                    && cols % 8 == 0;
+                if mma {
+                    let ncols = if cols % 64 == 0 { 64 } else { 32 };
+                    let kname = if ncols == 64 {
+                        "n_conv8_mma"
+                    } else {
+                        "n_conv8_mma_n32"
+                    };
+                    Ok(vec![(kname, pb, [m_dim.div_ceil(64), cols.div_ceil(ncols), 1])])
+                } else if use8 {
                     let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
                     Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), 1, 1])])
                 } else {
