@@ -13,6 +13,13 @@
 配对判据：检测框（8 点四边形）取轴对齐外接矩形，与 GT bbox 算 IoU，
 贪心取 ≥ --iou 的最大者，一对一。
 
+⚠️ **真值的 `bbox` 不是行分割真值。** 生成器会把**一条视觉上的整行**拆成两条
+相邻条目（一条 orientation=0、一条 180，x 间隙只有 4~13px）。我们把它认成
+一行是**对的**，但按条目配对就会记成两条 MISS。gen100 上 small 档的 6 条 MISS
+全是这个来源，`img-056` 那条间隙只有 **4px**。⇒ **看到 MISS 先裁图确认**，
+别急着改检测。实测 `merge_line_gap` 0.5 vs 0 在整个语料上结果逐字相同，
+那条同行合并逻辑在这份语料上根本没触发。
+
 用法：
   ./acc_truth.py --tier small --device metal
   ./acc_truth.py --tier small --device cpu --limit 20
