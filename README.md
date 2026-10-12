@@ -163,12 +163,14 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
   MoltenVK 翻译层）。det/rec/cls 整图会话与 Vulkan 共用同一后端无关
   计划模型（参数编码同源）；批维补齐/CTC argmax 出口/部署分级
   （`QPPOCR_GPU_STAGES`）与 Vulkan 侧同款语义。macOS 上 `--device gpu`
-  优先 Metal，MoltenVK 兜底。
+  优先 Metal，MoltenVK 兜底。真机 M4 上的完整实测（端到端 / 分阶段 /
+  三口径精度 / 内存 / GPU 能力）见 **[docs/metal-m4.md](docs/metal-m4.md)**。
 
 ## 已知限制（如实）
 
-- `medium` 档**未跑过精度基准**（能跑通，单图约 1.7 s）；预设值系从
-  small 照搬，无独立依据。
+- `medium` 档精度基准**已跑**（gen100 真值语料，CPU/Metal 同分，见
+  [docs/metal-m4.md](docs/metal-m4.md) §三）；预设值仍系从 small 照搬，
+  无独立依据。
 - 位级输出依赖线程数（gemm 分轴规则）：同一图在不同 `--threads` 下
   约 1/100 概率出现 ≤1 ulp 级的 box 微差（聚合指标不变）。同会话固定
   线程数即稳定。
@@ -181,6 +183,8 @@ threads / rec-shards / device` 五个轴，值可用 `base` 引用命令行给�
 ## 文档与示例
 
 - API 文档：rustdoc（`cargo doc --open`；发布 crates.io 后 docs.rs 自动生成）
+- 实测报告：[`docs/metal-m4.md`](docs/metal-m4.md)——Apple M4 真机上 CPU
+  vs Metal 的端到端、分阶段、三口径精度、内存与 GPU 能力实测，含复现命令
 - 可运行示例（`crates/qppocr/examples/`）：`api_smoke`（三行上手）、
   `api_verify`（serde/并发语义断言）、`char_boxes`（逐字坐标几何验证）、
   `retry_flags`（区域重试标记）、`phase_breakdown`（分阶段计时）、

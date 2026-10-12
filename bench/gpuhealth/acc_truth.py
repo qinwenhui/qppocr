@@ -70,7 +70,16 @@ def main():
     ap.add_argument("--models", default=os.path.join(ROOT, "models"))
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--iou", type=float, default=0.5)
+    ap.add_argument("--strip-space", action="store_true",
+                    help="两边都去掉半角空格再比（字典里没有空格字符，"
+                         "空格是 `rec_space_gap` 按几何补的启发式 ⇒ 报精度"
+                         "必须声明算不算，见 [[head2head-accuracy-space-is-the-whole-lead]]）")
     ap.add_argument("--dump", default=None, help="把漏行/空行明细写到这个文件")
+    ap.add_argument("--from-json", default=None,
+                    help="不跑引擎，直接吃一份 `qppocr *.jpg --json` 的落盘结果"
+                         "（按文件名对齐）。交付文档要「一次 run 同时给分阶段"
+                         "计时和精度」，而本脚本原来每图起一个进程、只留 lines、"
+                         "丢掉 timing ⇒ 不给这个口就得把语料跑两遍")
     a = ap.parse_args()
     meta_path = a.meta or os.path.join(a.dir, "metadata.json")
     meta = json.load(open(meta_path))
@@ -80,18 +89,31 @@ def main():
     tot = dict(gt=0, det=0, m=0, exact=0, empty=0, cer_num=0, cer_den=0)
     bad_imgs = []
     detail = []
+    def norm(s):
+        return s.replace(" ", "") if a.strip_space else s
+
+    cached = None
+    if a.from_json:
+        cached = {os.path.basename(o["image"]): o["lines"]
+                  for o in json.load(open(a.from_json))}
     for e in imgs:
         p = os.path.join(a.dir, e["file"])
-        try:
-            out = subprocess.run(
-                [a.bin, p, "--tier", a.tier, "--device", a.device,
-                 "--models", a.models, "--workers", "1", "--quiet", "--json"],
-                capture_output=True, text=True, env=env, timeout=600,
-            )
-            det = json.loads(out.stdout)[0]["lines"]
-        except Exception as ex:                                     # noqa: BLE001
-            print(f"✗ {e['file']} 跑失败：{ex}", file=sys.stderr)
-            continue
+        if cached is not None:
+            det = cached.get(e["file"])
+            if det is None:
+                print(f"✗ {e['file']} 不在 {a.from_json} 里", file=sys.stderr)
+                continue
+        else:
+            try:
+                out = subprocess.run(
+                    [a.bin, p, "--tier", a.tier, "--device", a.device,
+                     "--models", a.models, "--workers", "1", "--quiet", "--json"],
+                    capture_output=True, text=True, env=env, timeout=600,
+                )
+                det = json.loads(out.stdout)[0]["lines"]
+            except Exception as ex:                                 # noqa: BLE001
+                print(f"✗ {e['file']} 跑失败：{ex}", file=sys.stderr)
+                continue
 
         gt = e["lines"]
         dboxes = [(quad_aabb(l["box"]), l["text"]) for l in det]
@@ -116,13 +138,14 @@ def main():
                 continue
             used[bi] = True
             t = dboxes[bi][1]
+            tg, gg = norm(t), norm(g["text"])
             img["m"] += 1
-            img["gtch"] += len(g["text"])
-            if t == g["text"]:
+            img["gtch"] += len(gg)
+            if tg == gg:
                 img["exact"] += 1
                 b["exact"] += 1
             else:
-                img["dist"] += edit(t, g["text"])
+                img["dist"] += edit(tg, gg)
                 if t == "":
                     img["empty"] += 1
                     detail.append((e["file"], "EMPTY", g["text"], "", str(ori), str(gi)))
@@ -139,7 +162,8 @@ def main():
         if img["exact"] < img["m"]:
             bad_imgs.append((img["m"] - img["exact"], e["file"], img))
 
-    print(f"== 绝对精度：tier={a.tier} device={a.device} 图={len(imgs)} ==")
+    cal = "去空格" if a.strip_space else "原样（含启发式补的空格）"
+    print(f"== 绝对精度：tier={a.tier} device={a.device} 图={len(imgs)} 口径={cal} ==")
     print(f"GT 行 {tot['gt']} | 检出 {tot['det']} | 匹配 {tot['m']} "
           f"({tot['m']/max(tot['gt'],1):.1%})")
     print(f"文本完全正确 {tot['exact']}/{tot['m']} = {tot['exact']/max(tot['m'],1):.2%}")
