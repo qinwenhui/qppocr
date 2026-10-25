@@ -7,6 +7,10 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+# RUSTSEC-2024-0436：`paste` 已停止维护（unmaintained，非漏洞），由
+# metal 0.33 的 proc-macro 依赖链传递引入，上游无已修复版本可升级。
+# 只忽略这一条；新的漏洞/停更公告仍会照常拦下。
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 version = 2
