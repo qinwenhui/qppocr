@@ -1066,9 +1066,8 @@ fn conv8_inf_forensics() {
     // 输出 Inf 计数
     let count_inf_pub = |base: *mut u8| -> usize {
         // SAFETY: base 持久映射；输出区 51840*64 个 f32。
-        let of = unsafe {
-            std::slice::from_raw_parts(base.add(out_off * 4) as *const f32, 51840 * 64)
-        };
+        let of =
+            unsafe { std::slice::from_raw_parts(base.add(out_off * 4) as *const f32, 51840 * 64) };
         of.iter().filter(|v| !v.is_finite()).count()
     };
 
@@ -1091,10 +1090,9 @@ fn conv8_inf_forensics() {
     if n_inf > 0 {
         // 备份输入区（NHWC f32 [51840, 32]）
         // SAFETY: base 持久映射；输入区 51840*32 个 f32。
-        let orig: Vec<f32> = unsafe {
-            std::slice::from_raw_parts(base.add(in_off * 4) as *const f32, 51840 * 32)
-        }
-        .to_vec();
+        let orig: Vec<f32> =
+            unsafe { std::slice::from_raw_parts(base.add(in_off * 4) as *const f32, 51840 * 32) }
+                .to_vec();
         // 全零输入 → 若仍有 Inf：bias/weights/kernel 本身；否则输入位毒
         // SAFETY: 测试独占设备与映射区；长度由本测试的分配保证。
         let zero_all = |b: *mut u8| unsafe {

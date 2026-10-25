@@ -79,56 +79,210 @@ pub(crate) struct Variant {
 
 /// 全部变体（顺序即打印顺序）。
 pub(crate) const VARIANTS: &[Variant] = &[
-    Variant { name: "p_base", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: true },
-    Variant { name: "p_r8", rows: 8, nblk: 2, tile: "m8×n2", k1_only: false, is_control: false },
-    Variant { name: "p_nocoal", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
-    Variant { name: "p_fmaonly", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
-    Variant { name: "p_wconst", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
-    Variant { name: "p_m8n4", rows: 8, nblk: 1, tile: "m8×n1", k1_only: false, is_control: false },
+    Variant {
+        name: "p_base",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: true,
+    },
+    Variant {
+        name: "p_r8",
+        rows: 8,
+        nblk: 2,
+        tile: "m8×n2",
+        k1_only: false,
+        is_control: false,
+    },
+    Variant {
+        name: "p_nocoal",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
+    Variant {
+        name: "p_fmaonly",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
+    Variant {
+        name: "p_wconst",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
+    Variant {
+        name: "p_m8n4",
+        rows: 8,
+        nblk: 1,
+        tile: "m8×n1",
+        k1_only: false,
+        is_control: false,
+    },
     // 诊断：权重地址掩进 1 KB 窗口（条数不变、流量≈0）——把「带宽」与
     // 「装载指令」两个假设分开，见 probe_p_wsmall.metal 的头注释。
-    Variant { name: "p_wsmall", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
+    Variant {
+        name: "p_wsmall",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
     // 诊断：**激活**地址掩进 1 KB 窗口（条数不变、流量≈0）——`p_wsmall`
     // 只管权重那半边，这条补上激活那半边，见 probe_p_ismall.metal 头注释。
     // 要回答的是「把激活也改成 fp16（足迹砍半）值不值」。
-    Variant { name: "p_ismall", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
+    Variant {
+        name: "p_ismall",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
     // 窗口序：只改 gid 映射，把「同一片权重的行组」铺到一起，复用距离
     // 9 MB → ~123 KB。热循环、网格、覆盖全与 p_base 一致。
-    Variant { name: "p_window", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
-    Variant { name: "p_window8", rows: 8, nblk: 1, tile: "m8×n1", k1_only: false, is_control: false },
+    Variant {
+        name: "p_window",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
+    Variant {
+        name: "p_window8",
+        rows: 8,
+        nblk: 1,
+        tile: "m8×n1",
+        k1_only: false,
+        is_control: false,
+    },
     // 窗口序 + 窗内列主序（见 probe_p_colmajw.metal 头注释）：窗口序管权重
     // 复用距离、列主序管 lane 排布。若它 ≥ max(p_window, p_colmaj)，
     // 生产就不必按权重尺寸切两套映射。只对 1×1 有意义（窗口序的门）。
-    Variant { name: "p_colmajw", rows: 4, nblk: 2, tile: "m4×n2", k1_only: true, is_control: false },
+    Variant {
+        name: "p_colmajw",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: true,
+        is_control: false,
+    },
     // 列主序 warp 排布：相邻 lane 的通道连续（一条装载 = 4 条 line 填满，
     // 而不是 stride-2 的 8 条 half-used）。指令条数、网格、覆盖全同
     // `p_base`，见 probe_p_colmaj.metal 的头注释。
-    Variant { name: "p_colmaj", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
+    Variant {
+        name: "p_colmaj",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
     // 诊断：列主序 + 权重地址掩进 1 KB（见 probe_p_colmajsmall.metal）。
     // 要回答的是「p_wsmall 那 1.56× 的余量被列主序吃掉了吗」——决定任务
     // #12（线程组暂存权重切片）到底做不做。与 p_colmaj 同形，便于直接读差。
-    Variant { name: "p_colmajsmall", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
+    Variant {
+        name: "p_colmajsmall",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
     // 线程组暂存权重切片（见 probe_p_wstage.metal）。只对 1×1 开：3×3 要走
     // 9 遍 taps、每遍一对屏障，不是这条路的靶子。**位级应等于 p_colmaj**。
-    Variant { name: "p_wstage", rows: 4, nblk: 2, tile: "m4×n2", k1_only: true, is_control: false },
+    Variant {
+        name: "p_wstage",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: true,
+        is_control: false,
+    },
     // 诊断：同上但**删掉屏障**（故意算错）。把「屏障的代价」与「组内存占用率
     // 的代价」劈开——见 probe_p_wstage_nb.metal 的头注释。
-    Variant { name: "p_wstage_nb", rows: 4, nblk: 2, tile: "m4×n2", k1_only: true, is_control: false },
+    Variant {
+        name: "p_wstage_nb",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: true,
+        is_control: false,
+    },
     // k1 同分辨率快路：gather 地址整体提出热循环（见 probe_p_k1fast.metal）。
     // 与 p_base 的**唯一**差别是那个 `if`——累加顺序逐字相同，结果位级一致。
-    Variant { name: "p_k1fast", rows: 4, nblk: 2, tile: "m4×n2", k1_only: true, is_control: false },
+    Variant {
+        name: "p_k1fast",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: true,
+        is_control: false,
+    },
     // 权重存 fp16（见 probe_p_whalf.metal 头注释）：与 p_base 的唯一语义差
     // 是权重基址 `>>2` → `>>1`，装载条数/网格/热循环全同。要回答的是
     // 「§4 认定的 line 数/局部性」这根杠杆上，fp16 值多少——**在动生产
     // 代码之前**把这条路的价值量出来。
-    Variant { name: "p_whalf", rows: 4, nblk: 2, tile: "m4×n2", k1_only: false, is_control: false },
+    Variant {
+        name: "p_whalf",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: false,
+        is_control: false,
+    },
     // 瓦片空间（网格一律 = 计划的 m4n8；`p_t4n2` 是模板自身的控制组，
     // 它必须与 `p_base` 同时间——对不上就是模板没把累加器标量化）。
-    Variant { name: "p_t4n2", rows: 4, nblk: 2, tile: "m4×n2", k1_only: true, is_control: false },
-    Variant { name: "p_t8n1", rows: 4, nblk: 2, tile: "m8×n1", k1_only: true, is_control: false },
-    Variant { name: "p_t8n2", rows: 4, nblk: 2, tile: "m8×n2", k1_only: true, is_control: false },
-    Variant { name: "p_t16n1", rows: 4, nblk: 2, tile: "m16×n1", k1_only: true, is_control: false },
-    Variant { name: "p_t16n2", rows: 4, nblk: 2, tile: "m16×n2", k1_only: true, is_control: false },
+    Variant {
+        name: "p_t4n2",
+        rows: 4,
+        nblk: 2,
+        tile: "m4×n2",
+        k1_only: true,
+        is_control: false,
+    },
+    Variant {
+        name: "p_t8n1",
+        rows: 4,
+        nblk: 2,
+        tile: "m8×n1",
+        k1_only: true,
+        is_control: false,
+    },
+    Variant {
+        name: "p_t8n2",
+        rows: 4,
+        nblk: 2,
+        tile: "m8×n2",
+        k1_only: true,
+        is_control: false,
+    },
+    Variant {
+        name: "p_t16n1",
+        rows: 4,
+        nblk: 2,
+        tile: "m16×n1",
+        k1_only: true,
+        is_control: false,
+    },
+    Variant {
+        name: "p_t16n2",
+        rows: 4,
+        nblk: 2,
+        tile: "m16×n2",
+        k1_only: true,
+        is_control: false,
+    },
 ];
 
 /// 变体源码。公共头部（参数解析 + 索引推导 + act 语义）与
@@ -307,9 +461,10 @@ pub(crate) fn ct_groups_for(name: &str, m_dim: u32, in_h: u32, in_w: u32, co4: u
 ///
 /// **单开一张表**：参数块语义（`p[0..3] = M,N,K`）与网格（64×64 瓦片）
 /// 都和 conv8 那组无关，混进去 `groups_for` 会给出错的网格。
-pub(crate) const MM_PROBE_SHADERS: &[(&str, &str)] =
-    &[("p_mm_sg", include_str!("probe_mm_sg.metal")),
-      ("p_mm_sg_conv8", include_str!("probe_mm_sg_conv8.metal"))];
+pub(crate) const MM_PROBE_SHADERS: &[(&str, &str)] = &[
+    ("p_mm_sg", include_str!("probe_mm_sg.metal")),
+    ("p_mm_sg_conv8", include_str!("probe_mm_sg_conv8.metal")),
+];
 
 /// 64×64 瓦片的网格：`[ceil(M/64), ceil(N/64), 1]`，线程组固定 256。
 pub(crate) fn mm_sg_groups(m_pad: u32, n_pad: u32) -> [u32; 3] {
@@ -321,12 +476,13 @@ pub(crate) fn mm_sg_groups(m_pad: u32, n_pad: u32) -> [u32; 3] {
 /// 同参数块（`p[0..3] = M,N,K`）、同网格（64×64 瓦片、256 线程/组）、同数学，
 /// **只换 A/B 分片的来源**。`p_mm_sg` 从 `MM_PROBE_SHADERS` 借来当**同 run
 /// 对照**——没有它，「变快/变慢」就分不清是改动的功劳还是机器漂移。
-pub(crate) const MM_TG_PROBE_SHADERS: &[(&str, &str)] =
-    &[("p_mm_tg", include_str!("probe_mm_tg.metal")),
-      ("p_mm_tg2", include_str!("probe_mm_tg.metal")),
-      ("p_mm_f32_dev", include_str!("probe_mm_tg.metal")),
-      ("p_mm_f32_tg", include_str!("probe_mm_tg.metal")),
-      ("p_mm_f32_tg2", include_str!("probe_mm_tg.metal"))];
+pub(crate) const MM_TG_PROBE_SHADERS: &[(&str, &str)] = &[
+    ("p_mm_tg", include_str!("probe_mm_tg.metal")),
+    ("p_mm_tg2", include_str!("probe_mm_tg.metal")),
+    ("p_mm_f32_dev", include_str!("probe_mm_tg.metal")),
+    ("p_mm_f32_tg", include_str!("probe_mm_tg.metal")),
+    ("p_mm_f32_tg2", include_str!("probe_mm_tg.metal")),
+];
 
 /// `p_dw_u9`/`p_dw_u3` 只对「参数与其模板常量逐位相符」的形状成立 ——
 /// 拿 u9 去跑 3×3 会读到常量算出的错地址，输出全错。

@@ -523,7 +523,10 @@ fn diff_stats(a: &[f32], b: &[f32]) -> (f32, f32, usize) {
     let mut sum = 0.0f64;
     let mut ndiff = 0usize;
     for (x, y) in a.iter().zip(b.iter()) {
-        assert!(x.is_finite() && y.is_finite(), "出现 NaN/inf —— 多半是权重索引错位");
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "出现 NaN/inf —— 多半是权重索引错位"
+        );
         let d = (x - y).abs();
         if *x != *y {
             ndiff += 1;
@@ -584,7 +587,10 @@ fn det_session_f16_weights_end_to_end() {
         a.len(),
         flip_frac
     );
-    assert!(ndiff > 0, "fp16 权重没有生效：两条路逐位相同（weight_f16 没被计划读到？）");
+    assert!(
+        ndiff > 0,
+        "fp16 权重没有生效：两条路逐位相同（weight_f16 没被计划读到？）"
+    );
     // 千分之一是一个**很松**的界：真要读错通道的权重，翻转率是 O(1)
     // （整块前景/背景判反），不是 O(1e-3)。
     assert!(
@@ -639,14 +645,19 @@ fn rec_session_f16_weights_end_to_end() {
         }
         best
     };
-    let disagree = (0..nframes).filter(|f| argmax(&a, *f) != argmax(&c, *f)).count();
+    let disagree = (0..nframes)
+        .filter(|f| argmax(&a, *f) != argmax(&c, *f))
+        .count();
     eprintln!(
         "[metal] rec fp16 权重 vs f32：max|diff| = {max_abs:.3e}，mean|diff| = {mean_abs:.3e}，\
          非零差 {ndiff}/{}，argmax 不一致 {disagree}/{nframes} 帧",
         a.len()
     );
     assert!(ndiff > 0, "fp16 权重没有生效：两条路逐位相同");
-    assert_eq!(disagree, 0, "有 {disagree} 帧 argmax 变了——查内核与打包是否配对");
+    assert_eq!(
+        disagree, 0,
+        "有 {disagree} 帧 argmax 变了——查内核与打包是否配对"
+    );
 }
 
 /// 端到端：真实 tiny rec，Metal 整图 vs CPU executor——概率图容差 +
@@ -878,12 +889,7 @@ fn rec_small_bytes() -> Option<Vec<u8>> {
 ///
 /// `seed` 必须按形状给不同的值：同一份随机输入喂给不同宽度，会掩盖
 /// 「某些宽度才触发的寻址错误」。
-fn rec_small_case(
-    ctx: &MetalContext,
-    b: usize,
-    ww: usize,
-    seed0: u64,
-) -> (f32, f32, Vec<i64>) {
+fn rec_small_case(ctx: &MetalContext, b: usize, ww: usize, seed0: u64) -> (f32, f32, Vec<i64>) {
     let bytes = rec_small_bytes().expect("已确认模型存在");
     use qppocr_core::executor::Session;
     use qppocr_core::tensor::{DType, Tensor};
@@ -929,7 +935,12 @@ fn rec_small_case(
         .zip(c.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0f32, f32::max);
-    let mean_abs = a.iter().zip(c.iter()).map(|(x, y)| (x - y).abs()).sum::<f32>() / a.len() as f32;
+    let mean_abs = a
+        .iter()
+        .zip(c.iter())
+        .map(|(x, y)| (x - y).abs())
+        .sum::<f32>()
+        / a.len() as f32;
     (max_abs, mean_abs, out_gpu[0].shape.clone())
 }
 
@@ -1242,11 +1253,7 @@ fn attn_mm_raw() {
     }
 
     let seg = |x: usize| x.div_ceil(4) * 4;
-    let (a_w, b_w, o_w) = (
-        seg(batch * m_ * k),
-        seg(batch * k * n),
-        seg(batch * m_ * n),
-    );
+    let (a_w, b_w, o_w) = (seg(batch * m_ * k), seg(batch * k * n), seg(batch * m_ * n));
     let a_off = 4usize;
     let b_off = a_off + a_w;
     let o_off = b_off + b_w;
@@ -1271,8 +1278,14 @@ fn attn_mm_raw() {
     m[p + 7] = heads as u32;
 
     submit_compute(&ctx.inner.queue, |enc| {
-        ks.dispatch(enc, "n_attn_mm", &buf, p as u32, [1, (batch * m_) as u32, 1])
-            .expect("dispatch n_attn_mm");
+        ks.dispatch(
+            enc,
+            "n_attn_mm",
+            &buf,
+            p as u32,
+            [1, (batch * m_) as u32, 1],
+        )
+        .expect("dispatch n_attn_mm");
     })
     .expect("submit");
 
@@ -1289,7 +1302,10 @@ fn attn_mm_raw() {
         .zip(&want)
         .filter(|(x, y)| (**x - **y).abs() > 1e-5)
         .count();
-    eprintln!("[metal] n_attn_mm 分歧 {bad}/{} max|diff|={max_abs:.3e}", want.len());
+    eprintln!(
+        "[metal] n_attn_mm 分歧 {bad}/{} max|diff|={max_abs:.3e}",
+        want.len()
+    );
     assert_eq!(bad, 0, "n_attn_mm 对拍失败");
 }
 

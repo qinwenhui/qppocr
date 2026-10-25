@@ -14,9 +14,9 @@
 //! `wait_until_completed` ≈ 提交 + timeline 等值（P3 批间流水再上
 //! `add_completed_handler` 异步收尾）。
 
-pub(crate) mod device;
 #[cfg(test)]
 mod conv_probe;
+pub(crate) mod device;
 #[cfg(test)]
 mod kernel_tests;
 #[cfg(test)]

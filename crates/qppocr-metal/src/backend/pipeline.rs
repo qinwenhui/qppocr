@@ -46,7 +46,10 @@ const SHADERS: &[(&str, &str)] = &[
     // `n_conv8_mma3` 的双实例化是同一套做法，只有 NCOLS/NSG 模板参数不同
     // ——见该 .metal 头注释「两档」一节。同样：一份源码两个入口，编译不过
     // 一起消失。
-    ("n_conv8_mma", include_str!("../../shaders/n_conv8_mma.metal")),
+    (
+        "n_conv8_mma",
+        include_str!("../../shaders/n_conv8_mma.metal"),
+    ),
     (
         "n_conv8_mma_n32",
         include_str!("../../shaders/n_conv8_mma.metal"),
@@ -64,7 +67,10 @@ const SHADERS: &[(&str, &str)] = &[
     // （32 通道块，收 Co 是 32 倍数但不是 64 倍数的那批 conv）。网格公式、
     // 参数块、覆盖矩形两条完全一致，只有 NCOLS 模板参数不同——见该 .metal
     // 头注释「32 通道块」一节。同样：一份源码两个入口，编译不过一起消失。
-    ("n_conv8_mma3", include_str!("../../shaders/n_conv8_mma3.metal")),
+    (
+        "n_conv8_mma3",
+        include_str!("../../shaders/n_conv8_mma3.metal"),
+    ),
     (
         "n_conv8_mma3_n32",
         include_str!("../../shaders/n_conv8_mma3.metal"),
@@ -249,11 +255,7 @@ pub(crate) fn dispatch_with_tg(
         &p_off as *const u32 as *const std::ffi::c_void,
     );
     enc.dispatch_threads(
-        MTLSize::new(
-            groups[0] as u64 * tg,
-            groups[1] as u64,
-            groups[2] as u64,
-        ),
+        MTLSize::new(groups[0] as u64 * tg, groups[1] as u64, groups[2] as u64),
         MTLSize::new(tg, 1, 1),
     );
     Ok(())

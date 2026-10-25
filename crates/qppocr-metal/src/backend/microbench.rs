@@ -26,10 +26,10 @@ use std::time::Instant;
 
 use metal::MTLSize;
 
-use super::device::submit_compute;
-use super::pipeline::{dispatch_with_tg, KernelSet};
 use super::MetalContext;
-use super::conv_probe::{mm_sg_groups, MM_PROBE_SHADERS, MM_TG_PROBE_SHADERS, ProbeSet};
+use super::conv_probe::{MM_PROBE_SHADERS, MM_TG_PROBE_SHADERS, ProbeSet, mm_sg_groups};
+use super::device::submit_compute;
+use super::pipeline::{KernelSet, dispatch_with_tg};
 
 /// 有 Metal 设备就打开，否则跳过（CI 非 mac）。与 `kernel_tests` 同款。
 fn open_or_skip() -> Option<MetalContext> {
@@ -52,10 +52,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 /// SIGSEGV，所以这里判空并返回 `None`，让调用方跳过那一路而不是把测试进程带走。
 /// （本文件曾因此在 `dispatch_floor_attribution` 里段错误，见那里的长注释。）
 fn shared_zeroed(dev: &metal::Device, bytes: usize) -> Option<metal::Buffer> {
-    let b = dev.new_buffer(
-        bytes as u64,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let b = dev.new_buffer(bytes as u64, metal::MTLResourceOptions::StorageModeShared);
     let p = b.contents() as *mut u8;
     if p.is_null() {
         return None;
@@ -136,7 +133,8 @@ fn dispatch_marginal_cost() {
         let ms = bench(20, || {
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..n {
-                    ks.dispatch(enc, "n_entry", &buf, 0, [1, 1, 1]).expect("dispatch");
+                    ks.dispatch(enc, "n_entry", &buf, 0, [1, 1, 1])
+                        .expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [&buf];
                     enc.memory_barrier_with_resources(&res);
                 }
@@ -155,12 +153,16 @@ fn dispatch_marginal_cost() {
         let ms = bench(20, || {
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..n {
-                    ks.dispatch(enc, "n_entry", &buf, 0, [1, 1, 1]).expect("dispatch");
+                    ks.dispatch(enc, "n_entry", &buf, 0, [1, 1, 1])
+                        .expect("dispatch");
                 }
             })
             .expect("提交");
         });
-        eprintln!("[mb] {n:>4} 条 dispatch（无 barrier）: {ms:.3} ms（边际 {:.3} ms/条）", ms / n as f64);
+        eprintln!(
+            "[mb] {n:>4} 条 dispatch（无 barrier）: {ms:.3} ms（边际 {:.3} ms/条）",
+            ms / n as f64
+        );
     }
 }
 
@@ -190,7 +192,12 @@ fn real_plan_replay_cost() {
         let names: Vec<&str> = (0..n)
             .map(|i| {
                 const K: [&str; 6] = [
-                    "n_conv", "n_elem", "n_conv_dw", "n_pool", "n_channel", "n_resize",
+                    "n_conv",
+                    "n_elem",
+                    "n_conv_dw",
+                    "n_pool",
+                    "n_channel",
+                    "n_resize",
                 ];
                 K[i % K.len()]
             })
@@ -265,10 +272,7 @@ fn dispatch_floor_attribution() {
                     // SAFETY: `off` 是本作用域内的 u32，4 字节读在界内；
                     // set_bytes 在本调用期间同步拷贝。
                     enc.set_bytes(3, 4, &off as *const u32 as *const std::ffi::c_void);
-                    enc.dispatch_threads(
-                        MTLSize::new(tiles * 256, 1, 1),
-                        MTLSize::new(256, 1, 1),
-                    );
+                    enc.dispatch_threads(MTLSize::new(tiles * 256, 1, 1), MTLSize::new(256, 1, 1));
                 }
             })
             .expect("提交");
@@ -301,10 +305,7 @@ fn dispatch_floor_attribution() {
     //
     // 只清零**头 64 KB**（内核守卫读的参数区）：整块 256 MB 用 CPU 清零会把数据
     // 刷进缓存，热度与真实场景不同，会把这次测量污染掉。其余部分读到什么都没关系。
-    let shared256 = dev.new_buffer(
-        256 << 20,
-        metal::MTLResourceOptions::StorageModeShared,
-    );
+    let shared256 = dev.new_buffer(256 << 20, metal::MTLResourceOptions::StorageModeShared);
     let p256 = shared256.contents() as *mut u8;
     if p256.is_null() {
         eprintln!("[mb] 256 MB 共享缓冲分配失败——跳过（生产整块 222 MB，值得警惕）");
@@ -380,11 +381,21 @@ fn mm_sg_scan() {
         let (mp, np, kp) = (m.div_ceil(64) * 64, n.div_ceil(64) * 64, k.div_ceil(8) * 8);
         mp as u64 * kp as u64 + np as u64 * kp as u64 + mp as u64 * np as u64
     };
-    let max_elems = cases.iter().map(|(_, m, n, k)| per_case(*m, *n, *k)).max().unwrap();
-    let buf = ctx.inner.device.new_buffer(max_elems * 2, metal::MTLResourceOptions::StorageModeShared);
+    let max_elems = cases
+        .iter()
+        .map(|(_, m, n, k)| per_case(*m, *n, *k))
+        .max()
+        .unwrap();
+    let buf = ctx
+        .inner
+        .device
+        .new_buffer(max_elems * 2, metal::MTLResourceOptions::StorageModeShared);
     unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, (max_elems * 2) as usize) };
 
-    for variant in &[("p_mm_sg", "pure GEMM, ideal 64x64 tile"), ("p_mm_sg_conv8", "conv8 adapted tile")] {
+    for variant in &[
+        ("p_mm_sg", "pure GEMM, ideal 64x64 tile"),
+        ("p_mm_sg_conv8", "conv8 adapted tile"),
+    ] {
         let name = variant.0;
         let pipe = ps.pipe(name).expect(&format!("取 {} 管线", name));
         eprintln!("--- Variant: {} ---", name);
@@ -405,7 +416,8 @@ fn mm_sg_scan() {
 
             // 参数：M,N,K（对齐后的值）。
             let params = [m_pad as u32, n_pad as u32, k_pad as u32];
-            let params_bytes = unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
+            let params_bytes =
+                unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
 
             // 网格与线程组：与 mm_sg_groups 一致，tg=256 线程/组。
             let groups = [m_pad.div_ceil(64), n_pad.div_ceil(64), 1];
@@ -419,12 +431,17 @@ fn mm_sg_scan() {
                     enc.set_buffer(0, Some(&buf), 0);
                     enc.set_buffer(1, Some(&buf), off_w);
                     enc.set_buffer(2, Some(&buf), off_c);
-                    enc.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const std::ffi::c_void);
+                    enc.set_bytes(
+                        3,
+                        params_bytes.len() as u64,
+                        params_bytes.as_ptr() as *const std::ffi::c_void,
+                    );
                     enc.dispatch_threads(
                         MTLSize::new(threads[0] as u64, threads[1] as u64, threads[2] as u64),
                         MTLSize::new(256, 1, 1),
                     );
-                }).expect("提交");
+                })
+                .expect("提交");
             });
             // FLOPs ÷ 秒 ÷ 1e9 = GFLOPS。（曾错写 /1e6——打印值大 1000 倍，
             // 「44236%」其实是 44.2%。读数自洽但单位错了，和陈旧二进制同款
@@ -433,7 +450,17 @@ fn mm_sg_scan() {
             let roof = 3.34 * 1000.0; // FP32 峰值 GFLOPS（竞品 doc：MMA≈fp32）
             eprintln!(
                 "[mb/mm_sg] {:20} {:20} M={:6} N={:6} K={:6}  grid={:5}x{:3}  time={:6.2} ms  gflops={:7.1}  util={:4.1}%  B/FLOP={:.3} B/FLOP",
-                name, label, m, n, k, groups[0], groups[1], ms, gflops, gflops / roof * 100.0, bytes / flops as f64
+                name,
+                label,
+                m,
+                n,
+                k,
+                groups[0],
+                groups[1],
+                ms,
+                gflops,
+                gflops / roof * 100.0,
+                bytes / flops as f64
             );
         }
     }
@@ -490,8 +517,7 @@ fn mm_tg_scan() {
         let groups = [m_pad.div_ceil(64), n_pad.div_ceil(64), 1];
         let threads = [groups[0] * 256, groups[1], groups[2]];
         let params = [m_pad, n_pad, k_pad];
-        let params_bytes =
-            unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
+        let params_bytes = unsafe { std::slice::from_raw_parts(params.as_ptr() as *const u8, 12) };
 
         // **每个 case 按自己的精确尺寸分配，A/W/C 三段互不重叠**。
         //
@@ -504,13 +530,26 @@ fn mm_tg_scan() {
         let a_len = m_pad as u64 * k_pad as u64;
         let w_len = n_pad as u64 * k_pad as u64;
         let c_len = m_pad as u64 * n_pad as u64;
-        let buf = ctx.inner.device
-            .new_buffer((a_len + w_len + c_len) * 4, metal::MTLResourceOptions::StorageModeShared);
-        unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, ((a_len + w_len + c_len) * 4) as usize) };
+        let buf = ctx.inner.device.new_buffer(
+            (a_len + w_len + c_len) * 4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            std::ptr::write_bytes(
+                buf.contents() as *mut u8,
+                0,
+                ((a_len + w_len + c_len) * 4) as usize,
+            )
+        };
 
         eprintln!(
             "--- {} M={} N={} K={} grid={}x{}  buf={:.0} MB ---",
-            label, m, n, k, groups[0], groups[1],
+            label,
+            m,
+            n,
+            k,
+            groups[0],
+            groups[1],
             (a_len + w_len + c_len) as f64 * 4.0 / 1e6
         );
         for (name, esz, desc) in &arms {
@@ -528,17 +567,27 @@ fn mm_tg_scan() {
                     enc.set_buffer(0, Some(&buf), 0);
                     enc.set_buffer(1, Some(&buf), off_w);
                     enc.set_buffer(2, Some(&buf), off_c);
-                    enc.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const std::ffi::c_void);
+                    enc.set_bytes(
+                        3,
+                        params_bytes.len() as u64,
+                        params_bytes.as_ptr() as *const std::ffi::c_void,
+                    );
                     enc.dispatch_threads(
                         MTLSize::new(threads[0] as u64, threads[1] as u64, threads[2] as u64),
                         MTLSize::new(256, 1, 1),
                     );
-                }).expect("提交");
+                })
+                .expect("提交");
             });
             let gflops = flops as f64 / (ms / 1000.0) / 1e9;
             eprintln!(
                 "[mb/mm_tg] {:16} {:20} time={:8.2} ms  gflops={:7.1}  util={:4.1}%   {}",
-                name, label, ms, gflops, gflops / 3340.0 * 100.0, desc
+                name,
+                label,
+                ms,
+                gflops,
+                gflops / 3340.0 * 100.0,
+                desc
             );
         }
     }
@@ -604,13 +653,7 @@ impl ConvGeom {
 
 /// 把 NCHW 索引写成 NHWC 下标，做一次朴素卷积（对拍基准）。
 /// stride 1 + 对称 pad 的简写——见 [`cpu_conv_nhwc_geom`]。
-fn cpu_conv_nhwc(
-    input: &[f32],
-    weight: &[f32],
-    c: &ConvCase,
-    out_h: u32,
-    out_w: u32,
-) -> Vec<f32> {
+fn cpu_conv_nhwc(input: &[f32], weight: &[f32], c: &ConvCase, out_h: u32, out_w: u32) -> Vec<f32> {
     cpu_conv_nhwc_geom(input, weight, c, ConvGeom::sym(c), out_h, out_w)
 }
 
@@ -624,7 +667,12 @@ fn cpu_conv_nhwc_geom(
     out_h: u32,
     out_w: u32,
 ) -> Vec<f32> {
-    let (cin, cout, kh, kw) = (c.cin as usize, c.cout as usize, c.kh as usize, c.kw as usize);
+    let (cin, cout, kh, kw) = (
+        c.cin as usize,
+        c.cout as usize,
+        c.kh as usize,
+        c.kw as usize,
+    );
     let (sh, sw) = (g.sh as i64, g.sw as i64);
     let (pt, pl) = (g.pt as i64, g.pl as i64);
     let (ih_max, iw_max) = (c.h as i64, c.w as i64);
@@ -743,7 +791,12 @@ use qppocr_gpu::nhwc::f32_to_f16_bits;
 ///
 /// 注意这是**唯一**不靠「砍掉某样东西」来做的实验：`p_wconst`/`p_wsmall`/
 /// `p_fmaonly` 全都同时改了延迟与字节，只能证伪不能定位。
-fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, half_w: bool) -> ConvProbe {
+fn build_conv_case_batch(
+    device: &metal::DeviceRef,
+    c: &ConvCase,
+    batch: u32,
+    half_w: bool,
+) -> ConvProbe {
     build_conv_case_geom(device, c, ConvGeom::sym(c), batch, half_w)
 }
 
@@ -753,7 +806,15 @@ fn build_conv_case_batch(device: &metal::DeviceRef, c: &ConvCase, batch: u32, ha
 /// 字段（含 `out_off` 本身要改的那个值——它记录的是真实偏移，内核按它寻址）
 /// 都逐位对齐。于是「吞吐随时间随地址摆动」这件事被单独拎出来量。
 fn build_conv_case_gap(device: &metal::DeviceRef, c: &ConvCase, gap: u32) -> ConvProbe {
-    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, false, LayoutK::tight(gap, false))
+    build_conv_case_geom_w(
+        device,
+        c,
+        ConvGeom::sym(c),
+        1,
+        false,
+        false,
+        LayoutK::tight(gap, false),
+    )
 }
 
 /// 段布局旋钮。**只在探针里用**：生产布局由 `qppocr-gpu/src/plan.rs` 的
@@ -775,7 +836,11 @@ struct LayoutK {
 impl LayoutK {
     /// 紧排布局（历史的默认）。
     fn tight(gap: u32, with_res: bool) -> Self {
-        LayoutK { gap, with_res, at: None }
+        LayoutK {
+            gap,
+            with_res,
+            at: None,
+        }
     }
 }
 
@@ -787,8 +852,21 @@ impl LayoutK {
 /// （离散 2%）⇒ 单纯「输出段在哪」不是原因。剩下没被控过的变量只剩残差段：
 /// 生产里 `Conv.55` 的 `r` 与 `out` 紧邻（`out − r = m·co`），`Conv.58` 的
 /// 隔开 2.67 倍。本探针把这两档搭出来。
-fn build_conv_case_res(device: &metal::DeviceRef, c: &ConvCase, gap: u32, with_res: bool) -> ConvProbe {
-    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, false, LayoutK::tight(gap, with_res))
+fn build_conv_case_res(
+    device: &metal::DeviceRef,
+    c: &ConvCase,
+    gap: u32,
+    with_res: bool,
+) -> ConvProbe {
+    build_conv_case_geom_w(
+        device,
+        c,
+        ConvGeom::sym(c),
+        1,
+        false,
+        false,
+        LayoutK::tight(gap, with_res),
+    )
 }
 
 /// 按**显式绝对偏移**摆段的探针（布局见 [`LayoutK::at`]）。
@@ -811,7 +889,11 @@ fn build_conv_case_at(
         1,
         false,
         false,
-        LayoutK { gap: 0, with_res, at: Some((at, total_w)) },
+        LayoutK {
+            gap: 0,
+            with_res,
+            at: Some((at, total_w)),
+        },
     )
 }
 
@@ -829,7 +911,15 @@ fn build_conv_case_at(
 ///
 /// 前置：`ci4 % 8 == 0 && co4 % 8 == 0`（生产门禁 `cpad4 % 8` / `% 64` 已保证）。
 fn build_conv_case_wfrag(device: &metal::DeviceRef, c: &ConvCase) -> ConvProbe {
-    build_conv_case_geom_w(device, c, ConvGeom::sym(c), 1, false, true, LayoutK::tight(0, false))
+    build_conv_case_geom_w(
+        device,
+        c,
+        ConvGeom::sym(c),
+        1,
+        false,
+        true,
+        LayoutK::tight(0, false),
+    )
 }
 
 /// 同 [`build_conv_case_batch`]，但步长与 pad 由 `g` 给（写进参数块的
@@ -866,16 +956,22 @@ fn build_conv_case_geom_w(
     // 输入/权重：确定性的小值（避开 0/denormal）
     let mut seed = 0x1234_5678_9abc_def0u64;
     let mut rnd = || -> f32 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 0.125
     };
     // 输入按 NHWC 存（平面顺序 = 层内的自然顺序）。
     // batch 份各自独立（同一形状的不同「图」）——共用同一份会让 L2 命中
     // 率失真，把「多 warp 能不能藏停顿」与「输入是不是已经全在 L2 里」
     // 两个变量混在一起。CPU 对拍只比 b=0 那一份（见 `conv_error`）。
-    let input: Vec<f32> = (0..(c.h * c.w * ci4 * batch) as usize).map(|_| rnd()).collect();
+    let input: Vec<f32> = (0..(c.h * c.w * ci4 * batch) as usize)
+        .map(|_| rnd())
+        .collect();
     // 权重 ONNX 布局 [cout][cin][kh][kw]，用于 CPU 对拍
-    let weight: Vec<f32> = (0..(c.cout * c.cin * taps) as usize).map(|_| rnd()).collect();
+    let weight: Vec<f32> = (0..(c.cout * c.cin * taps) as usize)
+        .map(|_| rnd())
+        .collect();
 
     // 重排成内核要的 [tap][ci_pad4][co4]（float4 粒度）
     let mut w_repacked = vec![0f32; (taps * ci4 * co4) as usize];
@@ -927,7 +1023,12 @@ fn build_conv_case_geom_w(
     // 与生产侧 `plan.rs` 同款尾垫（`nhwc::MMA_W_TAIL`）：`n_conv8_mma*` 在
     // 列块不满时会读到权重行尾之后。`k.at` 给定时段偏移是显式写死的、后面
     // 紧跟的 bias 段恒为定值，越读落在那儿同样安全，故只在紧排布局里垫。
-    let n_w = n_w_data + if k.at.is_none() { qppocr_gpu::nhwc::MMA_W_TAIL as u32 } else { 0 };
+    let n_w = n_w_data
+        + if k.at.is_none() {
+            qppocr_gpu::nhwc::MMA_W_TAIL as u32
+        } else {
+            0
+        };
     let n_out = m_dim * co4 * batch;
     // 参数块占 word 64..64+21；张量必须让开，否则输入第一段就把
     // taps/cin4v 覆盖成浮点位型——内核会按天文数字循环，直接挂死。
@@ -938,7 +1039,10 @@ fn build_conv_case_geom_w(
     let (in_off_w, w_off_w, b_off_w, r_off_w, out_off_w, total) = match k.at {
         Some(([i, wt, b, r, o], tot)) => {
             assert!(p_words + 21 <= i, "显式布局里参数块会与 in 段交叠");
-            assert!(tot as u64 >= o as u64 + n_out as u64, "显式布局的缓冲总长装不下 out 段");
+            assert!(
+                tot as u64 >= o as u64 + n_out as u64,
+                "显式布局的缓冲总长装不下 out 段"
+            );
             (i, wt, b, r, o, tot as u64)
         }
         None => {
@@ -948,7 +1052,14 @@ fn build_conv_case_geom_w(
             let r_off_w = b_off_w + co4;
             let res_words = if k.with_res { n_out } else { 0 };
             let out_off_w = r_off_w + res_words + k.gap;
-            (in_off_w, w_off_w, b_off_w, r_off_w, out_off_w, (out_off_w + n_out + 64) as u64)
+            (
+                in_off_w,
+                w_off_w,
+                b_off_w,
+                r_off_w,
+                out_off_w,
+                (out_off_w + n_out + 64) as u64,
+            )
         }
     };
     let buf = device.new_buffer(total * 4, metal::MTLResourceOptions::StorageModeShared);
@@ -967,33 +1078,37 @@ fn build_conv_case_geom_w(
         // 偏移一律是 **word（f32 元素）下标**——内核内部 `>>2` 折算成
         // float4 下标（1 个 float4 = 4 word）。传字节会整个写飞。
         let words: [u32; 21] = [
-            in_off_w,  // in_off（word）
-            w_off_w,   // w_off
-            b_off_w,   // b_off
-            out_off_w, // out_off
-            m_dim,         // mDim
-            co4,           // nDim
-            out_w,         // outW
-            c.w,           // inW
-            c.h,           // inH
-            ci4 / 4,       // cin4v
-            taps,          // taps
-            c.kw,          // kW
-            g.sh,          // sH
-            g.sw,          // sW
-            pt,            // padT
-            pl,            // padL
-            0,             // act
-            0,             // c1
-            0,             // c2
-            0,             // c3
+            in_off_w,                                       // in_off（word）
+            w_off_w,                                        // w_off
+            b_off_w,                                        // b_off
+            out_off_w,                                      // out_off
+            m_dim,                                          // mDim
+            co4,                                            // nDim
+            out_w,                                          // outW
+            c.w,                                            // inW
+            c.h,                                            // inH
+            ci4 / 4,                                        // cin4v
+            taps,                                           // taps
+            c.kw,                                           // kW
+            g.sh,                                           // sH
+            g.sw,                                           // sW
+            pt,                                             // padT
+            pl,                                             // padL
+            0,                                              // act
+            0,                                              // c1
+            0,                                              // c2
+            0,                                              // c3
             if k.with_res { r_off_w } else { 0xFFFF_FFFF }, // r_off
         ];
         for (i, v) in words.iter().enumerate() {
             *p.add(i) = *v;
         }
         // 张量
-        std::ptr::copy_nonoverlapping(input.as_ptr(), base.add(in_off_w as usize) as *mut f32, n_in as usize);
+        std::ptr::copy_nonoverlapping(
+            input.as_ptr(),
+            base.add(in_off_w as usize) as *mut f32,
+            n_in as usize,
+        );
         if half_w {
             // 权重存 fp16：同一逻辑序（`[t][ci4][co4]`）、同一元素下标，
             // 只是每个值占 2 B。整段先清零（`new_buffer` 不清零，尾部的
@@ -1008,11 +1123,7 @@ fn build_conv_case_geom_w(
             std::ptr::copy_nonoverlapping(w_store.as_ptr(), wdst, n_w_data as usize);
             // 尾垫必须显式清零：`new_buffer` 不清零，越读到任意位型
             // （含 NaN）虽然只落在被掩码的列上，但测试要的是确定性。
-            std::ptr::write_bytes(
-                wdst.add(n_w_data as usize),
-                0,
-                (n_w - n_w_data) as usize,
-            );
+            std::ptr::write_bytes(wdst.add(n_w_data as usize), 0, (n_w - n_w_data) as usize);
         }
         // bias 清零（b_off 有效但全 0）
         std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, co4 as usize);
@@ -1042,7 +1153,11 @@ fn build_conv_case_geom_w(
     // 下界流量：权重只算一份（真实网络里它在 L2 里被各份共用）。
     // `half_w` 时权重段每元素 2 B——这个差额就是 `p_whalf` 要验的那件事，
     // 分母必须如实反映，否则达成带宽会虚高。
-    let w_bytes = if half_w { n_w as f64 * 2.0 } else { n_w as f64 * 4.0 };
+    let w_bytes = if half_w {
+        n_w as f64 * 2.0
+    } else {
+        n_w as f64 * 4.0
+    };
     let bytes = (n_in + n_out) as f64 * 4.0 + w_bytes;
     ConvProbe {
         buf,
@@ -1117,19 +1232,29 @@ struct KxkTestCover {
 
 fn kxk_cover_test(pr: &ConvProbe, kh: u32, kw: u32) -> KxkTestCover {
     let g = pr.geom;
-    assert!(pr.out_w % 4 == 0, "紧凑网格门禁 outW%4（outW={}）", pr.out_w);
+    assert!(
+        pr.out_w % 4 == 0,
+        "紧凑网格门禁 outW%4（outW={}）",
+        pr.out_w
+    );
     let y_lo = g.pt.div_ceil(g.sh);
     let y_hi = (pr.in_h - 1 - (kh - 1) + g.pt) / g.sh;
     let x_lo = g.pl.div_ceil(g.sw);
     let x_hi = (pr.in_w - 1 - (kw - 1) + g.pl) / g.sw;
     assert!(y_hi >= y_lo && y_hi <= pr.out_h - 1, "行内点区间非法");
-    assert!(x_hi >= x_lo + 63, "列上铺不出一个 64 整块（x_lo={x_lo} x_hi={x_hi}）");
+    assert!(
+        x_hi >= x_lo + 63,
+        "列上铺不出一个 64 整块（x_lo={x_lo} x_hi={x_hi}）"
+    );
     let nfb = (x_hi - 63 - x_lo) / 64 + 1;
     let has_tail = x_lo + 64 * nfb - 1 < x_hi;
     let gh = pr.out_w / 4;
     let gl = x_lo.div_ceil(4);
     let gr = (pr.out_w - 1 - x_hi).div_ceil(4);
-    assert!(gl + gr <= gh, "紧凑网格门禁 gL+gR<=gh（gL={gl} gR={gr} gh={gh}）");
+    assert!(
+        gl + gr <= gh,
+        "紧凑网格门禁 gL+gR<=gh（gL={gl} gR={gr} gh={gh}）"
+    );
     KxkTestCover {
         y_lo,
         y_hi,
@@ -1181,13 +1306,22 @@ struct DwCase {
 /// 在**同一 no_pad 配置**上的读数可比 —— 换配置后 m 变了，绝对值不可比。
 fn dw_dims(c: &DwCase, no_pad: bool) -> (u32, u32, u32) {
     let pad = if no_pad { 0 } else { (c.kh - 1) / 2 };
-    (((c.h + 2 * pad - c.kh) / c.stride) + 1, ((c.w + 2 * pad - c.kw) / c.stride) + 1, pad)
+    (
+        ((c.h + 2 * pad - c.kh) / c.stride) + 1,
+        ((c.w + 2 * pad - c.kw) / c.stride) + 1,
+        pad,
+    )
 }
 
 /// 朴素 depthwise 卷积（NHWC 输入、ONNX `[C,1,kh,kw]` 权重），对拍基准。
 fn cpu_dw_ref(input: &[f32], weight: &[f32], c: &DwCase, no_pad: bool) -> Vec<f32> {
     let (out_h, out_w, pad) = dw_dims(c, no_pad);
-    let (ch, kh, kw, s) = (c.c as usize, c.kh as usize, c.kw as usize, c.stride as usize);
+    let (ch, kh, kw, s) = (
+        c.c as usize,
+        c.kh as usize,
+        c.kw as usize,
+        c.stride as usize,
+    );
     let (ih_max, iw_max) = (c.h as i64, c.w as i64);
     let mut out = vec![0f32; out_h as usize * out_w as usize * ch];
     for oh in 0..out_h as usize {
@@ -1240,7 +1374,9 @@ fn build_dw_case(
 
     let mut seed = 0x0bad_c0de_dead_beefu64;
     let mut rnd = || -> f32 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 0.125
     };
     // 输入 NHWC；权重 ONNX 布局 [c][1][kh][kw]（对拍用），再重排成
@@ -1253,8 +1389,11 @@ fn build_dw_case(
         for c4 in 0..cv4 {
             for l in 0..4u32 {
                 let ch = c4 * 4 + l;
-                w_repacked[(t * cv4 + c4) as usize * 4 + l as usize] =
-                    if ch < c.c { weight[(ch * c.kh * c.kw + ky * c.kw + kx) as usize] } else { 0.0 };
+                w_repacked[(t * cv4 + c4) as usize * 4 + l as usize] = if ch < c.c {
+                    weight[(ch * c.kh * c.kw + ky * c.kw + kx) as usize]
+                } else {
+                    0.0
+                };
             }
         }
     }
@@ -1284,25 +1423,33 @@ fn build_dw_case(
             m_dim,
             c_dim,
             out_w,
-            c.w,  // inW
-            c.h,  // inH
+            c.w, // inW
+            c.h, // inH
             taps,
             c.kw, // kW
             c.stride,
             c.stride,
-            pad,  // padT
-            pad,  // padL
-            0,    // act = 0（探针只量卷积本体；act 由尾部一次施加，81 tap 下可忽略）
-            0,    // c1
-            0,    // c2
-            0,    // c3
+            pad,         // padT
+            pad,         // padL
+            0,           // act = 0（探针只量卷积本体；act 由尾部一次施加，81 tap 下可忽略）
+            0,           // c1
+            0,           // c2
+            0,           // c3
             0xFFFF_FFFF, // r_off = OFF_NONE
         ];
         for (i, v) in words.iter().enumerate() {
             *p.add(i) = *v;
         }
-        std::ptr::copy_nonoverlapping(input.as_ptr(), base.add(in_off_w as usize) as *mut f32, n_in as usize);
-        std::ptr::copy_nonoverlapping(w_repacked.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+        std::ptr::copy_nonoverlapping(
+            input.as_ptr(),
+            base.add(in_off_w as usize) as *mut f32,
+            n_in as usize,
+        );
+        std::ptr::copy_nonoverlapping(
+            w_repacked.as_ptr(),
+            base.add(w_off_w as usize) as *mut f32,
+            n_w as usize,
+        );
         std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, c_dim as usize);
         let op = base.add(out_off_w as usize) as *mut f32;
         for i in 0..n_out as usize {
@@ -1392,7 +1539,10 @@ fn time_dispatch(run: &dyn Fn(u32) -> f64) -> Timing {
         best = best.min(t);
         worst = worst.max(t);
     }
-    Timing { ms: best.max(1e-6), spread: worst / best.max(1e-6) }
+    Timing {
+        ms: best.max(1e-6),
+        spread: worst / best.max(1e-6),
+    }
 }
 
 /// 校准重复次数 `r`：让一轮（**一条命令缓冲里跑 `r` 次**）的总时长同时
@@ -1429,7 +1579,10 @@ fn conv_error(pr: &ConvProbe, c: &ConvCase) -> f32 {
         )
     };
     let want = cpu_conv_nhwc(&pr.input, &pr.weight, c, pr.out_h, pr.out_w);
-    got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max)
+    got.iter()
+        .zip(&want)
+        .map(|(g, w)| (g - w).abs())
+        .fold(0f32, f32::max)
 }
 
 /// 参数搬运对拍：小卷积跑一遍，与朴素 CPU 卷积比数值。
@@ -1438,11 +1591,20 @@ fn conv8_param_layout_matches_cpu() {
     let _g = gpu_guard();
     let Some(ctx) = open_or_skip() else { return };
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
-    let c = ConvCase { label: "sanity", h: 8, w: 8, cin: 8, cout: 8, kh: 3, kw: 3 };
+    let c = ConvCase {
+        label: "sanity",
+        h: 8,
+        w: 8,
+        cin: 8,
+        cout: 8,
+        kh: 3,
+        kw: 3,
+    };
     let pr = build_conv_case(&ctx.inner.device, &c);
 
     submit_compute(&ctx.inner.queue, |enc| {
-        ks.dispatch(enc, "n_conv8", &pr.buf, pr.p_off, pr.groups).expect("dispatch");
+        ks.dispatch(enc, "n_conv8", &pr.buf, pr.p_off, pr.groups)
+            .expect("dispatch");
     })
     .expect("提交");
 
@@ -1452,7 +1614,10 @@ fn conv8_param_layout_matches_cpu() {
         "[mb] conv8 参数对拍：{} 个输出，最大绝对误差 {worst:.3e}",
         pr.out_h * pr.out_w * pr.co4
     );
-    assert!(worst < 1e-4, "n_conv8 与 CPU 卷积不符（最大误差 {worst:.3e}）——参数块搬错了");
+    assert!(
+        worst < 1e-4,
+        "n_conv8 与 CPU 卷积不符（最大误差 {worst:.3e}）——参数块搬错了"
+    );
 }
 
 /// `n_conv8_mma` 与朴素 CPU 卷积对拍（1×1，f32 MMA）。
@@ -1500,21 +1665,35 @@ fn conv8_mma_matches_cpu() {
         (8, 8, 32, 24, "**尾块** Co=24 = 3 个 8 列分片"),
         (16, 144, 96, 48, "**尾块** Co=48 多行块"),
         (8, 17, 120, 360, "**尾块** Co=360（120→360 真实形状）"),
-        (2, 68, 120, 18712, "**尾块** MatMul.12 真实形状（120→18712）"),
+        (
+            2,
+            68,
+            120,
+            18712,
+            "**尾块** MatMul.12 真实形状（120→18712）",
+        ),
     ];
 
     for (h, w, cin, cout, note) in cases {
-        let c = ConvCase { label: "mma", h, w, cin, cout, kh: 1, kw: 1 };
+        let c = ConvCase {
+            label: "mma",
+            h,
+            w,
+            cin,
+            cout,
+            kh: 1,
+            kw: 1,
+        };
         let mut pr = build_conv_case(&ctx.inner.device, &c);
         // MMA 网格与 n_conv8 不同：x = 64 行块，y = NCOLS 列块，z = 批。
         // 通道块宽与内核名成对选（与 `plan.rs` 那一支同一个判据）。
         let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
-        let kname = if ncols == 64 { "n_conv8_mma" } else { "n_conv8_mma_n32" };
-        let groups = [
-            (h * w).div_ceil(64),
-            pr.co4.div_ceil(ncols),
-            1,
-        ];
+        let kname = if ncols == 64 {
+            "n_conv8_mma"
+        } else {
+            "n_conv8_mma_n32"
+        };
+        let groups = [(h * w).div_ceil(64), pr.co4.div_ceil(ncols), 1];
         // **第三档也要过**（`n_conv8_mma_sg4` = `<64,4>`，128 线程、`acc[4][4]`）：
         // 它与 `n_conv8_mma` 同网格、同参数块，只差线程组切分——所以同一个
         // `groups` 直接喂进去就是那条「切过去只换名与线程数」的主张的验证。
@@ -1568,18 +1747,74 @@ fn conv8_mma3_throughput() {
 
     let cases = [
         // det medium 的 FLOP 首名（9.6 GFLOP）
-        ConvCase { label: "det 136x240 c256->64 k3", h: 136, w: 240, cin: 256, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "det 136x240 c128->64 k3", h: 136, w: 240, cin: 128, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "det 240x216 c64->64 k3", h: 240, w: 216, cin: 64, cout: 64, kh: 3, kw: 3 },
+        ConvCase {
+            label: "det 136x240 c256->64 k3",
+            h: 136,
+            w: 240,
+            cin: 256,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "det 136x240 c128->64 k3",
+            h: 136,
+            w: 240,
+            cin: 128,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "det 240x216 c64->64 k3",
+            h: 240,
+            w: 216,
+            cin: 64,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
         // 这两条曾是**门外**（`co4=32 < 64`，64 宽通道瓦片放不下），逼出了
         // `n_conv8_mma3_n32`。det 480x432 c32->32 k3 正是 `conv8_variant_scan`
         // 量 p_base 的地方（1157 GFLOPS），现在可以直接对着那条 2.38× 的
         // 处方空间量 N32 兑现了多少。
-        ConvCase { label: "det 480x432 c32->32 k3 (N32)", h: 480, w: 432, cin: 32, cout: 32, kh: 3, kw: 3 },
-        ConvCase { label: "rec 48x544 c32->32 k3 (N32)", h: 48, w: 544, cin: 32, cout: 32, kh: 3, kw: 3 },
+        ConvCase {
+            label: "det 480x432 c32->32 k3 (N32)",
+            h: 480,
+            w: 432,
+            cin: 32,
+            cout: 32,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "rec 48x544 c32->32 k3 (N32)",
+            h: 48,
+            w: 544,
+            cin: 32,
+            cout: 32,
+            kh: 3,
+            kw: 3,
+        },
         // rec 前段（3×3 占 rec 设备时间的 16.2%）
-        ConvCase { label: "rec 24x272 c64->64 k3", h: 24, w: 272, cin: 64, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "rec 12x136 c128->128 k3", h: 12, w: 136, cin: 128, cout: 128, kh: 3, kw: 3 },
+        ConvCase {
+            label: "rec 24x272 c64->64 k3",
+            h: 24,
+            w: 272,
+            cin: 64,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "rec 12x136 c128->128 k3",
+            h: 12,
+            w: 136,
+            cin: 128,
+            cout: 128,
+            kh: 3,
+            kw: 3,
+        },
     ];
 
     for c in &cases {
@@ -1590,15 +1825,28 @@ fn conv8_mma3_throughput() {
         // 通道块宽与 plan.rs 同一判据（第 N 份拷贝，测试里就是要独立一份）。
         let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
         let nch = pr.co4.div_ceil(ncols); // 上取整（通道尾块，见 plan.rs 同支）
-        let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
+        let kname = if ncols == 64 {
+            "n_conv8_mma3"
+        } else {
+            "n_conv8_mma3_n32"
+        };
         // 契约检查：不满足就是**门外**（计划层不会派发这种形状），打印后跳过。
         // 后两条是边框紧凑网格的门禁（plan.rs 逐字同款）——把它们也算进契约，
         // 否则这里会量到一种生产根本不派发的配置。
         let gl = (k / 2 + 3) / 4;
-        if nfb < 1 || c.cin % 8 != 0 || pr.co4 % 8 != 0 || pr.out_w % 4 != 0 || 2 * gl > pr.out_w / 4 {
+        if nfb < 1
+            || c.cin % 8 != 0
+            || pr.co4 % 8 != 0
+            || pr.out_w % 4 != 0
+            || 2 * gl > pr.out_w / 4
+        {
             eprintln!(
                 "[mb] {:<26} 门外：nfb={nfb} cin={} co4={} outW={} 2gL={}（计划层会回落 n_conv8）",
-                c.label, c.cin, pr.co4, pr.out_w, 2 * gl
+                c.label,
+                c.cin,
+                pr.co4,
+                pr.out_w,
+                2 * gl
             );
             continue;
         }
@@ -1613,7 +1861,8 @@ fn conv8_mma3_throughput() {
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..reps {
                     for nm in names {
-                        ks.dispatch(enc, nm, &pr.buf, pr.p_off, groups).expect("dispatch");
+                        ks.dispatch(enc, nm, &pr.buf, pr.p_off, groups)
+                            .expect("dispatch");
                         let res: [&metal::ResourceRef; 1] = [&pr.buf];
                         enc.memory_barrier_with_resources(&res);
                     }
@@ -1625,11 +1874,13 @@ fn conv8_mma3_throughput() {
         // 奇偶轮换序（本机先跑的那条快 6~15%）
         let (mut a, mut b, mut e) = (f64::INFINITY, f64::INFINITY, f64::INFINITY);
         for i in 0..3 {
-            let one = |nm: &str, g: [u32; 3]| {
-                time_dispatch(&|r| run(&[nm], g, r))
-            };
+            let one = |nm: &str, g: [u32; 3]| time_dispatch(&|r| run(&[nm], g, r));
             let (x, y, z) = if i % 2 == 0 {
-                (one("n_conv8", pr.groups), one(kname, mma_groups), one("n_conv8_edge", eg))
+                (
+                    one("n_conv8", pr.groups),
+                    one(kname, mma_groups),
+                    one("n_conv8_edge", eg),
+                )
             } else {
                 let z = one("n_conv8_edge", eg);
                 let y = one(kname, mma_groups);
@@ -1710,10 +1961,42 @@ fn conv8_mma3_load_attribution() {
     // medium det 的真实形状（`QPPOCR_METAL_PLAN_DUMP`），按端到端时间排序。
     // 全是 stride1 + 对称 pad 的内点几何 ⇒ `build_conv_case` 直接支持。
     let cases = [
-        ConvCase { label: "Conv.121 240x216 c256->64 k3", h: 240, w: 216, cin: 256, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "Conv.3   240x216 c128->64 k3", h: 240, w: 216, cin: 128, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "Conv.111 240x216 c32->32 k7 ", h: 240, w: 216, cin: 32, cout: 32, kh: 7, kw: 7 },
-        ConvCase { label: "Conv.114 240x216 c32->32 k5 ", h: 240, w: 216, cin: 32, cout: 32, kh: 5, kw: 5 },
+        ConvCase {
+            label: "Conv.121 240x216 c256->64 k3",
+            h: 240,
+            w: 216,
+            cin: 256,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "Conv.3   240x216 c128->64 k3",
+            h: 240,
+            w: 216,
+            cin: 128,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "Conv.111 240x216 c32->32 k7 ",
+            h: 240,
+            w: 216,
+            cin: 32,
+            cout: 32,
+            kh: 7,
+            kw: 7,
+        },
+        ConvCase {
+            label: "Conv.114 240x216 c32->32 k5 ",
+            h: 240,
+            w: 216,
+            cin: 32,
+            cout: 32,
+            kh: 5,
+            kw: 5,
+        },
     ];
 
     for c in &cases {
@@ -1722,7 +2005,11 @@ fn conv8_mma3_load_attribution() {
         let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
         // 本组的形状全是 co4 ∈ {32,64}，整除/上取整同值；照抄 plan.rs 的式子。
         let nch = pr.co4.div_ceil(ncols);
-        let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
+        let kname = if ncols == 64 {
+            "n_conv8_mma3"
+        } else {
+            "n_conv8_mma3_n32"
+        };
         let inner_w = pr.out_w - (k - 1);
         let nfb = inner_w / 64;
         let tail = inner_w - nfb * 64;
@@ -1734,7 +2021,11 @@ fn conv8_mma3_load_attribution() {
         let run = |arm: &str, groups: [u32; 3], reps: u32| -> f64 {
             let pipe = probes.pipe(arm).expect("取管线");
             // `*_half` 是 128 线程/组的（4 个 simdgroup），其余都是 256。
-            let tg = if arm.ends_with("half") { 128u64 } else { 256u64 };
+            let tg = if arm.ends_with("half") {
+                128u64
+            } else {
+                256u64
+            };
             let t = Instant::now();
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..reps {
@@ -1752,7 +2043,8 @@ fn conv8_mma3_load_attribution() {
             let t = Instant::now();
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..reps {
-                    ks.dispatch(enc, kname, &pr.buf, pr.p_off, g_tail).expect("dispatch");
+                    ks.dispatch(enc, kname, &pr.buf, pr.p_off, g_tail)
+                        .expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [&pr.buf];
                     enc.memory_barrier_with_resources(&res);
                 }
@@ -1870,8 +2162,24 @@ fn conv8_edge_floor_diag() {
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
     let cases = [
-        ConvCase { label: "det 136x240 c256->64 k3", h: 136, w: 240, cin: 256, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "rec 12x136 c128->128 k3", h: 12, w: 136, cin: 128, cout: 128, kh: 3, kw: 3 },
+        ConvCase {
+            label: "det 136x240 c256->64 k3",
+            h: 136,
+            w: 240,
+            cin: 256,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "rec 12x136 c128->128 k3",
+            h: 12,
+            w: 136,
+            cin: 128,
+            cout: 128,
+            kh: 3,
+            kw: 3,
+        },
     ];
     for c in &cases {
         let pr = build_conv_case(&ctx.inner.device, c);
@@ -1879,7 +2187,8 @@ fn conv8_edge_floor_diag() {
             let t = Instant::now();
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..reps {
-                    ks.dispatch(enc, name, &pr.buf, pr.p_off, groups).expect("dispatch");
+                    ks.dispatch(enc, name, &pr.buf, pr.p_off, groups)
+                        .expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [&pr.buf];
                     enc.memory_barrier_with_resources(&res);
                 }
@@ -1905,13 +2214,16 @@ fn conv8_edge_floor_diag() {
             }
             let t = time_dispatch(&|r| run("n_conv8_edge", pr.groups, r)).ms;
             // C 档下内核自算的 e_tiles：（2*(0*gh) + (outH-0)*2*ceil(0/4)）*nh = 0
-            (t, 0u64, (pr.out_h * pr.out_w).div_ceil(4) as u64 * (pr.co4 / 8) as u64)
+            (
+                t,
+                0u64,
+                (pr.out_h * pr.out_w).div_ceil(4) as u64 * (pr.co4 / 8) as u64,
+            )
         };
         // B 档的 tile 数（与 edge_groups 同源，这里只是回读一遍用于打印）
         let gh = (pr.out_w / 4) as u64;
         let gl = ((c.kh / 2 + 3) / 4) as u64;
-        let tiles_b = (2 * ((c.kh as u64 / 2) * gh)
-            + (pr.out_h - c.kh + 1) as u64 * 2 * gl)
+        let tiles_b = (2 * ((c.kh as u64 / 2) * gh) + (pr.out_h - c.kh + 1) as u64 * 2 * gl)
             * (pr.co4 / 8) as u64;
         eprintln!(
             "[mb] edge 地板 {:<24} base {:>7.3} ms | edge 紧凑 {:>7.3}（网格 {:?}）| 空网格 {:>7.3} \
@@ -2007,19 +2319,43 @@ fn conv8_mma3_matches_cpu() {
     // 是枚举与平面映射不错位的前提）。对称 pad + stride1 下 `outW≡0 mod 4`
     // 蕴含 `tail = inner_w mod 64` 必为偶数，最小可达尾是 2。
     let mk = |h, w, cin, cout, k, note| {
-        let c = ConvCase { label: "mma3", h, w, cin, cout, kh: k, kw: k };
+        let c = ConvCase {
+            label: "mma3",
+            h,
+            w,
+            cin,
+            cout,
+            kh: k,
+            kw: k,
+        };
         let g = ConvGeom::sym(&c);
         (c, g, note)
     };
     let strided = |h, w, cin, cout, k, g, note| {
-        let c = ConvCase { label: "mma3", h, w, cin, cout, kh: k, kw: k };
+        let c = ConvCase {
+            label: "mma3",
+            h,
+            w,
+            cin,
+            cout,
+            kh: k,
+            kw: k,
+        };
         (c, g, note)
     };
     // 非方形：`kh`/`kw` 分开给，pad 由 [`ConvGeom::sym`] 各算一份
     // （`pH = kh/2`、`pW = kw/2`）——正是 det 那六对 1×7/7×1/5×1/1×5/3×1/1×3
     // 的形态（ONNX SAME：kH=1 那对 `padT=padB=0`，kW=1 那对 `padL=padR=0`）。
     let rect = |h, w, cin, cout, kh, kw, note| {
-        let c = ConvCase { label: "mma3", h, w, cin, cout, kh, kw };
+        let c = ConvCase {
+            label: "mma3",
+            h,
+            w,
+            cin,
+            cout,
+            kh,
+            kw,
+        };
         let g = ConvGeom::sym(&c);
         (c, g, note)
     };
@@ -2036,28 +2372,83 @@ fn conv8_mma3_matches_cpu() {
         mk(24, 200, 32, 32, 7, "**N32** Co=32 7×7 尾2"),
         // ── stride≠1 / 非对称 pad ──
         strided(
-            64, 132, 64, 64, 2,
-            ConvGeom { sh: 1, sw: 1, pt: 0, pl: 1, pb: 1, pr: 0 },
+            64,
+            132,
+            64,
+            64,
+            2,
+            ConvGeom {
+                sh: 1,
+                sw: 1,
+                pt: 0,
+                pl: 1,
+                pb: 1,
+                pr: 0,
+            },
             "**2×2 SAME** pads(0,1,0,1) gL=0 gR=1",
         ),
         strided(
-            64, 136, 64, 64, 3,
-            ConvGeom { sh: 2, sw: 2, pt: 1, pl: 1, pb: 1, pr: 1 },
+            64,
+            136,
+            64,
+            64,
+            3,
+            ConvGeom {
+                sh: 2,
+                sw: 2,
+                pt: 1,
+                pl: 1,
+                pb: 1,
+                pr: 1,
+            },
             "**3×3 stride2** 对称 pad1 gR=0",
         ),
         strided(
-            64, 136, 32, 32, 3,
-            ConvGeom { sh: 2, sw: 2, pt: 0, pl: 1, pb: 1, pr: 0 },
+            64,
+            136,
+            32,
+            32,
+            3,
+            ConvGeom {
+                sh: 2,
+                sw: 2,
+                pt: 0,
+                pl: 1,
+                pb: 1,
+                pr: 0,
+            },
             "**N32 3×3 stride2** pads(0,1,1,0)",
         ),
         strided(
-            65, 129, 32, 64, 2,
-            ConvGeom { sh: 1, sw: 1, pt: 0, pl: 0, pb: 0, pr: 0 },
+            65,
+            129,
+            32,
+            64,
+            2,
+            ConvGeom {
+                sh: 1,
+                sw: 1,
+                pt: 0,
+                pl: 0,
+                pb: 0,
+                pr: 0,
+            },
             "**2×2 无 pad ⇒ 边框空集**",
         ),
         strided(
-            67, 143, 32, 64, 4,
-            ConvGeom { sh: 2, sw: 2, pt: 1, pl: 1, pb: 2, pr: 2 },
+            67,
+            143,
+            32,
+            64,
+            4,
+            ConvGeom {
+                sh: 2,
+                sw: 2,
+                pt: 1,
+                pl: 1,
+                pb: 2,
+                pr: 2,
+            },
             "**4×4 stride2** 非对称 pads(1,1,2,2)",
         ),
         // ── 通道尾块（`cpad4(Co) % 32 != 0`）——
@@ -2077,8 +2468,19 @@ fn conv8_mma3_matches_cpu() {
         mk(16, 132, 32, 24, 3, "**Co=24** 单块 32 列只填 24"),
         mk(24, 200, 32, 8, 7, "**Co=8** 单块只填 8（最极端不满）"),
         strided(
-            64, 136, 32, 48, 3,
-            ConvGeom { sh: 2, sw: 2, pt: 1, pl: 1, pb: 1, pr: 1 },
+            64,
+            136,
+            32,
+            48,
+            3,
+            ConvGeom {
+                sh: 2,
+                sw: 2,
+                pt: 1,
+                pl: 1,
+                pb: 1,
+                pr: 1,
+            },
             "**Co=48 + 3×3 stride2** 尾块×步长",
         ),
         // ── 非方形 k（`kh != kw`）——det 那六对的形态 ──
@@ -2094,8 +2496,24 @@ fn conv8_mma3_matches_cpu() {
         //   · **kW=1 那两例**（`padL=padR=0` ⇒ `x_lo=0`、`x_hi=outW-1`）：
         //     反向退化——边框只剩上/下两条横带，`gL=gR=0`（中带瓦片数 = 0）。
         //   两例都要求 `outW % 4 == 0` 且 `outW ≥ 64`（列内点至少一个 64 块）。
-        rect(64, 132, 32, 64, 1, 7, "**1×7** kH=1 padT=0 上台空、边框只剩左右"),
-        rect(64, 132, 32, 64, 7, 1, "**7×1** kW=1 padL=0 中带空、边框只剩上下"),
+        rect(
+            64,
+            132,
+            32,
+            64,
+            1,
+            7,
+            "**1×7** kH=1 padT=0 上台空、边框只剩左右",
+        ),
+        rect(
+            64,
+            132,
+            32,
+            64,
+            7,
+            1,
+            "**7×1** kW=1 padL=0 中带空、边框只剩上下",
+        ),
         rect(64, 136, 32, 64, 3, 1, "**3×1** kW=1 窄列"),
         rect(64, 136, 32, 48, 1, 3, "**1×3 + Co=48** 非方形×通道尾块"),
         rect(64, 200, 32, 32, 5, 1, "**N32 5×1** 非方形×32 列块"),
@@ -2114,8 +2532,15 @@ fn conv8_mma3_matches_cpu() {
         // （`co4 % ncols != 0` 时最后一块不满，见内核头注释「尾块（N 方向）」）。
         let ncols = if co4 % 64 == 0 { 64 } else { 32 };
         let nch = co4.div_ceil(ncols);
-        let kname = if ncols == 64 { "n_conv8_mma3" } else { "n_conv8_mma3_n32" };
-        assert!(co4 % 8 == 0 && (ci4 % 8) == 0, "用例不满足通道门：co4={co4} ci4={ci4}");
+        let kname = if ncols == 64 {
+            "n_conv8_mma3"
+        } else {
+            "n_conv8_mma3_n32"
+        };
+        assert!(
+            co4 % 8 == 0 && (ci4 % 8) == 0,
+            "用例不满足通道门：co4={co4} ci4={ci4}"
+        );
 
         // 段布局重算（与 build_conv_case_geom 同式）+ 自检：公式漂了就先炸在
         // 这里，而不是让下面读到别的段上。
@@ -2140,7 +2565,8 @@ fn conv8_mma3_matches_cpu() {
         let tail = x_hi.saturating_sub(x_lo + 64 * cv.nfb - 1);
         let groups = cv_groups(&cv, nch);
         submit_compute(&ctx.inner.queue, |enc| {
-            ks.dispatch(enc, kname, &pr.buf, pr.p_off, groups).expect("dispatch");
+            ks.dispatch(enc, kname, &pr.buf, pr.p_off, groups)
+                .expect("dispatch");
         })
         .expect("提交");
         let got = read_out(&pr);
@@ -2180,7 +2606,8 @@ fn conv8_mma3_matches_cpu() {
         refill_out_sentinel(&pr);
         if eg[0] != 0 {
             submit_compute(&ctx.inner.queue, |enc| {
-                ks.dispatch(enc, "n_conv8_edge", &pr.buf, pr.p_off, eg).expect("dispatch");
+                ks.dispatch(enc, "n_conv8_edge", &pr.buf, pr.p_off, eg)
+                    .expect("dispatch");
             })
             .expect("提交");
         }
@@ -2217,7 +2644,8 @@ fn conv8_mma3_matches_cpu() {
             "[mb] conv8_mma3 对拍 {note:<34} ({out_h}×{out_w} c{cin}->{cout} k{kh}×{kw} s{sh} 尾 {tail}): \
              内点 {covered} px 误差 {worst_in:.3e}、边框 {border} px 误差 {worst_out:.3e}、\
              越界写 0/0｜edge 网格 {} → {} 组（紧凑/全平面）",
-            pr.groups[0], eg[0],
+            pr.groups[0],
+            eg[0],
             cin = c.cin,
             cout = c.cout,
             kh = c.kh,
@@ -2278,7 +2706,11 @@ fn clock_ramp_probe() {
     for reps in [16u32, 64, 256, 1024, 4096] {
         let t = run(reps) / reps as f64;
         let gflops = pr.flops / (t * 1e6);
-        let delta = if prev.is_nan() { 0.0 } else { (t / prev - 1.0) * 100.0 };
+        let delta = if prev.is_nan() {
+            0.0
+        } else {
+            (t / prev - 1.0) * 100.0
+        };
         eprintln!(
             "[mb]   reps={reps:<5} 单次 {t:>7.3} ms  {gflops:>7.1} GFLOPS  \
              （较上一档 {delta:+.1}%）"
@@ -2350,7 +2782,10 @@ fn fma_peak_reference() {
     let _g = gpu_guard();
     let Some(ctx) = open_or_skip() else { return };
     let probes = super::conv_probe::ProbeSet::new(&ctx.inner.device).expect("编译探针");
-    for (nacc, tag) in [(4u64, "4 个 float4 累加器（16 寄存器）"), (16, "16 个（64 寄存器）")] {
+    for (nacc, tag) in [
+        (4u64, "4 个 float4 累加器（16 寄存器）"),
+        (16, "16 个（64 寄存器）"),
+    ] {
         for groups in [13u32, 102, 810, 2560] {
             let gflops = measure_fma_peak(&ctx, &probes, groups, nacc);
             eprintln!("[mb] 峰值 {tag:<32} grid={groups:<5} {gflops:>8.1} GFLOPS");
@@ -2381,11 +2816,51 @@ fn conv8_variant_scan() {
         // 那个 dispatch。形状按 [8,27,120]→[8,27,18710] 折批后取：
         // m=8×27=216、cin=120、cout 补到 4 的倍数（18710→18712）、k=1。
         // 权重 9 MB 而输出 16 MB —— 是**权重流**型，不是算力型。
-        ConvCase { label: "rec ctc head 216x1 c120->18710 k1", h: 216, w: 1, cin: 120, cout: 18712, kh: 1, kw: 1 },
-        ConvCase { label: "rec 48x544 c32->32 k3 (full res)", h: 48, w: 544, cin: 32, cout: 32, kh: 3, kw: 3 },
-        ConvCase { label: "rec 24x272 c64->64 k3", h: 24, w: 272, cin: 64, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "det 480x432 c32->32 k3", h: 480, w: 432, cin: 32, cout: 32, kh: 3, kw: 3 },
-        ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec ctc head 216x1 c120->18710 k1",
+            h: 216,
+            w: 1,
+            cin: 120,
+            cout: 18712,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 48x544 c32->32 k3 (full res)",
+            h: 48,
+            w: 544,
+            cin: 32,
+            cout: 32,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "rec 24x272 c64->64 k3",
+            h: 24,
+            w: 272,
+            cin: 64,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "det 480x432 c32->32 k3",
+            h: 480,
+            w: 432,
+            cin: 32,
+            cout: 32,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "rec 6x68 c256->256 k1",
+            h: 6,
+            w: 68,
+            cin: 256,
+            cout: 256,
+            kh: 1,
+            kw: 1,
+        },
         // ── 补齐「生产形状的 1×1」这一档（2026-10-08）──────────────────
         //
         // 上面 5 个 case 里**没有一个是 det 尺寸的 1×1**，而 1×1 占了 det 的
@@ -2395,15 +2870,71 @@ fn conv8_variant_scan() {
         // 形状**逐字取自 `QPPOCR_METAL_PLAN_DUMP`**（img-004，small 模型），
         // 不是编的：以下分别是 det / rec 头里 m 与 cin×co 最大的那几层。
         // 实测达成率：det 侧 1×1 约 180–800 GFLOPS，也就是峰值的 5~23%。
-        ConvCase { label: "det 34x60 c192->384 k1 (×4 层)", h: 34, w: 60, cin: 192, cout: 384, kh: 1, kw: 1 },
-        ConvCase { label: "det 34x60 c384->192 k1 (×4 层)", h: 34, w: 60, cin: 384, cout: 192, kh: 1, kw: 1 },
-        ConvCase { label: "det 17x30 c384->768 k1", h: 17, w: 30, cin: 384, cout: 768, kh: 1, kw: 1 },
-        ConvCase { label: "rec 6x208 c192->384 k1 (热)", h: 6, w: 208, cin: 192, cout: 384, kh: 1, kw: 1 },
-        ConvCase { label: "rec 3x208 c384->768 k1 (热)", h: 3, w: 208, cin: 384, cout: 768, kh: 1, kw: 1 },
-        ConvCase { label: "rec 3x208 c768->384 k1 (热)", h: 3, w: 208, cin: 768, cout: 384, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det 34x60 c192->384 k1 (×4 层)",
+            h: 34,
+            w: 60,
+            cin: 192,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 34x60 c384->192 k1 (×4 层)",
+            h: 34,
+            w: 60,
+            cin: 384,
+            cout: 192,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 17x30 c384->768 k1",
+            h: 17,
+            w: 30,
+            cin: 384,
+            cout: 768,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 6x208 c192->384 k1 (热)",
+            h: 6,
+            w: 208,
+            cin: 192,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 3x208 c384->768 k1 (热)",
+            h: 3,
+            w: 208,
+            cin: 384,
+            cout: 768,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 3x208 c768->384 k1 (热)",
+            h: 3,
+            w: 208,
+            cin: 768,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
         // 真正的 CTC 分类层是 m=104（上面那条 216 是折批后的），cin 也小：
         // 它是**权重大、算力小**的极端，和卷积的瓶颈未必同一个。
-        ConvCase { label: "rec ctc head 104x1 c120->18710 k1", h: 104, w: 1, cin: 120, cout: 18712, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec ctc head 104x1 c120->18710 k1",
+            h: 104,
+            w: 1,
+            cin: 120,
+            cout: 18712,
+            kh: 1,
+            kw: 1,
+        },
         // ── 权重尺寸阶梯（2026-10-08）────────────────────────────────
         //
         // 生产里 taps==1 的权重段从 1 KB 到 8771 KB，而**窗口序的门**
@@ -2414,7 +2945,15 @@ fn conv8_variant_scan() {
         // 这条 576 KB（384×384）是补中间档——生产里 384x384 有 14 条、
         // 576 KB 那档 3 条、640 KB 那档 3 条。有了它才能判 `p_colmajw`
         // （窗口序+列主序叠加）是不是**两端都不劣**，从而免掉阈值。
-        ConvCase { label: "rec 6x208 c384->384 k1 (576K 中档)", h: 6, w: 208, cin: 384, cout: 384, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec 6x208 c384->384 k1 (576K 中档)",
+            h: 6,
+            w: 208,
+            cin: 384,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
         // ── 1–4 MB 权重档（2026-10-09）：**门下那段空白** ────────────────
         //
         // 窗口序的门（`cin4v*nv >= 65536`，即权重 ≥ 4 MB）当初划在 4 MB，
@@ -2440,9 +2979,33 @@ fn conv8_variant_scan() {
         // 以外的东西，这也解释了它为何显著超过权重的字节收益。
         // 下一根真正的杠杆是**减少 load 指令条数**（更宽的 load / 输入复用），
         // 不是提高局部性。
-        ConvCase { label: "det 34x60 c512->512 k1 (1.05M 门下)", h: 34, w: 60, cin: 512, cout: 512, kh: 1, kw: 1 },
-        ConvCase { label: "det 34x60 c512->1024 k1 (2.10M 门下)", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
-        ConvCase { label: "det 34x60 c1024->512 k1 (2.10M 门下)", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det 34x60 c512->512 k1 (1.05M 门下)",
+            h: 34,
+            w: 60,
+            cin: 512,
+            cout: 512,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 34x60 c512->1024 k1 (2.10M 门下)",
+            h: 34,
+            w: 60,
+            cin: 512,
+            cout: 1024,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 34x60 c1024->512 k1 (2.10M 门下)",
+            h: 34,
+            w: 60,
+            cin: 1024,
+            cout: 512,
+            kh: 1,
+            kw: 1,
+        },
     ];
     const ROUNDS: usize = 3;
     for c in &cases {
@@ -2480,7 +3043,14 @@ fn conv8_variant_scan() {
             }
             // `p_whalf` 读自己的 arena（fp16 权重），其余全走 `pr`。
             let ai = usize::from(v.name == "p_whalf");
-            plans.push((v.name, v.tile, v.rows, probes.pipe(v.name).expect("管线"), groups, ai));
+            plans.push((
+                v.name,
+                v.tile,
+                v.rows,
+                probes.pipe(v.name).expect("管线"),
+                groups,
+                ai,
+            ));
         }
 
         // 一条命令缓冲里跑 reps 次，返回总墙钟（毫秒）
@@ -2564,16 +3134,80 @@ fn conv8_throughput() {
     // 形状取自 rec(48×W) 与 det(960×864) 实际出现的层。
     let cases = [
         // rec 前段：全分辨率、3×3，通道少
-        ConvCase { label: "rec 48x544 c32->32 k3 (full res)", h: 48, w: 544, cin: 32, cout: 32, kh: 3, kw: 3 },
-        ConvCase { label: "rec 24x272 c64->64 k3", h: 24, w: 272, cin: 64, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "rec 24x272 c64->64 k1", h: 24, w: 272, cin: 64, cout: 64, kh: 1, kw: 1 },
-        ConvCase { label: "rec 12x136 c128->128 k3", h: 12, w: 136, cin: 128, cout: 128, kh: 3, kw: 3 },
+        ConvCase {
+            label: "rec 48x544 c32->32 k3 (full res)",
+            h: 48,
+            w: 544,
+            cin: 32,
+            cout: 32,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "rec 24x272 c64->64 k3",
+            h: 24,
+            w: 272,
+            cin: 64,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "rec 24x272 c64->64 k1",
+            h: 24,
+            w: 272,
+            cin: 64,
+            cout: 64,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 12x136 c128->128 k3",
+            h: 12,
+            w: 136,
+            cin: 128,
+            cout: 128,
+            kh: 3,
+            kw: 3,
+        },
         // det 前段
-        ConvCase { label: "det 480x432 c32->32 k3", h: 480, w: 432, cin: 32, cout: 32, kh: 3, kw: 3 },
-        ConvCase { label: "det 240x216 c64->64 k3", h: 240, w: 216, cin: 64, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "det 120x108 c128->128 k3", h: 120, w: 108, cin: 128, cout: 128, kh: 3, kw: 3 },
+        ConvCase {
+            label: "det 480x432 c32->32 k3",
+            h: 480,
+            w: 432,
+            cin: 32,
+            cout: 32,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "det 240x216 c64->64 k3",
+            h: 240,
+            w: 216,
+            cin: 64,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "det 120x108 c128->128 k3",
+            h: 120,
+            w: 108,
+            cin: 128,
+            cout: 128,
+            kh: 3,
+            kw: 3,
+        },
         // 大通道 1×1（rec 头常见）
-        ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec 6x68 c256->256 k1",
+            h: 6,
+            w: 68,
+            cin: 256,
+            cout: 256,
+            kh: 1,
+            kw: 1,
+        },
         // ── medium det 的**重头层**（`QPPOCR_METAL_PLAN_DUMP` 实测的 FLOP
         // 前几名，2026-10-09）。medium 与小档的差距（我们 4.9× vs 竞品 2.0×）
         // 全在这批层的效率上，而它们**一个都没进过上面的名单**。
@@ -2581,13 +3215,69 @@ fn conv8_throughput() {
         // 形状从 dump 的 `out=[1,co,H,W]` 抄，**不是**输入图分辨率：
         // 960×864 的图在 det 骨干里是 `m = 136*240 = 32640`（PaddleOCR 的
         // 下采样把 H/W 各砍到 1/4），照图像尺寸写会把 FLOP 放大 16 倍。
-        ConvCase { label: "det m32640 c256->64  k3 (9.6G 首名)", h: 136, w: 240, cin: 256, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "det m32640 c128->64  k3 (4.8G)", h: 136, w: 240, cin: 128, cout: 64, kh: 3, kw: 3 },
-        ConvCase { label: "det m32640 c32->32   k7 (4.3G)", h: 136, w: 240, cin: 32, cout: 32, kh: 7, kw: 7 },
-        ConvCase { label: "det m32640 c128->256 k1 (2.1G)", h: 136, w: 240, cin: 128, cout: 256, kh: 1, kw: 1 },
-        ConvCase { label: "det m130560 c64->32  k2 (2.1G)", h: 272, w: 480, cin: 64, cout: 32, kh: 2, kw: 2 },
-        ConvCase { label: "det 34x60  c1024->512 k1 (1.05G 门下)", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
-        ConvCase { label: "det 34x60  c512->1024 k1 (1.05G 门下)", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det m32640 c256->64  k3 (9.6G 首名)",
+            h: 136,
+            w: 240,
+            cin: 256,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "det m32640 c128->64  k3 (4.8G)",
+            h: 136,
+            w: 240,
+            cin: 128,
+            cout: 64,
+            kh: 3,
+            kw: 3,
+        },
+        ConvCase {
+            label: "det m32640 c32->32   k7 (4.3G)",
+            h: 136,
+            w: 240,
+            cin: 32,
+            cout: 32,
+            kh: 7,
+            kw: 7,
+        },
+        ConvCase {
+            label: "det m32640 c128->256 k1 (2.1G)",
+            h: 136,
+            w: 240,
+            cin: 128,
+            cout: 256,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det m130560 c64->32  k2 (2.1G)",
+            h: 272,
+            w: 480,
+            cin: 64,
+            cout: 32,
+            kh: 2,
+            kw: 2,
+        },
+        ConvCase {
+            label: "det 34x60  c1024->512 k1 (1.05G 门下)",
+            h: 34,
+            w: 60,
+            cin: 1024,
+            cout: 512,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 34x60  c512->1024 k1 (1.05G 门下)",
+            h: 34,
+            w: 60,
+            cin: 512,
+            cout: 1024,
+            kh: 1,
+            kw: 1,
+        },
     ];
     for c in &cases {
         let pr = build_conv_case(&ctx.inner.device, c);
@@ -2611,7 +3301,10 @@ fn conv8_throughput() {
         let (mut a, mut b) = (f64::INFINITY, f64::INFINITY);
         for i in 0..3 {
             let (x, y) = if i % 2 == 0 {
-                (time_dispatch(&|r| run(&pr, "n_conv8", r)), time_dispatch(&|r| run(&prh, "n_conv8h", r)))
+                (
+                    time_dispatch(&|r| run(&pr, "n_conv8", r)),
+                    time_dispatch(&|r| run(&prh, "n_conv8h", r)),
+                )
             } else {
                 let y = time_dispatch(&|r| run(&prh, "n_conv8h", r));
                 let x = time_dispatch(&|r| run(&pr, "n_conv8", r));
@@ -2648,21 +3341,77 @@ fn conv8_mma_throughput() {
 
     let cases = [
         // det medium 重头 1×1（2.1 GFLOP，门内）
-        ConvCase { label: "det m32640 c128->256 k1", h: 136, w: 240, cin: 128, cout: 256, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det m32640 c128->256 k1",
+            h: 136,
+            w: 240,
+            cin: 128,
+            cout: 256,
+            kh: 1,
+            kw: 1,
+        },
         // det 34x60 门下（1.05 GFLOP 各）
-        ConvCase { label: "det 34x60 c1024->512 k1", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
-        ConvCase { label: "det 34x60 c512->1024 k1", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det 34x60 c1024->512 k1",
+            h: 34,
+            w: 60,
+            cin: 1024,
+            cout: 512,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 34x60 c512->1024 k1",
+            h: 34,
+            w: 60,
+            cin: 512,
+            cout: 1024,
+            kh: 1,
+            kw: 1,
+        },
         // det 全分辨率 k1（m=32640，通道小）
-        ConvCase { label: "det m32640 c32->64 k1", h: 136, w: 240, cin: 32, cout: 64, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det m32640 c32->64 k1",
+            h: 136,
+            w: 240,
+            cin: 32,
+            cout: 64,
+            kh: 1,
+            kw: 1,
+        },
         // rec 1×1（行批次，m 小）
-        ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
-        ConvCase { label: "rec 6x208 c192->384 k1", h: 6, w: 208, cin: 192, cout: 384, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec 6x68 c256->256 k1",
+            h: 6,
+            w: 68,
+            cin: 256,
+            cout: 256,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 6x208 c192->384 k1",
+            h: 6,
+            w: 208,
+            cin: 192,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
         // rec 的 CTC 分类头（`MatMul.12`，out=[1,147,18710]，cin=192 co=18712）：
         // rec 设备端 `n_conv8` 的 87%（剖析值 41.5/47.8 ms），单条最大 1.886 ms。
         // **真实 co=18712 掉在 1×1 MMA 门外**（18712 % 64 = 24）⇒ 落回 `n_conv8`。
         // 这里把 co 补到 18816（多 0.55% 的活）让两臂同台 —— 量的正是
         // 「这一个节点搬进 MMA 能拿回多少」，也是放宽门禁前的定价。
-        ConvCase { label: "rec head m147 c192->18712", h: 147, w: 1, cin: 192, cout: 18816, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec head m147 c192->18712",
+            h: 147,
+            w: 1,
+            cin: 192,
+            cout: 18816,
+            kh: 1,
+            kw: 1,
+        },
         // ── `Conv.54/55/57/58` 的形状对（2026-10-11 加）───────────────────
         //
         // 生产里这两对是**互为镜像**的 1×1 层：同样 `2·m·cin·co` FLOP，
@@ -2675,8 +3424,24 @@ fn conv8_mma_throughput() {
         // 而两条的**参数块逐字节相同**（只差偏移），所以这不是尾声、不是形状
         // 之外的东西——本对探针就是问：这个 1.5~1.9× 在孤立环境里复现吗。
         // 复现 ⇒ 是这条形状本身的性质，与谁挨着谁无关。
-        ConvCase { label: "pair c768->1536 m1008 k1", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 },
-        ConvCase { label: "pair c1536->768 m1008 k1", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 },
+        ConvCase {
+            label: "pair c768->1536 m1008 k1",
+            h: 21,
+            w: 48,
+            cin: 768,
+            cout: 1536,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "pair c1536->768 m1008 k1",
+            h: 21,
+            w: 48,
+            cin: 1536,
+            cout: 768,
+            kh: 1,
+            kw: 1,
+        },
     ];
 
     for c in &cases {
@@ -2684,7 +3449,11 @@ fn conv8_mma_throughput() {
         // MMA 网格与 n_conv8 完全不同（见内核头注释）。
         let mma_groups = mm_sg_groups(c.h * c.w, pr.co4);
         // 契约检查：不满足就该跳过（计划层不会派发这种形状）。
-        assert!(c.cin % 8 == 0 && pr.co4 % 64 == 0, "{} 不满足 MMA 启用条件", c.label);
+        assert!(
+            c.cin % 8 == 0 && pr.co4 % 64 == 0,
+            "{} 不满足 MMA 启用条件",
+            c.label
+        );
 
         let run = |pr: &ConvProbe, name: &str, groups: [u32; 3], reps: u32| -> f64 {
             let t = Instant::now();
@@ -2717,7 +3486,14 @@ fn conv8_mma_throughput() {
         let gf = |ms: f64| pr.flops / (ms * 1e6);
         eprintln!(
             "[mb] {:<26} base {:>7.3} ms ({:>6.1} GFLOPS) → mma {:>7.3} ms ({:>6.1} GFLOPS) = {:.2}×  [grid {:?} → {:?}]",
-            c.label, a, gf(a), b, gf(b), a / b, pr.groups, mma_groups
+            c.label,
+            a,
+            gf(a),
+            b,
+            gf(b),
+            a / b,
+            pr.groups,
+            mma_groups
         );
     }
 }
@@ -2755,18 +3531,82 @@ fn conv8_mma_nsg4_scan() {
 
     let cases = [
         // det medium 重头 1×1（2.1 GFLOP）：大 m、小 K、中 N
-        ConvCase { label: "det m32640 c128->256 k1", h: 136, w: 240, cin: 128, cout: 256, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det m32640 c128->256 k1",
+            h: 136,
+            w: 240,
+            cin: 128,
+            cout: 256,
+            kh: 1,
+            kw: 1,
+        },
         // det 34x60：同一 m、K/N 互为镜像（生产里这对稳定差 1.5~1.9×）
-        ConvCase { label: "det 34x60 c1024->512 k1", h: 34, w: 60, cin: 1024, cout: 512, kh: 1, kw: 1 },
-        ConvCase { label: "det 34x60 c512->1024 k1", h: 34, w: 60, cin: 512, cout: 1024, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det 34x60 c1024->512 k1",
+            h: 34,
+            w: 60,
+            cin: 1024,
+            cout: 512,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 34x60 c512->1024 k1",
+            h: 34,
+            w: 60,
+            cin: 512,
+            cout: 1024,
+            kh: 1,
+            kw: 1,
+        },
         // det 全分辨率、通道很窄（NR=4 却只有 2 个 K 步，K 循环极短）
-        ConvCase { label: "det m32640 c32->64 k1", h: 136, w: 240, cin: 32, cout: 64, kh: 1, kw: 1 },
+        ConvCase {
+            label: "det m32640 c32->64 k1",
+            h: 136,
+            w: 240,
+            cin: 32,
+            cout: 64,
+            kh: 1,
+            kw: 1,
+        },
         // rec 行批次：m 很小（408 / 1248 行 ⇒ 7 / 20 个行块）
-        ConvCase { label: "rec 6x68 c256->256 k1", h: 6, w: 68, cin: 256, cout: 256, kh: 1, kw: 1 },
-        ConvCase { label: "rec 6x208 c192->384 k1", h: 6, w: 208, cin: 192, cout: 384, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec 6x68 c256->256 k1",
+            h: 6,
+            w: 68,
+            cin: 256,
+            cout: 256,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 6x208 c192->384 k1",
+            h: 6,
+            w: 208,
+            cin: 192,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
         // det/rec 都有的镜像对（m=1008）
-        ConvCase { label: "pair c768->1536 m1008 k1", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 },
-        ConvCase { label: "pair c1536->768 m1008 k1", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 },
+        ConvCase {
+            label: "pair c768->1536 m1008 k1",
+            h: 21,
+            w: 48,
+            cin: 768,
+            cout: 1536,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "pair c1536->768 m1008 k1",
+            h: 21,
+            w: 48,
+            cin: 1536,
+            cout: 768,
+            kh: 1,
+            kw: 1,
+        },
     ];
 
     let mut ratios = Vec::new();
@@ -2813,7 +3653,13 @@ fn conv8_mma_nsg4_scan() {
         let gf = |ms: f64| pr.flops / (ms * 1e6);
         eprintln!(
             "[mb] {:<26} <64,8> {:>7.3} ms ({:>6.1} GFLOPS) → <64,4> {:>7.3} ms ({:>6.1} GFLOPS) = {:.2}×  [grid {:?}]",
-            c.label, a, gf(a), b, gf(b), a / b, groups
+            c.label,
+            a,
+            gf(a),
+            b,
+            gf(b),
+            a / b,
+            groups
         );
         ratios.push(a / b);
     }
@@ -2860,8 +3706,24 @@ fn conv8_mma_layout_gap() {
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
     // 与生产那两条同形：`pair c1536->768 m1008`。间隔按 word 给。
-    let slow = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
-    let mirror = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
+    let slow = ConvCase {
+        label: "c1536->768",
+        h: 21,
+        w: 48,
+        cin: 1536,
+        cout: 768,
+        kh: 1,
+        kw: 1,
+    };
+    let mirror = ConvCase {
+        label: "c768->1536",
+        h: 21,
+        w: 48,
+        cin: 768,
+        cout: 1536,
+        kh: 1,
+        kw: 1,
+    };
     // 786432 word = 3 MB = 本形状的 `m·co`；`Conv.55/58` 的差正好是 1.67 个它。
     let gaps: [u32; 6] = [0, 262144, 786432, 2097152, 4194304, 8388608];
 
@@ -2869,8 +3731,14 @@ fn conv8_mma_layout_gap() {
         let t = Instant::now();
         submit_compute(&ctx.inner.queue, |enc| {
             for _ in 0..reps {
-                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
-                    .expect("dispatch");
+                ks.dispatch(
+                    enc,
+                    "n_conv8_mma",
+                    &pr.buf,
+                    pr.p_off,
+                    mm_sg_groups(21 * 48, pr.co4),
+                )
+                .expect("dispatch");
                 let res: [&metal::ResourceRef; 1] = [&pr.buf];
                 enc.memory_barrier_with_resources(&res);
             }
@@ -2946,8 +3814,24 @@ fn conv8_mma_residual() {
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
     // 与生产那两条同形：`Conv.55/58`（1536->768，21×48）。
-    let slow = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
-    let mirror = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
+    let slow = ConvCase {
+        label: "c1536->768",
+        h: 21,
+        w: 48,
+        cin: 1536,
+        cout: 768,
+        kh: 1,
+        kw: 1,
+    };
+    let mirror = ConvCase {
+        label: "c768->1536",
+        h: 21,
+        w: 48,
+        cin: 768,
+        cout: 1536,
+        kh: 1,
+        kw: 1,
+    };
     // `m·co` = 1008 × 768 = 774144 word。生产两档：紧邻（+0）与 +5/3·m·co
     // （即 `out − r` = 2.67·m·co）。5/3 是先除后乘，避免 `mco*5` 溢出前的取整差。
     let mco = 1008u32 * 768;
@@ -2957,8 +3841,14 @@ fn conv8_mma_residual() {
         let t = Instant::now();
         submit_compute(&ctx.inner.queue, |enc| {
             for _ in 0..reps {
-                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
-                    .expect("dispatch");
+                ks.dispatch(
+                    enc,
+                    "n_conv8_mma",
+                    &pr.buf,
+                    pr.p_off,
+                    mm_sg_groups(21 * 48, pr.co4),
+                )
+                .expect("dispatch");
                 let res: [&metal::ResourceRef; 1] = [&pr.buf];
                 enc.memory_barrier_with_resources(&res);
             }
@@ -2968,9 +3858,18 @@ fn conv8_mma_residual() {
     };
 
     let arms: [(&str, ConvProbe); 3] = [
-        ("无残差      ", build_conv_case_res(&ctx.inner.device, &slow, 0, false)),
-        ("残差紧邻 1.00×", build_conv_case_res(&ctx.inner.device, &slow, 0, true)),
-        ("残差远隔 2.67×", build_conv_case_res(&ctx.inner.device, &slow, far_gap, true)),
+        (
+            "无残差      ",
+            build_conv_case_res(&ctx.inner.device, &slow, 0, false),
+        ),
+        (
+            "残差紧邻 1.00×",
+            build_conv_case_res(&ctx.inner.device, &slow, 0, true),
+        ),
+        (
+            "残差远隔 2.67×",
+            build_conv_case_res(&ctx.inner.device, &slow, far_gap, true),
+        ),
     ];
     let mut best = vec![f64::INFINITY; arms.len()];
     for round in 0..3 {
@@ -3047,16 +3946,38 @@ fn conv8_mma_prod_geom() {
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
     // m = 3×336 = 1008 = 21×48（段长逐字节相同，只是空间形状不同）。
-    let wide = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
-    let bott = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    let wide = ConvCase {
+        label: "c768->1536",
+        h: 21,
+        w: 48,
+        cin: 768,
+        cout: 1536,
+        kh: 1,
+        kw: 1,
+    };
+    let bott = ConvCase {
+        label: "c1536->768",
+        h: 21,
+        w: 48,
+        cin: 1536,
+        cout: 768,
+        kh: 1,
+        kw: 1,
+    };
     const TOTAL: u32 = 28859520; // 生产计划里这四条的总长（word）
 
     let run = |pr: &ConvProbe, reps: u32| -> f64 {
         let t = Instant::now();
         submit_compute(&ctx.inner.queue, |enc| {
             for _ in 0..reps {
-                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
-                    .expect("dispatch");
+                ks.dispatch(
+                    enc,
+                    "n_conv8_mma",
+                    &pr.buf,
+                    pr.p_off,
+                    mm_sg_groups(21 * 48, pr.co4),
+                )
+                .expect("dispatch");
                 let res: [&metal::ResourceRef; 1] = [&pr.buf];
                 enc.memory_barrier_with_resources(&res);
             }
@@ -3068,19 +3989,43 @@ fn conv8_mma_prod_geom() {
     let arms: [(&str, ConvProbe); 4] = [
         (
             "Conv.54 生产几何",
-            build_conv_case_at(&ctx.inner.device, &wide, [25246848, 9610832, 10790480, 0, 27311232], TOTAL, false),
+            build_conv_case_at(
+                &ctx.inner.device,
+                &wide,
+                [25246848, 9610832, 10790480, 0, 27311232],
+                TOTAL,
+                false,
+            ),
         ),
         (
             "Conv.55 生产几何",
-            build_conv_case_at(&ctx.inner.device, &bott, [27311232, 10792040, 11971688, 25246848, 26020992], TOTAL, true),
+            build_conv_case_at(
+                &ctx.inner.device,
+                &bott,
+                [27311232, 10792040, 11971688, 25246848, 26020992],
+                TOTAL,
+                true,
+            ),
         ),
         (
             "Conv.57 生产几何",
-            build_conv_case_at(&ctx.inner.device, &wide, [21118080, 11980180, 13159828, 0, 27311232], TOTAL, false),
+            build_conv_case_at(
+                &ctx.inner.device,
+                &wide,
+                [21118080, 11980180, 13159828, 0, 27311232],
+                TOTAL,
+                false,
+            ),
         ),
         (
             "Conv.58 生产几何",
-            build_conv_case_at(&ctx.inner.device, &bott, [27311232, 13161388, 14341036, 21118080, 23182464], TOTAL, true),
+            build_conv_case_at(
+                &ctx.inner.device,
+                &bott,
+                [27311232, 13161388, 14341036, 21118080, 23182464],
+                TOTAL,
+                true,
+            ),
         ),
     ];
     let mut best = vec![f64::INFINITY; arms.len()];
@@ -3131,7 +4076,15 @@ fn conv8_mma_prod_bisect() {
     let Some(ctx) = open_or_skip() else { return };
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
-    let bott = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    let bott = ConvCase {
+        label: "c1536->768",
+        h: 21,
+        w: 48,
+        cin: 1536,
+        cout: 768,
+        kh: 1,
+        kw: 1,
+    };
     const TOTAL: u32 = 28859520;
     // `b` 恒取 `w + n_w`（生产的静态块就是「权重 + bias + 参数块」紧排）。
     const N_W: u32 = 1536 * 768;
@@ -3144,16 +4097,28 @@ fn conv8_mma_prod_bisect() {
         ("w → 55 的      ", [27311232, 10792040, 21118080, 23182464]),
         ("r → 55 的      ", [27311232, 13161388, 25246848, 23182464]),
         ("out → 55 的    ", [27311232, 13161388, 21118080, 26020992]),
-        ("in → 25246848（54）", [25246848, 13161388, 21118080, 23182464]),
-        ("in → 21118080（57）", [21118080, 13161388, 21118080, 23182464]),
+        (
+            "in → 25246848（54）",
+            [25246848, 13161388, 21118080, 23182464],
+        ),
+        (
+            "in → 21118080（57）",
+            [21118080, 13161388, 21118080, 23182464],
+        ),
     ];
 
     let run = |pr: &ConvProbe, reps: u32| -> f64 {
         let t = Instant::now();
         submit_compute(&ctx.inner.queue, |enc| {
             for _ in 0..reps {
-                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
-                    .expect("dispatch");
+                ks.dispatch(
+                    enc,
+                    "n_conv8_mma",
+                    &pr.buf,
+                    pr.p_off,
+                    mm_sg_groups(21 * 48, pr.co4),
+                )
+                .expect("dispatch");
                 let res: [&metal::ResourceRef; 1] = [&pr.buf];
                 enc.memory_barrier_with_resources(&res);
             }
@@ -3165,7 +4130,10 @@ fn conv8_mma_prod_bisect() {
     let probes: Vec<(&str, ConvProbe)> = geoms
         .iter()
         .map(|&(label, [i, w, r, o])| {
-            (label, build_conv_case_at(&ctx.inner.device, &bott, [i, w, b_of(w), r, o], TOTAL, true))
+            (
+                label,
+                build_conv_case_at(&ctx.inner.device, &bott, [i, w, b_of(w), r, o], TOTAL, true),
+            )
         })
         .collect();
     let mut best = vec![f64::INFINITY; probes.len()];
@@ -3210,7 +4178,15 @@ fn conv8_mma_w_sweep() {
     let Some(ctx) = open_or_skip() else { return };
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
 
-    let bott = ConvCase { label: "c1536->768", h: 21, w: 48, cin: 1536, cout: 768, kh: 1, kw: 1 };
+    let bott = ConvCase {
+        label: "c1536->768",
+        h: 21,
+        w: 48,
+        cin: 1536,
+        cout: 768,
+        kh: 1,
+        kw: 1,
+    };
     const TOTAL: u32 = 28859520;
     const N_W: u32 = 1536 * 768;
     // 激活段钉死在 Conv.55 的几何。
@@ -3221,8 +4197,14 @@ fn conv8_mma_w_sweep() {
         let t = Instant::now();
         submit_compute(&ctx.inner.queue, |enc| {
             for _ in 0..reps {
-                ks.dispatch(enc, "n_conv8_mma", &pr.buf, pr.p_off, mm_sg_groups(21 * 48, pr.co4))
-                    .expect("dispatch");
+                ks.dispatch(
+                    enc,
+                    "n_conv8_mma",
+                    &pr.buf,
+                    pr.p_off,
+                    mm_sg_groups(21 * 48, pr.co4),
+                )
+                .expect("dispatch");
                 let res: [&metal::ResourceRef; 1] = [&pr.buf];
                 enc.memory_barrier_with_resources(&res);
             }
@@ -3246,8 +4228,13 @@ fn conv8_mma_w_sweep() {
     // （之前每臂 `b = w + n_w` 恒同步，分不清是 w 还是 b）：
     // 每臂 `(w, b)` 显式给出。
     let ws: Vec<u32> = match mode.as_str() {
-        "fine" => (0..=16u32).map(|j| w0 + j * 1024).chain([13161388, 13261388]).collect(),
-        "dup" => vec![w0, 13161388, w0, 13161388, 13151336, 13151336, 10793064, 13162384],
+        "fine" => (0..=16u32)
+            .map(|j| w0 + j * 1024)
+            .chain([13161388, 13261388])
+            .collect(),
+        "dup" => vec![
+            w0, 13161388, w0, 13161388, 13151336, 13151336, 10793064, 13162384,
+        ],
         _ => (-4i32..=11)
             .map(|j| (w0 as i64 + j as i64 * 262144) as u32)
             .chain([13161388])
@@ -3259,7 +4246,9 @@ fn conv8_mma_w_sweep() {
     // 这里按 512 B 步长把跳变扫出来：`w = W58 + j*128`，`j = 0..=20`。
     const B58: u32 = 14341036; // Conv.58 的 b（= w + n_w）
     const W58: u32 = 13161388;
-    let near: Vec<(u32, u32)> = (0..=20u32).map(|j| (W58 + j * 128, B58 + j * 128)).collect();
+    let near: Vec<(u32, u32)> = (0..=20u32)
+        .map(|j| (W58 + j * 128, B58 + j * 128))
+        .collect();
     // `align`：把已测的所有点按 `w mod 16`（word，= 64 B）归类后浮现的规律 ——
     // ≡12（48 B）全是最慢 1.85~1.91，≡8（32 B）全是 1.44，唯一个 ≡0（64 B）
     // 的是 1.25。4 KB 与 1 MB 两个扫描之所以全平，正是因为两个步长都是 16 的
@@ -3268,7 +4257,15 @@ fn conv8_mma_w_sweep() {
     // `alignw`：把同一条相位规律换到**另一个形状**上验证。行距由 `co4` 决定
     // （1536 → 6144 B，仍是 128 B 整数倍），激活段用 `Conv.57` 的
     // `in=21118080 / out=27311232`、无残差。只对 `co4=768` 成立就不算规律。
-    let wide = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
+    let wide = ConvCase {
+        label: "c768->1536",
+        h: 21,
+        w: 48,
+        cin: 768,
+        cout: 1536,
+        kh: 1,
+        kw: 1,
+    };
     // `aligna`：把 16 个相位换到**激活段**上。`co4=1536` 那一档里 B 的行距是
     // 6144 B、A 的是 3072 B —— 而 `co4=768` 那档恰好反过来（B 3072 / A 6144），
     // 且大摆幅只出现在「3072 B 行距」的那个操作数上。所以「敏感的是 3072 B
@@ -3280,13 +4277,18 @@ fn conv8_mma_w_sweep() {
                 &bott,
                 true,
                 false,
-                near.iter().map(|&(w, b)| [in_w, w, b, r_w, out_w]).collect(),
+                near.iter()
+                    .map(|&(w, b)| [in_w, w, b, r_w, out_w])
+                    .collect(),
             ),
             "align" => (
                 &bott,
                 true,
                 false,
-                align.iter().map(|&(w, b)| [in_w, w, b, r_w, out_w]).collect(),
+                align
+                    .iter()
+                    .map(|&(w, b)| [in_w, w, b, r_w, out_w])
+                    .collect(),
             ),
             "alignw" => (
                 &wide,
@@ -3387,8 +4389,24 @@ fn conv_dw_w_sweep() {
     // 不足以否掉「生产 dw 掉 1.4× 是这个相位」——生产的 `Conv.64` 是
     // m=51840（grid 12960，对应 216x240 输入），下面第一例才是它。
     let cases = [
-        DwCase { label: "dw 9x9 c256 216x240 (Conv.64 生产网格 grid=12960)", h: 216, w: 240, c: 256, kh: 9, kw: 9, stride: 1 },
-        DwCase { label: "dw 9x9 c256 136x240 (Conv.64 小档)", h: 136, w: 240, c: 256, kh: 9, kw: 9, stride: 1 },
+        DwCase {
+            label: "dw 9x9 c256 216x240 (Conv.64 生产网格 grid=12960)",
+            h: 216,
+            w: 240,
+            c: 256,
+            kh: 9,
+            kw: 9,
+            stride: 1,
+        },
+        DwCase {
+            label: "dw 9x9 c256 136x240 (Conv.64 小档)",
+            h: 136,
+            w: 240,
+            c: 256,
+            kh: 9,
+            kw: 9,
+            stride: 1,
+        },
     ];
     // `QPPOCR_MB_DWMODE=w`（默认，扫权重段）/ `in`（扫输入段，权重钉死）。
     let mode = std::env::var("QPPOCR_MB_DWMODE").unwrap_or_else(|_| "w".into());
@@ -3405,14 +4423,18 @@ fn conv_dw_w_sweep() {
             .collect();
         // 网格必须与生产逐位一致，否则绝对值和相位效应都无从与生产对齐。
         for pr in &probes {
-            assert_eq!(pr.groups, super::conv_probe::dw_groups_for(pr.out_h * pr.out_w, pr.co4));
+            assert_eq!(
+                pr.groups,
+                super::conv_probe::dw_groups_for(pr.out_h * pr.out_w, pr.co4)
+            );
         }
 
         let run = |pr: &ConvProbe, reps: u32| -> f64 {
             let t = Instant::now();
             submit_compute(&ctx.inner.queue, |enc| {
                 for _ in 0..reps {
-                    ks.dispatch(enc, "n_conv_dw", &pr.buf, pr.p_off, pr.groups).expect("dispatch");
+                    ks.dispatch(enc, "n_conv_dw", &pr.buf, pr.p_off, pr.groups)
+                        .expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [&pr.buf];
                     enc.memory_barrier_with_resources(&res);
                 }
@@ -3424,7 +4446,11 @@ fn conv_dw_w_sweep() {
         let mut best = vec![f64::INFINITY; probes.len()];
         for round in 0..3 {
             let asc: Vec<usize> = (0..probes.len()).collect();
-            let order: Vec<usize> = if round % 2 == 0 { asc } else { asc.into_iter().rev().collect() };
+            let order: Vec<usize> = if round % 2 == 0 {
+                asc
+            } else {
+                asc.into_iter().rev().collect()
+            };
             for i in order {
                 let ms = time_dispatch(&|r| run(&probes[i], r)).ms;
                 best[i] = best[i].min(ms);
@@ -3641,8 +4667,7 @@ fn conv8_mma_load_attribution() {
         let t = Instant::now();
         submit_compute(&ctx.inner.queue, |enc| {
             for _ in 0..reps {
-                super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, g)
-                    .expect("dispatch");
+                super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, g).expect("dispatch");
                 let res: [&metal::ResourceRef; 1] = [&pr.buf];
                 enc.memory_barrier_with_resources(&res);
             }
@@ -3679,8 +4704,20 @@ fn conv8_mma_load_attribution() {
     );
     eprintln!(
         "[mb/attr] {:<6} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}   {:>7} {:>7} {:>7} {:>7} {:>7} {:>7}",
-        "cin", "base ms", "small ms", "hoist ms", "asmall ms", "bsmall ms", "ost16 ms", "ost2 ms",
-        "b/small", "b/hoist", "b/asmall", "b/bsmall", "b/ost16", "ost16/ost2"
+        "cin",
+        "base ms",
+        "small ms",
+        "hoist ms",
+        "asmall ms",
+        "bsmall ms",
+        "ost16 ms",
+        "ost2 ms",
+        "b/small",
+        "b/hoist",
+        "b/asmall",
+        "b/bsmall",
+        "b/ost16",
+        "ost16/ost2"
     );
     for (i, &cin) in cins.iter().enumerate() {
         let b = &best[i];
@@ -3815,8 +4852,7 @@ fn conv8_mma_wfrag() {
         let t = Instant::now();
         submit_compute(&ctx.inner.queue, |enc| {
             for _ in 0..reps {
-                super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, g)
-                    .expect("dispatch");
+                super::pipeline::dispatch_with(enc, pipe, &pr.buf, pr.p_off, g).expect("dispatch");
                 let res: [&metal::ResourceRef; 1] = [&pr.buf];
                 enc.memory_barrier_with_resources(&res);
             }
@@ -3962,7 +4998,10 @@ fn conv8_mma_arearead() {
     let (a0, o0) = ab(0);
     let (a1, o1) = ab(1);
     assert!((a0 - a1).abs() < a0 * 1e-6, "两臂 A 流量不等：{a0} vs {a1}");
-    assert!((o0 - o1).abs() < o0 * 1e-6, "两臂输出流量不等：{o0} vs {o1}");
+    assert!(
+        (o0 - o1).abs() < o0 * 1e-6,
+        "两臂输出流量不等：{o0} vs {o1}"
+    );
 
     let run = |pr: &ConvProbe, grid: [u32; 3], reps: u32| -> f64 {
         let t = Instant::now();
@@ -4113,11 +5152,17 @@ fn conv8_mma_batch_scaling() {
     for (ci, &cin) in cins.iter().enumerate() {
         // 以 batch=1 的每份时间为基，后面各档的相对值才是要读的数
         let base_pi = {
-            let i = combos.iter().position(|(a, b, ..)| *a == ci && *b == 0).unwrap();
+            let i = combos
+                .iter()
+                .position(|(a, b, ..)| *a == ci && *b == 0)
+                .unwrap();
             best[i]
         };
         for (bi, &b) in batches.iter().enumerate() {
-            let i = combos.iter().position(|(a, bb, ..)| *a == ci && *bb == bi).unwrap();
+            let i = combos
+                .iter()
+                .position(|(a, bb, ..)| *a == ci && *bb == bi)
+                .unwrap();
             let ms = best[i];
             let per = ms / b as f64;
             let flops = cases[ci].h as f64 * cases[ci].w as f64 * CO as f64 * cin as f64 * 2.0;
@@ -4146,17 +5191,31 @@ fn conv8_mma_batch_scaling() {
 /// （垃圾差也能过）要么太紧（fp16 的舍入差被当成错）。
 fn out_diff(a: &ConvProbe, b: &ConvProbe) -> (f32, f32) {
     let n = (a.out_h * a.out_w * a.co4) as usize;
-    assert_eq!(n, (b.out_h * b.out_w * b.co4) as usize, "两臂输出长度不一致");
+    assert_eq!(
+        n,
+        (b.out_h * b.out_w * b.co4) as usize,
+        "两臂输出长度不一致"
+    );
     // SAFETY: 两臂的段布局由同一段代码生成，输出段长 out_h*out_w*co4；
     // 缓冲是 Shared 存储，调用方已 wait_until_completed。
     let (sa, sb) = unsafe {
         (
-            std::slice::from_raw_parts((a.buf.contents() as *const f32).add(a.out_off_w as usize), n),
-            std::slice::from_raw_parts((b.buf.contents() as *const f32).add(b.out_off_w as usize), n),
+            std::slice::from_raw_parts(
+                (a.buf.contents() as *const f32).add(a.out_off_w as usize),
+                n,
+            ),
+            std::slice::from_raw_parts(
+                (b.buf.contents() as *const f32).add(b.out_off_w as usize),
+                n,
+            ),
         )
     };
     let scale = sa.iter().fold(0f32, |m, &v| m.max(v.abs()));
-    let dmax = sa.iter().zip(sb).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    let dmax = sa
+        .iter()
+        .zip(sb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
     (dmax, scale)
 }
 
@@ -4225,7 +5284,10 @@ fn conv8_ctc_head_prod_f32_vs_f16() {
          相对 {:.2e}）",
         dmax / scale.max(1e-30)
     );
-    assert!(scale > 0.0, "参考臂输出全 0 —— 内核没写（哨兵 7.0 也没了？）");
+    assert!(
+        scale > 0.0,
+        "参考臂输出全 0 —— 内核没写（哨兵 7.0 也没了？）"
+    );
     assert!(
         dmax < scale * 1e-2,
         "fp16 与 f32 输出差 {dmax:.3e}（量级 {scale:.3e}）——这不是舍入，\
@@ -4304,10 +5366,42 @@ fn conv8_grid_scaling_real_shapes() {
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
     // (h, w, cin, cout) 取自 `QPPOCR_METAL_PLAN_DUMP`；b=1 网格见 label。
     let cases = [
-        ConvCase { label: "Conv.42  3x58 c384->192 (grid= 9)", h: 6, w: 58, cin: 384, cout: 192, kh: 1, kw: 1 },
-        ConvCase { label: "Conv.49  3x58 c384->768 (grid=17)", h: 3, w: 58, cin: 384, cout: 768, kh: 1, kw: 1 },
-        ConvCase { label: "Conv.41  6x58 c192->384 (grid=17)", h: 6, w: 58, cin: 192, cout: 384, kh: 1, kw: 1 },
-        ConvCase { label: "MatMul.12  1x29 c120->18712 (grid=74)", h: 1, w: 29, cin: 120, cout: 18712, kh: 1, kw: 1 },
+        ConvCase {
+            label: "Conv.42  3x58 c384->192 (grid= 9)",
+            h: 6,
+            w: 58,
+            cin: 384,
+            cout: 192,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "Conv.49  3x58 c384->768 (grid=17)",
+            h: 3,
+            w: 58,
+            cin: 384,
+            cout: 768,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "Conv.41  6x58 c192->384 (grid=17)",
+            h: 6,
+            w: 58,
+            cin: 192,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "MatMul.12  1x29 c120->18712 (grid=74)",
+            h: 1,
+            w: 29,
+            cin: 120,
+            cout: 18712,
+            kh: 1,
+            kw: 1,
+        },
     ];
     // 要盖到 grid>=810：grid=9 那档得 b=90。取 96 一档给足余量。
     const BATCHES: [u32; 7] = [1, 3, 12, 24, 48, 96, 192];
@@ -4351,9 +5445,33 @@ fn conv8_batch_sweep() {
     let Some(ctx) = open_or_skip() else { return };
     let ks = KernelSet::new(&ctx.inner.device).expect("编译内核");
     let cases = [
-        ConvCase { label: "rec 6x208 c192->384 k1 (热)", h: 6, w: 208, cin: 192, cout: 384, kh: 1, kw: 1 },
-        ConvCase { label: "rec 3x208 c384->768 k1 (热)", h: 3, w: 208, cin: 384, cout: 768, kh: 1, kw: 1 },
-        ConvCase { label: "det 34x60 c192->384 k1", h: 34, w: 60, cin: 192, cout: 384, kh: 1, kw: 1 },
+        ConvCase {
+            label: "rec 6x208 c192->384 k1 (热)",
+            h: 6,
+            w: 208,
+            cin: 192,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "rec 3x208 c384->768 k1 (热)",
+            h: 3,
+            w: 208,
+            cin: 384,
+            cout: 768,
+            kh: 1,
+            kw: 1,
+        },
+        ConvCase {
+            label: "det 34x60 c192->384 k1",
+            h: 34,
+            w: 60,
+            cin: 192,
+            cout: 384,
+            kh: 1,
+            kw: 1,
+        },
     ];
     const BATCHES: [u32; 5] = [1, 2, 4, 8, 16];
 
@@ -4443,7 +5561,8 @@ fn mem_bandwidth_sweep() {
             let t = Instant::now();
             submit_compute(queue, |enc| {
                 for _ in 0..r {
-                    ks.dispatch(enc, "n_elem", &buf, p_off, groups).expect("dispatch");
+                    ks.dispatch(enc, "n_elem", &buf, p_off, groups)
+                        .expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [&buf];
                     enc.memory_barrier_with_resources(&res);
                 }
@@ -4522,15 +5641,8 @@ fn threads_per_group_sweep() {
                 for _ in 0..r {
                     // 走生产编码路径（只换线程组尺寸）：每线程仍是 1 个
                     // float4，总线程数恒定，唯一变量是组大小。
-                    dispatch_with_tg(
-                        enc,
-                        pipe,
-                        &buf,
-                        p_off,
-                        [groups as u32, 1, 1],
-                        tg,
-                    )
-                    .expect("dispatch");
+                    dispatch_with_tg(enc, pipe, &buf, p_off, [groups as u32, 1, 1], tg)
+                        .expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [&buf];
                     enc.memory_barrier_with_resources(&res);
                 }
@@ -4617,11 +5729,9 @@ fn head_argmax_tg_sweep() {
     let Some(ctx) = open_or_skip() else { return };
     let device = &ctx.inner.device;
     let queue = &ctx.inner.queue;
-    let probes = super::conv_probe::ProbeSet::from_list(
-        device,
-        super::conv_probe::HEAD_PROBE_SHADERS,
-    )
-    .expect("编译 head 探针");
+    let probes =
+        super::conv_probe::ProbeSet::from_list(device, super::conv_probe::HEAD_PROBE_SHADERS)
+            .expect("编译 head 探针");
     // 断言位级相同的变体：换线程组大小（归约序变但 max/argmax 与序无关）
     // 与链展开（加法次序一字不改）。`p_h_s*` / `p_h_noexp` 故意不等，只量时间。
     let names = [
@@ -4659,7 +5769,9 @@ fn head_argmax_tg_sweep() {
             // SAFETY: out_off + rows*2 在分配内（见 head_arena 的 pbase 计算）。
             let got: Vec<u32> = unsafe {
                 let base = buf.contents() as *const u32;
-                (0..rows * 2).map(|i| *base.add(out_off as usize + i)).collect()
+                (0..rows * 2)
+                    .map(|i| *base.add(out_off as usize + i))
+                    .collect()
             };
             match &want {
                 None => want = Some(got),
@@ -4782,8 +5894,7 @@ fn mem_bandwidth_barrier_cost() {
         let t = Instant::now();
         submit_compute(queue, |enc| {
             for _ in 0..r {
-                dispatch_with_tg(enc, pipe, &buf, p_off, [groups, 1, 1], tg)
-                    .expect("dispatch");
+                dispatch_with_tg(enc, pipe, &buf, p_off, [groups, 1, 1], tg).expect("dispatch");
                 if with {
                     let res: [&metal::ResourceRef; 1] = [&buf];
                     enc.memory_barrier_with_resources(&res);
@@ -4919,8 +6030,7 @@ fn buffer_creation_path_bandwidth() {
             let t = Instant::now();
             submit_compute(queue, |enc| {
                 for _ in 0..r {
-                    dispatch_with_tg(enc, pipe, buf, p_off, [groups, 1, 1], tg)
-                        .expect("dispatch");
+                    dispatch_with_tg(enc, pipe, buf, p_off, [groups, 1, 1], tg).expect("dispatch");
                     let res: [&metal::ResourceRef; 1] = [buf];
                     enc.memory_barrier_with_resources(&res);
                 }
@@ -4947,10 +6057,16 @@ fn dw_error(pr: &ConvProbe, c: &DwCase, no_pad: bool) -> f32 {
     // SAFETY: Shared 存储，`out_off_w` 起 `out_h*out_w*co4` 个 word 有效；
     // 调用方已 wait_until_completed。前 `out_w*c` 列是真实通道（尾部补齐）。
     let got = unsafe {
-        std::slice::from_raw_parts((pr.buf.contents() as *const f32).add(pr.out_off_w as usize), n)
+        std::slice::from_raw_parts(
+            (pr.buf.contents() as *const f32).add(pr.out_off_w as usize),
+            n,
+        )
     };
     let want = cpu_dw_ref(&pr.input, &pr.weight, c, no_pad);
-    got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max)
+    got.iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max)
 }
 
 /// `n_conv_dw` 热循环拆解：medium det 里它只做 **3.2% 的 FLOP**，却占
@@ -4969,19 +6085,75 @@ fn conv_dw_variant_scan() {
     // `h/w` 是**输入**分辨率（stride 1 时 = 输出）。
     let cases = [
         // 首恶：单条 6.54 ms、1.354 GFLOP。输入由 Resize.2/Add.158 给到 136x240。
-        DwCase { label: "dw 9x9 c256 136x240 (Conv.64 首恶)", h: 136, w: 240, c: 256, kh: 9, kw: 9, stride: 1 },
-        DwCase { label: "dw 9x9 c256  68x120 (Conv.62)", h: 68, w: 120, c: 256, kh: 9, kw: 9, stride: 1 },
-        DwCase { label: "dw 9x9 c64  136x240 (Conv.69)", h: 136, w: 240, c: 64, kh: 9, kw: 9, stride: 1 },
+        DwCase {
+            label: "dw 9x9 c256 136x240 (Conv.64 首恶)",
+            h: 136,
+            w: 240,
+            c: 256,
+            kh: 9,
+            kw: 9,
+            stride: 1,
+        },
+        DwCase {
+            label: "dw 9x9 c256  68x120 (Conv.62)",
+            h: 68,
+            w: 120,
+            c: 256,
+            kh: 9,
+            kw: 9,
+            stride: 1,
+        },
+        DwCase {
+            label: "dw 9x9 c64  136x240 (Conv.69)",
+            h: 136,
+            w: 240,
+            c: 64,
+            kh: 9,
+            kw: 9,
+            stride: 1,
+        },
         // 3x3 那批条数多（Conv.5/10/13/…），单条小但铺满整个骨干。
-        DwCase { label: "dw 3x3 c128 136x240 (Conv.5)", h: 136, w: 240, c: 128, kh: 3, kw: 3, stride: 1 },
-        DwCase { label: "dw 3x3 c512  34x60 ", h: 34, w: 60, c: 512, kh: 3, kw: 3, stride: 1 },
+        DwCase {
+            label: "dw 3x3 c128 136x240 (Conv.5)",
+            h: 136,
+            w: 240,
+            c: 128,
+            kh: 3,
+            kw: 3,
+            stride: 1,
+        },
+        DwCase {
+            label: "dw 3x3 c512  34x60 ",
+            h: 34,
+            w: 60,
+            c: 512,
+            kh: 3,
+            kw: 3,
+            stride: 1,
+        },
         // 5x5 那档：判据 `5..=9` 把它收进来了，但探针从没量过 —— det 里真有
         // 两条（Conv.21 c64 / Conv.27 c128），形状照抄 PLAN_DUMP。
         //   ⚠️ `DwCase::h/w` 是**输入**分辨率，且 k=5,p=2,s=1 时
         //   out = (in + 4 - 5) + 1 = in —— 想凑出 out=4 就要填 in=4，
         //   按 3x3 的直觉去「补两圈 pad」会得到另一个形状（已踩过）。
-        DwCase { label: "dw 5x5 c64   4x32  (Conv.21)", h: 4, w: 32, c: 64, kh: 5, kw: 5, stride: 1 },
-        DwCase { label: "dw 5x5 c128  2x32  (Conv.27)", h: 2, w: 32, c: 128, kh: 5, kw: 5, stride: 1 },
+        DwCase {
+            label: "dw 5x5 c64   4x32  (Conv.21)",
+            h: 4,
+            w: 32,
+            c: 64,
+            kh: 5,
+            kw: 5,
+            stride: 1,
+        },
+        DwCase {
+            label: "dw 5x5 c128  2x32  (Conv.27)",
+            h: 2,
+            w: 32,
+            c: 128,
+            kh: 5,
+            kw: 5,
+            stride: 1,
+        },
     ];
     let probes = super::conv_probe::ProbeSet::from_list(
         &ctx.inner.device,
@@ -5198,8 +6370,10 @@ fn conv_dw_variant_scan() {
             .expect("提交");
             t.elapsed().as_secs_f64() * 1000.0
         };
-        let pipes: Vec<&metal::ComputePipelineState> =
-            names.iter().map(|n| probes.pipe(n).expect("管线")).collect();
+        let pipes: Vec<&metal::ComputePipelineState> = names
+            .iter()
+            .map(|n| probes.pipe(n).expect("管线"))
+            .collect();
         let mut reps = Vec::new();
         let mut errs = Vec::new();
         for p in &pipes {
@@ -5282,7 +6456,9 @@ fn build_ct_case(device: &metal::DeviceRef, cin: u32, cout: u32, in_h: u32, in_w
 
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
     let mut rnd = || -> f32 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 0.25
     };
     let input: Vec<f32> = (0..(in_h * in_w * ci4) as usize).map(|_| rnd()).collect();
@@ -5327,16 +6503,38 @@ fn build_ct_case(device: &metal::DeviceRef, cin: u32, cout: u32, in_h: u32, in_w
         *base = 0;
         // 偏移一律是 **word（f32 元素）下标**——内核内部 `>>2` 折算成 float4。
         let words: [u32; 18] = [
-            in_off_w, w_off_w, b_off_w, out_off_w, // 0..3
-            m_dim, co4, out_w, in_w, in_h,         // 4..8
-            ci4, ci4 / 4, 2, 2, 2, 0,              // 9..14 cin,ci4v,sH,sW,kW,act
-            0, 0, 0,                               // 15..17 c1,c2,c3（act=0 用不到）
+            in_off_w,
+            w_off_w,
+            b_off_w,
+            out_off_w, // 0..3
+            m_dim,
+            co4,
+            out_w,
+            in_w,
+            in_h, // 4..8
+            ci4,
+            ci4 / 4,
+            2,
+            2,
+            2,
+            0, // 9..14 cin,ci4v,sH,sW,kW,act
+            0,
+            0,
+            0, // 15..17 c1,c2,c3（act=0 用不到）
         ];
         for (i, v) in words.iter().enumerate() {
             *p.add(i) = *v;
         }
-        std::ptr::copy_nonoverlapping(input.as_ptr(), base.add(in_off_w as usize) as *mut f32, n_in as usize);
-        std::ptr::copy_nonoverlapping(w_repacked.as_ptr(), base.add(w_off_w as usize) as *mut f32, n_w as usize);
+        std::ptr::copy_nonoverlapping(
+            input.as_ptr(),
+            base.add(in_off_w as usize) as *mut f32,
+            n_in as usize,
+        );
+        std::ptr::copy_nonoverlapping(
+            w_repacked.as_ptr(),
+            base.add(w_off_w as usize) as *mut f32,
+            n_w as usize,
+        );
         // bias 段存在但全 0：把 `b_off != OFF_NONE` 那条分支也照到（生产里
         // det 的 ConvTranspose 有 bias）。每线程多一条广播装载，可忽略。
         std::ptr::write_bytes(base.add(b_off_w as usize) as *mut f32, 0, co4 as usize);
@@ -5350,8 +6548,21 @@ fn build_ct_case(device: &metal::DeviceRef, cin: u32, cout: u32, in_h: u32, in_w
     let flops = m_dim as f64 * co4 as f64 * ci4 as f64 * 2.0;
     let bytes = (n_in + n_out) as f64 * 4.0 + n_w as f64 * 4.0;
     CtProbe {
-        buf, p_off: p_words, out_off_w, n_out, m_dim, in_h, in_w,
-        cin, cout, co4, ci4, input, weight, flops, bytes,
+        buf,
+        p_off: p_words,
+        out_off_w,
+        n_out,
+        m_dim,
+        in_h,
+        in_w,
+        cin,
+        cout,
+        co4,
+        ci4,
+        input,
+        weight,
+        flops,
+        bytes,
     }
 }
 
@@ -5412,9 +6623,16 @@ fn convt_probe_attribution() {
         ("ConvTranspose.2", 64, 4, 480, 432),
     ];
     let arms = [
-        "p_ct_base", "p_ct_ci4", "p_ct_tap4", "p_ct_tap4w4", // 结果正确
-        "p_ct_noin", "p_ct_now", "p_ct_fmaonly",             // 诊断：砍流
-        "p_ct_ismall", "p_ct_wsmall", "p_ct_osmall",         // 诊断：留条数砍字节
+        "p_ct_base",
+        "p_ct_ci4",
+        "p_ct_tap4",
+        "p_ct_tap4w4", // 结果正确
+        "p_ct_noin",
+        "p_ct_now",
+        "p_ct_fmaonly", // 诊断：砍流
+        "p_ct_ismall",
+        "p_ct_wsmall",
+        "p_ct_osmall", // 诊断：留条数砍字节
     ];
 
     for (label, cin, cout, h, w) in shapes {
@@ -5441,20 +6659,31 @@ fn convt_probe_attribution() {
         let want = cpu_convt_ref(&pr);
         let _ = run("p_ct_base", 1);
         let got = ct_read_out(&pr);
-        let err_base = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max);
+        let err_base = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0f32, f32::max);
         let base_out = got.clone();
         let mut errs = vec![("p_ct_base", err_base)];
         for arm in ["p_ct_ci4", "p_ct_tap4", "p_ct_tap4w4"] {
             let _ = run(arm, 1);
-                let g = ct_read_out(&pr);
+            let g = ct_read_out(&pr);
             // 与 p_ct_base 逐位比：这三个臂的累加顺序与 base 相同，应当**位级一致**。
-            let d = g.iter().zip(&base_out).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let d = g
+                .iter()
+                .zip(&base_out)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
             errs.push((arm, d));
         }
 
         eprintln!(
             "[ct] {label}: cin={cin} cout={cout} in={h}×{w} out={}×{} mDim={} nv={} 网格 base=[{},1,1] tap4=[{},1,1] tap4w4=[{},1,1]",
-            h * 2, w * 2, pr.m_dim, pr.co4 / 4,
+            h * 2,
+            w * 2,
+            pr.m_dim,
+            pr.co4 / 4,
             base_g[0],
             super::conv_probe::ct_groups_for("p_ct_tap4", pr.m_dim, h, w, pr.co4)[0],
             super::conv_probe::ct_groups_for("p_ct_tap4w4", pr.m_dim, h, w, pr.co4)[0],
@@ -5468,7 +6697,10 @@ fn convt_probe_attribution() {
         );
         eprintln!(
             "[ct] {label}: 最大绝对误差 vs CPU / vs base: {}",
-            errs.iter().map(|(n, e)| format!("{n}={e:.3e}")).collect::<Vec<_>>().join("  ")
+            errs.iter()
+                .map(|(n, e)| format!("{n}={e:.3e}"))
+                .collect::<Vec<_>>()
+                .join("  ")
         );
 
         // ---- 计时：三轮，奇偶轮换序（顺序效应在本机是 6~15%，见 ab.sh 那条）
@@ -5491,19 +6723,36 @@ fn convt_probe_attribution() {
         );
         eprintln!(
             "[ct] {label}  {:>9.3} {:>9.3} {:>9.3} {:>9.3} | {:>9.3} {:>9.3} {:>9.3} | {:>9.3} {:>9.3} {:>9.3}",
-            best[0], best[1], best[2], best[3], best[4], best[5], best[6], best[7], best[8], best[9]
+            best[0],
+            best[1],
+            best[2],
+            best[3],
+            best[4],
+            best[5],
+            best[6],
+            best[7],
+            best[8],
+            best[9]
         );
         eprintln!(
             "[ct] {label}  {:>9} {:>8.2}× {:>8.2}× {:>8.2}× | {:>8.2}× {:>8.2}× {:>8.2}× | {:>8.2}× {:>8.2}× {:>8.2}×",
             "base/→",
-            b0 / best[1], b0 / best[2], b0 / best[3],
-            b0 / best[4], b0 / best[5], b0 / best[6],
-            b0 / best[7], b0 / best[8], b0 / best[9]
+            b0 / best[1],
+            b0 / best[2],
+            b0 / best[3],
+            b0 / best[4],
+            b0 / best[5],
+            b0 / best[6],
+            b0 / best[7],
+            b0 / best[8],
+            b0 / best[9]
         );
         let gf = pr.flops / 1e9;
         eprintln!(
             "[ct] {label}: base {:.0} GFLOPS（峰值 6.3% 量级）/ tap4 {:.0} / tap4w4 {:.0}",
-            gf / best[0] * 1000.0, gf / best[2] * 1000.0, gf / best[3] * 1000.0
+            gf / best[0] * 1000.0,
+            gf / best[2] * 1000.0,
+            gf / best[3] * 1000.0
         );
     }
 }
@@ -5544,7 +6793,8 @@ fn convt_prod_matches_cpu() {
 
         let run = |name: &str, g: [u32; 3]| {
             submit_compute(&ctx.inner.queue, |enc| {
-                ks.dispatch(enc, name, &pr.buf, pr.p_off, g).expect("dispatch");
+                ks.dispatch(enc, name, &pr.buf, pr.p_off, g)
+                    .expect("dispatch");
             })
             .expect("提交");
         };
@@ -5557,7 +6807,10 @@ fn convt_prod_matches_cpu() {
             }
         };
         let maxdiff = |a: &[f32], b: &[f32]| {
-            a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
         };
 
         reset();
@@ -5574,7 +6827,10 @@ fn convt_prod_matches_cpu() {
         // 哨兵：内核没写的话输出全 7.0，maxdiff 会是大数——上面两条会先炸。
         assert!(e1 < 1e-4, "{label}: n_convt 对 CPU 误差 {e1:.3e}");
         assert!(e4 < 1e-4, "{label}: n_convt4w 对 CPU 误差 {e4:.3e}");
-        assert!(e14 == 0.0, "{label}: n_convt4w 与 n_convt 不是位级相等（{e14:.3e}）");
+        assert!(
+            e14 == 0.0,
+            "{label}: n_convt4w 与 n_convt 不是位级相等（{e14:.3e}）"
+        );
         eprintln!(
             "[ct/prod] {label}: cin={cin} cout={cout} in={h}×{w} 网格 n_convt=[{},1,1] n_convt4w=[{},1,1]  vs CPU {e1:.2e} / {e4:.2e}  vs 彼此 {e14:.1e} ✅",
             g1[0], g4[0]

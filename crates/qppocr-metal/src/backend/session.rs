@@ -696,9 +696,13 @@ impl MetalSession {
                 // 计划自己——容量逐计划翻倍、无界增长，最终 new_buffer 申请不
                 // 到存储。本仓实证：崩在 build_plan 的 _platform_memmove，
                 // KERN_INVALID_ADDRESS at 0x0，整批 worker 一起死。
-                let old = if share { cur_cap.unwrap_or(0) as u64 } else { 0 };
-                let cap = (built.total_words as u64 + built.total_words as u64 / 4 + 1024)
-                    .max(old * 2);
+                let old = if share {
+                    cur_cap.unwrap_or(0) as u64
+                } else {
+                    0
+                };
+                let cap =
+                    (built.total_words as u64 + built.total_words as u64 / 4 + 1024).max(old * 2);
                 // cap_words 是 u32；翻倍链一旦越界，这里必须报错而不是静默截断
                 // （截断后记录的容量小于实际分配，后续计划的越界自查会失准）。
                 if cap > u32::MAX as u64 {
@@ -749,9 +753,10 @@ impl MetalSession {
         // 垃圾 → 巨循环 → 挂死（本仓实测形态，见 plan.rs:1804）。
         //
         // 填充会作废跳过集声称的内容，所以一并清空 prev（强制全量上传）。
-        let prev = match std::env::var("QPPOCR_METAL_ARENA_FILL").ok().and_then(|v| {
-            u8::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()
-        }) {
+        let prev = match std::env::var("QPPOCR_METAL_ARENA_FILL")
+            .ok()
+            .and_then(|v| u8::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+        {
             Some(fb) => {
                 // SAFETY: base 指向 cap_words 个 word 的映射，而 bytes = total_words*4
                 // 且复用/新建都保证 cap_words >= total_words（上方判断）。
@@ -819,8 +824,11 @@ impl MetalSession {
             // 上传体量分布：`uploads` 每形状照写，`upload_init` 可跳。两清单
             // 谁在扛 20+ MB、是「少数巨块」还是「173 个小块堆出来的」，直接
             // 决定还有没有优化空间——离散量，不受机器负载窗影响。
-            let mut up: Vec<(u32, u32)> =
-                built.uploads.iter().map(|(o, d)| (*o, d.len() as u32)).collect();
+            let mut up: Vec<(u32, u32)> = built
+                .uploads
+                .iter()
+                .map(|(o, d)| (*o, d.len() as u32))
+                .collect();
             up.sort_by_key(|b| std::cmp::Reverse(b.1));
             let up_bytes: u64 = built.uploads.iter().map(|(_, d)| d.len() as u64).sum();
             let init_bytes: u64 = built.upload_init.iter().map(|(_, d)| d.len() as u64).sum();
@@ -856,8 +864,7 @@ impl MetalSession {
         // [0, total_words)）。配合 QPPOCR_METAL_ARENA_FILL 做两次运行对拍：
         // 不一致的字节 = 本次 build 从未写过。文件名带序号与形状，方便按序对齐。
         if let Some(prefix) = std::env::var_os("QPPOCR_METAL_ARENA_DUMP") {
-            static SEQ: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(0);
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let idx = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let shape = in_shape
                 .iter()
@@ -1254,7 +1261,7 @@ impl MetalSession {
         }
         let total: f64 = rows.iter().map(|r| r.ms).sum();
         let mut v: Vec<_> = agg.into_iter().collect();
-        v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+        v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
         eprintln!(
             "[prof] 逐内核设备端合计 {total:.2} ms（{} 条，计数器采样）",
             rows.len()
@@ -1286,7 +1293,6 @@ impl MetalSession {
         );
         Ok(())
     }
-
 }
 
 impl DeviceSession for MetalSession {
@@ -1497,7 +1503,11 @@ impl DeviceSession for MetalSession {
         // `[1,3,64,64]` 的 `rows=8`），那就是「出口把 16 字写去了别处」的直证。
         if self.argmax_exit && std::env::var_os("QPPOCR_METAL_EXIT_PARAM").is_some() {
             use std::fmt::Write as _;
-            if let Some(d) = plan.dispatches.iter().find(|d| d.kernel == "n_exit3_argmax") {
+            if let Some(d) = plan
+                .dispatches
+                .iter()
+                .find(|d| d.kernel == "n_exit3_argmax")
+            {
                 let blob = plan.statics.iter().find(|(off, _)| *off == d.p_off);
                 let n = blob.map(|(_, v)| v.len()).unwrap_or(6).max(6);
                 let (mut have, mut want) = (String::new(), String::new());
@@ -1665,7 +1675,10 @@ impl DeviceSession for MetalSession {
                 .map(|v| v.to_string())
                 .collect::<Vec<_>>()
                 .join("x");
-            (format!("{}.run{run_seq:03}.{shape}", p.to_string_lossy()), wins)
+            (
+                format!("{}.run{run_seq:03}.{shape}", p.to_string_lossy()),
+                wins,
+            )
         });
         /// 把若干「激活区相对字偏移」窗口读成一行十六进制（诊断用，纯读）。
         unsafe fn watch_line(base: *const u8, sw: usize, wins: &[(usize, usize)]) -> String {

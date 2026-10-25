@@ -279,7 +279,10 @@ fn matmul_weight_owners() {
     for n in &g.nodes {
         for i in &n.inputs {
             if !i.is_empty() {
-                users.entry(i.as_str()).or_default().push(n.op_type.as_str());
+                users
+                    .entry(i.as_str())
+                    .or_default()
+                    .push(n.op_type.as_str());
             }
         }
     }

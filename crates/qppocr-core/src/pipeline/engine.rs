@@ -1581,9 +1581,7 @@ impl Engine {
         };
         if retry_conf > 0.0 {
             let retry: Vec<usize> = (0..lines.len())
-                .filter(|&i| {
-                    wants_cls_retry(cls_conf[i], thresh, lines[i].confidence, retry_conf)
-                })
+                .filter(|&i| wants_cls_retry(cls_conf[i], thresh, lines[i].confidence, retry_conf))
                 .collect();
             if !retry.is_empty() {
                 // 翻转版裁切：本来翻了就取原图，本来没翻就转 180°。

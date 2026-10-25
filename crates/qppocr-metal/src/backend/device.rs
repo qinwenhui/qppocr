@@ -69,4 +69,3 @@ pub(crate) fn submit_compute_timed(
         ))),
     }
 }
-

@@ -714,10 +714,8 @@ impl VulkanSession {
             self.static_reserve
                 .load(std::sync::atomic::Ordering::Relaxed),
         )?;
-        self.static_reserve.fetch_max(
-            built.static_words,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.static_reserve
+            .fetch_max(built.static_words, std::sync::atomic::Ordering::Relaxed);
 
         // === 实分配：整块一次（KernelSet 绑单缓冲）===
         let t_alloc = std::time::Instant::now();

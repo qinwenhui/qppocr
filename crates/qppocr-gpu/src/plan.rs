@@ -974,10 +974,7 @@ impl PlanBuilder<'_> {
                 && self.argmax_exit
                 && n.op_type == "Softmax"
                 && is_output(&out)
-                && table
-                    .values
-                    .get(&out)
-                    .is_some_and(|v| v.shape.len() == 3)
+                && table.values.get(&out).is_some_and(|v| v.shape.len() == 3)
             {
                 let src = n.inputs[0].clone();
                 let sole_reader = !self.graph.outputs.contains(&src)
@@ -989,15 +986,18 @@ impl PlanBuilder<'_> {
                         .count()
                         == 1;
                 if sole_reader {
-                    if let (Some(&src_off), Some(&(rows, cpad))) = (offs.get(&src), rc.get(&src))
-                    {
-                        let real_cols =
-                            *table.values[&out].shape.last().unwrap_or(&1) as u32;
+                    if let (Some(&src_off), Some(&(rows, cpad))) = (offs.get(&src), rc.get(&src)) {
+                        let real_cols = *table.values[&out].shape.last().unwrap_or(&1) as u32;
                         let rpb = (rows / table.values[&out].shape[0].max(1) as u32).max(1);
                         // (val, idx) 2 word/行——与 exit3 argmax 同布局
                         let pairs_off = layout.alloc(rows * 2);
                         let mut pb = ParamBlock::new();
-                        pb.u(src_off).u(pairs_off).u(rows).u(real_cols).u(cpad).u(rpb);
+                        pb.u(src_off)
+                            .u(pairs_off)
+                            .u(rows)
+                            .u(real_cols)
+                            .u(cpad)
+                            .u(rpb);
                         let p_off = layout.alloc_static(pb.len_words());
                         params.push((p_off, Arc::new(pb.words().to_vec())));
                         recs.push(Rec {
@@ -1337,7 +1337,11 @@ impl PlanBuilder<'_> {
         // `PlanBuilder::grid_cap`）。余下的 tile 由内核循环吃掉，数值不变。
         let capped = |tiles: u32| -> u32 {
             let g = tiles.div_ceil(256);
-            if self.grid_cap == 0 { g } else { g.min(self.grid_cap) }
+            if self.grid_cap == 0 {
+                g
+            } else {
+                g.min(self.grid_cap)
+            }
         };
         let out = &n.outputs[0];
         let out_shape = shape_of(out);
@@ -1529,10 +1533,7 @@ impl PlanBuilder<'_> {
                         if e_tiles == 0 {
                             Ok(vec![mma])
                         } else {
-                            Ok(vec![
-                                mma,
-                                ("n_conv8_edge", pb, [capped(e_tiles), nb, 1]),
-                            ])
+                            Ok(vec![mma, ("n_conv8_edge", pb, [capped(e_tiles), nb, 1])])
                         }
                     } else if mma {
                         // 通道块宽 64/32 二选一（内核是同一模板的两条实例化，
@@ -1552,10 +1553,18 @@ impl PlanBuilder<'_> {
                         } else {
                             "n_conv8_mma_n32"
                         };
-                        Ok(vec![(kname, pb, [m_dim.div_ceil(64), co4.div_ceil(ncols), nb])])
+                        Ok(vec![(
+                            kname,
+                            pb,
+                            [m_dim.div_ceil(64), co4.div_ceil(ncols), nb],
+                        )])
                     } else if use8 {
                         let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
-                        Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1])])
+                        Ok(vec![(
+                            kname,
+                            pb,
+                            [capped(m_dim.div_ceil(4) * (nv / 2)), nb, 1],
+                        )])
                     } else {
                         Ok(vec![(
                             "n_conv",
@@ -1684,8 +1693,10 @@ impl PlanBuilder<'_> {
                 // **y 维（batch）同 n_convt**，只有 x 维改成「每线程 4 个 iw」的
                 // 计数（tiles 公式必须与 n_convt4w 里逐字一致）。
                 if self.conv_t_tile
-                    && kh == 2 && kw == 2
-                    && sh == 2 && sw == 2
+                    && kh == 2
+                    && kw == 2
+                    && sh == 2
+                    && sw == 2
                     && xs[3] % 4 == 0
                     && nv >= 4
                 {
@@ -1998,10 +2009,18 @@ impl PlanBuilder<'_> {
                     } else {
                         "n_conv8_mma_n32"
                     };
-                    Ok(vec![(kname, pb, [m_dim.div_ceil(64), cols.div_ceil(ncols), 1])])
+                    Ok(vec![(
+                        kname,
+                        pb,
+                        [m_dim.div_ceil(64), cols.div_ceil(ncols), 1],
+                    )])
                 } else if use8 {
                     let kname = if fp16 { "n_conv8h" } else { "n_conv8" };
-                    Ok(vec![(kname, pb, [capped(m_dim.div_ceil(4) * (nv / 2)), 1, 1])])
+                    Ok(vec![(
+                        kname,
+                        pb,
+                        [capped(m_dim.div_ceil(4) * (nv / 2)), 1, 1],
+                    )])
                 } else {
                     Ok(vec![("n_conv", pb, [div256(m_dim.div_ceil(4) * nv), 1, 1])])
                 }
@@ -2597,7 +2616,11 @@ impl Layout {
         // 整数倍 ⇒ **整张输入同相**，所以这是全局档位、不是逐行抖动。
         // 尺寸与起点一起抬：只抬起点的话，`free` 回填的复用块会把相位带回
         // 错位（复用是常态，det 计划里绝大多数激活段都走复用）。
-        let n = if self.split { n.div_ceil(16) * 16 } else { n.div_ceil(4) * 4 };
+        let n = if self.split {
+            n.div_ceil(16) * 16
+        } else {
+            n.div_ceil(4) * 4
+        };
         for i in 0..self.free.len() {
             if self.free[i].1 >= n {
                 let off = self.free[i].0;
@@ -2628,7 +2651,11 @@ impl Layout {
     pub(crate) fn free(&mut self, off: u32, n: u32) {
         // 与 `alloc` 同一条取整规则：复用块的尺寸也必须落在 16 word 上，
         // 否则「分配时对齐、复用后错位」——复用恰恰是 det 计划里的常态。
-        let n = if self.split { n.div_ceil(16) * 16 } else { n.div_ceil(4) * 4 };
+        let n = if self.split {
+            n.div_ceil(16) * 16
+        } else {
+            n.div_ceil(4) * 4
+        };
         if n > 0 {
             self.free.push((off, n));
         }
