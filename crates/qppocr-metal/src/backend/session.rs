@@ -181,6 +181,7 @@ impl Arena {
 // SAFETY: 同 MetalPlan——base 是 buf 的持久映射指针，存活期不短于 Arena
 // 且只在会话执行锁下访问；metal owned 类型 Send+Sync。
 unsafe impl Send for Arena {}
+// SAFETY: 同上——Arena 的数据只在会话执行锁下访问，裸指针不跨线程裸传。
 unsafe impl Sync for Arena {}
 
 /// Metal GPU 会话：形状键计划缓存（P2 det 范围——串行执行；rec/cls 的
@@ -1112,10 +1113,10 @@ impl MetalSession {
             .copied()
             .collect();
         let (mut wrote, mut skipped) = (0u64, 0u64);
-        // SAFETY: `a.base` 指向 `cap_words` 个 word 的映射，而计划的所有偏移
+        let t_replay = std::time::Instant::now();
+        // SAFETY: `g.base` 指向 `cap_words` 个 word 的映射，而计划的所有偏移
         // 都 < 它自己的 total_words ≤ 本 arena 建它时的 cap_words（arena 只增
         // 不减、计划只落在自己那块的范围内）。
-        let t_replay = std::time::Instant::now();
         unsafe {
             let base = g.base;
             for (off, data) in &plan.statics {

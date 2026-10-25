@@ -1,3 +1,11 @@
+#![allow(
+    clippy::doc_lazy_continuation,      // 探针日志段落按行书写
+    clippy::expect_fun_call,            // 探针失败信息需要拼接管线名
+    clippy::int_plus_one,               // 边界断言保持 ±1 的显式写法
+    clippy::manual_div_ceil,            // 网格尺寸与 kernel 侧逐字对应
+    clippy::undocumented_unsafe_blocks, // 裸指针探针：与生产同址同序，逐行注释无信息量
+    clippy::unnecessary_cast,           // 参数表统一显式转换，便于对照 shader
+)]
 //! 性能微基准：把「一次 run 的墙钟」拆成三个可独立测的固定开销。
 //!
 //! 动机：`QPPOCR_GPU_PROF` 显示 rec 每个宽度批次的墙钟在 **4.2~17 ms**
@@ -3261,8 +3269,6 @@ fn conv8_mma_w_sweep() {
     // （1536 → 6144 B，仍是 128 B 整数倍），激活段用 `Conv.57` 的
     // `in=21118080 / out=27311232`、无残差。只对 `co4=768` 成立就不算规律。
     let wide = ConvCase { label: "c768->1536", h: 21, w: 48, cin: 768, cout: 1536, kh: 1, kw: 1 };
-    let alignw: Vec<(u32, u32)> =
-        (0..16u32).map(|j| (11980180 + j, 11980180 + j + 768 * 1536)).collect();
     // `aligna`：把 16 个相位换到**激活段**上。`co4=1536` 那一档里 B 的行距是
     // 6144 B、A 的是 3072 B —— 而 `co4=768` 那档恰好反过来（B 3072 / A 6144），
     // 且大摆幅只出现在「3072 B 行距」的那个操作数上。所以「敏感的是 3072 B

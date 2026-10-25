@@ -6,7 +6,7 @@
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 每个版本写清**行为变化**，尤其是默认值变化。
 
-## [Unreleased]
+## [0.4.0] - 2026-10-25
 
 ### 新增（Added）
 
@@ -14,8 +14,8 @@
   `qppocr-metal`，随 feature `gpu` 在 macOS 上启用；其他平台编译为
   空枚举，构建面不变）：设备枚举/打开、MSL 源码内嵌运行时编译（显式
   禁 fast-math 保逐位可比）、n_ 内核族全量 19 个 MSL 移植（与
-  GLSL 逐行对应）、整图会话（批维补齐/real_n 早退/CTC argmax 出口/
-  精确宽与 Vulkan 侧同款语义）。统一内存零 staging：输入写入/输出读回
+  GLSL 逐行对应）、整图会话（按真实行合批/real_n 早退/CTC argmax 出口/
+  宽度分桶与 Vulkan 侧同款语义）。统一内存零 staging：输入写入/输出读回
   直接经 `StorageModeShared`。部署分级 `QPPOCR_GPU_STAGES=all|detrec|det`
   与 Vulkan 侧同款（委托 CPU 时 stderr 声明）；`GpuApi::Auto` 在
   macOS 优先 Metal（原生直连），Vulkan/MoltenVK 兜底。新增
@@ -69,6 +69,51 @@
   20 张图的 OCR 输出与改动前**逐字节相同**；qppocr-metal 31 项测试全过。
   同期观测：`det` 列 +1.75 ± 1.0 ms（约 4%），成因未定位，量级远小于 rec
   的收益（rec 约 −19%）。
+- **CPU（全平台）：修复 rec 的负线程缩放**。GEMM 切分轴原先按
+  `np >= par::threads()` 选择，线程数越多、越多窄 N 的识别 GEMM 掉进逐行
+  广播路径（同一形状慢 2.6~6.4×）；默认 8~16 线程的机器上几乎全部 rec
+  GEMM 都走了慢路径。改为只看形状（`np >= 2` 走面板，`np == 1` 保留 M 行
+  并行），线程数不再参与算法路径选择。本机 M4 隔离实测 rec 端到端
+  **95.3 s → 31.7 s（3.0×）**，输出文本与框逐字不变；Windows/Linux 的
+  x86 AVX2 走同一套面板/逐行实现，规则同样生效。
+- **Metal：`n_conv8` 引入 simdgroup_matrix（MMA）路径**，`MatMul.12`
+  1.62×；权重与激活的分配起点抬到 64 B 相位（同形状派发差 1.47× 的根因），
+  medium 端到端再降约 2.1 ms/图。
+- **Metal：`n_head_argmax` 融合内核**（Softmax + CTC argmax）1.91×，
+  small −1.70 ms/图；tiny/small 全语料逐位不变。
+- **Metal：`n_conv_dw_tile` 瓦片暂存**，dw 家族 17.27 → 11.77 ms（1.65×）。
+- **rec 桶宽粒度 8 → 32 → 64、cls 合批上限 8 → 32**：减少每图 run 数，
+  small 档约 −3 ms/图；精度代价已逐行对拍（1041 行中 7 行变化、0 处新增
+  错字）。
+- **全量 100 图三档端到端（本机 M4）**：CPU 49.3 / 203.7 / 1458.8 ms/图，
+  Metal 32.1 / 66.3 / 299.9 ms/图，**1.54× / 3.07× / 4.87×**。
+
+### 修复（Fixed）
+
+- **Metal 静默丢行（约 2.7% 的图出现一行空文本）**：计划账本用
+  `Arc::as_ptr` 的地址当身份，所有者释放后地址被后来的参数块复用，导致
+  假命中、跳过写入，内核读到别的形状的参数。账本改为钉住 `Arc`；互锁
+  对照 450 轮干净。
+- **Metal 共享 arena 冲掉计划静态区**：会话级共享 arena + 计划命中缓存
+  不重传参数，后建计划的静态区覆盖先前计划的参数块，shader 读垃圾并挂死。
+  已修（静态区重放/布局隔离），10 图一会话 0.52 s，修复前同形态 120 s
+  超时并打瘸 GPU。
+- **删除死的 fp16 实验路径**（Vulkan 的 f16 内核/模块与 Metal 的 fp16
+  分支）：从未接入生产路径，保留只会误导；仓库全程 f32。
+- **图像解码错误带上路径**，多图批处理定位 ENOENT 不再只报
+  `io: No such file or directory`。
+
+### 变更（Changed）
+
+- **cls 方向第二意见（默认开）**：cls 两类最大概率低于 `cls_thresh` **且**
+  首次 rec 置信度低于 `cls_retry_conf`（默认 0.85）时，翻转 180° 重读并取
+  置信度高者。small 档 +8 行、CER 1.82% → 0.32%；代价约 0.15 行/图的
+  额外 rec（只发生在已经读坏的行上）。`QPPOCR_CLS_RETRY=0` 可关闭。
+- **rec 分桶改为相对跨度判据**（GPU）：组内 `max(w)-min(w) ≤ grain` 即
+  合批，填充上界不变但不再被桶边界挡住；`QPPOCR_REC_BUCKET=1` 退回旧判据。
+  `exact_width` 字段退役，统一由 grain 控制。
+- **Vulkan 后端与 Metal 共用计划模型**，Vulkan 侧行为等价经测试套验证；
+  官方发行包仍为 CPU-only（`gpu` 不进默认 feature）。
 
 ## [0.3.1] - 2026-10-04
 

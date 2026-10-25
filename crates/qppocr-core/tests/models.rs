@@ -113,7 +113,7 @@ fn weight_bytes_report() {
         let Some(g) = check_model(f) else { continue };
         let mut items: Vec<(i64, &String)> =
             g.initializers.iter().map(|(k, t)| (t.numel(), k)).collect();
-        items.sort_by(|a, b| b.0.cmp(&a.0));
+        items.sort_by_key(|b| std::cmp::Reverse(b.0));
         let total: i64 = items.iter().map(|(n, _)| *n).sum();
         let used: HashSet<&str> = g
             .nodes

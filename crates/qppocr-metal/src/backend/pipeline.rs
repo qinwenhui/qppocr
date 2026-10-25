@@ -210,6 +210,7 @@ impl KernelSet {
 
 /// 录一条分发（管线已定）。**与 `KernelSet` 解耦**——微基准拿自己的
 /// 变体管线复用同一套绑定/网格语义，量到的差异才只归因于内核本身。
+#[cfg(test)] // 唯一调用方是 cfg(test) 的 microbench
 pub(crate) fn dispatch_with(
     enc: &ComputeCommandEncoderRef,
     pipe: &ComputePipelineState,

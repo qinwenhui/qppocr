@@ -985,7 +985,7 @@ impl PlanBuilder<'_> {
                         .graph
                         .nodes
                         .iter()
-                        .filter(|m| m.inputs.iter().any(|i| *i == src))
+                        .filter(|m| m.inputs.contains(&src))
                         .count()
                         == 1;
                 if sole_reader {
@@ -2551,6 +2551,7 @@ pub(crate) struct Layout {
 /// * 静态 0/4/8/12 → 合计 99.17 / 103.35 / 101.14 / 103.25 ms，差全在
 ///   `n_conv8_mma`（36.48 / 39.75 / 38.11 / 39.94）⇒ **0 比其余档快 4.5~9.5%**，
 ///   与探针（1.51×，相位 0 最快）同向。
+///
 /// 即：相位这条杠杆已经吃干净，剩下的**不是**"0 未必全局最优"。
 static APHASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
 static SPHASE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();

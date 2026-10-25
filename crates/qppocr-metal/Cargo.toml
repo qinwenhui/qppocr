@@ -16,12 +16,12 @@ default = ["metal"]
 metal = ["dep:metal"]
 
 [dependencies]
-qppocr-core = { path = "../qppocr-core", version = "0.3.1" }
+qppocr-core = { path = "../qppocr-core", version = "0.4.0" }
 # 共享计划模型（qppocr_gpu::plan/nhwc）：整图 dispatch 编排与权重重排。
 # default-features = false——不拉 Vulkan 依赖（ash），只取后端无关层。
-qppocr-gpu = { path = "../qppocr-gpu", version = "0.3.1", default-features = false }
+qppocr-gpu = { path = "../qppocr-gpu", version = "0.4.0", default-features = false }
 # session 的输出张量构造（F32Buf）——运行时依赖，非仅测试
-qppocr-kernels = { path = "../qppocr-kernels", version = "0.3.1" }
+qppocr-kernels = { path = "../qppocr-kernels", version = "0.4.0" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # 锁 minor：metal 升级走独立 PR（objc 系 raw 指针面全封在本 crate 的

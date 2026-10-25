@@ -1,4 +1,9 @@
-#![allow(clippy::undocumented_unsafe_blocks)] // 裸内核取证：持久映射指针操作，逐块 SAFETY 注释无信息量
+#![allow(
+    clippy::undocumented_unsafe_blocks, // 裸内核取证：持久映射指针操作，逐块 SAFETY 注释无信息量
+    clippy::unusual_byte_groupings,     // 随机种子按可读的十六进制段书写
+    clippy::approx_constant,            // 位级对照表按内核实现里的常数原值书写
+    clippy::needless_range_loop,        // 逐列对照按索引遍历
+)]
 //! P1 内核位级冒烟：`n_entry`（NCHW→NHWC 入口转换，纯数据搬移——位级
 //! 断言）与 `n_elem`（逐元素族——IEEE 基本运算逐位断言；exp 类与
 //! 乘加链见用例表说明）。
