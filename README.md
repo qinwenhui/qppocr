@@ -203,6 +203,8 @@ QQ 群（扫码加入，问题反馈 / 使用讨论 / 参与开发都欢迎）�
 
 - **[qpp-studio](https://github.com/qinwenhui/qpp-studio)** —— 基于本引擎的
   桌面门面软件（开箱即用的图形界面）。
+- **[qppocr-native](https://github.com/wuyuan2009123/qppocr-native)** —— 基于本引擎的多语言接入层。
+
 
 ## License
 
