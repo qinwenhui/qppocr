@@ -994,7 +994,7 @@ fn build_conv_case_geom_w(
         w_repacked
     } else {
         assert!(
-            ci4 % 8 == 0 && co4 % 8 == 0,
+            ci4.is_multiple_of(8) && co4.is_multiple_of(8),
             "分片分块布局要 ci4/co4 都是 8 的倍数，本形状 {}->{}（cin%8 或 co%8 不为 0）",
             c.cin,
             c.cout
@@ -1233,7 +1233,7 @@ struct KxkTestCover {
 fn kxk_cover_test(pr: &ConvProbe, kh: u32, kw: u32) -> KxkTestCover {
     let g = pr.geom;
     assert!(
-        pr.out_w % 4 == 0,
+        pr.out_w.is_multiple_of(4),
         "紧凑网格门禁 outW%4（outW={}）",
         pr.out_w
     );
@@ -1687,7 +1687,7 @@ fn conv8_mma_matches_cpu() {
         let mut pr = build_conv_case(&ctx.inner.device, &c);
         // MMA 网格与 n_conv8 不同：x = 64 行块，y = NCOLS 列块，z = 批。
         // 通道块宽与内核名成对选（与 `plan.rs` 那一支同一个判据）。
-        let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
+        let ncols = if pr.co4.is_multiple_of(64) { 64 } else { 32 };
         let kname = if ncols == 64 {
             "n_conv8_mma"
         } else {
@@ -1823,7 +1823,7 @@ fn conv8_mma3_throughput() {
         let nfb = (pr.out_w - (k - 1)) / 64;
         let nrows = pr.out_h - (k - 1);
         // 通道块宽与 plan.rs 同一判据（第 N 份拷贝，测试里就是要独立一份）。
-        let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
+        let ncols = if pr.co4.is_multiple_of(64) { 64 } else { 32 };
         let nch = pr.co4.div_ceil(ncols); // 上取整（通道尾块，见 plan.rs 同支）
         let kname = if ncols == 64 {
             "n_conv8_mma3"
@@ -1836,8 +1836,8 @@ fn conv8_mma3_throughput() {
         let gl = (k / 2 + 3) / 4;
         if nfb < 1
             || c.cin % 8 != 0
-            || pr.co4 % 8 != 0
-            || pr.out_w % 4 != 0
+            || !pr.co4.is_multiple_of(8)
+            || !pr.out_w.is_multiple_of(4)
             || 2 * gl > pr.out_w / 4
         {
             eprintln!(
@@ -2002,7 +2002,7 @@ fn conv8_mma3_load_attribution() {
     for c in &cases {
         let pr = build_conv_case(&ctx.inner.device, c);
         let k = c.kh;
-        let ncols = if pr.co4 % 64 == 0 { 64 } else { 32 };
+        let ncols = if pr.co4.is_multiple_of(64) { 64 } else { 32 };
         // 本组的形状全是 co4 ∈ {32,64}，整除/上取整同值；照抄 plan.rs 的式子。
         let nch = pr.co4.div_ceil(ncols);
         let kname = if ncols == 64 {
@@ -3450,7 +3450,7 @@ fn conv8_mma_throughput() {
         let mma_groups = mm_sg_groups(c.h * c.w, pr.co4);
         // 契约检查：不满足就该跳过（计划层不会派发这种形状）。
         assert!(
-            c.cin % 8 == 0 && pr.co4 % 64 == 0,
+            c.cin % 8 == 0 && pr.co4.is_multiple_of(64),
             "{} 不满足 MMA 启用条件",
             c.label
         );
@@ -3614,7 +3614,7 @@ fn conv8_mma_nsg4_scan() {
         let pr = build_conv_case(&ctx.inner.device, c);
         // 两条实例化适用域相同（都是 64 列块），网格公式也相同。
         assert!(
-            c.cin % 8 == 0 && pr.co4 % 64 == 0,
+            c.cin % 8 == 0 && pr.co4.is_multiple_of(64),
             "{} 不满足 `<64,4>` 的适用条件（nDim 必须是 64 的倍数）",
             c.label
         );
@@ -6446,7 +6446,7 @@ struct CtProbe {
 /// 组一个 2×2 stride-2、无 pad 的 ConvTranspose 用例（`n_convt` 在 det 里
 /// 的两条都是这个几何）。字段顺序与 `plan.rs` 的 ConvTranspose 分支逐字一致。
 fn build_ct_case(device: &metal::DeviceRef, cin: u32, cout: u32, in_h: u32, in_w: u32) -> CtProbe {
-    assert!(in_w % 4 == 0, "p_ct_tap4w4 要求 inW%4==0");
+    assert!(in_w.is_multiple_of(4), "p_ct_tap4w4 要求 inW%4==0");
     let ci4 = cin.div_ceil(4) * 4;
     let co4 = cout.div_ceil(4) * 4;
     let (out_h, out_w) = (in_h * 2, in_w * 2);

@@ -1382,27 +1382,27 @@ impl DeviceSession for MetalSession {
         // 诊断（`QPPOCR_METAL_IO_DUMP`）：memcpy 之后、dispatch **之前**再落一份输入。
         // 与 run 之后那份配对比较，把「host 喂进来的就是错的」和「被某个内核覆盖了」
         // 一刀切开——这是判据，不是猜测。
-        if self.argmax_exit {
-            if let Some(prefix) = std::env::var_os("QPPOCR_METAL_IO_DUMP") {
-                let shape = in_shape
-                    .iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join("x");
-                // SAFETY: in_f32_off + in_words ≤ total_words（memcpy 按输入形状分配）。
-                let pre = unsafe {
-                    std::slice::from_raw_parts(
-                        plan.base.add(plan.in_f32_off as usize * 4),
-                        in_words * 4,
-                    )
-                };
-                let path = format!(
-                    "{}.run{run_seq:03}.{shape}.in_pre",
-                    prefix.to_string_lossy()
-                );
-                if let Err(e) = std::fs::write(&path, pre) {
-                    eprintln!("[io-dump] 写 {path} 失败：{e}");
-                }
+        if self.argmax_exit
+            && let Some(prefix) = std::env::var_os("QPPOCR_METAL_IO_DUMP")
+        {
+            let shape = in_shape
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("x");
+            // SAFETY: in_f32_off + in_words ≤ total_words（memcpy 按输入形状分配）。
+            let pre = unsafe {
+                std::slice::from_raw_parts(
+                    plan.base.add(plan.in_f32_off as usize * 4),
+                    in_words * 4,
+                )
+            };
+            let path = format!(
+                "{}.run{run_seq:03}.{shape}.in_pre",
+                prefix.to_string_lossy()
+            );
+            if let Err(e) = std::fs::write(&path, pre) {
+                eprintln!("[io-dump] 写 {path} 失败：{e}");
             }
         }
 
@@ -1696,15 +1696,15 @@ impl DeviceSession for MetalSession {
             }
             s
         }
-        if let (true, Some((prefix, wins))) = (self.argmax_exit, watch.as_ref()) {
-            if !wins.is_empty() {
-                let sw = (plan.static_bytes / 4) as usize;
-                // SAFETY: 窗口都在 [static_words, total_words) 内（Layout 两段分离），
-                // 且此刻还未提交任何 dispatch，无并发写。
-                let line = unsafe { watch_line(plan.base, sw, wins) };
-                let path = format!("{prefix}.pre");
-                let _ = std::fs::write(&path, format!("{line}\n"));
-            }
+        if let (true, Some((prefix, wins))) = (self.argmax_exit, watch.as_ref())
+            && !wins.is_empty()
+        {
+            let sw = (plan.static_bytes / 4) as usize;
+            // SAFETY: 窗口都在 [static_words, total_words) 内（Layout 两段分离），
+            // 且此刻还未提交任何 dispatch，无并发写。
+            let line = unsafe { watch_line(plan.base, sw, wins) };
+            let path = format!("{prefix}.pre");
+            let _ = std::fs::write(&path, format!("{line}\n"));
         }
         let t0 = std::time::Instant::now();
         let (encode_ms, wait_ms) = if let Some(n) = chunk {
@@ -1743,39 +1743,39 @@ impl DeviceSession for MetalSession {
                     blk.first().map_or("?", |d| d.kernel),
                     blk.last().map_or("?", |d| d.kernel),
                 );
-                if let Some(bail) = bail_ms {
-                    if w > bail {
-                        eprintln!(
-                            "[chunk] ✖ run#{run_seq} {tid:?} dispatch {lo}..{} 等待 {w:.1} ms > \
+                if let Some(bail) = bail_ms
+                    && w > bail
+                {
+                    eprintln!(
+                        "[chunk] ✖ run#{run_seq} {tid:?} dispatch {lo}..{} 等待 {w:.1} ms > \
                              阈值 {bail:.0} ms —— 访存通路很可能就被这一块打瘸了。\
                              立即退出（不再提交后续 dispatch）。凶手内核区间：{:?} → {:?}",
-                            lo + blk.len(),
-                            blk.first().map_or("?", |d| d.kernel),
-                            blk.last().map_or("?", |d| d.kernel),
-                        );
-                        std::process::exit(97);
-                    }
+                        lo + blk.len(),
+                        blk.first().map_or("?", |d| d.kernel),
+                        blk.last().map_or("?", |d| d.kernel),
+                    );
+                    std::process::exit(97);
                 }
                 // 逐块窗口采样（见上面 `QPPOCR_METAL_WATCH` 的说明）。
-                if let (true, Some((prefix, wins))) = (self.argmax_exit, watch.as_ref()) {
-                    if !wins.is_empty() {
-                        let sw = (plan.static_bytes / 4) as usize;
-                        // SAFETY: 同上（窗口在映射内）；本块已 wait 返回，GPU 不再写。
-                        let line = unsafe { watch_line(plan.base, sw, wins) };
-                        let path = format!("{prefix}.trace");
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&path)
-                        {
-                            let _ = writeln!(
-                                f,
-                                "{lo:>4}..{:<4} {:>22} {line}",
-                                lo + blk.len(),
-                                blk.first().map_or("?", |d| d.kernel),
-                            );
-                        }
+                if let (true, Some((prefix, wins))) = (self.argmax_exit, watch.as_ref())
+                    && !wins.is_empty()
+                {
+                    let sw = (plan.static_bytes / 4) as usize;
+                    // SAFETY: 同上（窗口在映射内）；本块已 wait 返回，GPU 不再写。
+                    let line = unsafe { watch_line(plan.base, sw, wins) };
+                    let path = format!("{prefix}.trace");
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        let _ = writeln!(
+                            f,
+                            "{lo:>4}..{:<4} {:>22} {line}",
+                            lo + blk.len(),
+                            blk.first().map_or("?", |d| d.kernel),
+                        );
                     }
                 }
             }
