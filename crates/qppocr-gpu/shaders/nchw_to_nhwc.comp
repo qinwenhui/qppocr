@@ -1,0 +1,19 @@
+// NCHW [1,C,H,W] → NHWC [1,H,W,C]（1D 平坦索引——与 elementwise 同模式）
+// dispatch: [ceil(total/256)] with local (256,1,1)
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(push_constant) uniform PC {
+    uint in_off; uint out_off; uint C; uint H; uint W;
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;  // NHWC 输出平坦下标
+    uint total = pc.H * pc.W * pc.C;
+    if (idx >= total) return;
+    uint c = idx % pc.C;
+    uint hw = idx / pc.C;
+    uint w = hw % pc.W;
+    uint h = hw / pc.W;
+    data[pc.out_off + idx] = data[pc.in_off + c * pc.H * pc.W + h * pc.W + w];
+}

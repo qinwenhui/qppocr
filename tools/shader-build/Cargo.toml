@@ -1,0 +1,12 @@
+[package]
+name = "shader-build"
+description = "GLSL → SPIR-V 编译工具（glslc）——签入产物，仓库运行时零着色器依赖"
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+# 独立工具：不进 workspace（cargo build --workspace 不该拖着编译器依赖）。
+# 无第三方依赖——只 subprocess 调 glslc（PATH/VULKAN_SDK/WSL 自动探测）。
+[workspace]
+
+[dependencies]

@@ -1,0 +1,88 @@
+// ConvTranspose（NHWC f32，kH≤sH 且 kW≤sW——det 的 FPN 2×2 s2 上采样）：
+// 每输出恰由一个 (ih,iw,ky,kx) tap 决定。ONNX 权重 [Ci,Co,kh,kw] 重排为
+// 每 tap 一张 [Ci][nv] 的 vec4 矩阵（元素 = 4 个输出通道）。
+// act：0=无、1=gelu(c1,c2,c3)、2=relu（镜像 conv.comp）。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(std430, binding = 0) buffer D32 { vec4 d[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+const uint OFF_NONE = 0xFFFFFFFFu;
+
+// exp1/erf1：conv.comp 的逐字拷贝（与 CPU 位级一致的多项式，非硬件 exp）。
+float exp1(float x) {
+    const float LN2_HI = 0.6931472;
+    const float LN2_LO = -2.9802322e-8;
+    const float INV_LN2 = 1.442695;
+    x = clamp(x, -88.0, 88.0);
+    float kf = roundEven(x * INV_LN2);
+    float r = fma(-kf, LN2_HI, x);
+    r = fma(-kf, LN2_LO, r);
+    float p = 1.0 / 720.0;
+    p = fma(p, r, 1.0 / 120.0);
+    p = fma(p, r, 1.0 / 24.0);
+    p = fma(p, r, 1.0 / 6.0);
+    p = fma(p, r, 0.5);
+    p = fma(p, r, 1.0);
+    p = fma(p, r, 1.0);
+    int ki = int(kf) + 127;
+    return uintBitsToFloat(uint(ki) << 23) * p;
+}
+
+float erf1(float x) {
+    float ax = abs(x);
+    float t = 1.0 / fma(0.3275911, ax, 1.0);
+    float p = 1.0614054;
+    p = fma(p, t, -1.453152027);
+    p = fma(p, t, 1.421413741);
+    p = fma(p, t, -0.284496736);
+    p = fma(p, t, 0.2548296);
+    p *= t;
+    float e = exp1(-ax * ax);
+    float r = fma(-p, e, 1.0);
+    return uintBitsToFloat(floatBitsToUint(r) | (floatBitsToUint(x) & 0x80000000u));
+}
+
+void main() {
+    uint P = pc.p_off;
+    uint in_off = params[P + 0], w_off = params[P + 1], b_off = params[P + 2];
+    uint out_off = params[P + 3];
+    uint mDim = params[P + 4], nDim = params[P + 5], outW = params[P + 6];
+    uint inW = params[P + 7], inH = params[P + 8], cin = params[P + 9];
+    uint ci4v = params[P + 10], sH = params[P + 11], sW = params[P + 12];
+    uint kW = params[P + 13], act = params[P + 14];
+    float c1 = uintBitsToFloat(params[P + 15]);
+    float c2 = uintBitsToFloat(params[P + 16]);
+    float c3 = uintBitsToFloat(params[P + 17]);
+
+    uint b = gl_WorkGroupID.y;
+    uint nv = nDim >> 2;
+    uint gid = gl_GlobalInvocationID.x;
+    uint tiles = mDim * nv;
+    if (gid >= tiles) return;
+    uint n4 = gid % nv;
+    uint m = gid / nv;
+    uint oh = m / outW, ow = m - oh * outW;
+    uint ih = oh / sH, ky = oh - ih * sH;
+    uint iw = ow / sW, kx = ow - iw * sW;
+    uint tap = ky * kW + kx;
+    uint ib = (in_off >> 2) + b * inH * inW * ci4v;
+    uint wb = w_off >> 2;
+    uint ob = (out_off >> 2) + b * mDim * nv;
+
+    uint px = ih * inW + iw;
+    vec4 acc = vec4(0.0);
+    for (uint ci = 0u; ci < cin; ci++) {
+        float xv = d[ib + px * ci4v + (ci >> 2)][ci & 3u];
+        acc += xv * vec4(d[wb + tap * cin * nv + ci * nv + n4]);
+    }
+    if (b_off != OFF_NONE) acc += vec4(d[(b_off >> 2) + n4]); // bias 全批共享（曾有 b*nv 越界）
+    if (act == 2u) acc = max(acc, vec4(0.0));
+    else if (act == 1u) {
+        float inv = 1.0 / c1;
+        acc = c3 * acc * (vec4(erf1(acc.x * inv), erf1(acc.y * inv),
+                               erf1(acc.z * inv), erf1(acc.w * inv)) + c2);
+    }
+    d[ob + m * nv + n4] = vec4(acc);
+}

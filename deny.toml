@@ -1,0 +1,39 @@
+# cargo-deny 配置：许可与依赖审计。
+# 本项目刻意保持极少依赖且全部 feature 门控，这里把清单收紧。
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# RUSTSEC-2024-0436：`paste` 已停止维护（unmaintained，非漏洞），由
+# metal 0.33 的 proc-macro 依赖链传递引入，上游无已修复版本可升级。
+# 只忽略这一条；新的漏洞/停更公告仍会照常拦下。
+ignore = ["RUSTSEC-2024-0436"]
+
+[licenses]
+version = 2
+# 只允许与 MIT OR Apache-2.0 兼容的许可。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

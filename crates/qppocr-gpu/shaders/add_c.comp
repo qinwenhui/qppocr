@@ -1,0 +1,16 @@
+// 逐通道加：A[N,C,HW] + b[C]（det 头部的 [1,C,1,1] 偏置广播）。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(push_constant) uniform PC {
+    uint a_off; uint b_off; uint out_off;
+    uint hw; uint c;
+} pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    uint ch = gl_GlobalInvocationID.y;
+    uint n = gl_GlobalInvocationID.z;
+    if (j >= pc.hw) return;
+    uint base = n * pc.c * pc.hw + ch * pc.hw + j;
+    data[pc.out_off + base] = data[pc.a_off + base] + data[pc.b_off + ch];
+}

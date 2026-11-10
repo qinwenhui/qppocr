@@ -1,0 +1,17 @@
+// 逐通道乘：A[N,C,HW] * b[C]（SE 门的广播形态）。
+// 3D dispatch：x=HW/256、y=C、z=N——免 div/mod 取通道下标。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(push_constant) uniform PC {
+    uint a_off; uint b_off; uint out_off;
+    uint hw; uint c;
+} pc;
+void main() {
+    uint j = gl_GlobalInvocationID.x;   // HW 内下标
+    uint ch = gl_GlobalInvocationID.y;  // 通道
+    uint n = gl_GlobalInvocationID.z;   // 批
+    if (j >= pc.hw) return;
+    uint base = n * pc.c * pc.hw + ch * pc.hw + j;
+    data[pc.out_off + base] = data[pc.a_off + base] * data[pc.b_off + ch];
+}

@@ -1,0 +1,7 @@
+# 开发用工具链。MSRV 声明在根 Cargo.toml 的 rust-version（1.89，
+# avx512f 检测字符串的稳定版本），CI 里有单独的 job 用 MSRV 构建；
+# 日常开发钉在当前稳定版。跨机构建盒若无法下载该 channel，删除本
+# 文件回落 default 工具链（≥1.89 即可）。
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

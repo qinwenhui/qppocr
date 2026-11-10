@@ -1,0 +1,34 @@
+// 通道拼接（NHWC f32，axis=1）：out 行 = 各输入行按通道段串接。
+// 一线程一 (空间位置, 输出 c4)；线性扫 ≤8 段找源。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 1) buffer Params { uint params[]; };
+layout(std430, binding = 0) buffer D32 { vec4 d[]; };
+layout(push_constant) uniform PC { uint p_off; } pc;
+
+void main() {
+    uint P = pc.p_off;
+    uint out_off = params[P + 0];
+    uint hw = params[P + 1];        // 空间位置数（N*H*W）
+    uint nIn = params[P + 2];
+    uint outC4 = params[P + 3];     // 总通道 / 4（pad 后）
+
+    uint gid = gl_GlobalInvocationID.x;
+    uint tiles = hw * outC4;
+    if (gid >= tiles) return;
+    uint c4 = gid % outC4;
+    uint pos = gid / outC4;
+
+    // 段表在参数块尾部：{src_off, c4_len} × nIn
+    uint acc = 0u;
+    for (uint i = 0u; i < nIn; i++) {
+        uint sOff = params[P + 4 + i * 2];
+        uint sC4 = params[P + 5 + i * 2];
+        if (c4 < acc + sC4) {
+            d[(out_off >> 2) + pos * outC4 + c4] =
+                d[(sOff >> 2) + pos * sC4 + (c4 - acc)];
+            return;
+        }
+        acc += sC4;
+    }
+}

@@ -1,0 +1,15 @@
+// hardsigmoid：v = x*alpha + beta（CPU 判据是 fma——GPU 编译器可能不融合，
+// ≤1 ulp 差异，容差内）；clamp 顺序镜像标量判据：v<0→0, v>1→1。
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Buf { float data[]; };
+layout(push_constant) uniform PC {
+    uint in_off; uint out_off; uint n;
+    float alpha; float beta;
+} pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) return;
+    float v = data[pc.in_off + i] * pc.alpha + pc.beta;
+    data[pc.out_off + i] = v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v);
+}
